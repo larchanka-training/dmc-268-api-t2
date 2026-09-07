@@ -28,9 +28,19 @@ docker compose exec api alembic upgrade head
 
 ```bash
 uv sync
-cp .env.example .env   # укажите POSTGRES_HOST=localhost и REDIS_URL=redis://localhost:6379/0
+cp .env.example .env   # укажите POSTGRES__HOST=localhost и REDIS__URL=redis://localhost:6379/0
 uv run uvicorn app.main:app --reload
 ```
+
+## Логирование
+
+Логи пишутся одновременно в stdout и в файл `logs/app.log` (ротация: 10 МБ × 5 копий). Настройки — в `.env`:
+
+- `LOGGING__LEVEL` — уровень журнала (по умолчанию `INFO`);
+- `LOGGING__FORMAT` — `console` (человекочитаемый, по умолчанию) или `json` (в docker-compose включён автоматически);
+- `LOGGING__FILE_ENABLED`, `LOGGING__FILE_PATH` — файловый вывод.
+
+Каждый запрос получает Request ID: он попадает во все записи журнала этого запроса и в заголовок ответа `X-Request-Id`.
 
 ## Проверки качества
 
@@ -39,3 +49,5 @@ uv run ruff check
 uv run ruff format --check
 uv run mypy .
 ```
+
+Примечание: каталог `migrations/` исключён из ruff и mypy — это генерируемый boilerplate Alembic.

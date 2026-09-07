@@ -13,3 +13,7 @@ _Avoid_: `/health`, health check, пинг
 **Readiness**:
 Проверка готовности: доступность зависимостей (PostgreSQL, Redis) через отдельный эндпоинт. Отдельное понятие, никогда не смешивается с Healthcheck.
 _Avoid_: deep healthcheck, расширенный healthcheck
+
+**Request ID**:
+Идентификатор корреляции HTTP-запроса: middleware генерирует его на каждый запрос, примешивает ко всем записям журнала и возвращает в заголовке `X-Request-Id`; входящее значение заголовка переиспользуется.
+_Avoid_: correlation id, trace id

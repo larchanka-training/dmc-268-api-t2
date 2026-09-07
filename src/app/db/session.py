@@ -11,7 +11,7 @@ __all__ = ["Base", "async_session_factory", "engine", "get_session"]
 
 settings = get_settings()
 
-engine = create_async_engine(settings.async_db_url, echo=False)
+engine = create_async_engine(settings.postgres.url, echo=False)
 
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 

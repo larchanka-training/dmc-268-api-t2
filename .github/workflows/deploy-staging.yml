@@ -211,7 +211,7 @@ jobs:
           done
 
           echo "Running database migrations..."
-          compose run --rm --no-deps api alembic upgrade head
+          compose run --rm --no-deps --interactive=false -T api alembic upgrade head </dev/null
 
           echo "Starting API..."
           compose up -d api

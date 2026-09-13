@@ -2,6 +2,12 @@ name: Terraform staging
 
 on:
   workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the Terraform changes to staging
+        required: true
+        type: boolean
+        default: false
 
   pull_request:
     branches:
@@ -20,17 +26,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: terraform-staging
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
 jobs:
-  plan:
-    name: Terraform plan
+  validate:
+    name: Terraform validate
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-
-    env:
-      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
-      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
-      TF_IN_AUTOMATION: "true"
-      TF_INPUT: "false"
 
     defaults:
       run:
@@ -49,33 +57,82 @@ jobs:
       - name: Check formatting
         run: terraform fmt -check -recursive
 
-      - name: Initialize Terraform
+      - name: Initialize without remote state
         run: terraform init -backend=false
 
       - name: Validate Terraform
         run: terraform validate
 
-      - name: Validate staging target
-        shell: bash
-        run: |
-          set -euo pipefail
+  plan:
+    name: Terraform plan
+    if: github.event_name != 'pull_request'
+    needs:
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
-          if [[ -z "${SSH_HOST:-}" ]]; then
-            echo "::error::VPS_DMC268_IP_T2 is not available"
-            exit 1
-          fi
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TERRAFORM_TOKEN }}
+      TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
+      TF_VAR_ssh_user: terraform-plan
+      TF_VAR_ssh_password: not-used-during-plan
+      TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
 
-          if [[ -z "${SSH_HOST_KEY:-}" ]]; then
-            echo "::error::SSH host key is not configured"
-            exit 1
-          fi
+    defaults:
+      run:
+        working-directory: infra/terraform
 
-          echo "Required staging target configuration is available"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Initialize HCP Terraform
+        run: terraform init
 
       - name: Terraform plan
-        env:
-          TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
-          TF_VAR_ssh_user: terraform-plan
-          TF_VAR_ssh_password: not-used-during-plan
-          TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
         run: terraform plan -input=false -no-color
+
+  apply:
+    name: Terraform apply
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.apply == true &&
+      github.ref == 'refs/heads/main'
+    needs:
+      - validate
+      - plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TERRAFORM_TOKEN }}
+      TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
+      TF_VAR_ssh_user: ${{ secrets.VPS_DMC268_U }}
+      TF_VAR_ssh_password: ${{ secrets.VPS_DMC268_P }}
+      TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Initialize HCP Terraform
+        run: terraform init
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -input=false -no-color

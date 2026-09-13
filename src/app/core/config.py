@@ -23,7 +23,9 @@ class Postgres(BaseModel):
         """Async SQLAlchemy URL for PostgreSQL."""
         user = quote_plus(self.user)
         password = quote_plus(self.password)
-        return f"postgresql+asyncpg://{user}:{password}@{self.host}:{self.port}/{self.db}"
+        return (
+            f"postgresql+asyncpg://{user}:{password}@{self.host}:{self.port}/{self.db}"
+        )
 
 
 class Redis(BaseModel):

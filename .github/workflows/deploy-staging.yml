@@ -1,0 +1,236 @@
+name: Deploy staging
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    name: Deploy to staging VPS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    # Do not allow staging deployment from a feature branch.
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      DEPLOY_PATH: /opt/dmc-268-t2
+      API_IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate deployment configuration
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSH_PASSWORD: ${{ secrets.VPS_DMC268_P }}
+          POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SSH_HOST:-}" ]]; then
+            echo "::error::VPS_DMC268_IP_T2 is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_USER:-}" ]]; then
+            echo "::error::VPS_DMC268_U is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_PASSWORD:-}" ]]; then
+            echo "::error::VPS_DMC268_P is not available"
+            exit 1
+          fi
+
+          if [[ -z "${POSTGRES_PASSWORD:-}" ]]; then
+            echo "::error::STAGING_POSTGRES_PASSWORD is not available"
+            exit 1
+          fi
+
+          echo "Required staging deployment configuration is available"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "${SSH_HOST} ${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Verify Docker runtime
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            'docker --version && docker compose version'
+
+      - name: Prepare deployment directory
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "install -d -m 0755 '${DEPLOY_PATH}'"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            docker-compose.staging.yml \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/docker-compose.staging.yml"
+
+      - name: Write staging environment
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+          POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'API_IMAGE=%s\n' "${API_IMAGE}"
+            printf 'POSTGRES__USER=dmc\n'
+            printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
+            printf 'POSTGRES__DB=dmc\n'
+          } | sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "umask 077 && cat > '${DEPLOY_PATH}/.env.staging'"
+
+      - name: Deploy application
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cleanup_registry() {
+            sshpass -e ssh \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              "${SSH_USER}@${SSH_HOST}" \
+              'docker logout ghcr.io >/dev/null 2>&1 || true' \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup_registry EXIT
+
+          printf '%s' "${GHCR_TOKEN}" | sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          cd /opt/dmc-268-t2
+
+          compose() {
+            docker compose \
+              --env-file .env.staging \
+              -f docker-compose.staging.yml \
+              "$@"
+          }
+
+          compose pull
+
+          compose up -d db redis
+
+          echo "Waiting for PostgreSQL and Redis..."
+          for attempt in $(seq 1 30); do
+            db_id="$(compose ps -q db)"
+            redis_id="$(compose ps -q redis)"
+
+            db_status="$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "${db_id}" 2>/dev/null || true)"
+
+            redis_status="$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "${redis_id}" 2>/dev/null || true)"
+
+            if [[ "${db_status}" == "healthy" && "${redis_status}" == "healthy" ]]; then
+              break
+            fi
+
+            if [[ "${attempt}" -eq 30 ]]; then
+              echo "ERROR: PostgreSQL or Redis did not become healthy"
+              compose ps
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Running database migrations..."
+          compose run --rm --no-deps api alembic upgrade head
+
+          echo "Starting API..."
+          compose up -d api
+
+          echo "Waiting for API healthcheck..."
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/healthcheck >/dev/null; then
+              echo "Staging API is healthy"
+              compose ps
+              exit 0
+            fi
+
+            if [[ "${attempt}" -eq 30 ]]; then
+              echo "ERROR: API healthcheck failed"
+              compose ps
+              compose logs --tail=100 api
+              exit 1
+            fi
+
+            sleep 2
+          done
+          REMOTE

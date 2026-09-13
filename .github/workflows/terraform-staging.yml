@@ -76,7 +76,7 @@ jobs:
       TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
       TF_VAR_ssh_user: terraform-plan
       TF_VAR_ssh_password: not-used-during-plan
-      TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      TF_VAR_ssh_host_key: ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDCTfrO6+yE0rPk6M9d4LF7OfQNiT6Ba5oft06X4sb2Begdl/OWHgxAHRszxYzrfQNB1fLHFiwbMjF4HvUnJu20=
 
     defaults:
       run:
@@ -115,7 +115,7 @@ jobs:
       TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
       TF_VAR_ssh_user: ${{ secrets.VPS_DMC268_U }}
       TF_VAR_ssh_password: ${{ secrets.VPS_DMC268_P }}
-      TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      TF_VAR_ssh_host_key: ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDCTfrO6+yE0rPk6M9d4LF7OfQNiT6Ba5oft06X4sb2Begdl/OWHgxAHRszxYzrfQNB1fLHFiwbMjF4HvUnJu20=
 
     defaults:
       run:

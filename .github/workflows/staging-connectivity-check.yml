@@ -108,6 +108,25 @@ jobs:
           echo "Hostname: $(hostname)"
           echo "Kernel: $(uname -sr)"
 
+          echo "OS:"
+          if [[ -r /etc/os-release ]]; then
+            . /etc/os-release
+            echo "  ${PRETTY_NAME:-unknown}"
+          else
+            echo "  /etc/os-release is not available"
+          fi
+
+          if [[ "$(id -u)" -eq 0 ]]; then
+            echo "Privilege: root"
+          elif ! command -v sudo >/dev/null 2>&1; then
+            echo "Privilege: sudo is not installed"
+          elif sudo -n true 2>/dev/null; then
+            echo "Privilege: passwordless sudo"
+          else
+            echo "Privilege: sudo exists but passwordless sudo is unavailable"
+            echo "Groups: $(id -nG)"
+          fi
+
           if command -v docker >/dev/null 2>&1; then
             docker --version
           else

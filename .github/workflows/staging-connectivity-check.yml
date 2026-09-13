@@ -1,0 +1,122 @@
+name: Staging connectivity check
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - chore/staging-connectivity-check
+    paths:
+      - .github/workflows/staging-connectivity-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  connectivity:
+    name: SSH connectivity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+
+    steps:
+      - name: Validate configuration
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SSH_HOST:-}" ]]; then
+            echo "::error::VPS_DMC268_IP_T2 is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_USER:-}" ]]; then
+            echo "::error::VPS_DMC268_U is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSHPASS:-}" ]]; then
+            echo "::error::VPS_DMC268_P is not available"
+            exit 1
+          fi
+
+          echo "Required staging configuration is available"
+
+      - name: Check SSH port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if timeout 10 bash -c "exec 3<>/dev/tcp/${SSH_HOST}/22"; then
+            echo "TCP port 22 is reachable"
+          else
+            echo "::error::Cannot connect to ${SSH_HOST}:22"
+            exit 1
+          fi
+
+      - name: Configure known hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s %s %s\n' \
+            "${SSH_HOST}" \
+            "ssh-ed25519" \
+            "AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd" \
+            > ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/known_hosts
+
+          echo "Pinned SSH host key configured"
+
+      - name: Install password SSH helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Check SSH login and server environment
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o NumberOfPasswordPrompts=1 \
+            "${SSH_USER}@${SSH_HOST}" \
+            'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          echo "SSH login successful"
+          echo "User: $(whoami)"
+          echo "Hostname: $(hostname)"
+          echo "Kernel: $(uname -sr)"
+
+          if command -v docker >/dev/null 2>&1; then
+            docker --version
+          else
+            echo "Docker is not installed"
+          fi
+
+          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            docker compose version
+          else
+            echo "Docker Compose is not available"
+          fi
+          REMOTE

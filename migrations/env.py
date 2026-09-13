@@ -16,7 +16,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().postgres.url)
+# Alembic uses ConfigParser, where "%" is interpolation syntax.
+database_url = get_settings().postgres.url.replace("%", "%%")
+config.set_main_option("sqlalchemy.url", database_url)
 
 target_metadata = Base.metadata
 

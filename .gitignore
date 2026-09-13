@@ -10,3 +10,13 @@ venv/
 .ruff_cache/
 dist/
 logs/
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json

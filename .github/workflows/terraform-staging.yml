@@ -3,9 +3,16 @@ name: Terraform staging
 on:
   workflow_dispatch:
 
+  pull_request:
+    branches:
+      - main
+    paths:
+      - infra/terraform/**
+      - .github/workflows/terraform-staging.yml
+
   push:
     branches:
-      - chore/staging-connectivity-check
+      - main
     paths:
       - infra/terraform/**
       - .github/workflows/terraform-staging.yml
@@ -48,10 +55,7 @@ jobs:
       - name: Validate Terraform
         run: terraform validate
 
-      - name: Validate staging inputs
-        env:
-          SSH_USER: ${{ secrets.VPS_DMC268_U }}
-          SSH_PASSWORD: ${{ secrets.VPS_DMC268_P }}
+      - name: Validate staging target
         shell: bash
         run: |
           set -euo pipefail
@@ -61,27 +65,17 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "${SSH_USER:-}" ]]; then
-            echo "::error::VPS_DMC268_U is not available"
-            exit 1
-          fi
-
-          if [[ -z "${SSH_PASSWORD:-}" ]]; then
-            echo "::error::VPS_DMC268_P is not available"
-            exit 1
-          fi
-
           if [[ -z "${SSH_HOST_KEY:-}" ]]; then
             echo "::error::SSH host key is not configured"
             exit 1
           fi
 
-          echo "Required staging inputs are available"
+          echo "Required staging target configuration is available"
 
       - name: Terraform plan
         env:
           TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
-          TF_VAR_ssh_user: ${{ secrets.VPS_DMC268_U }}
-          TF_VAR_ssh_password: ${{ secrets.VPS_DMC268_P }}
+          TF_VAR_ssh_user: terraform-plan
+          TF_VAR_ssh_password: not-used-during-plan
           TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
         run: terraform plan -input=false -no-color

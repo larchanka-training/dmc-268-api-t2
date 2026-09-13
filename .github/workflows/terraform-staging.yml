@@ -1,0 +1,87 @@
+name: Terraform staging
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - chore/staging-connectivity-check
+    paths:
+      - infra/terraform/**
+      - .github/workflows/terraform-staging.yml
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize Terraform
+        run: terraform init -backend=false
+
+      - name: Validate Terraform
+        run: terraform validate
+
+      - name: Validate staging inputs
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSH_PASSWORD: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SSH_HOST:-}" ]]; then
+            echo "::error::VPS_DMC268_IP_T2 is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_USER:-}" ]]; then
+            echo "::error::VPS_DMC268_U is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_PASSWORD:-}" ]]; then
+            echo "::error::VPS_DMC268_P is not available"
+            exit 1
+          fi
+
+          if [[ -z "${SSH_HOST_KEY:-}" ]]; then
+            echo "::error::SSH host key is not configured"
+            exit 1
+          fi
+
+          echo "Required staging inputs are available"
+
+      - name: Terraform plan
+        env:
+          TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
+          TF_VAR_ssh_user: ${{ secrets.VPS_DMC268_U }}
+          TF_VAR_ssh_password: ${{ secrets.VPS_DMC268_P }}
+          TF_VAR_ssh_host_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+        run: terraform plan -input=false -no-color

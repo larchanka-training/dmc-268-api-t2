@@ -20,3 +20,6 @@ crash.log
 crash.*.log
 *.tfvars
 *.tfvars.json
+
+# Staging runtime secrets
+.env.staging

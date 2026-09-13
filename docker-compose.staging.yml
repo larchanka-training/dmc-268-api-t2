@@ -1,0 +1,76 @@
+name: dmc-268-t2-staging
+
+services:
+  api:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthcheck', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - backend
+
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      - backend
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks:
+      - backend
+
+volumes:
+  db-data:
+
+networks:
+  backend:

@@ -51,3 +51,8 @@ uv run mypy .
 ```
 
 Примечание: каталог `migrations/` исключён из ruff и mypy — это генерируемый boilerplate Alembic.
+
+## Staging
+
+Инфраструктура, Terraform, CI/CD и процедура staging deployment описаны в
+[`docs/staging-deployment.md`](docs/staging-deployment.md).

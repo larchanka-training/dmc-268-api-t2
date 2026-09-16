@@ -1,0 +1,138 @@
+name: Terraform staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the Terraform changes to staging
+        required: true
+        type: boolean
+        default: false
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - infra/terraform/**
+      - .github/workflows/terraform-staging.yml
+
+  push:
+    branches:
+      - main
+    paths:
+      - infra/terraform/**
+      - .github/workflows/terraform-staging.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-staging
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  validate:
+    name: Terraform validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without remote state
+        run: terraform init -backend=false
+
+      - name: Validate Terraform
+        run: terraform validate
+
+  plan:
+    name: Terraform plan
+    if: github.event_name != 'pull_request'
+    needs:
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TERRAFORM_TOKEN }}
+      TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
+      TF_VAR_ssh_user: terraform-plan
+      TF_VAR_ssh_password: not-used-during-plan
+      TF_VAR_ssh_host_key: ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDCTfrO6+yE0rPk6M9d4LF7OfQNiT6Ba5oft06X4sb2Begdl/OWHgxAHRszxYzrfQNB1fLHFiwbMjF4HvUnJu20=
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Initialize HCP Terraform
+        run: terraform init
+
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color
+
+  apply:
+    name: Terraform apply
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.apply == true &&
+      github.ref == 'refs/heads/main'
+    needs:
+      - validate
+      - plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.HCP_TERRAFORM_TOKEN }}
+      TF_VAR_ssh_host: ${{ vars.VPS_DMC268_IP_T2 }}
+      TF_VAR_ssh_user: ${{ secrets.VPS_DMC268_U }}
+      TF_VAR_ssh_password: ${{ secrets.VPS_DMC268_P }}
+      TF_VAR_ssh_host_key: ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDCTfrO6+yE0rPk6M9d4LF7OfQNiT6Ba5oft06X4sb2Begdl/OWHgxAHRszxYzrfQNB1fLHFiwbMjF4HvUnJu20=
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Initialize HCP Terraform
+        run: terraform init
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -input=false -no-color

@@ -1,12 +1,14 @@
 ---
 name: project-code-review
-description: Post-implementation review of the agent's own changes — acceptance criteria, tests, bugs/correctness, and security. Invoke only when the user says /project-code-review or explicitly asks to review the implementation before merge.
+description: Post-implementation review of the agent's own changes — acceptance criteria, tests, bugs/correctness, and security. Follow when user says /project-code-review, asks to review before merge, or AGENTS.md Close phase applies after an implementation slice.
 disable-model-invocation: true
 ---
 
 # Project code review
 
 Review **this agent's recent changes** (working tree, branch vs merge-base, or a fixed point the user names). This is a coding-agent procedure — **not** the product AI Code Reviewer service.
+
+When `AGENTS.md` Close applies, walk these four axes even if the user did not type `/project-code-review`. Quality commands alone are not enough.
 
 ## Scope
 

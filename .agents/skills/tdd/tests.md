@@ -22,6 +22,16 @@ Characteristics:
 - Describes WHAT, not HOW
 - One logical assertion per test
 
+## Coverage at the seam
+
+At each agreed seam, prefer a small set of behaviour cases:
+
+1. **Happy path** with representative valid inputs.
+2. **Boundary / invalid / empty** inputs the public contract must handle (reject, default, or message) — not every permutation of every argument.
+3. **Each distinct public outcome** the contract promises (success shapes, error kinds, empty states) — observed through the seam, not by reading locals.
+
+Do **not** require a test per internal `if`/`switch`. If a branch matters, it must show up as a different **observable** result or side effect at the seam; otherwise delete or simplify the branch.
+
 ## Bad Tests
 
 **Implementation-detail tests**: Coupled to internal structure.

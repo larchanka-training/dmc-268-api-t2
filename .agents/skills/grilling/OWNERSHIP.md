@@ -11,5 +11,5 @@ eval_result: candidate
 allowed_tools: repo default
 mcp_deps: []
 rollback: delete .agents/skills/grilling + demote grill package from AGENTS.md default-active
-notes: Only intentional model-reachable primitive; behind grill-me user door.
+notes: Gated (disable-model-invocation); load only via grill-me / explicit grill ask.
 ```

@@ -13,6 +13,8 @@ mcp_deps: []
 rollback: delete .agents/skills/tdd + demote from AGENTS.md default-active
 notes: >
   Rewritten trigger + disable-model-invocation.
+  Seams: reuse if present; ask once only if missing.
+  AGENTS Execute phase follows this procedure without a second /tdd.
   Dropped upstream codebase-design Skill call (not in team catalog).
-  Points review stage at project-code-review instead of Matt code-review.
+  Points review stage at project-code-review / AGENTS Close.
 ```

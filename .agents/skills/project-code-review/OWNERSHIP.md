@@ -14,4 +14,5 @@ rollback: delete .agents/skills/project-code-review + remove from AGENTS.md queu
 notes: >
   Queued (not default-active). Not Matt code-review.
   Covers AC, tests, bugs/correctness, security post-implementation.
+  AGENTS Close phase follows these axes without requiring /project-code-review.
 ```

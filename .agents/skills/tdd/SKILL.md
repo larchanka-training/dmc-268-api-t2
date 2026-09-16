@@ -1,6 +1,6 @@
 ---
 name: tdd
-description: Red-green TDD at agreed seams. Invoke only when user says /tdd or explicitly asks for test-first on a named seam.
+description: Red-green TDD at agreed seams. Follow when user says /tdd, asks for test-first, or AGENTS.md Execute phase applies to a behaviour change.
 disable-model-invocation: true
 ---
 
@@ -20,9 +20,9 @@ See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for mocking g
 
 A **seam** is the public boundary you test at: the interface where you observe behavior without reaching inside. Tests live at seams, never against internals.
 
-**Test only at pre-agreed seams.** Before writing any test, write down the seams under test and confirm them with the user. No test is written at an unconfirmed seam. You can't test everything, so agreeing the seams up front is how testing effort lands on the critical paths and complex logic instead of every edge case.
+**Test only at agreed seams.** Prefer seams already stated in grill outcome, spec Testing Decisions, tickets, or conversation. Write them down once if missing, then proceed — ask the user **once** only when no seam is documented and more than one plausible public boundary exists. Do not re-confirm seams that are already agreed.
 
-Ask: "What's the public interface, and which seams should we test?"
+You can't test everything, so seams focus effort on critical paths and complex logic instead of every edge case. Coverage at the seam: see [tests.md](tests.md).
 
 ## Anti-patterns
 
@@ -34,4 +34,4 @@ Ask: "What's the public interface, and which seams should we test?"
 
 - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 - **One slice at a time.** One seam, one test, one minimal implementation per cycle.
-- **Refactoring is not part of the loop.** Prefer a separate review pass (e.g. `/project-code-review`), not the red → green implementation cycle.
+- **Refactoring is not part of the loop.** Prefer a separate review pass (AGENTS.md Close / `/project-code-review`), not the red → green implementation cycle.

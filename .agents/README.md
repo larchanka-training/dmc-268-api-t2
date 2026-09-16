@@ -9,6 +9,7 @@ Human-only notes (governance, wiring, SHAs). Day-to-day agent brief is repo-root
 - Do **not** install wholesale Matt / Superpowers / Larchanka / Vercel packs; no marketplace auto-update as sole channel.
 - One school per failure mode (don’t stack overlapping align/TDD/review packs).
 - Team docs home (proposed, Tech Lead confirm): UI repo `docs/` — API links, does not fork.
+- **UI autonomy (Sprint 1+):** `AGENTS.md` phase router (Align → Execute → Close). Skills stay slash-gated (`disable-model-invocation`); Close loads `project-code-review` Process (not one-line axis verdicts). `grilling` is gated — not model-reachable. API `.agents/skills/` must match this catalog SHA.
 
 ## Sync
 
@@ -17,7 +18,7 @@ Human-only notes (governance, wiring, SHAs). Day-to-day agent brief is repo-root
 | **Source of truth** | UI repo `dmc-268-ui-t2` |
 | **API copy rule** | Same files under `.agents/skills/` as UI |
 | **Upstream Matt pin** | `3cca18b368ae95cdbdebbff572ccafa662551015` ([mattpocock/skills](https://github.com/mattpocock/skills)) |
-| **Shared catalog sync SHA** | `06cce159093ddbf4f83f8688aa90c601e7fa00c531b9834b67883f24eb39406f` (also `SYNC_SHA.txt`) |
+| **Shared catalog sync SHA** | `acbd51faeba5e6505e93d83d584c7e673ad72346d6bafce349b009d461e8fe9b` (also `SYNC_SHA.txt`) |
 | **Sprint** | 1 candidate convention (not proven prod) |
 
 Recompute after skill edits (hash sorted `path + file SHA256` lines of `.agents/skills/**`). UI and API must match. API is a copy — edit skills in UI first, then re-copy and refresh this SHA in both READMEs.
@@ -27,14 +28,14 @@ Recompute after skill edits (hash sorted `path + file SHA256` lines of `.agents/
 | Skill | In folder? | Default-active (≤2)? | Model invoke? | Notes |
 |---|---|---|---|---|
 | `grill-me` | Yes | **Yes** (with grilling) | `disable-model-invocation: true` | User door |
-| `grilling` | Yes | **Yes** (same package) | Allowed (primitive) | Only intentional model-reachable skill |
-| `tdd` | Yes | **Yes** | `disable-model-invocation: true` | Rewritten `/tdd` |
+| `grilling` | Yes | **Yes** (same package) | `disable-model-invocation: true` | Only via grill-me / explicit grill |
+| `tdd` | Yes | **Yes** | `disable-model-invocation: true` | `/tdd` or AGENTS Execute phase |
 | `to-spec` | Yes | Queued | `disable-model-invocation: true` | Follows `AGENTS.md` outputs |
 | `to-tickets` | Yes | Queued | `disable-model-invocation: true` | Follows `AGENTS.md` outputs |
-| `project-code-review` | Yes | Queued | `disable-model-invocation: true` | Project-owned; AC/tests/bugs/security |
+| `project-code-review` | Yes | Queued | `disable-model-invocation: true` | `/…` or AGENTS Close axes |
 | `skill-creator` | **No** | — | — | Engineer 4 meta only (skills_talks / personal) |
 
-Promote later = move a queued skill into the ≤2 active set and demote another. Update this matrix and the short “prefer grill/`/tdd`” line in both `AGENTS.md` files.
+Promote later = move a queued skill into the ≤2 active set and demote another. Update this matrix and the phase lines in UI `AGENTS.md`.
 
 ## Tool wiring
 

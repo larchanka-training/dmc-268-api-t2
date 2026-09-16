@@ -9,7 +9,9 @@ Prefer HTTP handlers or service interfaces the product owns — not private help
 ```python
 # GOOD: Tests observable behavior via public API
 def test_user_can_checkout_with_valid_cart(client):
-    cart_id = client.post("/carts", json={"items": [{"sku": "a", "qty": 1}]}).json()["id"]
+    cart_id = client.post("/carts", json={"items": [{"sku": "a", "qty": 1}]}).json()[
+        "id"
+    ]
     result = client.post(f"/carts/{cart_id}/checkout", json={"payment_method": "card"})
     assert result.status_code == 200
     assert result.json()["status"] == "confirmed"
@@ -31,8 +33,11 @@ def test_checkout_calls_payment_service(mocker):
 # BAD: Bypasses interface to verify persistence
 def test_create_user_saves_to_database(db_session):
     create_user(name="Alice")
-    row = db_session.execute(text("SELECT * FROM users WHERE name = :n"), {"n": "Alice"}).first()
+    row = db_session.execute(
+        text("SELECT * FROM users WHERE name = :n"), {"n": "Alice"}
+    ).first()
     assert row is not None
+
 
 # GOOD: Verifies through the public contract
 def test_create_user_makes_user_retrievable(client):
@@ -49,6 +54,7 @@ def test_calculate_total_sums_line_items():
     items = [{"price": 10}, {"price": 5}]
     expected = sum(i["price"] for i in items)
     assert calculate_total(items) == expected
+
 
 # GOOD: Independent known literal
 def test_calculate_total_sums_line_items():

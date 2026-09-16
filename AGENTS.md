@@ -32,7 +32,9 @@ Agreed lasting notes → team tracker (issue or PR). Session drafts → `.scratc
 
 ## When behaviour changes
 
-Write a failing test first, then the minimal code to pass it. Test through public APIs (HTTP handlers, service interfaces), not private helpers. One small slice at a time. Before more production code, the next AC case at the seam must still fail (real red). If it is already green, the last green overshot — delete speculative code or split the slice. Reuse seams already agreed; full procedure: `.agents/skills/tdd/SKILL.md`.
+When a test runner exists for the seam under change (this repo: `uv run pytest`): write a failing test first, then the minimal code to pass it. Test through public APIs (HTTP handlers, service interfaces), not private helpers. One small slice at a time. Before more production code, the next AC case at the seam must still fail (real red). If it is already green, the last green overshot — delete speculative code or split the slice. Reuse seams already agreed; full procedure: `.agents/skills/tdd/SKILL.md` (language-neutral core + Python/FastAPI appendix).
+
+Do **not** assume npm/Vitest — that is UI follow-up scope. If a seam truly has no runnable test harness yet, do not invent an impossible red gate; use the quality commands below and say so in Close.
 
 ## Stack
 

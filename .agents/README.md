@@ -9,19 +9,25 @@ Human-only notes (governance, wiring, SHAs). Day-to-day agent brief is repo-root
 - Do **not** install wholesale Matt / Superpowers / Larchanka / Vercel packs; no marketplace auto-update as sole channel.
 - One school per failure mode (don’t stack overlapping align/TDD/review packs).
 - Team docs home (proposed, Tech Lead confirm): UI repo `docs/` — API links, does not fork.
-- **UI autonomy (Sprint 1+):** `AGENTS.md` phase router (Align → Execute → Close). Skills stay slash-gated (`disable-model-invocation`); Close loads `project-code-review` Process (not one-line axis verdicts). `grilling` is gated — not model-reachable. API `.agents/skills/` must match this catalog SHA.
+- Third-party MIT notices for vendored Matt skills: `THIRD_PARTY_NOTICES.md` (pin alone is not enough).
+- **UI autonomy (Sprint 1+):** `AGENTS.md` phase router (Align → Execute → Close). Skills stay slash/`$skill` gated (`disable-model-invocation` + Codex `allow_implicit_invocation: false`); Close loads `project-code-review` Process (not one-line axis verdicts). `grilling` is gated — not model-reachable. API `.agents/skills/` must match this catalog SHA.
 
 ## Sync
 
 | Field | Value |
 |---|---|
 | **Source of truth** | UI repo `dmc-268-ui-t2` |
-| **API copy rule** | Same files under `.agents/skills/` as UI |
+| **API copy rule** | Same files under `.agents/skills/` as UI (plus sync artifacts below) |
 | **Upstream Matt pin** | `3cca18b368ae95cdbdebbff572ccafa662551015` ([mattpocock/skills](https://github.com/mattpocock/skills)) |
-| **Shared catalog sync SHA** | `acbd51faeba5e6505e93d83d584c7e673ad72346d6bafce349b009d461e8fe9b` (also `SYNC_SHA.txt`) |
+| **Shared catalog sync SHA** | see `.agents/SYNC_SHA.txt` (content checksum of `.agents/skills/**`) |
+| **Sync checker** | `.agents/check-sync.mjs` (owns the hash algorithm) |
 | **Sprint** | 1 candidate convention (not proven prod) |
 
-Recompute after skill edits (hash sorted `path + file SHA256` lines of `.agents/skills/**`). UI and API must match. API is a copy — edit skills in UI first, then re-copy and refresh this SHA in both READMEs.
+`SYNC_SHA` is a **non-secret catalog content checksum** for UI↔API equality — safe to commit and push. It is not a credential.
+
+**Order:** edit skills in UI → `node .agents/check-sync.mjs --write` → copy `.agents/skills/`, `SYNC_SHA.txt`, `check-sync.mjs`, and this README sync story to API → `node .agents/check-sync.mjs` must exit 0 in both repos.
+
+Do not re-specify the hash algorithm in prose; the script is the source of truth. Exit `0` = match, `1` = mismatch / missing SHA file.
 
 ## Default-active vs queued
 
@@ -41,11 +47,13 @@ Promote later = move a queued skill into the ≤2 active set and demote another.
 
 Portable catalog path: `.agents/skills/<name>/SKILL.md`.
 
-| Tool | How to wire |
+| Tool | How to wire / invoke |
 |---|---|
-| **Cursor** | Symlink or copy into `.cursor/skills/` (Cursor discovers project skills there), **or** invoke by pointing the agent at `.agents/skills/<name>/SKILL.md`. Prefer symlink so UI remains SoT. |
-| **Claude Code** | Point skill roots at `.agents/skills` / copy into the tool's project skills dir. Keep `disable-model-invocation` semantics. |
-| **Codex** | Map `disable-model-invocation: true` → `allow_implicit_invocation: false` for the same skills. |
+| **Cursor** | Symlink or copy into `.cursor/skills/` (Cursor discovers project skills there), **or** point the agent at `.agents/skills/<name>/SKILL.md`. Explicit invoke: `/skill-name` (e.g. `/grill-me`). Prefer symlink so UI remains SoT. |
+| **Claude Code** | Point skill roots at `.agents/skills` / copy into the tool's project skills dir. Root `CLAUDE.md` points at `AGENTS.md`. Keep `disable-model-invocation` semantics. |
+| **Codex** | Discovers `.agents/skills` natively. Explicit invoke: `$skill-name` (e.g. `$grill-me`). Each explicit-only skill has `agents/openai.yaml` with `policy.allow_implicit_invocation: false` matching Cursor's `disable-model-invocation: true`. |
+
+**Hybrid policy:** default-active skills (`grill-me`/`grilling`, `tdd`) are **user/phase gated** — load when the user names them or `AGENTS.md` phases say so. Tools must **not** implicitly auto-pick those skills.
 
 ## Ownership
 

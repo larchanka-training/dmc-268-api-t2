@@ -11,7 +11,7 @@ Always-on brief for coding agents. Longer procedures live in `.agents/skills/` (
 ## Phases
 
 1. **Align** — Scope empty or the user asks to stress-test a plan → `/grill-me` only. Do **not** open grilling on model whim.
-2. **Execute** — User gave go-ahead, or grill outcome / spec / tickets already exist in context → implement. On behaviour change, follow the `/tdd` procedure (red → green at agreed seams) without waiting for a second `/tdd` if they already said implement / approved the plan. If a test fails for a bad fixture/double (false red), fix the test and re-run to a **real** red before writing production code.
+2. **Execute** — User gave go-ahead, or grill outcome / spec / tickets already exist in context → implement. On behaviour change, follow the `/tdd` procedure (red → green at agreed seams) without waiting for a second `/tdd` if they already said implement / approved the plan. If a test fails for a bad fixture/double (false red), fix the test and re-run to a **real** red before writing production code. Each production-code edit names the **one** AC case under change and cites that turn’s failing test output; do not land multi-case production dumps in one green.
 3. **Close** — After the slice is green: load `.agents/skills/project-code-review/SKILL.md` and run its Process (pin range → quality commands → four axes with severity → merge blocked yes/no). One-line axis verdicts without that Process are not Close. Lint/test alone is not “reviewed.”
 
 ## No re-ask

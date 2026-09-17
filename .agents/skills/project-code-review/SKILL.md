@@ -15,7 +15,7 @@ When `AGENTS.md` Close applies, walk these four axes even if the user did not ty
 Check four axes. Report each separately; do not merge findings into a single ranked list.
 
 1. **Acceptance criteria** — Does the diff satisfy the agreed AC / Issue / PR / grill outcome? Flag missing, partial, or wrong behaviour. If no AC source exists, say so and review against the user's stated goal only.
-2. **Tests** — Are tests present where behaviour changed? Are they at appropriate seams (public behaviour, not internals)? Do they pass, or is there a clear gap / skip with reason? Cite commands run and results.
+2. **Tests** — Are tests present where behaviour changed? Are they at appropriate seams (public behaviour, not internals)? Do they pass, or is there a clear gap / skip with reason? Cite commands run and results. When a test runner existed for the seam: if transcript or diff shows a new AC case added **already-green** (no real red before the production change that satisfied it), flag **should-fix** TDD overshoot — even when product behaviour is correct.
 3. **Bugs / correctness** — Logic errors, edge cases, race/error handling, regressions vs nearby code. Prefer concrete repro or failing assertion over vague concern.
 4. **Security** — Secrets in code/diff, authz gaps, injection (SQL/command/HTML), unsafe defaults, sensitive logging. Skip vibes; flag only plausible issues in the changed surface.
 

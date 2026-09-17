@@ -34,4 +34,6 @@ You can't test everything, so seams focus effort on critical paths and complex l
 
 - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 - **One slice at a time.** One seam, one test, one minimal implementation per cycle.
+- **Hard stop after each green.** Add exactly **one** next agreed AC test at the seam and run it. If it is **already green**, you overshot: delete speculative production code or split the last change until that test is a **real red**. Do not add further cases or more production code while the next case is green. “I need the full correct handler for this case” is still overshoot if later AC cases would already pass.
+- **Evidence before production edits.** Before changing production code for a case, the turn must show failing test-runner output for **that** case (after fixing any false red from a bad fixture/double).
 - **Refactoring is not part of the loop.** Prefer a separate review pass (AGENTS.md Close / `/project-code-review`), not the red → green implementation cycle.

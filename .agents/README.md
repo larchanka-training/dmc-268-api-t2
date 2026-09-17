@@ -51,7 +51,7 @@ Portable catalog path: `.agents/skills/<name>/SKILL.md`.
 |---|---|
 | **Cursor** | Symlink or copy into `.cursor/skills/` (Cursor discovers project skills there), **or** point the agent at `.agents/skills/<name>/SKILL.md`. Explicit invoke: `/skill-name` (e.g. `/grill-me`). Prefer symlink so UI remains SoT. |
 | **Claude Code** | Point skill roots at `.agents/skills` / copy into the tool's project skills dir. Root `CLAUDE.md` points at `AGENTS.md`. Keep `disable-model-invocation` semantics. |
-| **Codex** | Discovers `.agents/skills` natively. Explicit invoke: `$skill-name` (e.g. `$grill-me`). Each explicit-only skill has `agents/openai.yaml` with `policy.allow_implicit_invocation: false` matching Cursor's `disable-model-invocation: true`. |
+| **Codex** | Discovers `.agents/skills` natively. Project overrides: `.codex/config.toml` (validator path). Explicit invoke: `$skill-name` (e.g. `$grill-me`). Each explicit-only skill has `agents/openai.yaml` with `policy.allow_implicit_invocation: false` matching Cursor's `disable-model-invocation: true`. Do **not** duplicate the catalog under `.codex/skills/`. Validator: `python .agents/scripts/validate_skill.py .agents/skills/<skill-name>` (deps in `.agents/scripts/requirements.txt`). |
 
 **Hybrid policy:** default-active skills (`grill-me`/`grilling`, `tdd`) are **user/phase gated** — load when the user names them or `AGENTS.md` phases say so. Tools must **not** implicitly auto-pick those skills.
 

@@ -28,9 +28,7 @@ ALLOWED_FRONTMATTER_PROPERTIES = frozenset(
 
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 NAME_RE = re.compile(r"^[a-z0-9-]+$")
-FENCE_LINE_RE = re.compile(
-    r"^[ \t]*(?:(?:[-+*]|\d+[.)])[ \t]+)?(`{3,}|~{3,})(.*)$"
-)
+FENCE_LINE_RE = re.compile(r"^[ \t]*(?:(?:[-+*]|\d+[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")
 TODO_LINE_RE = re.compile(r"[ ]{0,3}\[TODO:[^\n]*\][ \t]*")
 
 
@@ -91,8 +89,7 @@ def _check_name(frontmatter):
         )
     elif name.startswith("-") or name.endswith("-") or "--" in name:
         msg = (
-            f"Name '{name}' cannot start/end with hyphen "
-            "or contain consecutive hyphens"
+            f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens"
         )
     elif len(name) > MAX_SKILL_NAME_LENGTH:
         msg = (

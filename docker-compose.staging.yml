@@ -1,11 +1,20 @@
 name: dmc-268-t2-staging
 
 services:
+  web:
+    image: ${UI_IMAGE:?UI_IMAGE is required}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+
   api:
     image: ${API_IMAGE:?API_IMAGE is required}
     restart: unless-stopped
-    ports:
-      - "8000:8000"
     environment:
       POSTGRES__HOST: db
       POSTGRES__PORT: "5432"

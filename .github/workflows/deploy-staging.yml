@@ -2,6 +2,11 @@ name: Deploy staging
 
 on:
   workflow_dispatch:
+    inputs:
+      ui_sha:
+        description: Full UI commit SHA published to GHCR
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +26,8 @@ jobs:
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       DEPLOY_PATH: /opt/dmc-268-t2
       API_IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+      UI_IMAGE: ghcr.io/larchanka-training/dmc-268-ui-t2:sha-${{ inputs.ui_sha }}
+      UI_SHA: ${{ inputs.ui_sha }}
 
     steps:
       - name: Checkout repository
@@ -52,6 +59,11 @@ jobs:
 
           if [[ -z "${POSTGRES_PASSWORD:-}" ]]; then
             echo "::error::STAGING_POSTGRES_PASSWORD is not available"
+            exit 1
+          fi
+
+          if [[ ! "${UI_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::ui_sha must be a full 40-character Git commit SHA"
             exit 1
           fi
 
@@ -122,6 +134,7 @@ jobs:
 
           {
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
+            printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
             printf 'POSTGRES__USER=dmc\n'
             printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
@@ -218,16 +231,49 @@ jobs:
 
           echo "Waiting for API healthcheck..."
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8000/healthcheck >/dev/null; then
-              echo "Staging API is healthy"
+            api_id="$(compose ps -q api)"
+
+            api_status="$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "${api_id}" 2>/dev/null || true)"
+
+            if [[ "${api_status}" == "healthy" ]]; then
+              echo "API is healthy"
+              break
+            fi
+
+            if [[ "${api_status}" == "unhealthy" ]]; then
+              echo "ERROR: API became unhealthy"
+              compose ps
+              compose logs --tail=100 api
+              exit 1
+            fi
+
+            if [[ "${attempt}" -eq 30 ]]; then
+              echo "ERROR: API did not become healthy"
+              compose ps
+              compose logs --tail=100 api
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Starting web..."
+          compose up -d web
+
+          echo "Waiting for web..."
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1/ >/dev/null; then
+              echo "Staging web is healthy"
               compose ps
               exit 0
             fi
 
             if [[ "${attempt}" -eq 30 ]]; then
-              echo "ERROR: API healthcheck failed"
+              echo "ERROR: Web healthcheck failed"
               compose ps
-              compose logs --tail=100 api
+              compose logs --tail=100 web
               exit 1
             fi
 

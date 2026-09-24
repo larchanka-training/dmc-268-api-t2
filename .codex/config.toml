@@ -1,0 +1,10 @@
+developer_instructions = """
+When validating skills in this project, use
+.agents/scripts/validate_skill.py instead of the bundled
+skill-creator quick_validate. Run it from the project root:
+python .agents/scripts/validate_skill.py .agents/skills/<skill-name>
+Use Python 3 with the dependencies in .agents/scripts/requirements.txt.
+The project validator permits disable-model-invocation while preserving
+other validation checks. This selects the validator when validation is
+needed; it does not require validation after creating or editing skills.
+"""

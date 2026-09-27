@@ -1,6 +1,5 @@
 # ERD backend — DMC-268 API (Team 2)
 
-**Статус:** схема хранения данных для предметного ядра backend.  
 **Основание:** актуальный `SYSTEM_DESIGN.md` и модель данных backend.
 
 ---
@@ -225,20 +224,20 @@ erDiagram
 
 ## 3. Кардинальности и ограничения
 
-| Объект | Ограничение |
-| --- | --- |
-| Repository → ChangeRequest | `1:N` |
-| ChangeRequest → ReviewJob | `1:N` |
-| ReviewJob → ContextPayload | `1:N` |
-| ContextPayload → ChunkResult | `1:0..1`, `UNIQUE(context_payload_id)` |
-| ChunkResult → Finding | `1:N` |
-| ReviewJob → Publication | `1:1`, `UNIQUE(review_job_id)` |
-| ReviewJob → TaskLease | `1:0..1`, `UNIQUE(review_job_id)` |
-| ReviewJob → OutboxEvent | `1:N` |
-| RepositoryAccess | `UNIQUE(repository_id, user_id)` |
-| ChangeRequest | `UNIQUE(repository_id, external_number)` |
-| WebhookReceipt | `UNIQUE(provider_name, delivery_id)` |
-| IdempotencyRecord | `UNIQUE(scope, idempotency_key)` |
+| Объект                       | Ограничение                              |
+| ---------------------------- | ---------------------------------------- |
+| Repository → ChangeRequest   | `1:N`                                    |
+| ChangeRequest → ReviewJob    | `1:N`                                    |
+| ReviewJob → ContextPayload   | `1:N`                                    |
+| ContextPayload → ChunkResult | `1:0..1`, `UNIQUE(context_payload_id)`   |
+| ChunkResult → Finding        | `1:N`                                    |
+| ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
+| ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
+| ReviewJob → OutboxEvent      | `1:N`                                    |
+| RepositoryAccess             | `UNIQUE(repository_id, user_id)`         |
+| ChangeRequest                | `UNIQUE(repository_id, external_number)` |
+| WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |
+| IdempotencyRecord            | `UNIQUE(scope, idempotency_key)`         |
 
 Допустимые значения:
 

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
 from app.db.models import OutboxEvent, Publication, ReviewJob
+from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,7 @@ def build_start_review(command: StartReviewCommand) -> StartReviewAggregate:
     whose fields are already fixed by ERD/System Design.
     """
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     review_id = uuid.uuid4()
 
     review_job = ReviewJob(

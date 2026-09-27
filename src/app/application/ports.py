@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +34,15 @@ class ReviewChunkResult:
 
 
 class VcsPort(Protocol):
-    async def capture_snapshot(self, *, review_job_id: uuid.UUID) -> ChangeRequestSnapshot: ...
+    async def capture_snapshot(
+        self, *, review_job_id: uuid.UUID
+    ) -> ChangeRequestSnapshot: ...
 
 
 class ContextBuilderPort(Protocol):
-    async def build(self, *, review_job_id: uuid.UUID) -> Sequence[BuiltContextPayload]: ...
+    async def build(
+        self, *, review_job_id: uuid.UUID
+    ) -> Sequence[BuiltContextPayload]: ...
 
 
 class LlmGatewayPort(Protocol):
@@ -55,7 +60,7 @@ class ReviewJobRepositoryPort(Protocol):
 class UnitOfWorkPort(Protocol):
     review_jobs: ReviewJobRepositoryPort
 
-    async def __aenter__(self) -> "UnitOfWorkPort": ...
+    async def __aenter__(self) -> UnitOfWorkPort: ...
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None: ...
     async def commit(self) -> None: ...
     async def rollback(self) -> None: ...

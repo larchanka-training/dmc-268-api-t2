@@ -1,5 +1,5 @@
-from app.db.base import Base
 from app.db import models  # noqa: F401
+from app.db.base import Base
 
 
 def test_expected_core_tables_are_registered() -> None:

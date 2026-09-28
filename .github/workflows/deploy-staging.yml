@@ -4,13 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       ui_sha:
-        description: Full UI commit SHA published to GHCR
-        required: true
+        description: Optional full UI commit SHA published to GHCR; omit to keep the currently deployed UI version
+        required: false
         type: string
+        default: ""
+  workflow_run:
+    workflows: ["API CI"]
+    types:
+      - completed
 
 permissions:
   contents: read
   packages: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -18,16 +27,32 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
-    # Do not allow staging deployment from a feature branch.
-    if: github.ref == 'refs/heads/main'
+    # Deploy only from main: workflow_dispatch must be run from main, and
+    # workflow_run must be a successful "API CI" run on main (github.ref is
+    # always the default branch for workflow_run, so head_branch is what
+    # filters out PR and feature-branch runs).
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      )
 
     env:
       SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       DEPLOY_PATH: /opt/dmc-268-t2
-      API_IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-      UI_IMAGE: ghcr.io/larchanka-training/dmc-268-ui-t2:sha-${{ inputs.ui_sha }}
+      # For workflow_run, github.sha is the default-branch HEAD, not the commit
+      # "API CI" built; head_sha is the actual built commit. For
+      # workflow_dispatch the fallback is this workflow's own commit.
+      API_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      API_IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.event.workflow_run.head_sha || github.sha }}
       UI_SHA: ${{ inputs.ui_sha }}
+      # UI_IMAGE is resolved in the "Resolve UI image" step.
 
     steps:
       - name: Checkout repository
@@ -62,7 +87,12 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "${UI_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          if [[ ! "${API_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::API commit SHA must be a full 40-character Git SHA, got: ${API_SHA}"
+            exit 1
+          fi
+
+          if [[ -n "${UI_SHA}" && ! "${UI_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::ui_sha must be a full 40-character Git commit SHA"
             exit 1
           fi
@@ -98,6 +128,45 @@ jobs:
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
             'docker --version && docker compose version'
+
+      - name: Resolve UI image
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${UI_SHA}" ]]; then
+            ui_image="ghcr.io/larchanka-training/dmc-268-ui-t2:sha-${UI_SHA}"
+            echo "UI_IMAGE=${ui_image}" >> "${GITHUB_ENV}"
+            echo "Using UI image from ui_sha input: ${ui_image}"
+            exit 0
+          fi
+
+          # No ui_sha: keep the UI version currently deployed on the VPS so an
+          # API-only deploy never bumps the frontend.
+          remote_ui_image="$(sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "grep -E '^UI_IMAGE=' '${DEPLOY_PATH}/.env.staging' 2>/dev/null | tail -n1 | cut -d= -f2-" || true)"
+
+          if [[ -z "${remote_ui_image}" ]]; then
+            echo "::error::ui_sha was not provided and ${DEPLOY_PATH}/.env.staging on the VPS has no UI_IMAGE."
+            echo "::error::Run this workflow once manually with ui_sha to pin the frontend version; automatic deployments will keep it afterwards."
+            exit 1
+          fi
+
+          if [[ ! "${remote_ui_image}" =~ ^ghcr\.io/larchanka-training/dmc-268-ui-t2:sha-[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::UI_IMAGE in .env.staging has an unexpected format: ${remote_ui_image}"
+            exit 1
+          fi
+
+          echo "UI_IMAGE=${remote_ui_image}" >> "${GITHUB_ENV}"
+          echo "Keeping deployed UI image: ${remote_ui_image}"
 
       - name: Prepare deployment directory
         env:

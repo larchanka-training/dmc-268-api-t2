@@ -33,7 +33,6 @@ GitHub
                              |     +-- React static
                              |     +-- /api/* -> FastAPI
                              |     +-- /healthcheck -> FastAPI
-                             |     +-- /readiness -> FastAPI
                              |
                              +-- FastAPI :8000
                              +-- PostgreSQL
@@ -195,7 +194,7 @@ Nginx:
 * раздаёт React static;
 * поддерживает SPA fallback на `index.html`;
 * проксирует `/api/*` в FastAPI;
-* проксирует `/healthcheck` и `/readiness` в FastAPI;
+* проксирует `/healthcheck` в FastAPI;
 * публикует порт `80`.
 
 Текущий публичный staging:
@@ -344,17 +343,25 @@ Workflow:
 .github/workflows/deploy-staging.yml
 ```
 
-Deployment запускается вручную только из `main`.
+Деплой разрешён только из `main` и работает в двух режимах.
 
-При запуске требуется указать полный 40-character SHA frontend-коммита:
+### Автоматический деплой backend
 
 ```text
-ui_sha
+merge API -> main
+      ↓
+API CI (quality, build, publish)
+      ↓
+Deploy staging (workflow_run после успешного API CI)
 ```
 
-Этот SHA должен соответствовать уже опубликованному UI image.
+Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`).
 
-Пример:
+Версия UI при этом сохраняется: если `ui_sha` не указан, workflow читает текущий `UI_IMAGE` из `.env.staging` на VPS и обновляет только `API_IMAGE` (см. ADR `docs/adr/0001-autonomous-cd.md`).
+
+### Деплой с новой версией UI
+
+`ui_sha` теперь опционален. Чтобы задеплоить новую версию frontend, workflow запускается с полным 40-character SHA уже опубликованного UI image:
 
 ```text
 Actions
@@ -364,35 +371,48 @@ Actions
 → ui_sha: <full-ui-commit-sha>
 ```
 
-API image определяется текущим API commit SHA.
+UI-репозиторий может запускать этот же workflow автоматически после публикации своего образа:
 
-Workflow:
+```bash
+gh workflow run deploy-staging --repo larchanka-training/dmc-268-api-t2 --ref main -f ui_sha=<full-ui-commit-sha>
+```
 
-1. проверяет GitHub Variables, Secrets и формат `ui_sha`;
+Для этого в секретах UI-репозитория хранится PAT с правом запуска workflow в API-репозитории; настройка триггера находится в UI-репозитории.
+
+### Правила и крайние случаи
+
+- Если `ui_sha` не указан, а `UI_IMAGE` в `.env.staging` отсутствует (первый деплой после bootstrap), workflow падает до любых изменений на сервере. Первый деплой выполняется вручную с `ui_sha`; дальше автоматические деплои сохраняют зафиксированную версию UI.
+- Параллельные деплои (от пуша API и от триггера UI) выстраиваются в очередь через `concurrency: deploy-staging` без отмены.
+- Эндпоинт `/readiness` в API отсутствует; через Nginx проксируется только `/healthcheck`.
+
+### Шаги workflow
+
+1. проверяет GitHub Variables, Secrets и формат SHA;
 2. настраивает SSH с strict host key checking;
 3. проверяет Docker и Docker Compose на VPS;
-4. копирует `docker-compose.staging.yml`;
-5. создаёт `.env.staging`;
-6. временно авторизуется в GHCR;
-7. выполняет `docker compose pull`;
-8. запускает PostgreSQL и Redis;
-9. ждёт их healthchecks;
-10. выполняет:
+4. определяет `UI_IMAGE`: из `ui_sha` или из текущего `.env.staging`;
+5. копирует `docker-compose.staging.yml`;
+6. создаёт `.env.staging`;
+7. временно авторизуется в GHCR;
+8. выполняет `docker compose pull`;
+9. запускает PostgreSQL и Redis;
+10. ждёт их healthchecks;
+11. выполняет:
 
 ```text
 alembic upgrade head
 ```
 
-11. запускает API;
-12. ждёт Docker healthcheck API;
-13. запускает web/Nginx;
-14. проверяет:
+12. запускает API;
+13. ждёт Docker healthcheck API;
+14. запускает web/Nginx;
+15. проверяет:
 
 ```text
 http://127.0.0.1/
 ```
 
-15. выполняет logout из GHCR.
+16. выполняет logout из GHCR.
 
 Deployment считается успешным только после успешной проверки web endpoint.
 
@@ -426,7 +446,9 @@ Docker build
 GHCR API image sha-<api-commit>
 ```
 
-После этого staging deployment запускается вручную из API repository с нужным `ui_sha`.
+Backend деплоится автоматически: после успешного API CI workflow `Deploy staging` обновляет `API_IMAGE`, сохраняя текущую версию UI.
+
+Frontend после публикации образа инициирует деплой своей версии: UI-репозиторий запускает `Deploy staging` с `ui_sha` через PAT, либо деплой запускается вручную.
 
 Terraform запускать для обычного обновления application code не требуется.
 

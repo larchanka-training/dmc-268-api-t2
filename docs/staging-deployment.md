@@ -379,10 +379,13 @@ gh workflow run deploy-staging --repo larchanka-training/dmc-268-api-t2 --ref ma
 
 Для этого в секретах UI-репозитория хранится PAT с правом запуска workflow в API-репозитории; настройка триггера находится в UI-репозитории.
 
+Версия API при таком деплое сохраняется: `API_IMAGE` читается из текущего `.env.staging`, обновляется только `UI_IMAGE`.
+
 ### Правила и крайние случаи
 
 - Если `ui_sha` не указан, а `UI_IMAGE` в `.env.staging` отсутствует (первый деплой после bootstrap), workflow падает до любых изменений на сервере. Первый деплой выполняется вручную с `ui_sha`; дальше автоматические деплои сохраняют зафиксированную версию UI.
 - Параллельные деплои (от пуша API и от триггера UI) выстраиваются в очередь через `concurrency: deploy-staging` без отмены.
+- Деплой обновляет только образ инициировавшей стороны: UI-деплой (с `ui_sha`) сохраняет текущую версию API, API-деплой — текущую версию UI. Исключение — свежий сервер без `.env.staging`: ручной первый деплой с `ui_sha` берёт для API коммит самого workflow (запускать после зелёного API CI).
 - Эндпоинт `/readiness` в API отсутствует; через Nginx проксируется только `/healthcheck`.
 
 ### Шаги workflow
@@ -390,7 +393,7 @@ gh workflow run deploy-staging --repo larchanka-training/dmc-268-api-t2 --ref ma
 1. проверяет GitHub Variables, Secrets и формат SHA;
 2. настраивает SSH с strict host key checking;
 3. проверяет Docker и Docker Compose на VPS;
-4. определяет `UI_IMAGE`: из `ui_sha` или из текущего `.env.staging`;
+4. определяет `API_IMAGE` и `UI_IMAGE`: обновляется только инициировавшая сторона, версия другой стороны читается из текущего `.env.staging`;
 5. копирует `docker-compose.staging.yml`;
 6. создаёт `.env.staging`;
 7. временно авторизуется в GHCR;

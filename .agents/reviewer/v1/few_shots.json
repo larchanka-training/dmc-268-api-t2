@@ -1,0 +1,129 @@
+[
+  {
+    "id": "python-unhandled-none",
+    "languages": ["Python"],
+    "title": "Load user settings",
+    "files": [
+      {
+        "file_id": "example_1",
+        "old_path": "app/settings.py",
+        "new_path": "app/settings.py",
+        "status": "modified",
+        "old_blob_sha": "a1",
+        "new_blob_sha": "b1",
+        "language": "Python",
+        "hunks": [
+          {
+            "hunk_id": "example_1_h1",
+            "old_start": 10,
+            "old_count": 2,
+            "new_start": 10,
+            "new_count": 3,
+            "lines": [
+              {"kind": "context", "text": "def load(user_id):", "old_line": 10, "new_line": 10},
+              {"kind": "deleted", "text": "    return repo.get(user_id) or DEFAULTS", "old_line": 11, "new_line": null},
+              {"kind": "added", "text": "    row = repo.get(user_id)", "old_line": null, "new_line": 11},
+              {"kind": "added", "text": "    return row.settings", "old_line": null, "new_line": 12}
+            ]
+          }
+        ]
+      }
+    ],
+    "output": {
+      "summary": "Изменение убрало обработку отсутствующей записи.",
+      "findings": [
+        {
+          "location": {"path": "app/settings.py", "side": "NEW", "line": 12, "end_line": null},
+          "category": "correctness",
+          "severity": "high",
+          "title": "AttributeError для пользователя без настроек",
+          "explanation": "repo.get возвращает None, если записи нет. Тогда row.settings бросает AttributeError, и запрос завершается ошибкой 500 вместо значений по умолчанию.",
+          "evidence": "Строка 12 обращается к row.settings без проверки; удалённая строка 11 возвращала DEFAULTS для этого случая.",
+          "recommendation": "Вернуть DEFAULTS, если row is None, например: return row.settings if row else DEFAULTS."
+        }
+      ],
+      "limitations": []
+    }
+  },
+  {
+    "id": "typescript-sql-injection",
+    "languages": ["TypeScript"],
+    "title": "Search orders by customer",
+    "files": [
+      {
+        "file_id": "example_2",
+        "old_path": null,
+        "new_path": "src/orders/search.ts",
+        "status": "added",
+        "old_blob_sha": null,
+        "new_blob_sha": "c2",
+        "language": "TypeScript",
+        "hunks": [
+          {
+            "hunk_id": "example_2_h1",
+            "old_start": 0,
+            "old_count": 0,
+            "new_start": 1,
+            "new_count": 3,
+            "lines": [
+              {"kind": "added", "text": "export async function search(db: Db, name: string) {", "old_line": null, "new_line": 1},
+              {"kind": "added", "text": "  return db.query(`SELECT * FROM orders WHERE customer = '${name}'`);", "old_line": null, "new_line": 2},
+              {"kind": "added", "text": "}", "old_line": null, "new_line": 3}
+            ]
+          }
+        ]
+      }
+    ],
+    "output": {
+      "summary": "Новый поиск заказов строит SQL из пользовательского ввода.",
+      "findings": [
+        {
+          "location": {"path": "src/orders/search.ts", "side": "NEW", "line": 2, "end_line": null},
+          "category": "security",
+          "severity": "critical",
+          "title": "SQL-инъекция через параметр name",
+          "explanation": "Значение name подставляется в текст запроса без экранирования. Строка вида ' OR '1'='1 возвращает все заказы, а более сложный ввод позволяет изменять данные.",
+          "evidence": "Строка 2 интерполирует name в шаблонную строку SQL внутри db.query.",
+          "recommendation": "Использовать параметризованный запрос: db.query('SELECT * FROM orders WHERE customer = $1', [name])."
+        }
+      ],
+      "limitations": []
+    }
+  },
+  {
+    "id": "no-findings",
+    "languages": [],
+    "title": "Rename local variable",
+    "files": [
+      {
+        "file_id": "example_3",
+        "old_path": "app/report.py",
+        "new_path": "app/report.py",
+        "status": "modified",
+        "old_blob_sha": "d3",
+        "new_blob_sha": "e3",
+        "language": "Python",
+        "hunks": [
+          {
+            "hunk_id": "example_3_h1",
+            "old_start": 5,
+            "old_count": 2,
+            "new_start": 5,
+            "new_count": 2,
+            "lines": [
+              {"kind": "deleted", "text": "    t = sum(item.price for item in items)", "old_line": 5, "new_line": null},
+              {"kind": "deleted", "text": "    return t", "old_line": 6, "new_line": null},
+              {"kind": "added", "text": "    total = sum(item.price for item in items)", "old_line": null, "new_line": 5},
+              {"kind": "added", "text": "    return total", "old_line": null, "new_line": 6}
+            ]
+          }
+        ]
+      }
+    ],
+    "output": {
+      "summary": "Переименование локальной переменной, поведение не меняется.",
+      "findings": [],
+      "limitations": []
+    }
+  }
+]

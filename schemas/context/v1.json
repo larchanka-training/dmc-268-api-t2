@@ -1,0 +1,784 @@
+{
+  "$defs": {
+    "Budget": {
+      "additionalProperties": false,
+      "properties": {
+        "estimated_input_tokens": {
+          "minimum": 0,
+          "title": "Estimated Input Tokens",
+          "type": "integer"
+        },
+        "reserved_output_tokens": {
+          "minimum": 0,
+          "title": "Reserved Output Tokens",
+          "type": "integer"
+        },
+        "limit_input_tokens": {
+          "minimum": 0,
+          "title": "Limit Input Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "estimated_input_tokens",
+        "reserved_output_tokens",
+        "limit_input_tokens"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "ContextQuality": {
+      "enum": [
+        "full",
+        "degraded",
+        "diff_only"
+      ],
+      "title": "ContextQuality",
+      "type": "string"
+    },
+    "Coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "included": {
+          "items": {
+            "$ref": "#/$defs/CoveredFile"
+          },
+          "title": "Included",
+          "type": "array"
+        },
+        "skipped": {
+          "items": {
+            "$ref": "#/$defs/SkippedItem"
+          },
+          "title": "Skipped",
+          "type": "array"
+        },
+        "context_quality": {
+          "$ref": "#/$defs/ContextQuality"
+        }
+      },
+      "required": [
+        "included",
+        "skipped",
+        "context_quality"
+      ],
+      "title": "Coverage",
+      "type": "object"
+    },
+    "CoveredFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "ranges": {
+          "items": {
+            "$ref": "#/$defs/LineRange"
+          },
+          "title": "Ranges",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "ranges"
+      ],
+      "title": "CoveredFile",
+      "type": "object"
+    },
+    "Discussion": {
+      "additionalProperties": false,
+      "description": "Existing PR discussion relevant to the chunk (shape not fixed by SD).",
+      "properties": {
+        "author": {
+          "title": "Author",
+          "type": "string"
+        },
+        "body": {
+          "title": "Body",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        }
+      },
+      "required": [
+        "author",
+        "body"
+      ],
+      "title": "Discussion",
+      "type": "object"
+    },
+    "FileContext": {
+      "additionalProperties": false,
+      "properties": {
+        "diff": {
+          "$ref": "#/$defs/FileDiff"
+        },
+        "source_windows": {
+          "items": {
+            "$ref": "#/$defs/SourceWindow"
+          },
+          "title": "Source Windows",
+          "type": "array"
+        },
+        "whole_file": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WholeFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "diff",
+        "source_windows",
+        "whole_file"
+      ],
+      "title": "FileContext",
+      "type": "object"
+    },
+    "FileDiff": {
+      "additionalProperties": false,
+      "properties": {
+        "file_id": {
+          "title": "File Id",
+          "type": "string"
+        },
+        "old_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Old Path"
+        },
+        "new_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "New Path"
+        },
+        "status": {
+          "$ref": "#/$defs/FileStatus"
+        },
+        "old_blob_sha": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Old Blob Sha"
+        },
+        "new_blob_sha": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "New Blob Sha"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Language"
+        },
+        "hunks": {
+          "items": {
+            "$ref": "#/$defs/Hunk"
+          },
+          "title": "Hunks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "file_id",
+        "old_path",
+        "new_path",
+        "status",
+        "old_blob_sha",
+        "new_blob_sha",
+        "language",
+        "hunks"
+      ],
+      "title": "FileDiff",
+      "type": "object"
+    },
+    "FileStatus": {
+      "enum": [
+        "added",
+        "modified",
+        "deleted",
+        "renamed"
+      ],
+      "title": "FileStatus",
+      "type": "string"
+    },
+    "Hunk": {
+      "additionalProperties": false,
+      "properties": {
+        "hunk_id": {
+          "title": "Hunk Id",
+          "type": "string"
+        },
+        "old_start": {
+          "minimum": 0,
+          "title": "Old Start",
+          "type": "integer"
+        },
+        "old_count": {
+          "minimum": 0,
+          "title": "Old Count",
+          "type": "integer"
+        },
+        "new_start": {
+          "minimum": 0,
+          "title": "New Start",
+          "type": "integer"
+        },
+        "new_count": {
+          "minimum": 0,
+          "title": "New Count",
+          "type": "integer"
+        },
+        "lines": {
+          "items": {
+            "$ref": "#/$defs/HunkLine"
+          },
+          "title": "Lines",
+          "type": "array"
+        }
+      },
+      "required": [
+        "hunk_id",
+        "old_start",
+        "old_count",
+        "new_start",
+        "new_count",
+        "lines"
+      ],
+      "title": "Hunk",
+      "type": "object"
+    },
+    "HunkLine": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/LineKind"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "old_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Old Line"
+        },
+        "new_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "New Line"
+        }
+      },
+      "required": [
+        "kind",
+        "text",
+        "old_line",
+        "new_line"
+      ],
+      "title": "HunkLine",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "LineKind": {
+      "enum": [
+        "added",
+        "deleted",
+        "context"
+      ],
+      "title": "LineKind",
+      "type": "string"
+    },
+    "LineRange": {
+      "additionalProperties": false,
+      "properties": {
+        "start_line": {
+          "minimum": 1,
+          "title": "Start Line",
+          "type": "integer"
+        },
+        "end_line": {
+          "minimum": 1,
+          "title": "End Line",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_line",
+        "end_line"
+      ],
+      "title": "LineRange",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "body": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Body"
+        },
+        "base_ref": {
+          "title": "Base Ref",
+          "type": "string"
+        },
+        "head_ref": {
+          "title": "Head Ref",
+          "type": "string"
+        },
+        "commit_messages": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Commit Messages",
+          "type": "array"
+        },
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Languages",
+          "type": "array"
+        },
+        "discussions": {
+          "items": {
+            "$ref": "#/$defs/Discussion"
+          },
+          "title": "Discussions",
+          "type": "array"
+        },
+        "rules_version": {
+          "title": "Rules Version",
+          "type": "string"
+        },
+        "output_language": {
+          "const": "ru",
+          "title": "Output Language",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "body",
+        "base_ref",
+        "head_ref",
+        "commit_messages",
+        "languages",
+        "discussions",
+        "rules_version",
+        "output_language"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    },
+    "RelatedSymbol": {
+      "additionalProperties": false,
+      "properties": {
+        "qualified_name": {
+          "title": "Qualified Name",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "signature": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Signature"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Path"
+        },
+        "commit_sha": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Commit Sha"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LineRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relation": {
+          "title": "Relation",
+          "type": "string"
+        },
+        "relation_to_change": {
+          "title": "Relation To Change",
+          "type": "string"
+        },
+        "source_excerpt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Excerpt"
+        }
+      },
+      "required": [
+        "qualified_name",
+        "kind",
+        "signature",
+        "path",
+        "commit_sha",
+        "range",
+        "relation",
+        "relation_to_change"
+      ],
+      "title": "RelatedSymbol",
+      "type": "object"
+    },
+    "Side": {
+      "enum": [
+        "OLD",
+        "NEW"
+      ],
+      "title": "Side",
+      "type": "string"
+    },
+    "SkipReason": {
+      "enum": [
+        "policy",
+        "unsupported_language",
+        "unavailable_blob",
+        "provider_truncated",
+        "token_budget",
+        "file_limit",
+        "line_limit",
+        "context_error"
+      ],
+      "title": "SkipReason",
+      "type": "string"
+    },
+    "SkippedItem": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "ranges": {
+          "items": {
+            "$ref": "#/$defs/LineRange"
+          },
+          "title": "Ranges",
+          "type": "array"
+        },
+        "reason": {
+          "$ref": "#/$defs/SkipReason"
+        }
+      },
+      "required": [
+        "path",
+        "reason"
+      ],
+      "title": "SkippedItem",
+      "type": "object"
+    },
+    "Snapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "base_repository_id": {
+          "title": "Base Repository Id",
+          "type": "string"
+        },
+        "head_repository_id": {
+          "title": "Head Repository Id",
+          "type": "string"
+        },
+        "base_sha": {
+          "title": "Base Sha",
+          "type": "string"
+        },
+        "merge_base_sha": {
+          "title": "Merge Base Sha",
+          "type": "string"
+        },
+        "head_sha": {
+          "title": "Head Sha",
+          "type": "string"
+        },
+        "captured_at": {
+          "format": "date-time",
+          "title": "Captured At",
+          "type": "string"
+        },
+        "provider_metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Provider Metadata",
+          "type": "object"
+        }
+      },
+      "required": [
+        "provider",
+        "base_repository_id",
+        "head_repository_id",
+        "base_sha",
+        "merge_base_sha",
+        "head_sha",
+        "captured_at",
+        "provider_metadata"
+      ],
+      "title": "Snapshot",
+      "type": "object"
+    },
+    "SourceWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "commit_sha": {
+          "title": "Commit Sha",
+          "type": "string"
+        },
+        "start_line": {
+          "minimum": 1,
+          "title": "Start Line",
+          "type": "integer"
+        },
+        "end_line": {
+          "minimum": 1,
+          "title": "End Line",
+          "type": "integer"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "covered_hunk_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Covered Hunk Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "side",
+        "commit_sha",
+        "start_line",
+        "end_line",
+        "text",
+        "covered_hunk_ids"
+      ],
+      "title": "SourceWindow",
+      "type": "object"
+    },
+    "WholeFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "commit_sha": {
+          "title": "Commit Sha",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "changed_ranges": {
+          "items": {
+            "$ref": "#/$defs/LineRange"
+          },
+          "title": "Changed Ranges",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "side",
+        "commit_sha",
+        "text",
+        "changed_ranges"
+      ],
+      "title": "WholeFile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "review_id": {
+      "title": "Review Id",
+      "type": "string"
+    },
+    "chunk_id": {
+      "title": "Chunk Id",
+      "type": "string"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/Snapshot"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/FileContext"
+      },
+      "minItems": 1,
+      "title": "Files",
+      "type": "array"
+    },
+    "related_symbols": {
+      "items": {
+        "$ref": "#/$defs/RelatedSymbol"
+      },
+      "title": "Related Symbols",
+      "type": "array"
+    },
+    "coverage": {
+      "$ref": "#/$defs/Coverage"
+    },
+    "budget": {
+      "$ref": "#/$defs/Budget"
+    }
+  },
+  "required": [
+    "schema_version",
+    "review_id",
+    "chunk_id",
+    "snapshot",
+    "metadata",
+    "files",
+    "related_symbols",
+    "coverage",
+    "budget"
+  ],
+  "title": "ContextPayload",
+  "type": "object"
+}

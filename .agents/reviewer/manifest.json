@@ -1,0 +1,12 @@
+{
+  "versions": {
+    "v1": {
+      "system": "v1/system.md",
+      "few_shots": "v1/few_shots.json",
+      "sha256": {
+        "v1/system.md": "e2e7090a6b2285440a1cf4e4342d8f296b5bc6b41478743587d23992fbde8877",
+        "v1/few_shots.json": "13613d2103d206dcf8e7c89504a13660df040d58b289e7c8890d3977510e50e9"
+      }
+    }
+  }
+}

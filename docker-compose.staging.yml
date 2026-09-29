@@ -25,6 +25,15 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). The app refuses
+      # to start if a provider in the chain lacks its settings.
+      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:?LLM__PRIMARY_PROVIDER is required}
+      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:?LLM__FALLBACK_ENABLED is required}
+      LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
+      LLM__EUROROUTER__MODEL: ${LLM__EUROROUTER__MODEL:-}
+      LLM__EUROROUTER__API_KEYS: ${LLM__EUROROUTER__API_KEYS:-}
+      LLM__OLLAMA__BASE_URL: ${LLM__OLLAMA__BASE_URL:-http://ollama:11434}
+      LLM__OLLAMA__MODEL: ${LLM__OLLAMA__MODEL:-}
     depends_on:
       db:
         condition: service_healthy

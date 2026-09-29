@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Text,
@@ -17,6 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.schema import conv
 
 from app.db.base import Base
 
@@ -43,15 +45,8 @@ class Repository(Base):
     provider_name: Mapped[str] = mapped_column(Text, nullable=False)
     repo_name: Mapped[str] = mapped_column(Text, nullable=False)
     owner: Mapped[str] = mapped_column(Text, nullable=False)
-    current_settings_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey(
-            "repository_settings.id",
-            name="fk_repository_current_settings",
-            deferrable=True,
-            initially="DEFERRED",
-        ),
-        nullable=False,
+    current_settings_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
     )
 
     change_requests: Mapped[list[ChangeRequest]] = relationship(
@@ -61,12 +56,30 @@ class Repository(Base):
         back_populates="repository",
         foreign_keys="RepositorySettings.repository_id",
     )
-    current_settings: Mapped[RepositorySettings] = relationship(
-        foreign_keys=[current_settings_id],
+    current_settings: Mapped[RepositorySettings | None] = relationship(
+        primaryjoin=(
+            "and_(Repository.id == RepositorySettings.repository_id, "
+            "Repository.current_settings_id == RepositorySettings.id)"
+        ),
+        foreign_keys="[Repository.current_settings_id]",
         post_update=True,
     )
     accesses: Mapped[list[RepositoryAccess]] = relationship(back_populates="repository")
     quota_usage: Mapped[list[QuotaUsage]] = relationship(back_populates="repository")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_name",
+            "external_id",
+            name="uq_repository_provider_external_id",
+        ),
+        ForeignKeyConstraint(
+            ["id", "current_settings_id"],
+            ["repository_settings.repository_id", "repository_settings.id"],
+            name="fk_repository_current_settings_same_repository",
+            use_alter=True,
+        ),
+    )
 
 
 class RepositorySettings(Base):
@@ -94,7 +107,12 @@ class RepositorySettings(Base):
         foreign_keys=[repository_id],
     )
     review_jobs: Mapped[list[ReviewJob]] = relationship(
-        back_populates="repository_settings"
+        back_populates="repository_settings",
+        primaryjoin=(
+            "and_(RepositorySettings.repository_id == ReviewJob.repository_id, "
+            "RepositorySettings.id == ReviewJob.repository_settings_id)"
+        ),
+        foreign_keys="[ReviewJob.repository_settings_id]",
     )
 
     __table_args__ = (
@@ -107,6 +125,11 @@ class RepositorySettings(Base):
         CheckConstraint(
             "surrounding_lines >= 0",
             name="ck_repository_settings_surrounding_nonnegative",
+        ),
+        UniqueConstraint(
+            "repository_id",
+            "id",
+            name="uq_repository_settings_repository_id_id",
         ),
     )
 
@@ -160,13 +183,25 @@ class ChangeRequest(Base):
     current_status: Mapped[str] = mapped_column(Text, nullable=False)
 
     repository: Mapped[Repository] = relationship(back_populates="change_requests")
-    review_jobs: Mapped[list[ReviewJob]] = relationship(back_populates="change_request")
+    review_jobs: Mapped[list[ReviewJob]] = relationship(
+        back_populates="change_request",
+        primaryjoin=(
+            "and_(ChangeRequest.repository_id == ReviewJob.repository_id, "
+            "ChangeRequest.id == ReviewJob.change_request_id)"
+        ),
+        foreign_keys="[ReviewJob.change_request_id]",
+    )
 
     __table_args__ = (
         UniqueConstraint(
             "repository_id",
             "external_number",
             name="uq_change_request_repository_number",
+        ),
+        UniqueConstraint(
+            "repository_id",
+            "id",
+            name="uq_change_request_repository_id_id",
         ),
     )
 
@@ -177,12 +212,14 @@ class ReviewJob(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    repository_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     change_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("change_request.id"), nullable=False
+        UUID(as_uuid=True), nullable=False
     )
     repository_settings_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("repository_settings.id"), nullable=False
+        UUID(as_uuid=True), nullable=False
     )
+    config_digest: Mapped[str] = mapped_column(Text, nullable=False)
     rules_digest: Mapped[str] = mapped_column(Text, nullable=False)
     trigger_type: Mapped[str] = mapped_column(Text, nullable=False)
     initiator_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -237,15 +274,28 @@ class ReviewJob(Base):
     )
     final_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    change_request: Mapped[ChangeRequest] = relationship(back_populates="review_jobs")
+    change_request: Mapped[ChangeRequest] = relationship(
+        back_populates="review_jobs",
+        primaryjoin=(
+            "and_(ReviewJob.repository_id == ChangeRequest.repository_id, "
+            "ReviewJob.change_request_id == ChangeRequest.id)"
+        ),
+        foreign_keys=[change_request_id],
+    )
     repository_settings: Mapped[RepositorySettings] = relationship(
-        back_populates="review_jobs"
+        back_populates="review_jobs",
+        primaryjoin=(
+            "and_(ReviewJob.repository_id == RepositorySettings.repository_id, "
+            "ReviewJob.repository_settings_id == RepositorySettings.id)"
+        ),
+        foreign_keys=[repository_settings_id],
     )
     initiator_user: Mapped[User | None] = relationship(foreign_keys=[initiator_user_id])
     events: Mapped[list[ReviewEvent]] = relationship(back_populates="review_job")
     context_payloads: Mapped[list[ContextPayload]] = relationship(
         back_populates="review_job"
     )
+    chunk_results: Mapped[list[ChunkResult]] = relationship(back_populates="review_job")
     publication: Mapped[Publication] = relationship(
         back_populates="review_job", uselist=False
     )
@@ -264,7 +314,31 @@ class ReviewJob(Base):
             "('snapshot','context','inference','validation','done')",
             name="ck_review_job_stage",
         ),
+        CheckConstraint(
+            "(status IN ('QUEUED','RUNNING') AND finished_at IS NULL) OR "
+            "(status IN ('COMPLETED','PARTIAL','FAILED','SKIPPED') "
+            "AND finished_at IS NOT NULL)",
+            name=conv("ck_review_job_status_finished_at"),
+        ),
+        ForeignKeyConstraint(
+            ["repository_id", "change_request_id"],
+            ["change_request.repository_id", "change_request.id"],
+            name="fk_review_job_change_request_same_repository",
+        ),
+        ForeignKeyConstraint(
+            ["repository_id", "repository_settings_id"],
+            ["repository_settings.repository_id", "repository_settings.id"],
+            name="fk_review_job_settings_same_repository",
+        ),
         Index("ix_review_job_status_retry_at", "status", "retry_at"),
+        Index(
+            "uq_review_job_active_equivalent",
+            "change_request_id",
+            "requested_head_sha",
+            "config_digest",
+            unique=True,
+            postgresql_where=text("finished_at IS NULL"),
+        ),
     )
 
 
@@ -317,7 +391,7 @@ class ContextPayload(Base):
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="context_payloads")
     chunk_result: Mapped[ChunkResult | None] = relationship(
-        back_populates="context_payload", uselist=False
+        back_populates="context_payload", uselist=False, passive_deletes=True
     )
 
     __table_args__ = (
@@ -331,11 +405,17 @@ class ChunkResult(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    context_payload_id: Mapped[uuid.UUID] = mapped_column(
+    review_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=False
+    )
+    context_payload_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("context_payload.id"),
-        nullable=False,
-        unique=True,
+        ForeignKey(
+            "context_payload.id",
+            name="fk_chunk_result_context_payload",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
     )
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
@@ -346,7 +426,8 @@ class ChunkResult(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
 
-    context_payload: Mapped[ContextPayload] = relationship(
+    review_job: Mapped[ReviewJob] = relationship(back_populates="chunk_results")
+    context_payload: Mapped[ContextPayload | None] = relationship(
         back_populates="chunk_result"
     )
     findings: Mapped[list[Finding]] = relationship(back_populates="chunk_result")
@@ -354,6 +435,7 @@ class ChunkResult(Base):
     __table_args__ = (
         CheckConstraint("schema_version > 0", name="ck_chunk_result_schema_version"),
         CheckConstraint("latency_ms >= 0", name="ck_chunk_result_latency_nonnegative"),
+        UniqueConstraint("context_payload_id", name="uq_chunk_result_context_payload"),
     )
 
 

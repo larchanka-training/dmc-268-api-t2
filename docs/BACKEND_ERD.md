@@ -23,18 +23,19 @@ erDiagram
     Repository ||--o{ QuotaUsage : учитывает
     Repository ||--o{ ChangeRequest : содержит
     RepositorySettings ||--o{ ReviewJob : фиксируются_для
-    Repository ||--|| RepositorySettings : текущие_настройки
+    Repository ||--o| RepositorySettings : текущие_настройки
 
     ChangeRequest ||--o{ ReviewJob : проверяется
     ReviewJob ||--o{ ReviewEvent : события
     ReviewJob ||--o{ ContextPayload : формирует
+    ReviewJob ||--o{ ChunkResult : сохраняет_результаты
     ReviewJob ||--|| Publication : публикация
     ReviewJob ||--o{ OutboxEvent : создаёт
     ReviewJob ||--o| TaskLease : lease
     ReviewJob ||--o{ IdempotencyRecord : результат
     ReviewJob ||--o{ ReviewJob : rerun_of
 
-    ContextPayload ||--o| ChunkResult : результат
+    ContextPayload o|--o| ChunkResult : исходный_контекст
     ChunkResult ||--o{ Finding : находки
 
     Repository {
@@ -43,7 +44,7 @@ erDiagram
         TEXT provider_name
         TEXT repo_name
         TEXT owner
-        UUID current_settings_id FK
+        UUID current_settings_id FK "nullable"
     }
 
     ChangeRequest {
@@ -62,8 +63,10 @@ erDiagram
 
     ReviewJob {
         UUID id PK
-        UUID change_request_id FK
-        UUID repository_settings_id FK
+        UUID repository_id "integrity anchor"
+        UUID change_request_id "composite FK"
+        UUID repository_settings_id "composite FK"
+        TEXT config_digest
         TEXT rules_digest
         TEXT trigger_type
         UUID initiator_user_id FK
@@ -113,7 +116,8 @@ erDiagram
 
     ChunkResult {
         UUID id PK
-        UUID context_payload_id FK
+        UUID review_job_id FK
+        UUID context_payload_id FK "nullable, ON DELETE SET NULL"
         INT schema_version
         TEXT summary
         JSONB limitations
@@ -226,16 +230,21 @@ erDiagram
 
 | Объект                       | Ограничение                              |
 | ---------------------------- | ---------------------------------------- |
+| Repository                   | `UNIQUE(provider_name, external_id)`     |
+| Repository → current settings | `0..1`; composite FK `(id, current_settings_id) → RepositorySettings(repository_id, id)` |
+| RepositorySettings           | `UNIQUE(repository_id, id)` for composite references |
 | Repository → ChangeRequest   | `1:N`                                    |
+| ChangeRequest                | `UNIQUE(repository_id, external_number)` and `UNIQUE(repository_id, id)` |
 | ChangeRequest → ReviewJob    | `1:N`                                    |
+| ReviewJob repository/settings | composite FKs require ChangeRequest and frozen RepositorySettings to belong to `ReviewJob.repository_id` |
 | ReviewJob → ContextPayload   | `1:N`                                    |
-| ContextPayload → ChunkResult | `1:0..1`, `UNIQUE(context_payload_id)`   |
+| ReviewJob → ChunkResult      | `1:N`; durable result ownership          |
+| ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, `ON DELETE SET NULL` |
 | ChunkResult → Finding        | `1:N`                                    |
 | ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
 | ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
 | ReviewJob → OutboxEvent      | `1:N`                                    |
 | RepositoryAccess             | `UNIQUE(repository_id, user_id)`         |
-| ChangeRequest                | `UNIQUE(repository_id, external_number)` |
 | WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |
 | IdempotencyRecord            | `UNIQUE(scope, idempotency_key)`         |
 
@@ -250,6 +259,29 @@ erDiagram
 - `OutboxEvent.task_kind`: `analyze | publish`;
 - `QuotaUsage.type`: `starts | active_jobs`;
 - `RepositoryAccess.role`: `reviewer | admin`.
+
+Именованный CHECK `ck_review_job_status_finished_at` использует
+`ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED` и
+`RUNNING` требуют `finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и
+`SKIPPED` требуют `finished_at IS NOT NULL`. Terminal-переход записывает status и
+`finished_at` в одной транзакции. `stage` в этот invariant не входит.
+
+`Repository.current_settings_id` изначально равен `NULL`. После создания первой
+версии настроек составной FK разрешает назначить только настройки того же
+repository. Исторический `ReviewJob.repository_settings_id` остаётся неизменным,
+когда current settings переходит на новую версию. FK immediate, не deferred.
+SQLAlchemy `use_alter` разрывает только DDL-цикл создания таблиц из-за двух
+встречных repository/settings ссылок; данные создаются через nullable-then-update.
+
+`ReviewJob.config_digest` — SHA-256 детерминированного JSON ровно из
+`repository_settings_id`, `rules_digest`, `model_ref`, nullable `model_digest`,
+`model_settings`, `prompt_version` и `prompt_digest`. Идентификаторы run/snapshot
+и lifecycle/result поля исключены.
+
+После retention cleanup `ChunkResult.context_payload_id` становится `NULL`;
+долговременный путь — `ReviewJob -> ChunkResult -> Finding`. Будущий persistence
+path обязан выводить `ChunkResult.review_job_id` из owning ContextPayload/review,
+а не принимать несвязанный review ID.
 
 ---
 
@@ -274,6 +306,9 @@ erDiagram
 ## 5. Индексы
 
 - `review_job(status, retry_at)` — выбор ReviewJob для recovery;
+- partial `UNIQUE(change_request_id, requested_head_sha, config_digest) WHERE finished_at IS NULL`
+  — не более одного незавершённого эквивалентного запуска; завершённые запуски не
+  блокируют rerun;
 - `outbox_event(broker_published_at, created_at)` — выбор событий dispatcher;
 - `task_lease(expires_at)` — выбор истёкших lease;
 - `idempotency_record(expires_at)` — удаление истёкших записей;

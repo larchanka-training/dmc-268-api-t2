@@ -23,7 +23,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
-    # current_settings_id is created before repository_settings; its FK is added below.
+    # The same-repository current-settings FK is added after repository_settings.
     op.create_table(
         "repository",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -31,8 +31,13 @@ def upgrade() -> None:
         sa.Column("provider_name", sa.Text(), nullable=False),
         sa.Column("repo_name", sa.Text(), nullable=False),
         sa.Column("owner", sa.Text(), nullable=False),
-        sa.Column("current_settings_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("current_settings_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "provider_name",
+            "external_id",
+            name="uq_repository_provider_external_id",
+        ),
     )
 
     op.create_table(
@@ -52,15 +57,18 @@ def upgrade() -> None:
         sa.CheckConstraint("surrounding_lines >= 0", name="ck_repository_settings_surrounding_nonnegative"),
         sa.ForeignKeyConstraint(["repository_id"], ["repository.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "repository_id",
+            "id",
+            name="uq_repository_settings_repository_id_id",
+        ),
     )
     op.create_foreign_key(
-        "fk_repository_current_settings",
+        "fk_repository_current_settings_same_repository",
         "repository",
         "repository_settings",
-        ["current_settings_id"],
-        ["id"],
-        deferrable=True,
-        initially="DEFERRED",
+        ["id", "current_settings_id"],
+        ["repository_id", "id"],
     )
 
     op.create_table(
@@ -92,13 +100,20 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["repository_id"], ["repository.id"]),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("repository_id", "external_number", name="uq_change_request_repository_number"),
+        sa.UniqueConstraint(
+            "repository_id",
+            "id",
+            name="uq_change_request_repository_id_id",
+        ),
     )
 
     op.create_table(
         "review_job",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("repository_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("change_request_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("repository_settings_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("config_digest", sa.Text(), nullable=False),
         sa.Column("rules_digest", sa.Text(), nullable=False),
         sa.Column("trigger_type", sa.Text(), nullable=False),
         sa.Column("initiator_user_id", postgresql.UUID(as_uuid=True), nullable=True),
@@ -134,13 +149,34 @@ def upgrade() -> None:
             "stage IS NULL OR stage IN ('snapshot','context','inference','validation','done')",
             name="ck_review_job_stage",
         ),
-        sa.ForeignKeyConstraint(["change_request_id"], ["change_request.id"]),
+        sa.CheckConstraint(
+            "(status IN ('QUEUED','RUNNING') AND finished_at IS NULL) OR "
+            "(status IN ('COMPLETED','PARTIAL','FAILED','SKIPPED') "
+            "AND finished_at IS NOT NULL)",
+            name=sa.schema.conv("ck_review_job_status_finished_at"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["repository_id", "change_request_id"],
+            ["change_request.repository_id", "change_request.id"],
+            name="fk_review_job_change_request_same_repository",
+        ),
         sa.ForeignKeyConstraint(["initiator_user_id"], ["user.id"]),
-        sa.ForeignKeyConstraint(["repository_settings_id"], ["repository_settings.id"]),
+        sa.ForeignKeyConstraint(
+            ["repository_id", "repository_settings_id"],
+            ["repository_settings.repository_id", "repository_settings.id"],
+            name="fk_review_job_settings_same_repository",
+        ),
         sa.ForeignKeyConstraint(["rerun_of"], ["review_job.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_review_job_status_retry_at", "review_job", ["status", "retry_at"], unique=False)
+    op.create_index(
+        "uq_review_job_active_equivalent",
+        "review_job",
+        ["change_request_id", "requested_head_sha", "config_digest"],
+        unique=True,
+        postgresql_where=sa.text("finished_at IS NULL"),
+    )
 
     op.create_table(
         "review_event",
@@ -178,7 +214,8 @@ def upgrade() -> None:
     op.create_table(
         "chunk_result",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("context_payload_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("review_job_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("context_payload_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("summary", sa.Text(), nullable=False),
         sa.Column("limitations", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -187,9 +224,17 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("schema_version > 0", name="ck_chunk_result_schema_version"),
         sa.CheckConstraint("latency_ms >= 0", name="ck_chunk_result_latency_nonnegative"),
-        sa.ForeignKeyConstraint(["context_payload_id"], ["context_payload.id"]),
+        sa.ForeignKeyConstraint(
+            ["context_payload_id"],
+            ["context_payload.id"],
+            name="fk_chunk_result_context_payload",
+            ondelete="SET NULL",
+        ),
+        sa.ForeignKeyConstraint(["review_job_id"], ["review_job.id"]),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("context_payload_id"),
+        sa.UniqueConstraint(
+            "context_payload_id", name="uq_chunk_result_context_payload"
+        ),
     )
 
     op.create_table(
@@ -351,12 +396,17 @@ def downgrade() -> None:
     op.drop_table("context_payload")
     op.drop_table("review_event")
 
+    op.drop_index("uq_review_job_active_equivalent", table_name="review_job")
     op.drop_index("ix_review_job_status_retry_at", table_name="review_job")
     op.drop_table("review_job")
     op.drop_table("change_request")
     op.drop_table("repository_access")
 
-    op.drop_constraint("fk_repository_current_settings", "repository", type_="foreignkey")
+    op.drop_constraint(
+        "fk_repository_current_settings_same_repository",
+        "repository",
+        type_="foreignkey",
+    )
     op.drop_table("repository_settings")
     op.drop_table("repository")
     op.drop_table("user")

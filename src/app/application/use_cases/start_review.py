@@ -1,88 +1,46 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 
-from app.db.models import OutboxEvent, Publication, ReviewJob
-from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
+from app.application.ports import StartReviewCommand, UnitOfWorkPort
 
 
-@dataclass(frozen=True, slots=True)
-class StartReviewCommand:
-    change_request_id: uuid.UUID
-    repository_settings_id: uuid.UUID
-    requested_head_sha: str
-    rules_digest: str
-    trigger_type: str
-    initiator_user_id: uuid.UUID | None
-    model_ref: str
-    model_digest: str | None
-    model_settings: dict[str, object]
-    prompt_version: str
-    prompt_digest: str
-    trace_id: str
+def compute_config_digest(command: StartReviewCommand) -> str:
+    """Return the deterministic identity of the frozen analysis configuration."""
+
+    payload = {
+        "model_digest": command.model_digest,
+        "model_ref": command.model_ref,
+        "model_settings": command.model_settings,
+        "prompt_digest": command.prompt_digest,
+        "prompt_version": command.prompt_version,
+        "repository_settings_id": str(command.repository_settings_id),
+        "rules_digest": command.rules_digest,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-@dataclass(frozen=True, slots=True)
-class StartReviewAggregate:
-    review_job: ReviewJob
-    publication: Publication
-    outbox_event: OutboxEvent
+async def start_review(
+    command: StartReviewCommand, *, unit_of_work: UnitOfWorkPort
+) -> uuid.UUID:
+    """Persist the initial review aggregate through one transaction boundary."""
+
+    config_digest = compute_config_digest(command)
+    async with unit_of_work:
+        review_id = await unit_of_work.review_jobs.add_start_review(
+            command,
+            config_digest=config_digest,
+        )
+        await unit_of_work.commit()
+    return review_id
 
 
-def build_start_review(command: StartReviewCommand) -> StartReviewAggregate:
-    """Build the rows that must be persisted atomically for a new review.
-
-    Access checks, quota reservation and Idempotency-Key handling belong to the
-    surrounding application use case/UoW. This function only builds the rows
-    whose fields are already fixed by ERD/System Design.
-    """
-
-    now = datetime.now(UTC)
-    review_id = uuid.uuid4()
-
-    review_job = ReviewJob(
-        id=review_id,
-        change_request_id=command.change_request_id,
-        repository_settings_id=command.repository_settings_id,
-        rules_digest=command.rules_digest,
-        trigger_type=command.trigger_type,
-        initiator_user_id=command.initiator_user_id,
-        requested_head_sha=command.requested_head_sha,
-        model_ref=command.model_ref,
-        model_digest=command.model_digest,
-        model_settings=command.model_settings,
-        prompt_version=command.prompt_version,
-        prompt_digest=command.prompt_digest,
-        created_at=now,
-        status=ReviewStatus.QUEUED.value,
-        stage=None,
-        queue_deadline_at=now + timedelta(minutes=15),
-        coverage={},
-    )
-
-    publication = Publication(
-        id=uuid.uuid4(),
-        review_job_id=review_id,
-        status=PublicationStatus.NOT_READY.value,
-        provider_metadata=None,
-        created_at=now,
-    )
-
-    outbox_event = OutboxEvent(
-        id=uuid.uuid4(),
-        review_job_id=review_id,
-        schema_version=1,
-        task_kind=TaskKind.ANALYZE.value,
-        attempt=1,
-        trace_id=command.trace_id,
-        created_at=now,
-        broker_published_at=None,
-    )
-
-    return StartReviewAggregate(
-        review_job=review_job,
-        publication=publication,
-        outbox_event=outbox_event,
-    )
+__all__ = ["StartReviewCommand", "compute_config_digest", "start_review"]

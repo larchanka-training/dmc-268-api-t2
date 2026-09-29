@@ -49,7 +49,9 @@ src/app/
 ├─ db/
 │  ├─ base.py                     # общий SQLAlchemy Base
 │  ├─ session.py                  # асинхронный движок SQLAlchemy и сессия БД
-│  └─ models.py                   # ORM-модели предметной схемы
+│  ├─ models.py                   # ORM-модели предметной схемы
+│  ├─ repositories.py             # SQLAlchemy persistence adapter
+│  └─ uow.py                      # граница commit/rollback
 ├─ domain/
 │  └─ enums.py                    # значения lifecycle и domain enum
 ├─ application/
@@ -86,12 +88,27 @@ Idempotency-Key
  ↓
 ChangeRequest + текущий RepositorySettings
  ↓
+config_digest + проверка active-run unique index
+ ↓
 ReviewJob + Publication(NOT_READY) + OutboxEvent(analyze)
  ↓
 COMMIT
 ```
 
-При создании `ReviewJob` фиксируются `requested_head_sha`, `repository_settings_id`, `rules_digest`, идентификаторы prompt и модели.
+При создании `ReviewJob` repository adapter выводит `repository_id` из выбранного
+`ChangeRequest`, а составные FK гарантируют принадлежность ChangeRequest и
+зафиксированной версии RepositorySettings одному repository. В `ReviewJob`
+фиксируются `requested_head_sha`, `repository_settings_id`, `rules_digest`,
+идентификаторы prompt и модели. Чистая application-функция заранее вычисляет
+`config_digest` как SHA-256 детерминированного UTF-8 JSON этих frozen config полей:
+UUID сериализуется строкой, nullable model digest остаётся JSON `null`, ключи
+сортируются, separators компактны. Run/snapshot/lifecycle/result поля не входят в
+digest.
+
+Незавершённый запуск определяется `finished_at IS NULL`. Частичный уникальный
+индекс по ChangeRequest, requested head и `config_digest` атомарно запрещает второй
+эквивалентный запуск. DB adapter создаёт ReviewJob, Publication и OutboxEvent в
+одной session, но не делает commit; commit/rollback принадлежит application UoW.
 
 ### 3.2 Worker анализа
 
@@ -123,7 +140,13 @@ Finding[] + final_summary + coverage
 OutboxEvent(publish), если результат допускает публикацию
 ```
 
-`ContextPayload` содержит canonical payload одного вызова LLM с указанием `schema_version`. `ChunkResult` хранит результат соответствующего вызова. Результат LLM и данные Change Request проходят validation перед сохранением и публикацией.
+`ContextPayload` содержит canonical payload одного вызова LLM с указанием
+`schema_version`. `ChunkResult` хранит результат соответствующего вызова и имеет
+долговременную ссылку на ReviewJob. Ссылка на ContextPayload nullable и использует
+`ON DELETE SET NULL`, поэтому context можно удалить раньше результата и Finding.
+Будущий persistence path обязан выводить `ChunkResult.review_job_id` из owning
+ContextPayload/review. Результат LLM и данные Change Request проходят validation
+перед сохранением и публикацией.
 
 ### 3.3 Worker публикации
 
@@ -149,6 +172,11 @@ Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, пе
 
 Recovery обрабатывает expired/no lease с учётом `retry_at` и deadline-полей.
 
+Переход ReviewJob в terminal status атомарно записывает тот же terminal `status`
+и non-null `finished_at`. DB CHECK запрещает active status с заполненным
+`finished_at` и terminal status с `finished_at IS NULL`; `stage` в invariant не
+участвует.
+
 Временные ограничения:
 
 - очередь: до 15 минут;
@@ -165,13 +193,13 @@ Recovery обрабатывает expired/no lease с учётом `retry_at` и
 
 | Сущность | Назначение |
 | --- | --- |
-| `Repository` | подключённый внешний repository |
+| `Repository` | подключённый внешний repository; внешний identity уникален по provider+external ID |
 | `RepositorySettings` | неизменяемая версия настроек repository |
 | `ChangeRequest` | текущее provider-neutral состояние PR/MR |
 | `ReviewJob` | отдельный запуск анализа для зафиксированного состояния |
 | `ReviewEvent` | история значимых событий ReviewJob |
 | `ContextPayload` | canonical payload одного вызова LLM |
-| `ChunkResult` | результат одного вызова LLM |
+| `ChunkResult` | результат одного вызова LLM, сохраняемый по ReviewJob независимо от retention контекста |
 | `Finding` | проверенная находка с координатами и рекомендацией |
 | `Publication` | состояние публикации результата во внешний VCS |
 | `OutboxEvent` | команда очереди для transactional outbox |
@@ -194,6 +222,12 @@ PostgreSQL хранит долговременное состояние сист
 | `LlmGatewayPort` | `ContextPayload` → структурированный `ReviewChunkResult` |
 | `PublisherPort` | сохранённый результат ReviewJob → remote publication IDs |
 | repository/UoW ports | операции хранения и управление транзакцией |
+
+`StartReviewCommand` является application value. Use case вычисляет
+`config_digest`, вызывает `ReviewJobRepositoryPort.add_start_review` и делает один
+UoW commit. SQLAlchemy repository выводит repository anchor из ChangeRequest и
+строит ORM-записи ReviewJob/Publication/OutboxEvent. Ни Session, ни ORM entities не
+пересекают application boundary, а repository не скрывает собственный commit.
 
 Сообщение очереди содержит `schema_version`, `event_id`, `review_id`, `task_kind`, `attempt`, `trace_id`. Diff, prompt и результат LLM в сообщении broker не передаются.
 
@@ -218,9 +252,9 @@ ORM-модели не используются как публичные HTTP DT
 
 ## 7. Транзакционные границы
 
-1. Создание `ReviewJob`, `Publication(NOT_READY)`, `OutboxEvent(analyze)` и резервирование квоты выполняются в одной транзакции.
+1. Создание `ReviewJob`, `Publication(NOT_READY)`, `OutboxEvent(analyze)` и резервирование квоты выполняются в одной UoW-транзакции; нарушение active-run uniqueness откатывает агрегат целиком.
 2. Snapshot, изменение `stage` и соответствующий `ReviewEvent` сохраняются согласованно.
-3. `ContextPayload`, `ChunkResult` и проверенные `Finding` сохраняются только при актуальном lease и fencing token.
+3. `ContextPayload`, `ChunkResult` и проверенные `Finding` сохраняются только при актуальном lease и fencing token; ChunkResult получает `review_job_id` от owning context/review.
 4. Конечное состояние анализа и `OutboxEvent(publish)` фиксируются в одной транзакции.
 5. `broker_published_at` устанавливается после publisher confirm.
 6. Вызовы внешних API выполняются вне открытой транзакции PostgreSQL.
@@ -241,11 +275,14 @@ ORM-модели не используются как публичные HTTP DT
 - предметная миграция Alembic после baseline;
 - контракты ports для VCS, Context Builder, LLM Gateway, Publisher и Unit of Work;
 - создание начального состояния `ReviewJob`;
+- SQLAlchemy repository/UoW для атомарного начального агрегата без зависимости application слоя от ORM;
+- same-repository composite FK, внешний repository identity, active-run index и status/finished-at CHECK;
+- независимый retention ChunkResult/Finding через прямую связь с ReviewJob;
 - тесты метаданных для ключевых ограничений схемы.
 
 В разработке:
 
-- реализации repositories и Unit of Work;
+- остальные реализации repositories и Unit of Work;
 - HTTP-обработчики и DTO;
 - GitHub/VCS adapter;
 - Context Builder;

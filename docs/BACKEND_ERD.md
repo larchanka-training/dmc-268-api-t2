@@ -108,7 +108,7 @@ erDiagram
 
     ContextPayload {
         UUID id PK
-        UUID review_job_id FK
+        UUID review_job_id FK "UNIQUE with id"
         INT schema_version
         JSONB payload_body
         TIMESTAMPTZ created_at
@@ -117,7 +117,7 @@ erDiagram
     ChunkResult {
         UUID id PK
         UUID review_job_id FK
-        UUID context_payload_id FK "nullable, ON DELETE SET NULL"
+        UUID context_payload_id FK "nullable, composite FK"
         INT schema_version
         TEXT summary
         JSONB limitations
@@ -239,7 +239,8 @@ erDiagram
 | ReviewJob repository/settings | composite FKs require ChangeRequest and frozen RepositorySettings to belong to `ReviewJob.repository_id` |
 | ReviewJob → ContextPayload   | `1:N`                                    |
 | ReviewJob → ChunkResult      | `1:N`; durable result ownership          |
-| ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, `ON DELETE SET NULL` |
+| ContextPayload | `UNIQUE(review_job_id, id)` for composite reference |
+| ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, composite FK `(review_job_id, context_payload_id) → ContextPayload(review_job_id, id)`, `ON DELETE SET NULL (context_payload_id)` |
 | ChunkResult → Finding        | `1:N`                                    |
 | ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
 | ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
@@ -264,7 +265,9 @@ erDiagram
 `ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED` и
 `RUNNING` требуют `finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и
 `SKIPPED` требуют `finished_at IS NOT NULL`. Terminal-переход записывает status и
-`finished_at` в одной транзакции. `stage` в этот invariant не входит.
+`finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого
+statement, одной транзакции с двумя отдельными обновлениями недостаточно.
+`stage` в этот invariant не входит.
 
 `Repository.current_settings_id` изначально равен `NULL`. После создания первой
 версии настроек составной FK разрешает назначить только настройки того же
@@ -279,9 +282,13 @@ SQLAlchemy `use_alter` разрывает только DDL-цикл создан
 и lifecycle/result поля исключены.
 
 После retention cleanup `ChunkResult.context_payload_id` становится `NULL`;
-долговременный путь — `ReviewJob -> ChunkResult -> Finding`. Будущий persistence
-path обязан выводить `ChunkResult.review_job_id` из owning ContextPayload/review,
-а не принимать несвязанный review ID.
+долговременный путь — `ReviewJob -> ChunkResult -> Finding`. Если context указан,
+составной FK `fk_chunk_result_context_payload_same_review` требует совпадения
+`review_job_id` у результата и context. При удалении context PostgreSQL обнуляет
+только `context_payload_id`, сохраняя владельца результата. Миграция `0003` после
+`0002` добавляет это ограничение без изменения старой миграции. При наличии
+несогласованных исторических строк создание FK завершается ошибкой и транзакция
+миграции откатывается без исправления данных.
 
 ---
 

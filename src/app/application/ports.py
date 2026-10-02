@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from types import TracebackType
 from typing import Protocol
 
@@ -50,6 +51,20 @@ class StartReviewCommand:
     trace_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewJobSnapshot:
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    change_request_id: uuid.UUID
+    repository_settings_id: uuid.UUID
+    requested_head_sha: str
+    config_digest: str
+    status: str
+    stage: str | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
 class VcsPort(Protocol):
     async def capture_snapshot(
         self, *, review_job_id: uuid.UUID
@@ -71,7 +86,7 @@ class PublisherPort(Protocol):
 
 
 class ReviewJobRepositoryPort(Protocol):
-    async def get(self, review_job_id: uuid.UUID) -> object | None: ...
+    async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None: ...
 
     async def add_start_review(
         self, command: StartReviewCommand, *, config_digest: str

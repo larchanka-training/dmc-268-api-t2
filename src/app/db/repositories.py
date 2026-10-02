@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.ports import StartReviewCommand
+from app.application.ports import ReviewJobSnapshot, StartReviewCommand
 from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob
 from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
 
@@ -17,8 +17,22 @@ class SqlAlchemyReviewJobRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get(self, review_job_id: uuid.UUID) -> ReviewJob | None:
-        return await self._session.get(ReviewJob, review_job_id)
+    async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None:
+        review_job = await self._session.get(ReviewJob, review_job_id)
+        if review_job is None:
+            return None
+        return ReviewJobSnapshot(
+            id=review_job.id,
+            repository_id=review_job.repository_id,
+            change_request_id=review_job.change_request_id,
+            repository_settings_id=review_job.repository_settings_id,
+            requested_head_sha=review_job.requested_head_sha,
+            config_digest=review_job.config_digest,
+            status=review_job.status,
+            stage=review_job.stage,
+            created_at=review_job.created_at,
+            finished_at=review_job.finished_at,
+        )
 
     async def add_start_review(
         self, command: StartReviewCommand, *, config_digest: str

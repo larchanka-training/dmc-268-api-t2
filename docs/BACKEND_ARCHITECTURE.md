@@ -64,7 +64,8 @@ src/app/
 migrations/
 └─ versions/
    ├─ 0001_baseline.py
-   └─ 0002_backend_core.py
+   ├─ 0002_backend_core.py
+   └─ 0003_result_context_ownership.py
 
 docs/
 ├─ BACKEND_ARCHITECTURE.md
@@ -143,10 +144,10 @@ OutboxEvent(publish), если результат допускает публи�
 `ContextPayload` содержит canonical payload одного вызова LLM с указанием
 `schema_version`. `ChunkResult` хранит результат соответствующего вызова и имеет
 долговременную ссылку на ReviewJob. Ссылка на ContextPayload nullable и использует
-`ON DELETE SET NULL`, поэтому context можно удалить раньше результата и Finding.
-Будущий persistence path обязан выводить `ChunkResult.review_job_id` из owning
-ContextPayload/review. Результат LLM и данные Change Request проходят validation
-перед сохранением и публикацией.
+составной FK по `(review_job_id, context_payload_id)`: БД разрешает только context
+того же ReviewJob. При удалении context `ON DELETE SET NULL (context_payload_id)`
+сохраняет `review_job_id`, результат и Finding. Результат LLM и данные Change
+Request проходят validation перед сохранением и публикацией.
 
 ### 3.3 Worker публикации
 
@@ -172,8 +173,8 @@ Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, пе
 
 Recovery обрабатывает expired/no lease с учётом `retry_at` и deadline-полей.
 
-Переход ReviewJob в terminal status атомарно записывает тот же terminal `status`
-и non-null `finished_at`. DB CHECK запрещает active status с заполненным
+Переход ReviewJob в terminal status записывает terminal `status` и non-null
+`finished_at` одним SQL `UPDATE` или ORM flush. DB CHECK запрещает active status с заполненным
 `finished_at` и terminal status с `finished_at IS NULL`; `stage` в invariant не
 участвует.
 
@@ -228,6 +229,9 @@ PostgreSQL хранит долговременное состояние сист
 UoW commit. SQLAlchemy repository выводит repository anchor из ChangeRequest и
 строит ORM-записи ReviewJob/Publication/OutboxEvent. Ни Session, ни ORM entities не
 пересекают application boundary, а repository не скрывает собственный commit.
+`ReviewJobRepositoryPort.get` возвращает immutable `ReviewJobSnapshot` с
+идентификаторами, зафиксированными параметрами запуска и состоянием либо `None`,
+если ReviewJob не найден.
 
 Сообщение очереди содержит `schema_version`, `event_id`, `review_id`, `task_kind`, `attempt`, `trace_id`. Diff, prompt и результат LLM в сообщении broker не передаются.
 
@@ -272,13 +276,20 @@ ORM-модели не используются как публичные HTTP DT
 - хранение `TaskLease` и fencing token;
 - ограничения для `QuotaUsage`;
 - перечисления domain-слоя;
-- предметная миграция Alembic после baseline;
+- миграции Alembic `0002_backend_core` и `0003_result_context_ownership` после baseline;
 - контракты ports для VCS, Context Builder, LLM Gateway, Publisher и Unit of Work;
 - создание начального состояния `ReviewJob`;
 - SQLAlchemy repository/UoW для атомарного начального агрегата без зависимости application слоя от ORM;
 - same-repository composite FK, внешний repository identity, active-run index и status/finished-at CHECK;
-- независимый retention ChunkResult/Finding через прямую связь с ReviewJob;
-- тесты метаданных для ключевых ограничений схемы.
+- независимый retention ChunkResult/Finding через прямую связь с ReviewJob и
+  составной FK, запрещающий context другого ReviewJob;
+- тесты метаданных и интеграционные тесты PostgreSQL для ограничений схемы;
+- CI с PostgreSQL 18, `alembic check` и циклом downgrade/upgrade на отдельной
+  тестовой базе.
+
+Миграция `0003` проверяет существующие пары ChunkResult/ContextPayload при
+создании составного FK. Если данные уже имеют разных владельцев, PostgreSQL
+отклоняет миграцию целиком; автоматического исправления таких строк нет.
 
 В разработке:
 
@@ -290,7 +301,7 @@ ORM-модели не используются как публичные HTTP DT
 - RabbitMQ dispatcher;
 - workers анализа, публикации и recovery;
 - Publisher reconciliation;
-- интеграционные тесты с PostgreSQL и RabbitMQ;
+- интеграционные тесты с RabbitMQ;
 - readiness endpoint;
 - модель хранения OAuth/access;
 - provider-specific данные установки;

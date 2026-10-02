@@ -25,6 +25,11 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      # Секреты времени выполнения: деплой-workflow прокидывает их в env-файл,
+      # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
+      LLM__API_KEY: ${LLM__API_KEY:-}
+      LLM__API_BASE: ${LLM__API_BASE:-}
+      WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
     depends_on:
       db:
         condition: service_healthy
@@ -62,6 +67,11 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      # Секреты времени выполнения: деплой-workflow прокидывает их в env-файл,
+      # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
+      LLM__API_KEY: ${LLM__API_KEY:-}
+      LLM__API_BASE: ${LLM__API_BASE:-}
+      WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
     depends_on:
       db:
         condition: service_healthy

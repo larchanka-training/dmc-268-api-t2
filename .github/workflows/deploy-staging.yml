@@ -292,9 +292,19 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSHPASS: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          LLM_API_KEY: ${{ secrets.LLM__API_KEY }}
+          LLM_API_BASE: ${{ secrets.LLM__API_BASE }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
         shell: bash
         run: |
           set -euo pipefail
+
+          append_optional() {
+            local name="$1" value="$2"
+            if [[ -n "${value}" ]]; then
+              printf '%s=%s\n' "${name}" "${value}"
+            fi
+          }
 
           {
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
@@ -302,6 +312,12 @@ jobs:
             printf 'POSTGRES__USER=dmc\n'
             printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
+            # Runtime secrets passthrough: GitHub Encrypted Secrets ->
+            # container env. Forwarded only when the secret is defined;
+            # naming convention in docs/staging-deployment.md.
+            append_optional 'LLM__API_KEY' "${LLM_API_KEY:-}"
+            append_optional 'LLM__API_BASE' "${LLM_API_BASE:-}"
+            append_optional 'WEBHOOK__SECRET' "${WEBHOOK_SECRET:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \

@@ -169,9 +169,13 @@ def test_one_chunk_result_per_context_payload() -> None:
         constraint
         for constraint in table.constraints
         if isinstance(constraint, ForeignKeyConstraint)
-        and constraint.name == "fk_chunk_result_context_payload"
+        and constraint.name == "fk_chunk_result_context_payload_same_review"
     )
-    assert context_fk.ondelete == "SET NULL"
+    assert tuple(column.name for column in context_fk.columns) == (
+        "review_job_id",
+        "context_payload_id",
+    )
+    assert context_fk.ondelete == "SET NULL (context_payload_id)"
 
 
 def test_one_publication_and_one_live_lease_per_review_job() -> None:

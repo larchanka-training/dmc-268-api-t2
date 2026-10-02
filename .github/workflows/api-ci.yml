@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - main
+      - develop
 
 permissions:
   contents: read
@@ -60,6 +61,23 @@ jobs:
       - name: Build API image
         run: docker build -t dmc-268-api-t2:${{ github.sha }} .
 
+  compose:
+    name: Compose config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate dev compose file
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+
+      - name: Validate staging compose file
+        run: docker compose --env-file .env.staging.example -f docker-compose.staging.yml config -q
+
   publish:
     name: Publish API image
     runs-on: ubuntu-24.04
@@ -67,7 +85,9 @@ jobs:
     needs:
       - quality
       - docker
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Images are published only from deployable branches: main (staging) and
+    # develop (develop environment).
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
 
     permissions:
       contents: read

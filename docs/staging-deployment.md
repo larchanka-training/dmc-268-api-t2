@@ -1,6 +1,6 @@
 # Staging infrastructure and deployment
 
-Документ описывает текущее staging-окружение DMC-268 Team 2, Terraform bootstrap, CI/CD и процедуру deployment frontend и backend.
+Документ описывает окружения DMC-268 Team 2 (staging и develop), Terraform bootstrap, CI/CD и процедуру deployment frontend, backend и воркеров.
 
 ## Общая схема
 
@@ -15,36 +15,51 @@ GitHub
   |     |
   |     +-- UI image -> GHCR
   |
-  +-- API CI
+  +-- API CI (push в main или develop)
   |     |
   |     +-- API image -> GHCR
   |
-  +-- Terraform / Deploy
+  +-- Deploy (workflow_run после успешного API CI, либо вручную)
         |
         +----> HCP Terraform
         |      remote state
         |
-        +---- SSH ----> Staging VPS
+        +---- SSH ----> VPS Hetzner
                          |
-                         +-- Docker Compose
-                             |
-                             +-- web / Nginx :80
-                             |     |
-                             |     +-- React static
-                             |     +-- /api/* -> FastAPI
-                             |     +-- /healthcheck -> FastAPI
-                             |     +-- /readiness -> FastAPI
-                             |
-                             +-- FastAPI :8000
-                             +-- PostgreSQL
-                             +-- Redis
+                         +-- staging: /opt/dmc-268-t2          :80
+                         |     +-- web / Nginx :80
+                         |     |     +-- React static
+                         |     |     +-- /api/* -> FastAPI
+                         |     |     +-- /healthcheck -> FastAPI
+                         |     +-- FastAPI :8000
+                         |     +-- worker (очередь, тот же API-образ)
+                         |     +-- PostgreSQL, Redis
+                         |
+                         +-- develop: /opt/dmc-268-t2-develop  :8080
+                               +-- та же конфигурация,
+                                   свои контейнеры db/redis
 ```
 
-Из application-сервисов публично доступен только web-контейнер на порту `80`.
+Из application-сервисов публично доступен только web-контейнер каждого окружения: staging — порт `80`, develop — порт `8080`.
 
-FastAPI, PostgreSQL и Redis доступны только внутри Docker network.
+FastAPI, воркер, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
 
-DNS и TLS/HTTPS в текущем staging пока не настроены.
+DNS и TLS/HTTPS пока не настроены (HTTP по IP).
+
+## Окружения
+
+Один VPS обслуживает два изолированных окружения — по одному на деплой-ветку:
+
+|  | staging | develop |
+|---|---|---|
+| Ветка-триггер | `main` | `develop` |
+| Каталог на VPS | `/opt/dmc-268-t2` | `/opt/dmc-268-t2-develop` |
+| Env-файл | `.env.staging` | `.env.staging.develop` |
+| Compose-проект | `dmc-268-t2-staging` | `dmc-268-t2-develop` |
+| Порт web | `80` | `8080` |
+| URL | `http://213.199.63.63/` | `http://213.199.63.63:8080/` |
+
+Окружения изолированы: у каждого свои контейнеры PostgreSQL и Redis, свои volumes (префикс — имя compose-проекта) и свой env-файл на VPS. Пароль PostgreSQL общий (`STAGING_POSTGRES_PASSWORD`).
 
 ## Staging VPS
 
@@ -166,6 +181,7 @@ docker-compose.staging.yml
 ```text
 web
 api
+worker
 db
 redis
 ```
@@ -195,8 +211,8 @@ Nginx:
 * раздаёт React static;
 * поддерживает SPA fallback на `index.html`;
 * проксирует `/api/*` в FastAPI;
-* проксирует `/healthcheck` и `/readiness` в FastAPI;
-* публикует порт `80`.
+* проксирует `/healthcheck` в FastAPI;
+* публикует порт `80` (хостовый порт задаёт `WEB_PORT` в env-файле окружения: staging — `80`, develop — `8080`).
 
 Текущий публичный staging:
 
@@ -219,6 +235,14 @@ API доступен только внутри Docker network:
 ```text
 web -> api:8000
 ```
+
+### Worker
+
+Воркер запускается из того же immutable API-образа, что и FastAPI, и обновляется тем же деплоем: API-образ — одна деплой-единица репозитория (один образ, два сервиса: `api` и `worker`).
+
+Команда воркера сейчас — заглушка (`sleep infinity`): юнит деплоя существует, а логика фоновой обработки очереди появится в задаче про очередь задач (воркеры на Redis). После её реализации менять деплой не придётся — воркер уже обновляется автоматически вместе с API.
+
+Воркер не публикует порт наружу и доступен только внутри Docker network.
 
 ### PostgreSQL
 
@@ -267,10 +291,24 @@ STAGING_POSTGRES_PASSWORD
 ```dotenv
 API_IMAGE=ghcr.io/larchanka-training/dmc-268-api-t2:sha-<api-commit-sha>
 UI_IMAGE=ghcr.io/larchanka-training/dmc-268-ui-t2:sha-<ui-commit-sha>
+WEB_PORT=80
 POSTGRES__USER=dmc
 POSTGRES__PASSWORD=<secret>
 POSTGRES__DB=dmc
 ```
+
+### Passthrough секретов времени выполнения
+
+Конвенция: секрет приложения живёт в GitHub Encrypted Secrets под тем же именем, под которым его читает контейнер. Деплой-workflow переносит заданные секреты в env-файл окружения; незаданные секреты в файл не попадают вовсе.
+
+| Секрет GitHub | Переменная контейнера | Назначение |
+|---|---|---|
+| `STAGING_POSTGRES_PASSWORD` | `POSTGRES__PASSWORD` | Пароль PostgreSQL |
+| `LLM__API_KEY` | `LLM__API_KEY` | Ключ LLM-провайдера (LLM Gateway) |
+| `LLM__API_BASE` | `LLM__API_BASE` | Базовый URL LLM API |
+| `WEBHOOK__SECRET` | `WEBHOOK__SECRET` | HMAC-секрет входящих VCS webhooks |
+
+Чтобы добавить секрет из таблицы, достаточно создать его в GitHub — деплой менять не нужно. Новая переменная вне таблицы — это одна строка в шаге «Write runtime environment» деплой-workflow и одна строка в `environment:` сервисов compose.
 
 `.env.staging` исключён из Git и существует только на staging VPS.
 
@@ -294,13 +332,16 @@ Ruff format check
 mypy
 pytest
 Docker build
+Compose config (dev- и staging-файлы)
 ```
 
-После push в `main`, если проверки успешны, публикуется immutable Docker image:
+После push в `main` или `develop`, если проверки успешны, публикуется immutable Docker image:
 
 ```text
 ghcr.io/larchanka-training/dmc-268-api-t2:sha-<full-commit-sha>
 ```
+
+Образ из `main` деплоится в staging, из `develop` — в develop-окружение.
 
 Для feature branches и Pull Requests images в GHCR не публикуются.
 
@@ -329,6 +370,8 @@ Docker build
 ghcr.io/larchanka-training/dmc-268-ui-t2:sha-<full-commit-sha>
 ```
 
+Автоматический деплой UI инициируется из UI-репозитория — инструкция для UI-команды: `docs/ui-cd-handoff.md`.
+
 Frontend использует:
 
 ```text
@@ -336,7 +379,7 @@ Node 24
 pnpm 12.4.1
 ```
 
-## Staging deployment
+## Deployment (CD)
 
 Workflow:
 
@@ -344,59 +387,82 @@ Workflow:
 .github/workflows/deploy-staging.yml
 ```
 
-Deployment запускается вручную только из `main`.
+Деплой выполняется в окружение, соответствующее ветке-источнику: пуш в `main` обновляет staging, пуш в `develop` — develop-окружение.
 
-При запуске требуется указать полный 40-character SHA frontend-коммита:
+### Автоматический деплой backend и воркера
 
 ```text
-ui_sha
+merge API -> main (или develop)
+      ↓
+API CI (quality, build, publish)
+      ↓
+Deploy (workflow_run после успешного API CI)
 ```
 
-Этот SHA должен соответствовать уже опубликованному UI image.
+Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main` или `develop`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`). Обновляются и API, и воркер (один образ), версия UI сохраняется (см. ниже).
 
-Пример:
+Версия UI при этом сохраняется: если `ui_sha` не указан, workflow читает текущий `UI_IMAGE` из env-файла окружения на VPS и обновляет только `API_IMAGE` (см. ADR `docs/adr/0001-autonomous-cd.md`).
+
+### Деплой с новой версией UI
+
+`ui_sha` опционален. Чтобы задеплоить новую версию frontend, workflow запускается с полным 40-character SHA уже опубликованного UI image:
 
 ```text
 Actions
-→ Deploy staging
+→ Deploy
 → Run workflow
 → Branch: main
+→ environment: staging (или develop)
 → ui_sha: <full-ui-commit-sha>
 ```
 
-API image определяется текущим API commit SHA.
+UI-репозиторий может запускать этот же workflow автоматически после публикации своего образа:
 
-Workflow:
+```bash
+gh workflow run deploy-staging --repo larchanka-training/dmc-268-api-t2 --ref main -f ui_sha=<full-ui-commit-sha>
+```
 
-1. проверяет GitHub Variables, Secrets и формат `ui_sha`;
-2. настраивает SSH с strict host key checking;
-3. проверяет Docker и Docker Compose на VPS;
-4. копирует `docker-compose.staging.yml`;
-5. создаёт `.env.staging`;
-6. временно авторизуется в GHCR;
-7. выполняет `docker compose pull`;
-8. запускает PostgreSQL и Redis;
-9. ждёт их healthchecks;
-10. выполняет:
+Для этого в секретах UI-репозитория хранится PAT с правом запуска workflow в API-репозитории; настройка триггера находится в UI-репозитории.
+
+Версия API при таком деплое сохраняется: `API_IMAGE` читается из текущего `.env.staging`, обновляется только `UI_IMAGE`.
+
+### Правила и крайние случаи
+
+- Если `ui_sha` не указан, а `UI_IMAGE` в env-файле окружения отсутствует (первый деплой после bootstrap), workflow падает до любых изменений на сервере. Первый деплой в каждое окружение выполняется вручную с `ui_sha`; дальше автоматические деплои сохраняют зафиксированную версию UI.
+- Ручной запуск (dispatch) берёт API-образ последнего успешного push-прогона API CI целевой ветки, поэтому образ гарантированно существует в GHCR.
+- Параллельные деплои в одно окружение (от пуша API и от триггера UI) выстраиваются в очередь через `concurrency` (`deploy-staging` / `deploy-develop`) без отмены; очереди разных окружений независимы.
+- Деплой обновляет только образ инициировавшей стороны: UI-деплой (с `ui_sha`) сохраняет текущую версию API, API-деплой — текущую версию UI. Исключение — свежее окружение без env-файла: ручной первый деплой с `ui_sha` берёт последний опубликованный API-образ целевой ветки.
+- Эндпоинт `/readiness` в API отсутствует; через Nginx проксируется только `/healthcheck`.
+
+### Шаги workflow
+
+1. определяет целевое окружение (staging/develop) и API-коммит;
+2. проверяет GitHub Variables, Secrets и формат SHA;
+3. настраивает SSH с strict host key checking;
+4. проверяет Docker и Docker Compose на VPS;
+5. определяет `API_IMAGE` и `UI_IMAGE`: обновляется только инициировавшая сторона, версия другой стороны читается из текущего env-файла окружения;
+6. копирует `docker-compose.staging.yml`;
+7. создаёт env-файл окружения (включая passthrough секретов);
+8. временно авторизуется в GHCR;
+9. выполняет `docker compose pull`;
+10. запускает PostgreSQL и Redis;
+11. ждёт их healthchecks;
+12. выполняет:
 
 ```text
 alembic upgrade head
 ```
 
-11. запускает API;
-12. ждёт Docker healthcheck API;
-13. запускает web/Nginx;
-14. проверяет:
-
-```text
-http://127.0.0.1/
-```
-
-15. выполняет logout из GHCR.
+13. запускает API;
+14. ждёт Docker healthcheck API;
+15. запускает воркер и проверяет, что он в состоянии running;
+16. запускает web/Nginx;
+17. проверяет web endpoint окружения (`http://127.0.0.1/` для staging, `http://127.0.0.1:8080/` для develop);
+18. выполняет logout из GHCR.
 
 Deployment считается успешным только после успешной проверки web endpoint.
 
-## Обычный процесс обновления staging
+## Обычный процесс обновления
 
 Frontend:
 
@@ -415,7 +481,7 @@ GHCR UI image sha-<ui-commit>
 Backend:
 
 ```text
-merge API -> main
+merge API -> main (или develop)
        ↓
 API CI
        ↓
@@ -426,15 +492,17 @@ Docker build
 GHCR API image sha-<api-commit>
 ```
 
-После этого staging deployment запускается вручную из API repository с нужным `ui_sha`.
+Backend и воркер деплоятся автоматически: после успешного API CI workflow `Deploy` обновляет `API_IMAGE` в окружении, соответствующем ветке, сохраняя текущую версию UI.
+
+Frontend после публикации образа инициирует деплой своей версии: UI-репозиторий запускает `Deploy` с `ui_sha` через PAT (см. `docs/ui-cd-handoff.md`), либо деплой запускается вручную.
 
 Terraform запускать для обычного обновления application code не требуется.
 
 Terraform `apply` нужен только при изменении infrastructure/bootstrap configuration.
 
-## Проверка staging
+## Проверка окружений
 
-Frontend:
+Staging:
 
 ```bash
 curl -i --max-time 10 http://213.199.63.63/
@@ -462,7 +530,16 @@ HTTP/1.1 200 OK
 {"status":"ok"}
 ```
 
-Прямой доступ к FastAPI не должен работать:
+Develop-окружение:
+
+```bash
+curl -i --max-time 10 http://213.199.63.63:8080/
+curl -i --max-time 10 http://213.199.63.63:8080/healthcheck
+```
+
+Ожидание то же: `200 OK` и `{"status":"ok"}`.
+
+Прямой доступ к FastAPI не должен работать (оба окружения):
 
 ```bash
 curl -i --max-time 5 http://213.199.63.63:8000/healthcheck
@@ -479,7 +556,7 @@ curl -i --max-time 5 http://213.199.63.63:8000/healthcheck
 * публичный HTTP-трафик проходит через Nginx;
 * SSH host key verification не отключается;
 * Docker images имеют immutable commit SHA tags;
-* staging deployment разрешён только из `main`;
+* деплой выполняется только из `main` и `develop` в соответствующие изолированные окружения;
 * Terraform apply выполняется вручную;
 * deployment workflow использует `GITHUB_TOKEN` для временной авторизации в GHCR и выполняет logout после deployment;
 * UI package остаётся private и доступен API workflow с `Read` permission.

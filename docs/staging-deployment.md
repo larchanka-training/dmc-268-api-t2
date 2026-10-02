@@ -274,6 +274,27 @@ POSTGRES__DB=dmc
 
 `.env.staging` исключён из Git и существует только на staging VPS.
 
+### LLM gateway: ключ Eurorouter
+
+Ключ Eurorouter идёт тем же путём, что и пароль PostgreSQL: GitHub Actions Secret → `.env.staging` на VPS → переменные окружения контейнера `api` (позже — analyze worker). Подробности: `docs/llm-gateway-review-pipeline.md` §6, §6a.
+
+| Имя в GitHub Actions | Тип | Переменная в контейнере |
+|---|---|---|
+| `STAGING_EUROROUTER_API_KEYS` | Secret (один ключ или несколько через запятую) | `LLM__EUROROUTER__API_KEYS` |
+| `STAGING_EUROROUTER_BASE_URL` | Variable, только `https://…/v1` | `LLM__EUROROUTER__BASE_URL` |
+| `STAGING_EUROROUTER_MODEL` | Variable | `LLM__EUROROUTER__MODEL` |
+| `STAGING_LLM_PRIMARY_PROVIDER` | Variable, `eurorouter` (по умолчанию) или `ollama` | `LLM__PRIMARY_PROVIDER` |
+| `STAGING_LLM_FALLBACK_ENABLED` | Variable, `false` (по умолчанию) или `true` | `LLM__FALLBACK_ENABLED` |
+| `STAGING_OLLAMA_BASE_URL`, `STAGING_OLLAMA_MODEL` | Variables, нужны только если Ollama в цепочке | `LLM__OLLAMA__BASE_URL`, `LLM__OLLAMA__MODEL` |
+
+Пока Ollama не развёрнута в staging, используется режим `eurorouter` без резерва.
+
+Шаг «Validate deployment configuration» проверяет, что для провайдеров из цепочки заданы нужные значения. Значение ключа при этом не выводится. Если Eurorouter в цепочке, а ключа нет, deploy падает на этом шаге. Приложение тоже не стартует без ключа.
+
+Ротация ключа: обновить Secret `STAGING_EUROROUTER_API_KEYS` и перезапустить workflow deploy. Горячей смены ключа нет.
+
+Staging-хосту нужен исходящий HTTPS-доступ к Eurorouter.
+
 UI container package является private.
 
 GitHub Actions API-репозитория имеет `Read` access к package `dmc-268-ui-t2` через GitHub Packages `Manage Actions access`.

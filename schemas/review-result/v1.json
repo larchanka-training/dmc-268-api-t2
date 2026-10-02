@@ -1,0 +1,150 @@
+{
+  "$defs": {
+    "Category": {
+      "enum": [
+        "security",
+        "correctness",
+        "performance",
+        "maintainability"
+      ],
+      "title": "Category",
+      "type": "string"
+    },
+    "LLMFinding": {
+      "additionalProperties": false,
+      "properties": {
+        "location": {
+          "$ref": "#/$defs/Location"
+        },
+        "category": {
+          "$ref": "#/$defs/Category"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "title": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "explanation": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Explanation",
+          "type": "string"
+        },
+        "evidence": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Evidence",
+          "type": "string"
+        },
+        "recommendation": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Recommendation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "location",
+        "category",
+        "severity",
+        "title",
+        "explanation",
+        "evidence",
+        "recommendation"
+      ],
+      "title": "LLMFinding",
+      "type": "object"
+    },
+    "Location": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "line": {
+          "minimum": 1,
+          "title": "Line",
+          "type": "integer"
+        },
+        "end_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "End Line"
+        }
+      },
+      "required": [
+        "path",
+        "side",
+        "line",
+        "end_line"
+      ],
+      "title": "Location",
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "critical",
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "Side": {
+      "enum": [
+        "OLD",
+        "NEW"
+      ],
+      "title": "Side",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The only schema passed to the model as structured-output format (spec §3.2).\n\nEvery field is required (nullable where optional) to stay compatible with\nOpenAI-style ``strict`` JSON Schema.",
+  "properties": {
+    "summary": {
+      "maxLength": 2000,
+      "title": "Summary",
+      "type": "string"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/LLMFinding"
+      },
+      "maxItems": 50,
+      "title": "Findings",
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 10,
+      "title": "Limitations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "summary",
+    "findings",
+    "limitations"
+  ],
+  "title": "LLMReviewOutput",
+  "type": "object"
+}

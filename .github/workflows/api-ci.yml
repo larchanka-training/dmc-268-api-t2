@@ -60,6 +60,23 @@ jobs:
       - name: Build API image
         run: docker build -t dmc-268-api-t2:${{ github.sha }} .
 
+  compose:
+    name: Compose config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate dev compose file
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+
+      - name: Validate staging compose file
+        run: docker compose --env-file .env.staging.example -f docker-compose.staging.yml config -q
+
   publish:
     name: Publish API image
     runs-on: ubuntu-24.04

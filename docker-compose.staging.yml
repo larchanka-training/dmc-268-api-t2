@@ -45,6 +45,31 @@ services:
     networks:
       - backend
 
+  worker:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    restart: unless-stopped
+    # Заглушка вместо реального воркера: юнит деплоя существует уже сейчас
+    # (CD обновляет его вместе с API), логику очереди добавит задача про
+    # фоновые воркеры — той же командой в этом же сервисе.
+    command: ["sleep", "infinity"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
   db:
     image: postgres:18-alpine
     restart: unless-stopped

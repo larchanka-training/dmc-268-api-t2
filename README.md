@@ -18,6 +18,8 @@ docker compose up --build
 
 API будет доступен на http://localhost:8000, healthcheck — http://localhost:8000/healthcheck.
 
+Рядом поднимаются PostgreSQL, Redis и сервис-заглушка `worker` (логику фоновой очереди добавит задача про воркеры; деплой-юнит уже существует).
+
 Миграции (после старта compose):
 
 ```bash
@@ -54,5 +56,5 @@ uv run mypy .
 
 ## Staging
 
-Инфраструктура, Terraform, CI/CD и процедура staging deployment описаны в
+Инфраструктура, Terraform, CI/CD (автодеплой `main` → staging, `develop` → develop-окружение) и процедура деплоя описаны в
 [`docs/staging-deployment.md`](docs/staging-deployment.md).

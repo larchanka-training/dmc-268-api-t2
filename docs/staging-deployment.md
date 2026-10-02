@@ -212,7 +212,7 @@ Nginx:
 * поддерживает SPA fallback на `index.html`;
 * проксирует `/api/*` в FastAPI;
 * проксирует `/healthcheck` в FastAPI;
-* публикует порт `80`.
+* публикует порт `80` (хостовый порт задаёт `WEB_PORT` в env-файле окружения: staging — `80`, develop — `8080`).
 
 Текущий публичный staging:
 
@@ -291,6 +291,7 @@ STAGING_POSTGRES_PASSWORD
 ```dotenv
 API_IMAGE=ghcr.io/larchanka-training/dmc-268-api-t2:sha-<api-commit-sha>
 UI_IMAGE=ghcr.io/larchanka-training/dmc-268-ui-t2:sha-<ui-commit-sha>
+WEB_PORT=80
 POSTGRES__USER=dmc
 POSTGRES__PASSWORD=<secret>
 POSTGRES__DB=dmc

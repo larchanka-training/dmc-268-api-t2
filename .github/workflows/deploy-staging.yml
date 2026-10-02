@@ -24,6 +24,7 @@ on:
 permissions:
   contents: read
   packages: read
+  actions: read # dispatch: read API CI runs to resolve the deployed commit
 
 concurrency:
   group: deploy-${{ (github.event_name == 'workflow_dispatch' && inputs.environment) || ((github.event.workflow_run.head_branch == 'develop' && 'develop') || 'staging') }}
@@ -36,10 +37,11 @@ jobs:
     timeout-minutes: 15
 
     # workflow_dispatch must run from main (the workflow's canonical version);
-    # workflow_run must be a successful "API CI" run on main (deploys staging)
-    # or develop (deploys the develop environment). github.ref is always the
-    # default branch for workflow_run, so head_branch is what filters PR and
-    # feature-branch runs.
+    # workflow_run must be a successful push-triggered "API CI" run on main
+    # (deploys staging) or develop (deploys the develop environment). The
+    # event filter excludes PR runs: they publish no image and their
+    # head_branch is the PR branch, not a deployable branch. github.ref is
+    # always the default branch for workflow_run.
     if: >-
       (
         github.event_name == 'workflow_dispatch' &&
@@ -47,6 +49,7 @@ jobs:
       ) || (
         github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
         (
           github.event.workflow_run.head_branch == 'main' ||
           github.event.workflow_run.head_branch == 'develop'
@@ -309,6 +312,7 @@ jobs:
           {
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
+            printf 'WEB_PORT=%s\n' "${WEB_PORT}"
             printf 'POSTGRES__USER=dmc\n'
             printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'

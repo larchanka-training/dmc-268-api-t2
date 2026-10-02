@@ -5,7 +5,9 @@ services:
     image: ${UI_IMAGE:?UI_IMAGE is required}
     restart: unless-stopped
     ports:
-      - "80:80"
+      # Хостовый порт задаёт окружение (staging 80, develop 8080);
+      # деплой-workflow прокидывает WEB_PORT в env-файл.
+      - "${WEB_PORT:-80}:80"
     depends_on:
       api:
         condition: service_healthy

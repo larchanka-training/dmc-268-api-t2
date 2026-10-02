@@ -1,8 +1,16 @@
-name: Deploy staging
+name: Deploy
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+          - develop
       ui_sha:
         description: Optional full UI commit SHA published to GHCR; omit to keep the currently deployed UI version
         required: false
@@ -18,48 +26,108 @@ permissions:
   packages: read
 
 concurrency:
-  group: deploy-staging
+  group: deploy-${{ (github.event_name == 'workflow_dispatch' && inputs.environment) || ((github.event.workflow_run.head_branch == 'develop' && 'develop') || 'staging') }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy to staging VPS
+    name: Deploy to VPS
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
-    # Deploy only from main: workflow_dispatch must be run from main, and
-    # workflow_run must be a successful "API CI" run on main (github.ref is
-    # always the default branch for workflow_run, so head_branch is what
-    # filters out PR and feature-branch runs).
+    # workflow_dispatch must run from main (the workflow's canonical version);
+    # workflow_run must be a successful "API CI" run on main (deploys staging)
+    # or develop (deploys the develop environment). github.ref is always the
+    # default branch for workflow_run, so head_branch is what filters PR and
+    # feature-branch runs.
     if: >-
-      github.ref == 'refs/heads/main' &&
       (
-        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) || (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
         (
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.head_branch == 'main'
+          github.event.workflow_run.head_branch == 'main' ||
+          github.event.workflow_run.head_branch == 'develop'
         )
       )
 
     env:
       SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
-      DEPLOY_PATH: /opt/dmc-268-t2
-      # For workflow_run, github.sha is the default-branch HEAD, not the commit
-      # "API CI" built; head_sha is the actual built commit. For
-      # workflow_dispatch this is the commit the workflow ran on. Single
-      # source of truth for the API version; API_IMAGE is built from it in
-      # the "Resolve image versions" step.
-      API_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       UI_SHA: ${{ inputs.ui_sha }}
-      # API_IMAGE and UI_IMAGE are resolved in the "Resolve image versions"
-      # step: only the initiating side's image changes, the other side's
-      # deployed version is kept from the VPS state (ADR 0001).
+      # ENV_NAME, DEPLOY_PATH, ENV_FILE, WEB_PORT and API_SHA are resolved per
+      # environment in the "Resolve deployment target" step: only the
+      # initiating side's image changes, the other side's deployed version is
+      # kept from the VPS state (ADR 0001).
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Resolve deployment target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            env_name="${{ inputs.environment }}"
+          else
+            case "${{ github.event.workflow_run.head_branch }}" in
+              main) env_name='staging' ;;
+              develop) env_name='develop' ;;
+              *)
+                echo "::error::Unexpected API CI branch: ${{ github.event.workflow_run.head_branch }}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          case "${env_name}" in
+            staging)
+              deploy_path='/opt/dmc-268-t2'
+              env_file='.env.staging'
+              web_port='80'
+              ci_branch='main'
+              ;;
+            develop)
+              deploy_path='/opt/dmc-268-t2-develop'
+              env_file='.env.staging.develop'
+              web_port='8080'
+              ci_branch='develop'
+              ;;
+          esac
+
+          # For workflow_run, github.sha is the default-branch HEAD, not the
+          # commit "API CI" built; head_sha is the actual built commit. For
+          # workflow_dispatch, take the latest successful push-triggered
+          # "API CI" run on the target branch, so the image is guaranteed to
+          # exist in GHCR.
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            api_sha="${{ github.event.workflow_run.head_sha }}"
+          else
+            api_sha="$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/api-ci.yml/runs?event=push&status=success&branch=${ci_branch}&per_page=1" \
+              --jq '.workflow_runs[0].head_sha // empty')"
+            if [[ -z "${api_sha}" ]]; then
+              echo "::error::No successful API CI run found for branch ${ci_branch}; push to ${ci_branch} first."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "ENV_NAME=${env_name}"
+            echo "DEPLOY_PATH=${deploy_path}"
+            echo "ENV_FILE=${env_file}"
+            echo "WEB_PORT=${web_port}"
+            echo "API_SHA=${api_sha}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Deploy target: ${env_name} (${deploy_path}, API CI branch: ${ci_branch})"
+          echo "API commit: ${api_sha}"
 
       - name: Validate deployment configuration
         env:
@@ -152,15 +220,15 @@ jobs:
               -o PreferredAuthentications=password \
               -o PubkeyAuthentication=no \
               "${SSH_USER}@${SSH_HOST}" \
-              "grep -E '^${key}=' '${DEPLOY_PATH}/.env.staging' 2>/dev/null | tail -n1 | cut -d= -f2-" || true
+              "grep -E '^${key}=' '${DEPLOY_PATH}/${ENV_FILE}' 2>/dev/null | tail -n1 | cut -d= -f2-" || true
           }
 
           # Only the image of the initiating side changes; the other side's
-          # deployed version is kept from .env.staging on the VPS (ADR 0001).
+          # deployed version is kept from the env file on the VPS (ADR 0001).
           if [[ -n "${UI_SHA}" ]]; then
             ui_image="${ui_image_base}${UI_SHA}"
             api_image="$(read_remote_env API_IMAGE)"
-            # Bootstrap: a fresh VPS has no .env.staging yet. The manual first
+            # Bootstrap: a fresh VPS has no env file yet. The manual first
             # deploy (run from main after API CI) pins this workflow's commit.
             if [[ -z "${api_image}" ]]; then
               api_image="ghcr.io/${{ github.repository }}:sha-${API_SHA}"
@@ -172,7 +240,7 @@ jobs:
           fi
 
           if [[ -z "${ui_image}" ]]; then
-            echo "::error::ui_sha was not provided and ${DEPLOY_PATH}/.env.staging on the VPS has no UI_IMAGE."
+            echo "::error::ui_sha was not provided and ${DEPLOY_PATH}/${ENV_FILE} on the VPS has no UI_IMAGE."
             echo "::error::Run this workflow once manually with ui_sha to pin the frontend version; automatic deployments will keep it afterwards."
             exit 1
           fi
@@ -219,7 +287,7 @@ jobs:
             docker-compose.staging.yml \
             "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/docker-compose.staging.yml"
 
-      - name: Write staging environment
+      - name: Write runtime environment
         env:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSHPASS: ${{ secrets.VPS_DMC268_P }}
@@ -240,7 +308,7 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "umask 077 && cat > '${DEPLOY_PATH}/.env.staging'"
+            "umask 077 && cat > '${DEPLOY_PATH}/${ENV_FILE}'"
 
       - name: Deploy application
         env:
@@ -277,14 +345,15 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            'bash -s' <<'REMOTE'
+            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' bash -s" \
+            <<'REMOTE'
           set -euo pipefail
 
-          cd /opt/dmc-268-t2
+          cd "${DEPLOY_PATH}"
 
           compose() {
             docker compose \
-              --env-file .env.staging \
+              --env-file "${ENV_FILE}" \
               -f docker-compose.staging.yml \
               "$@"
           }
@@ -355,13 +424,39 @@ jobs:
             sleep 2
           done
 
+          echo "Starting worker..."
+          compose up -d worker
+
+          echo "Waiting for worker..."
+          for attempt in $(seq 1 30); do
+            worker_id="$(compose ps -q worker)"
+
+            worker_state="$(docker inspect \
+              --format='{{.State.Status}}' \
+              "${worker_id}" 2>/dev/null || true)"
+
+            if [[ "${worker_state}" == "running" ]]; then
+              echo "Worker is running"
+              break
+            fi
+
+            if [[ "${attempt}" -eq 30 ]]; then
+              echo "ERROR: Worker did not reach running state"
+              compose ps
+              compose logs --tail=100 worker
+              exit 1
+            fi
+
+            sleep 2
+          done
+
           echo "Starting web..."
           compose up -d web
 
           echo "Waiting for web..."
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1/ >/dev/null; then
-              echo "Staging web is healthy"
+            if curl -fsS "http://127.0.0.1:${WEB_PORT}/" >/dev/null; then
+              echo "${ENV_NAME} web is healthy"
               compose ps
               exit 0
             fi

@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - main
+      - develop
 
 permissions:
   contents: read
@@ -84,7 +85,9 @@ jobs:
     needs:
       - quality
       - docker
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Images are published only from deployable branches: main (staging) and
+    # develop (develop environment).
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
 
     permissions:
       contents: read

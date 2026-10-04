@@ -1,0 +1,931 @@
+openapi: 3.1.0
+info:
+  title: DMC-268 API
+  version: 1.0.0
+  description: >-
+    Authoritative HTTP contract. Browser mutations require the session cookie,
+    an allowlisted Origin, and X-CSRF-Token. Ordinary authentication failures
+    return AUTHENTICATION_REQUIRED and never redirect to GitHub.
+servers:
+  - url: /
+tags:
+  - name: auth
+  - name: repositories
+  - name: reviews
+  - name: webhooks
+  - name: diagnostics
+paths:
+  /api/v1/auth/github/start:
+    get:
+      tags: [auth]
+      operationId: startGithubOAuth
+      summary: Start backend-mediated GitHub OAuth
+      description: >-
+        return_to is accepted only when it is a safe local frontend path. It is
+        bound to a single-use OAuth state; invalid or absent values become '/'.
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirect to GitHub authorization
+          headers:
+            Location: { schema: { type: string } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/auth/github/callback:
+    get:
+      tags: [auth]
+      operationId: finishGithubOAuth
+      summary: Validate OAuth state and establish a session
+      description: >-
+        Uses required single-use state rather than a CSRF header. A valid code
+        plus state sets a 30-minute Secure, HttpOnly, SameSite=Lax JWT cookie
+        containing a unique sid backed by an active PostgreSQL session, then
+        redirects to the safe return path. A provider failure with valid state
+        redirects to a fixed frontend auth-error route containing only a safe
+        application error code and never establishes a session.
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+        - name: error
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '303':
+          description: Redirect to safe return path or fixed auth-error route
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie:
+              schema: { type: string }
+              description: Session establishment or cookie clearing directive
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Revoke the current session and clear its cookie
+      description: >-
+        Idempotent. An active valid session requires an allowlisted Origin and
+        valid CSRF token, then is revoked. Invalid Origin/CSRF on an active
+        session returns ACCESS_DENIED. An absent, expired, invalid, or already
+        revoked session still clears the cookie and returns 204.
+      security: [{ cookieAuth: [] }, {}]
+      parameters:
+        - name: Origin
+          in: header
+          required: false
+          schema: { type: string, format: uri }
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '204':
+          description: Session revoked or already absent
+          headers:
+            Set-Cookie: { schema: { type: string } }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+  /api/v1/me:
+    get:
+      tags: [auth]
+      operationId: getCurrentUser
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200':
+          description: Current user, authoritative session expiry, and plaintext CSRF token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+  /api/v1/repositories:
+    get:
+      tags: [repositories]
+      operationId: listRepositories
+      description: >-
+        Requires local RepositoryAccess and current GitHub read access. Stable
+        ordering is owner ASC, name ASC, id ASC.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Accessible repositories
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepositoryPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+  /api/v1/repositories/{id}/pull-requests:
+    get:
+      tags: [repositories]
+      operationId: listPullRequests
+      description: >-
+        Provider-backed OPEN pull requests only. ChangeRequest is durable local
+        history, not the complete catalog. Provider-native cursor ordering is
+        preserved; no globally re-sorted order across pages is promised.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Open pull requests
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PullRequestPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/repositories/{id}/settings:
+    get:
+      tags: [repositories]
+      operationId: getRepositorySettings
+      description: Admin role required.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+      responses:
+        '200':
+          description: Current immutable settings version
+          headers:
+            ETag:
+              required: true
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepositorySettings' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+    put:
+      tags: [repositories]
+      operationId: replaceRepositorySettings
+      summary: Fully replace editable repository settings
+      description: Admin role required.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - $ref: '#/components/parameters/Origin'
+        - name: If-Match
+          in: header
+          required: true
+          schema: { type: string }
+          description: ETag of the current immutable settings version
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RepositorySettingsReplacement' }
+      responses:
+        '200':
+          description: New immutable settings version
+          headers:
+            ETag:
+              required: true
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepositorySettings' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '409':
+          $ref: '#/components/responses/SettingsVersionConflict'
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/repositories/{id}/pull-requests/{number}/reviews:
+    post:
+      tags: [reviews]
+      operationId: startReview
+      description: >-
+        Starts an asynchronous review. The server chooses and freezes settings,
+        model, and prompt versions. A new run returns 202; a same-key/same-body
+        replay returns 200. Same-key/different-body returns IDEMPOTENCY_CONFLICT.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - $ref: '#/components/parameters/PullRequestNumber'
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartReviewRequest' }
+      responses:
+        '200':
+          description: Existing resource for a same-key/same-body replay
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartReviewReplayResponse' }
+        '202':
+          description: New review accepted
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartReviewResponse' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '409':
+          description: Idempotency, head, or equivalent-active-review conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                idempotency: { value: { code: IDEMPOTENCY_CONFLICT, message: Idempotency key conflicts with the request., request_id: req_123, retryable: false, retry_after: null } }
+                head: { value: { code: PR_HEAD_MISMATCH, message: Pull request head does not match., request_id: req_123, retryable: false, retry_after: null } }
+                active: { value: { code: REVIEW_ALREADY_ACTIVE, message: An equivalent review is already active., request_id: req_123, retryable: false, retry_after: null } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/QuotaExceeded' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/repositories/{id}/reviews:
+    get:
+      tags: [reviews]
+      operationId: listRepositoryReviews
+      description: Stable ordering is created_at DESC, id DESC.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: pull_request_number
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ReviewStatus' }
+      responses:
+        '200':
+          description: Review history
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewListPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/reviews/{id}:
+    get:
+      tags: [reviews]
+      operationId: getReview
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+      responses:
+        '200':
+          description: Review detail with one canonical status and no stage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewDetail' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+  /api/v1/reviews/{id}/findings:
+    get:
+      tags: [reviews]
+      operationId: listReviewFindings
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Validated findings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FindingPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+  /api/v1/reviews/{id}/diff:
+    get:
+      tags: [reviews]
+      operationId: getReviewDiff
+      description: Stored bounded diff; never returns a prompt payload. Not paginated in v1.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+      responses:
+        '200':
+          description: Canonical stored diff
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Diff' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '410': { $ref: '#/components/responses/DiffExpired' }
+  /api/v1/reviews/{id}/events:
+    get:
+      tags: [reviews]
+      operationId: listReviewEvents
+      description: Public safe projection; phase, attempt, and safe_details are not exposed.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Append-only event history
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewEventPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+  /api/v1/reviews/{id}/publication-retries:
+    post:
+      tags: [reviews]
+      operationId: retryPublication
+      description: >-
+        Eligible only for confirmed-absent FAILED publication. UNKNOWN, PARTIAL,
+        stale snapshots, and other states return PUBLICATION_RETRY_NOT_ALLOWED.
+        This never reruns LLM analysis.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Publication retry accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationRetryResponse' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '409': { $ref: '#/components/responses/PublicationRetryNotAllowed' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/webhooks/github:
+    post:
+      tags: [webhooks]
+      operationId: receiveGithubWebhook
+      description: >-
+        Authenticates the raw body with X-Hub-Signature-256 and deduplicates by
+        X-GitHub-Delivery. It never uses user JWT or CSRF. A valid duplicate or
+        unknown event returns 2xx and creates no duplicate/unknown task.
+        Reviewer-assignment triggering remains feature-gated.
+      security: []
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-GitHub-Delivery
+          in: header
+          required: true
+          schema: { type: string, minLength: 1 }
+        - name: X-GitHub-Event
+          in: header
+          required: true
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '202': { description: 'Valid delivery accepted, ignored, or already processed' }
+        '401':
+          description: Missing or invalid signature; both use the same safe shape
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: AUTHENTICATION_REQUIRED, message: Authentication is required., request_id: req_123, retryable: false, retry_after: null }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /healthcheck:
+    get:
+      tags: [diagnostics]
+      operationId: healthcheck
+      description: Dependency-free liveness check.
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /readiness:
+    get:
+      tags: [diagnostics]
+      operationId: readiness
+      description: Never exposes dependency hostnames, secrets, or raw errors.
+      security: []
+      responses:
+        '200':
+          description: Ready or degraded with capability-level availability
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: PostgreSQL or another unrecoverable core readiness failure
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: dmc_session
+      description: >-
+        Secure, HttpOnly, SameSite=Lax JWT cookie with a unique sid. Every use
+        also validates the active, non-revoked PostgreSQL session.
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Plaintext token obtained from /api/v1/me for browser mutations.
+  parameters:
+    RepositoryId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+    ReviewId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+    PullRequestNumber:
+      name: number
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string, minLength: 1 }
+      description: Opaque continuation cursor
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      schema: { type: string, format: uri }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1 }
+  schemas:
+    ReviewStatus:
+      type: string
+      enum: [QUEUED, FETCHING_DIFF, PARSING_CONTEXT, LLM_PROCESSING, COMPLETED, PARTIAL, FAILED, SKIPPED]
+    PublicationStatus:
+      type: string
+      enum: [NOT_READY, PENDING, PUBLISHED, PARTIAL, FAILED, UNKNOWN, SKIPPED]
+    ErrorCode:
+      type: string
+      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE]
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id, retryable, retry_after]
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        message: { type: string }
+        request_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: [integer, 'null'], minimum: 0, description: 'Seconds until retry, or null' }
+    Me:
+      type: object
+      additionalProperties: false
+      required: [user, session, csrf_token]
+      properties:
+        user:
+          type: object
+          additionalProperties: false
+          required: [id, provider, external_id, login]
+          properties:
+            id: { type: string }
+            provider: { type: string }
+            external_id: { type: string }
+            login: { type: string }
+        session:
+          type: object
+          additionalProperties: false
+          required: [expires_at]
+          properties:
+            expires_at: { type: string, format: date-time }
+        csrf_token: { type: string, minLength: 1 }
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [can_start_review, can_manage_settings]
+      properties:
+        can_start_review: { const: true }
+        can_manage_settings: { type: boolean }
+    Repository:
+      type: object
+      additionalProperties: false
+      required: [id, provider, external_id, owner, name, role, capabilities]
+      properties:
+        id: { type: string }
+        provider: { const: github }
+        external_id: { type: string }
+        owner: { type: string }
+        name: { type: string }
+        role: { enum: [reviewer, admin] }
+        capabilities: { $ref: '#/components/schemas/Capabilities' }
+      allOf:
+        - if: { properties: { role: { const: reviewer } } }
+          then: { properties: { capabilities: { properties: { can_manage_settings: { const: false } } } } }
+        - if: { properties: { role: { const: admin } } }
+          then: { properties: { capabilities: { properties: { can_manage_settings: { const: true } } } } }
+    RepositoryPage:
+      $ref: '#/components/schemas/RepositoryPageValue'
+    RepositoryPageValue:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Repository' } }
+        next_cursor: { type: [string, 'null'] }
+    PullRequestRef:
+      type: object
+      additionalProperties: false
+      required: [repository_external_id, ref, sha]
+      properties:
+        repository_external_id: { type: string }
+        ref: { type: string }
+        sha: { type: string }
+    PullRequest:
+      type: object
+      additionalProperties: false
+      required: [number, title, author, state, source, base]
+      properties:
+        number: { type: integer, minimum: 1 }
+        title: { type: string }
+        author:
+          type: object
+          additionalProperties: false
+          required: [login]
+          properties: { login: { type: string } }
+        state: { const: OPEN }
+        source: { $ref: '#/components/schemas/PullRequestRef' }
+        base: { $ref: '#/components/schemas/PullRequestRef' }
+    PullRequestPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/PullRequest' } }
+        next_cursor: { type: [string, 'null'] }
+    Rules:
+      type: object
+      additionalProperties: false
+      required: [instructions]
+      properties:
+        instructions:
+          type: array
+          uniqueItems: true
+          items: { type: string, minLength: 1, pattern: '.*\S.*' }
+    Ignores:
+      type: object
+      additionalProperties: false
+      required: [globs]
+      properties:
+        globs:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            pattern: '^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\)(?!.*\x00)(?!!).*\S.*$'
+            description: Normalized repository-relative POSIX pattern; data only, never a shell argument.
+    RepositorySettingsReplacement:
+      type: object
+      additionalProperties: false
+      required: [rules, ignores, max_starts_per_hour, max_active_jobs, output_language, surrounding_lines]
+      properties:
+        rules: { $ref: '#/components/schemas/Rules' }
+        ignores: { $ref: '#/components/schemas/Ignores' }
+        max_starts_per_hour: { type: integer, minimum: 0 }
+        max_active_jobs: { type: integer, minimum: 0 }
+        output_language: { const: ru }
+        surrounding_lines: { type: integer, minimum: 0 }
+    RepositorySettings:
+      type: object
+      additionalProperties: false
+      required: [version, rules, ignores, max_starts_per_hour, max_active_jobs, output_language, surrounding_lines, created_at]
+      properties:
+        version: { type: string, description: Opaque immutable settings version/id }
+        rules: { $ref: '#/components/schemas/Rules' }
+        ignores: { $ref: '#/components/schemas/Ignores' }
+        max_starts_per_hour: { type: integer, minimum: 0 }
+        max_active_jobs: { type: integer, minimum: 0 }
+        output_language: { const: ru }
+        surrounding_lines: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    StartReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [requested_head_sha]
+      properties:
+        requested_head_sha: { type: string, minLength: 1 }
+        rerun_of: { type: [string, 'null'] }
+    StartReviewResponse:
+      type: object
+      additionalProperties: false
+      required: [review_id, status, resource_url]
+      properties:
+        review_id: { type: string }
+        status: { const: QUEUED }
+        resource_url: { type: string }
+    StartReviewReplayResponse:
+      type: object
+      additionalProperties: false
+      required: [review_id, status, resource_url]
+      properties:
+        review_id: { type: string }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        resource_url: { type: string }
+    ReviewListItem:
+      type: object
+      additionalProperties: false
+      required: [id, pull_request_number, requested_head_sha, status, publication_status, created_at, finished_at]
+      properties:
+        id: { type: string }
+        pull_request_number: { type: integer, minimum: 1 }
+        requested_head_sha: { type: string }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        publication_status: { $ref: '#/components/schemas/PublicationStatus' }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    ReviewListPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ReviewListItem' } }
+        next_cursor: { type: [string, 'null'] }
+    LineRange:
+      type: object
+      additionalProperties: false
+      required: [start_line, end_line]
+      properties:
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1, description: Must be greater than or equal to start_line }
+    CoverageEntry:
+      type: object
+      additionalProperties: false
+      required: [path, ranges]
+      properties:
+        path: { type: string }
+        ranges: { type: array, items: { $ref: '#/components/schemas/LineRange' } }
+    SkippedCoverageEntry:
+      type: object
+      additionalProperties: false
+      required: [path, ranges, reason]
+      properties:
+        path: { type: string }
+        ranges: { type: array, items: { $ref: '#/components/schemas/LineRange' } }
+        reason: { enum: [policy, unsupported_language, unavailable_blob, provider_truncated, token_budget, file_limit, line_limit, context_error] }
+    Coverage:
+      type: object
+      additionalProperties: false
+      required: [included, skipped, context_quality]
+      properties:
+        included: { type: array, items: { $ref: '#/components/schemas/CoverageEntry' } }
+        skipped: { type: array, items: { $ref: '#/components/schemas/SkippedCoverageEntry' } }
+        context_quality: { enum: [full, degraded, diff_only] }
+    Usage:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens: { type: integer, minimum: 0 }
+        output_tokens: { type: integer, minimum: 0 }
+    SafeReviewError:
+      type: object
+      additionalProperties: false
+      required: [reason_code, retryable, retry_at]
+      properties:
+        reason_code: { $ref: '#/components/schemas/ReasonCode' }
+        retryable: { type: boolean }
+        retry_at: { type: [string, 'null'], format: date-time }
+    ReasonCode:
+      type: string
+      enum: [QUEUE_DEADLINE_EXCEEDED, VCS_RATE_LIMITED, VCS_UNAVAILABLE, VCS_ACCESS_DENIED, PR_STALE_OR_CLOSED, DIFF_UNTRUSTWORTHY, SOURCE_BLOB_UNAVAILABLE, AST_PARSE_FAILED, LLM_TIMEOUT, LLM_UNAVAILABLE, LLM_OUTPUT_INVALID, ANALYSIS_DEADLINE_EXCEEDED]
+    ReviewDetail:
+      type: object
+      additionalProperties: false
+      required: [id, repository_id, pull_request_number, status, requested_head_sha, snapshot, progress, summary, coverage, usage, publication_status, created_at, started_at, finished_at, retry_at, error]
+      properties:
+        id: { type: string }
+        repository_id: { type: string }
+        pull_request_number: { type: integer, minimum: 1 }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        requested_head_sha: { type: string }
+        snapshot:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [base_sha, merge_base_sha, head_sha, captured_at]
+          properties:
+            base_sha: { type: string }
+            merge_base_sha: { type: string }
+            head_sha: { type: string }
+            captured_at: { type: string, format: date-time }
+        progress:
+          type: object
+          additionalProperties: false
+          required: [completed_chunks, planned_chunks]
+          properties:
+            completed_chunks: { type: integer, minimum: 0 }
+            planned_chunks: { type: integer, minimum: 0 }
+        summary: { type: [string, 'null'] }
+        coverage: { oneOf: [{ $ref: '#/components/schemas/Coverage' }, { type: 'null' }] }
+        usage: { oneOf: [{ $ref: '#/components/schemas/Usage' }, { type: 'null' }] }
+        publication_status: { $ref: '#/components/schemas/PublicationStatus' }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        retry_at: { type: [string, 'null'], format: date-time }
+        error: { oneOf: [{ $ref: '#/components/schemas/SafeReviewError' }, { type: 'null' }] }
+    Finding:
+      type: object
+      additionalProperties: false
+      required: [id, fingerprint, path, side, start_line, end_line, category, severity, title, explanation, evidence, recommendation, proposed_diff_fix, publication_reference]
+      properties:
+        id: { type: string }
+        fingerprint: { type: string }
+        path: { type: string }
+        side: { enum: [OLD, NEW] }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1, description: Must be greater than or equal to start_line }
+        category: { enum: [security, correctness, performance, maintainability] }
+        severity: { enum: [critical, high, medium, low] }
+        title: { type: string }
+        explanation: { type: string }
+        evidence: { type: string }
+        recommendation: { type: string }
+        proposed_diff_fix: { type: [string, 'null'] }
+        publication_reference: { type: [string, 'null'], description: Opaque provider reference; never raw provider metadata }
+    FindingPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Finding' } }
+        next_cursor: { type: [string, 'null'] }
+    DiffLine:
+      type: object
+      additionalProperties: false
+      required: [kind, content, old_line, new_line]
+      properties:
+        kind: { enum: [added, deleted, context] }
+        content: { type: string }
+        old_line: { type: [integer, 'null'], minimum: 1 }
+        new_line: { type: [integer, 'null'], minimum: 1 }
+    DiffHunk:
+      type: object
+      additionalProperties: false
+      required: [old_start, old_lines, new_start, new_lines, lines]
+      properties:
+        old_start: { type: integer, minimum: 1 }
+        old_lines: { type: integer, minimum: 0 }
+        new_start: { type: integer, minimum: 1 }
+        new_lines: { type: integer, minimum: 0 }
+        lines: { type: array, items: { $ref: '#/components/schemas/DiffLine' } }
+    DiffFile:
+      type: object
+      additionalProperties: false
+      required: [path, previous_path, status, hunks]
+      properties:
+        path: { type: string }
+        previous_path: { type: [string, 'null'] }
+        status: { enum: [added, modified, deleted, renamed] }
+        hunks: { type: array, items: { $ref: '#/components/schemas/DiffHunk' } }
+    Diff:
+      type: object
+      additionalProperties: false
+      required: [files]
+      properties:
+        files: { type: array, items: { $ref: '#/components/schemas/DiffFile' } }
+    ReviewEvent:
+      type: object
+      additionalProperties: false
+      required: [id, occurred_at, event_type, status, reason_code, retryable]
+      properties:
+        id: { type: string }
+        occurred_at: { type: string, format: date-time }
+        event_type: { type: string }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        reason_code: { oneOf: [{ $ref: '#/components/schemas/ReasonCode' }, { type: 'null' }] }
+        retryable: { type: boolean }
+    ReviewEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ReviewEvent' } }
+        next_cursor: { type: [string, 'null'] }
+    PublicationRetryResponse:
+      type: object
+      additionalProperties: false
+      required: [review_id, publication_status]
+      properties:
+        review_id: { type: string }
+        publication_status: { const: PENDING }
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties: { status: { const: ok } }
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [status, capabilities]
+      properties:
+        status: { enum: [ready, degraded, not_ready] }
+        capabilities:
+          type: object
+          additionalProperties: false
+          required: [stored_reads, auth_sessions, review_start, analysis_dispatch, publication]
+          properties:
+            stored_reads: { type: boolean }
+            auth_sessions: { type: boolean }
+            review_start: { type: boolean }
+            analysis_dispatch: { type: boolean }
+            publication: { type: boolean }
+  responses:
+    AuthenticationRequired:
+      description: AUTHENTICATION_REQUIRED — active authenticated session required
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: AUTHENTICATION_REQUIRED, message: Authentication is required., request_id: req_123, retryable: false, retry_after: null }
+    AccessDenied:
+      description: ACCESS_DENIED — access, CSRF, or Origin check failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: ACCESS_DENIED, message: Access is denied., request_id: req_123, retryable: false, retry_after: null }
+    ResourceNotFound:
+      description: RESOURCE_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: RESOURCE_NOT_FOUND, message: Resource was not found., request_id: req_123, retryable: false, retry_after: null }
+    SettingsVersionConflict:
+      description: SETTINGS_VERSION_CONFLICT
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: SETTINGS_VERSION_CONFLICT, message: Settings version is stale., request_id: req_123, retryable: false, retry_after: null }
+    PublicationRetryNotAllowed:
+      description: PUBLICATION_RETRY_NOT_ALLOWED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: PUBLICATION_RETRY_NOT_ALLOWED, message: Publication retry is not allowed., request_id: req_123, retryable: false, retry_after: null }
+    DiffExpired:
+      description: DIFF_EXPIRED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: DIFF_EXPIRED, message: Stored diff has expired., request_id: req_123, retryable: false, retry_after: null }
+    ValidationFailed:
+      description: VALIDATION_FAILED, including missing If-Match
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: VALIDATION_FAILED, message: Request validation failed., request_id: req_123, retryable: false, retry_after: null }
+    QuotaExceeded:
+      description: QUOTA_EXCEEDED
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 0 } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: QUOTA_EXCEEDED, message: Review start quota was exceeded., request_id: req_123, retryable: true, retry_after: 60 }
+    ServiceUnavailable:
+      description: SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, or UPSTREAM_UNAVAILABLE
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 0 } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: SERVICE_UNAVAILABLE, message: Service is temporarily unavailable., request_id: req_123, retryable: true, retry_after: 30 }

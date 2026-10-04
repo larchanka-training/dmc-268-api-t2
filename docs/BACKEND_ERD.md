@@ -89,7 +89,6 @@ erDiagram
         TIMESTAMPTZ started_at
         TIMESTAMPTZ finished_at
         TEXT status
-        TEXT stage
         TIMESTAMPTZ queue_deadline_at
         TIMESTAMPTZ analysis_deadline_at
         JSONB coverage
@@ -102,8 +101,11 @@ erDiagram
         TIMESTAMPTZ occurred_at
         TEXT event_type
         TEXT status
-        TEXT stage
+        TEXT phase "nullable"
         TEXT reason_code
+        BOOLEAN retryable
+        INT attempt
+        JSONB safe_details "nullable"
     }
 
     ContextPayload {
@@ -140,6 +142,7 @@ erDiagram
         TEXT explanation
         TEXT evidence
         TEXT recommendation
+        TEXT proposed_diff_fix "nullable"
         TIMESTAMPTZ created_at
     }
 
@@ -250,8 +253,8 @@ erDiagram
 
 Допустимые значения:
 
-- `ReviewJob.status`: `QUEUED | RUNNING | COMPLETED | PARTIAL | FAILED | SKIPPED`;
-- `ReviewJob.stage`: `snapshot | context | inference | validation | done | NULL`;
+- `ReviewJob.status`: `QUEUED | FETCHING_DIFF | PARSING_CONTEXT | LLM_PROCESSING | COMPLETED | PARTIAL | FAILED | SKIPPED`;
+- `ReviewEvent.phase`: `FETCHING_DIFF | PARSING_CONTEXT | LLM_PROCESSING | NULL`;
 - `Publication.status`: `NOT_READY | PENDING | PUBLISHED | PARTIAL | FAILED | UNKNOWN | SKIPPED`;
 - `Finding.side`: `OLD | NEW`;
 - `Finding.category`: `security | correctness | performance | maintainability`;
@@ -261,10 +264,11 @@ erDiagram
 - `RepositoryAccess.role`: `reviewer | admin`.
 
 Именованный CHECK `ck_review_job_status_finished_at` использует
-`ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED` и
-`RUNNING` требуют `finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и
-`SKIPPED` требуют `finished_at IS NOT NULL`. Terminal-переход записывает status и
-`finished_at` в одной транзакции. `stage` в этот invariant не входит.
+`ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED`,
+`FETCHING_DIFF`, `PARSING_CONTEXT` и `LLM_PROCESSING` требуют
+`finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и `SKIPPED` требуют
+`finished_at IS NOT NULL`. Terminal-переход записывает status и `finished_at` в
+одной транзакции. Отдельного current/public `stage` нет.
 
 `Repository.current_settings_id` изначально равен `NULL`. После создания первой
 версии настроек составной FK разрешает назначить только настройки того же
@@ -295,11 +299,37 @@ path обязан выводить `ChunkResult.review_job_id` из owning Conte
 - `ContextPayload.payload_body`;
 - `ChunkResult.limitations`;
 - `ChunkResult.usage`;
+- `ReviewEvent.safe_details`;
 - `Publication.provider_metadata`;
 - `RepositorySettings.rules`;
 - `RepositorySettings.ignores`.
 
-`ContextPayload.payload_body` содержит `snapshot`, `metadata`, `files`, `related_symbols`, `coverage`, `budget`. Значения `review_id`, `chunk_id` и `schema_version` представлены отдельными колонками `review_job_id`, `id`, `schema_version`.
+`ContextPayload.payload_body` содержит `snapshot`, `metadata`, `files`,
+`related_symbols`, `coverage`, `budget`. Значения `review_id`, `chunk_id` и
+`schema_version` представлены отдельными колонками `review_job_id`, `id`,
+`schema_version`. Полный контракт задан `schemas/context/v1.json`.
+
+`ChunkResult.limitations` содержит JSON array строк. `usage` nullable и при
+наличии содержит только non-negative `input_tokens` и `output_tokens`. Finding
+сохраняет nullable `proposed_diff_fix`; это предложение никогда не применяется
+автоматически.
+
+Forward migration 0003 нормализует legacy `ChunkResult.limitations = {}` в `[]`
+и canonical empty rules одновременно обновляет `rules_digest`. Legacy
+`ReviewEvent.stage` преобразуется для всех событий: snapshot/context/inference/
+validation становятся соответствующими active phase, а done становится `NULL`;
+status меняется только у legacy `RUNNING`. Downgrade намеренно lossy: точное
+canonical empty `limitations = []` возвращается в legacy `{}`, canonical empty
+rules/ignores возвращаются в `{}`; исторический rules digest восстановить
+невозможно, поэтому downgrade записывает детерминированный SHA-256 compact sorted
+`{}` (`44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`).
+`done` из nullable phase не восстанавливается.
+
+`RepositorySettings.rules` имеет canonical форму `{"instructions": []}`, а
+`ignores` — `{"globs": []}`. Строки уникальны и непусты; порядок instructions
+семантически значим. Globs — normalized repository-relative POSIX patterns без
+absolute path, `..`, backslash, NUL и negation. `rules_digest` создаёт backend из
+canonical serialization правил.
 
 ---
 
@@ -317,14 +347,14 @@ path обязан выводить `ChunkResult.review_job_id` из owning Conte
 
 ---
 
-## 6. Открытые вопросы
+## 6. Отложенная реализация
 
-- структура `ReviewJob.error/reason`;
 - семантика `Repository.enabled`;
 - место хранения GitHub `installation_id`;
-- JSON schema для `RepositorySettings.rules/ignores`;
-- модель хранения OAuth/access для `User`;
-- необходимость `ChunkResult.schema_version` после окончательной сверки с canonical review-result schema.
+- физическая модель OAuth identity/access и обязательного PostgreSQL
+  `AuthSession`; accepted контракт требует 30-минутную JWT cookie с уникальным
+  `sid`, server-side revocation и CSRF verifier;
+- полные worker/dispatcher/recovery adapters.
 
 ---
 

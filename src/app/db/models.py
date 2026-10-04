@@ -91,8 +91,12 @@ class RepositorySettings(Base):
     repository_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("repository.id"), nullable=False
     )
-    rules: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    ignores: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    rules: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=lambda: {"instructions": []}
+    )
+    ignores: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=lambda: {"globs": []}
+    )
     max_starts_per_hour: Mapped[int] = mapped_column(Integer, nullable=False)
     max_active_jobs: Mapped[int] = mapped_column(Integer, nullable=False)
     output_language: Mapped[str] = mapped_column(Text, nullable=False)
@@ -262,7 +266,6 @@ class ReviewJob(Base):
         DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    stage: Mapped[str | None] = mapped_column(Text, nullable=True)
     queue_deadline_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -306,16 +309,15 @@ class ReviewJob(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('QUEUED','RUNNING','COMPLETED','PARTIAL','FAILED','SKIPPED')",
+            "status IN "
+            "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING',"
+            "'COMPLETED','PARTIAL','FAILED','SKIPPED')",
             name="ck_review_job_status",
         ),
         CheckConstraint(
-            "stage IS NULL OR stage IN "
-            "('snapshot','context','inference','validation','done')",
-            name="ck_review_job_stage",
-        ),
-        CheckConstraint(
-            "(status IN ('QUEUED','RUNNING') AND finished_at IS NULL) OR "
+            "(status IN "
+            "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING') "
+            "AND finished_at IS NULL) OR "
             "(status IN ('COMPLETED','PARTIAL','FAILED','SKIPPED') "
             "AND finished_at IS NOT NULL)",
             name=conv("ck_review_job_status_finished_at"),
@@ -356,20 +358,38 @@ class ReviewEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    phase: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryable: Mapped[bool] = mapped_column(nullable=False, default=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    safe_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="events")
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('QUEUED','RUNNING','COMPLETED','PARTIAL','FAILED','SKIPPED')",
+            "status IN "
+            "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING',"
+            "'COMPLETED','PARTIAL','FAILED','SKIPPED')",
             name="ck_review_event_status",
         ),
         CheckConstraint(
-            "stage IS NULL OR stage IN "
-            "('snapshot','context','inference','validation','done')",
-            name="ck_review_event_stage",
+            "phase IS NULL OR phase IN "
+            "('FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING')",
+            name="ck_review_event_phase",
+        ),
+        CheckConstraint(
+            "reason_code IS NULL OR reason_code IN "
+            "('QUEUE_DEADLINE_EXCEEDED','VCS_RATE_LIMITED','VCS_UNAVAILABLE',"
+            "'VCS_ACCESS_DENIED','PR_STALE_OR_CLOSED','DIFF_UNTRUSTWORTHY',"
+            "'SOURCE_BLOB_UNAVAILABLE','AST_PARSE_FAILED','LLM_TIMEOUT',"
+            "'LLM_UNAVAILABLE','LLM_OUTPUT_INVALID','ANALYSIS_DEADLINE_EXCEEDED')",
+            name="ck_review_event_reason_code",
+        ),
+        CheckConstraint("attempt >= 1", name="ck_review_event_attempt_positive"),
+        CheckConstraint(
+            "safe_details IS NULL OR jsonb_typeof(safe_details) = 'object'",
+            name="ck_review_event_safe_details_object",
         ),
     )
 
@@ -419,8 +439,8 @@ class ChunkResult(Base):
     )
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
-    limitations: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    usage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    limitations: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
@@ -459,6 +479,7 @@ class Finding(Base):
     explanation: Mapped[str] = mapped_column(Text, nullable=False)
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     recommendation: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_diff_fix: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

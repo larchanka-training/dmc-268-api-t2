@@ -55,7 +55,6 @@ class SqlAlchemyReviewJobRepository:
                     created_at=now,
                     finished_at=None,
                     status=ReviewStatus.QUEUED.value,
-                    stage=None,
                     queue_deadline_at=now + timedelta(minutes=15),
                     coverage={},
                 ),

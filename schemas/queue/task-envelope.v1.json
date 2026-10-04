@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/queue/task-envelope.v1.json",
+  "title": "Queue task envelope v1",
+  "description": "Producers emit only canonical fields. V1 consumers ignore unknown optional fields; breaking changes require a new major schema version and consumer.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "event_id", "review_id", "task_kind", "attempt", "trace_id"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "review_id": { "type": "string", "minLength": 1 },
+    "task_kind": { "enum": ["analyze", "publish"] },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "trace_id": { "type": "string", "minLength": 1 }
+  }
+}

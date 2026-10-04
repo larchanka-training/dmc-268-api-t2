@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/review-result/v1.json",
+  "title": "ReviewChunkResult v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "summary", "findings", "limitations", "usage", "latency_ms"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "summary": { "type": "string" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "usage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input_tokens", "output_tokens"],
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "latency_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "description": "One concrete issue at one repository-relative location or range. end_line must be greater than or equal to start_line.",
+      "additionalProperties": false,
+      "required": ["path", "side", "start_line", "end_line", "category", "severity", "title", "explanation", "evidence", "recommendation", "proposed_diff_fix"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*\\u0000).+$"
+        },
+        "side": { "enum": ["OLD", "NEW"] },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "category": { "enum": ["security", "correctness", "performance", "maintainability"] },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "title": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 },
+        "proposed_diff_fix": { "type": ["string", "null"], "description": "Suggestion only; never automatically applied." }
+      }
+    }
+  }
+}

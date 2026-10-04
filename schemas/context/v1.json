@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/context/v1.json",
+  "title": "ContextPayload v1",
+  "description": "Immutable backend-owned context for one model invocation. Paths are normalized repository-relative POSIX paths and all ranges are inclusive and 1-based.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "review_id", "chunk_id", "snapshot", "metadata", "files", "related_symbols", "coverage", "budget"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "review_id": { "$ref": "#/$defs/nonEmptyString" },
+    "chunk_id": { "$ref": "#/$defs/nonEmptyString" },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "base_repository_id", "head_repository_id", "base_sha", "merge_base_sha", "head_sha", "captured_at", "provider_metadata"],
+      "properties": {
+        "provider": { "const": "github" },
+        "base_repository_id": { "$ref": "#/$defs/nonEmptyString" },
+        "head_repository_id": { "$ref": "#/$defs/nonEmptyString" },
+        "base_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "merge_base_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "head_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "provider_metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pull_number", "diff_version"],
+          "properties": {
+            "pull_number": { "type": "integer", "minimum": 1 },
+            "diff_version": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "body", "base_ref", "head_ref", "commit_messages", "languages", "discussions", "rules_version", "output_language"],
+      "properties": {
+        "title": { "type": "string" },
+        "body": { "type": ["string", "null"] },
+        "base_ref": { "$ref": "#/$defs/nonEmptyString" },
+        "head_ref": { "$ref": "#/$defs/nonEmptyString" },
+        "commit_messages": { "type": "array", "items": { "type": "string" } },
+        "languages": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" }, "uniqueItems": true },
+        "discussions": {
+          "type": "array",
+          "description": "Provider-neutral discussion text only; no provider raw payload.",
+          "items": { "type": "string" }
+        },
+        "rules_version": { "$ref": "#/$defs/nonEmptyString" },
+        "output_language": { "const": "ru" }
+      }
+    },
+    "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/fileContext" } },
+    "related_symbols": { "type": "array", "items": { "$ref": "#/$defs/relatedSymbol" } },
+    "coverage": { "$ref": "#/$defs/coverage" },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["estimated_input_tokens", "reserved_output_tokens", "limit_input_tokens"],
+      "properties": {
+        "estimated_input_tokens": { "type": "integer", "minimum": 0 },
+        "reserved_output_tokens": { "type": "integer", "minimum": 0 },
+        "limit_input_tokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*\\u0000).+$"
+    },
+    "range": {
+      "type": "object",
+      "description": "Inclusive 1-based range; end_line must be greater than or equal to start_line.",
+      "additionalProperties": false,
+      "required": ["start_line", "end_line"],
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "diffLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text", "old_line", "new_line"],
+      "properties": {
+        "kind": { "enum": ["added", "deleted", "context"] },
+        "text": { "type": "string" },
+        "old_line": { "type": ["integer", "null"], "minimum": 1 },
+        "new_line": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "added" } } },
+          "then": { "properties": { "old_line": { "type": "null" }, "new_line": { "type": "integer", "minimum": 1 } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "deleted" } } },
+          "then": { "properties": { "old_line": { "type": "integer", "minimum": 1 }, "new_line": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "context" } } },
+          "then": { "properties": { "old_line": { "type": "integer", "minimum": 1 }, "new_line": { "type": "integer", "minimum": 1 } } }
+        }
+      ]
+    },
+    "hunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hunk_id", "old_start", "old_count", "new_start", "new_count", "lines"],
+      "properties": {
+        "hunk_id": { "$ref": "#/$defs/nonEmptyString" },
+        "old_start": { "type": "integer", "minimum": 1 },
+        "old_count": { "type": "integer", "minimum": 0 },
+        "new_start": { "type": "integer", "minimum": 1 },
+        "new_count": { "type": "integer", "minimum": 0 },
+        "lines": { "type": "array", "items": { "$ref": "#/$defs/diffLine" } }
+      }
+    },
+    "fileDiff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_id", "old_path", "new_path", "status", "old_blob_sha", "new_blob_sha", "language", "hunks"],
+      "properties": {
+        "file_id": { "$ref": "#/$defs/nonEmptyString" },
+        "old_path": { "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "new_path": { "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "status": { "enum": ["added", "modified", "deleted", "renamed"] },
+        "old_blob_sha": { "type": ["string", "null"] },
+        "new_blob_sha": { "type": ["string", "null"] },
+        "language": { "$ref": "#/$defs/nonEmptyString" },
+        "hunks": { "type": "array", "items": { "$ref": "#/$defs/hunk" } }
+      }
+    },
+    "sourceWindow": {
+      "type": "object",
+      "description": "Inclusive 1-based source range.",
+      "additionalProperties": false,
+      "required": ["path", "side", "commit_sha", "start_line", "end_line", "text", "covered_hunk_ids"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "side": { "enum": ["OLD", "NEW"] },
+        "commit_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "text": { "type": "string" },
+        "covered_hunk_ids": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" }, "uniqueItems": true }
+      }
+    },
+    "wholeFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "side", "commit_sha", "text", "changed_ranges"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "side": { "enum": ["OLD", "NEW"] },
+        "commit_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "text": { "type": "string" },
+        "changed_ranges": { "type": "array", "items": { "$ref": "#/$defs/range" } }
+      }
+    },
+    "fileContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diff", "source_windows", "whole_file"],
+      "properties": {
+        "diff": { "$ref": "#/$defs/fileDiff" },
+        "source_windows": { "type": "array", "items": { "$ref": "#/$defs/sourceWindow" } },
+        "whole_file": { "oneOf": [{ "$ref": "#/$defs/wholeFile" }, { "type": "null" }] }
+      }
+    },
+    "relatedSymbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qualified_name", "kind", "signature", "path", "commit_sha", "range", "relation", "relation_to_change", "source_excerpt"],
+      "properties": {
+        "qualified_name": { "$ref": "#/$defs/nonEmptyString" },
+        "kind": { "$ref": "#/$defs/nonEmptyString" },
+        "signature": { "type": "string" },
+        "path": { "$ref": "#/$defs/path" },
+        "commit_sha": { "$ref": "#/$defs/nonEmptyString" },
+        "range": { "$ref": "#/$defs/range" },
+        "relation": { "$ref": "#/$defs/nonEmptyString" },
+        "relation_to_change": { "$ref": "#/$defs/nonEmptyString" },
+        "source_excerpt": { "type": "string" }
+      }
+    },
+    "coverageEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "ranges"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "ranges": { "type": "array", "items": { "$ref": "#/$defs/range" } }
+      }
+    },
+    "skippedCoverageEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "ranges", "reason"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "ranges": { "type": "array", "items": { "$ref": "#/$defs/range" } },
+        "reason": { "enum": ["policy", "unsupported_language", "unavailable_blob", "provider_truncated", "token_budget", "file_limit", "line_limit", "context_error"] }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["included", "skipped", "context_quality"],
+      "properties": {
+        "included": { "type": "array", "items": { "$ref": "#/$defs/coverageEntry" } },
+        "skipped": { "type": "array", "items": { "$ref": "#/$defs/skippedCoverageEntry" } },
+        "context_quality": { "enum": ["full", "degraded", "diff_only"] }
+      }
+    }
+  }
+}

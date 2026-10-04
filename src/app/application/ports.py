@@ -4,7 +4,9 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Protocol
+from typing import Literal, Protocol
+
+from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,13 +27,62 @@ class BuiltContextPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class PullRequestAuthor:
+    login: str
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestRef:
+    repository_external_id: str
+    ref: str
+    sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPullRequest:
+    number: int
+    title: str
+    author: PullRequestAuthor
+    state: Literal["OPEN"]
+    source: PullRequestRef
+    base: PullRequestRef
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPullRequestPage:
+    items: Sequence[OpenPullRequest]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFinding:
+    path: str
+    side: FindingSide
+    start_line: int
+    end_line: int
+    category: FindingCategory
+    severity: FindingSeverity
+    title: str
+    explanation: str
+    evidence: str
+    recommendation: str
+    proposed_diff_fix: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewChunkResult:
     schema_version: int
     summary: str
-    limitations: dict[str, object]
-    usage: dict[str, object]
+    limitations: list[str]
+    usage: TokenUsage | None
     latency_ms: int
-    findings: Sequence[dict[str, object]]
+    findings: Sequence[ReviewFinding]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +102,14 @@ class StartReviewCommand:
 
 
 class VcsPort(Protocol):
+    async def list_open_pull_requests(
+        self,
+        *,
+        repository_id: uuid.UUID,
+        cursor: str | None,
+        limit: int,
+    ) -> OpenPullRequestPage: ...
+
     async def capture_snapshot(
         self, *, review_job_id: uuid.UUID
     ) -> ChangeRequestSnapshot: ...

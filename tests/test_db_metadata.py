@@ -1,3 +1,5 @@
+from typing import get_args, get_type_hints
+
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import configure_mappers
 
@@ -133,8 +135,10 @@ def test_review_job_same_repository_and_active_run_constraints() -> None:
         and constraint.name == "ck_review_job_status_finished_at"
     )
     check_sql = str(status_finished_check.sqltext)
-    assert "status IN ('QUEUED','RUNNING') AND finished_at IS NULL" in check_sql
+    for status in ("QUEUED", "FETCHING_DIFF", "PARSING_CONTEXT", "LLM_PROCESSING"):
+        assert status in check_sql
     assert "finished_at IS NOT NULL" in check_sql
+    assert "stage" not in review_job.c
 
     active_index = next(
         index
@@ -156,6 +160,8 @@ def test_one_chunk_result_per_context_payload() -> None:
     table = Base.metadata.tables["chunk_result"]
     assert table.c.context_payload_id.nullable is True
     assert table.c.review_job_id.nullable is False
+    assert table.c.usage.nullable is True
+    assert get_args(get_type_hints(models.ChunkResult)["limitations"])[0] == list[str]
     assert (
         "uq_chunk_result_context_payload",
         ("context_payload_id",),
@@ -177,3 +183,25 @@ def test_one_chunk_result_per_context_payload() -> None:
 def test_one_publication_and_one_live_lease_per_review_job() -> None:
     assert Base.metadata.tables["publication"].c.review_job_id.unique is True
     assert Base.metadata.tables["task_lease"].c.review_job_id.unique is True
+
+
+def test_review_event_and_finding_match_contract_foundation() -> None:
+    review_event = Base.metadata.tables["review_event"]
+    finding = Base.metadata.tables["finding"]
+
+    assert "stage" not in review_event.c
+    assert review_event.c.phase.nullable is True
+    assert review_event.c.retryable.nullable is False
+    assert review_event.c.attempt.nullable is False
+    assert review_event.c.safe_details.nullable is True
+    assert finding.c.proposed_diff_fix.nullable is True
+
+    check_names = {
+        constraint.name
+        for constraint in review_event.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "ck_review_event_ck_review_event_phase" in check_names
+    assert "ck_review_event_ck_review_event_reason_code" in check_names
+    assert "ck_review_event_ck_review_event_attempt_positive" in check_names
+    assert "ck_review_event_ck_review_event_safe_details_object" in check_names

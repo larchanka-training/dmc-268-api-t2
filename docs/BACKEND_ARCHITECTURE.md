@@ -68,7 +68,8 @@ migrations/
 
 docs/
 ├─ BACKEND_ARCHITECTURE.md
-└─ BACKEND_ERD.md
+├─ BACKEND_ERD.md
+└─ PIPELINE_SPEC.md
 ```
 
 ---
@@ -117,7 +118,7 @@ digest.
  ↓
 TaskLease + fencing_token
  ↓
-ReviewJob: RUNNING / snapshot
+ReviewJob: FETCHING_DIFF
  ↓
 проверка snapshot через VCS
  ↓
@@ -131,7 +132,7 @@ LLM Gateway
  ↓
 ChunkResult[]
  ↓
-validation + дедупликация
+validation внутри LLM_PROCESSING + дедупликация
  ↓
 Finding[] + final_summary + coverage
  ↓
@@ -174,8 +175,10 @@ Recovery обрабатывает expired/no lease с учётом `retry_at` и
 
 Переход ReviewJob в terminal status атомарно записывает тот же terminal `status`
 и non-null `finished_at`. DB CHECK запрещает active status с заполненным
-`finished_at` и terminal status с `finished_at IS NULL`; `stage` в invariant не
-участвует.
+`finished_at` и terminal status с `finished_at IS NULL`. Единственное текущее
+состояние ReviewJob хранится в `status`: `QUEUED`, `FETCHING_DIFF`,
+`PARSING_CONTEXT`, `LLM_PROCESSING`, `COMPLETED`, `PARTIAL`, `FAILED` или
+`SKIPPED`. Отдельного current/public `stage` нет.
 
 Временные ограничения:
 
@@ -197,7 +200,7 @@ Recovery обрабатывает expired/no lease с учётом `retry_at` и
 | `RepositorySettings` | неизменяемая версия настроек repository |
 | `ChangeRequest` | текущее provider-neutral состояние PR/MR |
 | `ReviewJob` | отдельный запуск анализа для зафиксированного состояния |
-| `ReviewEvent` | история значимых событий ReviewJob |
+| `ReviewEvent` | append-only история переходов, retry, degradation и failure с безопасными деталями |
 | `ContextPayload` | canonical payload одного вызова LLM |
 | `ChunkResult` | результат одного вызова LLM, сохраняемый по ReviewJob независимо от retention контекста |
 | `Finding` | проверенная находка с координатами и рекомендацией |
@@ -217,7 +220,7 @@ PostgreSQL хранит долговременное состояние сист
 
 | Port | Контракт |
 | --- | --- |
-| `VcsPort` | получение snapshot, Change Request, diff и кода |
+| `VcsPort` | provider-backed cursor list текущих OPEN PR, получение snapshot, diff и кода |
 | `ContextBuilderPort` | snapshot + исходные данные → `ContextPayload` |
 | `LlmGatewayPort` | `ContextPayload` → структурированный `ReviewChunkResult` |
 | `PublisherPort` | сохранённый результат ReviewJob → remote publication IDs |
@@ -231,6 +234,11 @@ UoW commit. SQLAlchemy repository выводит repository anchor из ChangeRe
 
 Сообщение очереди содержит `schema_version`, `event_id`, `review_id`, `task_kind`, `attempt`, `trace_id`. Diff, prompt и результат LLM в сообщении broker не передаются.
 
+Machine-readable queue и dead-letter контракты находятся в `schemas/queue/`.
+Dead-letter содержит только безопасные метаданные. Replay выполняется оператором
+через исходный PostgreSQL `OutboxEvent`, а не через raw dead message; полная
+семантика определена в `PIPELINE_SPEC.md`.
+
 ---
 
 ## 6. Граница API
@@ -240,7 +248,7 @@ HTTP-маршруты и DTO должны соответствовать canonic
 Требования:
 
 - ручной запуск ReviewJob использует scoped `Idempotency-Key`;
-- API возвращает `status`, `stage` и результат без raw response LLM provider;
+- API возвращает единый `status` и результат без raw response LLM provider;
 - события ReviewJob доступны через отдельный read use case;
 - `GET /healthcheck` остаётся dependency-free liveness endpoint;
 - readiness проверяет зависимости через отдельный endpoint;
@@ -253,7 +261,7 @@ ORM-модели не используются как публичные HTTP DT
 ## 7. Транзакционные границы
 
 1. Создание `ReviewJob`, `Publication(NOT_READY)`, `OutboxEvent(analyze)` и резервирование квоты выполняются в одной UoW-транзакции; нарушение active-run uniqueness откатывает агрегат целиком.
-2. Snapshot, изменение `stage` и соответствующий `ReviewEvent` сохраняются согласованно.
+2. Snapshot, изменение `status` и соответствующий `ReviewEvent` сохраняются согласованно.
 3. `ContextPayload`, `ChunkResult` и проверенные `Finding` сохраняются только при актуальном lease и fencing token; ChunkResult получает `review_job_id` от owning context/review.
 4. Конечное состояние анализа и `OutboxEvent(publish)` фиксируются в одной транзакции.
 5. `broker_published_at` устанавливается после publisher confirm.
@@ -293,5 +301,13 @@ ORM-модели не используются как публичные HTTP DT
 - интеграционные тесты с PostgreSQL и RabbitMQ;
 - readiness endpoint;
 - модель хранения OAuth/access;
+- обязательная accepted auth-модель включает 30-минутную JWT cookie с `sid` и
+  authoritative PostgreSQL `AuthSession`; полная реализация auth отложена;
 - provider-specific данные установки;
-- структуры `ReviewJob.error/reason` и `RepositorySettings.rules/ignores`.
+- HTTP handlers, DTO и session/CSRF/Origin middleware.
+
+`RepositorySettings.rules` имеет форму `{"instructions": [...]}`, где элементы —
+уникальные непустые строки, а порядок значим. `ignores` имеет форму
+`{"globs": [...]}` с уникальными repository-relative normalized POSIX patterns.
+Patterns являются данными и никогда не передаются shell. `rules_digest`
+вычисляется backend из canonical serialization; клиент его не задаёт.

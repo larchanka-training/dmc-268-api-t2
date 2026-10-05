@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/events/tags.py",
+    "side": "NEW",
+    "start_line": 1,
+    "end_line": 1,
+    "category": "correctness",
+    "severity": "medium"
+  }
+]

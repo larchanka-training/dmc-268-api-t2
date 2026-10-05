@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/billing/charge.py",
+    "side": "NEW",
+    "start_line": 5,
+    "end_line": 6,
+    "category": "correctness",
+    "severity": "high"
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "title": "Path traversal при отдаче файла по имени из запроса",
+  "description": "Отдача прикреплённых файлов по имени.",
+  "language": "python",
+  "category": "security"
+}

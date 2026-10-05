@@ -52,6 +52,37 @@ uv run mypy .
 
 Примечание: каталог `migrations/` исключён из ruff и mypy — это генерируемый boilerplate Alembic.
 
+```bash
+uv run pytest
+```
+
+Часть тестов (`tests/test_postgres_integration.py`) требуют реальный PostgreSQL
+и самоскипаются, если не задан `DMC268_TEST_DATABASE_URL`:
+
+```bash
+docker compose up -d db
+DMC268_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/postgres \
+  uv run alembic upgrade head
+DMC268_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/postgres \
+  uv run pytest tests/test_postgres_integration.py
+```
+
+## Gold-benchmark датасет и eval-харнесс
+
+`test-prs-dataset/` — датасет синтетических PR с известными багами (см.
+[`test-prs-dataset/README.md`](test-prs-dataset/README.md)). `scripts/eval_harness/`
+прогоняет его через LLM-ревьюера и проверяет валидность формата ответа
+(JSON Schema) и метрики Precision/Recall:
+
+```bash
+# offline/replay — без вызовов LLM, используется в CI
+uv run python -m scripts.eval_harness --mode offline --dataset-dir test-prs-dataset
+
+# live — реальный вызов LLM (EVAL_LLM_BASE_URL/EVAL_LLM_API_KEY/EVAL_LLM_MODEL)
+EVAL_LLM_BASE_URL=... EVAL_LLM_API_KEY=... EVAL_LLM_MODEL=... \
+  uv run python -m scripts.eval_harness --mode live --dataset-dir test-prs-dataset
+```
+
 ## Staging
 
 Инфраструктура, Terraform, CI/CD и процедура staging deployment описаны в

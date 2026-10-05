@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/validation/range_check.py",
+    "side": "NEW",
+    "start_line": 2,
+    "end_line": 8,
+    "category": "maintainability",
+    "severity": "low"
+  }
+]

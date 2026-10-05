@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/orders/repository.py",
+    "side": "NEW",
+    "start_line": 2,
+    "end_line": 2,
+    "category": "performance",
+    "severity": "high"
+  }
+]

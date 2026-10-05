@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/healthchecks/tcp_probe.py",
+    "side": "NEW",
+    "start_line": 4,
+    "end_line": 7,
+    "category": "performance",
+    "severity": "medium"
+  }
+]

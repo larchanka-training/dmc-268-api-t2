@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/attachments/download.py",
+      "side": "NEW",
+      "start_line": 6,
+      "end_line": 6,
+      "category": "security",
+      "severity": "high",
+      "title": "Path traversal: filename не очищается от '../'",
+      "explanation": "filename приходит от клиента и подставляется в путь без проверки. Значение вроде '../../etc/passwd' позволяет читать произвольные файлы на диске сервера.",
+      "evidence": "file_path = ATTACHMENTS_ROOT / filename",
+      "recommendation": "Разрешать только безопасные имена файлов (без '..' и разделителей пути) и проверять, что итоговый путь остаётся внутри ATTACHMENTS_ROOT (resolve() + is_relative_to())."
+    }
+  ],
+  "limitations": []
+}

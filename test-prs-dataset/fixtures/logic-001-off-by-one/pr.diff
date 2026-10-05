@@ -1,0 +1,10 @@
+diff --git a/app/pagination/slice.py b/app/pagination/slice.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/pagination/slice.py
+@@ -0,0 +1,4 @@
++def page_slice(items, page_number, page_size):
++    start = (page_number - 1) * page_size
++    end = start + page_size - 1
++    return items[start:end]

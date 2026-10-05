@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/billing/charge.py",
+      "side": "NEW",
+      "start_line": 5,
+      "end_line": 6,
+      "category": "correctness",
+      "severity": "high",
+      "title": "Голый except скрывает сбой сохранения списания",
+      "explanation": "Любая ошибка при account.save() (например, обрыв соединения с БД) молча проглатывается через 'except: pass'. Функция вернёт уменьшенный account.balance из памяти, даже если списание фактически не было сохранено — рассинхронизация баланса.",
+      "evidence": "except:\n        pass",
+      "recommendation": "Ловить конкретное исключение, логировать его и пробрасывать дальше (или откатывать изменение account.balance) вместо молчаливого подавления."
+    }
+  ],
+  "limitations": []
+}

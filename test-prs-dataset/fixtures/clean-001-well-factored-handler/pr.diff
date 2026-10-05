@@ -1,0 +1,14 @@
+diff --git a/app/users/lookup.py b/app/users/lookup.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/users/lookup.py
+@@ -0,0 +1,8 @@
++def find_user_by_email(connection, email):
++    cursor = connection.cursor()
++    cursor.execute(
++        "SELECT id, email FROM users WHERE email = %s",
++        (email,),
++    )
++    row = cursor.fetchone()
++    return row if row is not None else None

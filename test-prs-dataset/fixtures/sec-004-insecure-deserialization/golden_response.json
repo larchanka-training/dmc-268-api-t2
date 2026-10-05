@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/cache/session_store.py",
+      "side": "NEW",
+      "start_line": 7,
+      "end_line": 7,
+      "category": "security",
+      "severity": "critical",
+      "title": "pickle.loads на данных из внешнего хранилища допускает RCE",
+      "explanation": "pickle.loads выполняет произвольный код при десериализации. Если злоумышленник может записать значение по ключу session:* в Redis (например, через другую уязвимость или shared Redis), он получает удалённое выполнение кода.",
+      "evidence": "return pickle.loads(raw)",
+      "recommendation": "Использовать безопасный формат сериализации (json) для данных, пересекающих доверительную границу."
+    }
+  ],
+  "limitations": []
+}

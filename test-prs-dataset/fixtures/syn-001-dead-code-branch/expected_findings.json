@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/orders/format_status.py",
+    "side": "NEW",
+    "start_line": 4,
+    "end_line": 4,
+    "category": "maintainability",
+    "severity": "low"
+  }
+]

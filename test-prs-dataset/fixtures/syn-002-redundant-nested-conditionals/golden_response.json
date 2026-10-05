@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/validation/range_check.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 8,
+      "category": "maintainability",
+      "severity": "low",
+      "title": "Четырёхуровневая вложенность вместо одного условия",
+      "explanation": "Логика сводится к одному булеву выражению, но реализована через вложенные if/else с дублирующимися return True/False, что затрудняет чтение и сопровождение без какой-либо дополнительной функциональности.",
+      "evidence": "if value >= low:\n        if value <= high:",
+      "recommendation": "Заменить на 'return low <= value <= high'."
+    }
+  ],
+  "limitations": []
+}

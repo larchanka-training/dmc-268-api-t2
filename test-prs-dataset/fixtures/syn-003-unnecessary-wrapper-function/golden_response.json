@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/users/display_name.py",
+      "side": "NEW",
+      "start_line": 4,
+      "end_line": 5,
+      "category": "maintainability",
+      "severity": "low",
+      "title": "Обёртка get_full_name дублирует _build_full_name без изменений",
+      "explanation": "get_full_name не добавляет ни валидации, ни трансформации — это прямой проброс аргументов в _build_full_name. Лишний слой косвенности усложняет навигацию по коду без какой-либо пользы.",
+      "evidence": "return _build_full_name(first_name, last_name)",
+      "recommendation": "Удалить один из уровней: либо инлайнить _build_full_name в get_full_name, либо убрать get_full_name и использовать _build_full_name напрямую."
+    }
+  ],
+  "limitations": []
+}

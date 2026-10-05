@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/pricing/discount.py",
+      "side": "NEW",
+      "start_line": 1,
+      "end_line": 17,
+      "category": "maintainability",
+      "severity": "low",
+      "title": "Паттерн Strategy ради единственного неизменного правила скидки",
+      "explanation": "Вся иерархия классов (DiscountStrategy, TenPercentDiscountStrategy, DiscountCalculator) существует ради одного фиксированного вычисления amount * 0.9. Нет признаков того, что скидка когда-либо параметризуется другой стратегией — абстракция добавляет косвенность без пользы.",
+      "evidence": "class DiscountStrategy:",
+      "recommendation": "Заменить всю конструкцию на 'def apply_order_discount(amount): return amount * 0.9' и вводить Strategy только когда появится реальная потребность в нескольких взаимозаменяемых правилах."
+    }
+  ],
+  "limitations": []
+}

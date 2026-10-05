@@ -1,0 +1,6 @@
+{
+  "title": "Голый except скрывает ошибку платежа",
+  "description": "Списание средств с баланса пользователя.",
+  "language": "python",
+  "category": "correctness"
+}

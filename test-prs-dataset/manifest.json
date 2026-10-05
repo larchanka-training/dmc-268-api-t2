@@ -1,0 +1,112 @@
+[
+  {
+    "id": "sec-001-sql-injection",
+    "category": "security",
+    "title": "SQL-инъекция через конкатенацию строки запроса"
+  },
+  {
+    "id": "sec-002-hardcoded-secret",
+    "category": "security",
+    "title": "Захардкоженный API-ключ в коде"
+  },
+  {
+    "id": "sec-003-ssrf",
+    "category": "security",
+    "title": "SSRF через неограниченный URL из пользовательского ввода"
+  },
+  {
+    "id": "sec-004-insecure-deserialization",
+    "category": "security",
+    "title": "Небезопасная десериализация pickle из внешнего источника"
+  },
+  {
+    "id": "sec-005-path-traversal",
+    "category": "security",
+    "title": "Path traversal при отдаче файла по имени из запроса"
+  },
+  {
+    "id": "mem-001-unclosed-file-handle",
+    "category": "performance",
+    "title": "Незакрытый файловый дескриптор в цикле"
+  },
+  {
+    "id": "mem-002-unclosed-db-connection",
+    "category": "performance",
+    "title": "Соединение с БД не возвращается в пул"
+  },
+  {
+    "id": "mem-003-unbounded-cache-growth",
+    "category": "performance",
+    "title": "Неограниченный рост словаря-кэша в памяти процесса"
+  },
+  {
+    "id": "mem-004-unclosed-socket",
+    "category": "performance",
+    "title": "Сокет не закрывается при ошибке подключения"
+  },
+  {
+    "id": "logic-001-off-by-one",
+    "category": "correctness",
+    "title": "Ошибка на единицу при постраничной выборке"
+  },
+  {
+    "id": "logic-002-wrong-boolean-operator",
+    "category": "correctness",
+    "title": "Неверный логический оператор в проверке доступа"
+  },
+  {
+    "id": "logic-003-bare-except-swallows-error",
+    "category": "correctness",
+    "title": "Голый except скрывает ошибку платежа"
+  },
+  {
+    "id": "logic-004-mutable-default-argument",
+    "category": "correctness",
+    "title": "Изменяемое значение по умолчанию расшаривается между вызовами"
+  },
+  {
+    "id": "logic-005-race-condition-check-then-act",
+    "category": "correctness",
+    "title": "Гонка между проверкой остатка и списанием со склада"
+  },
+  {
+    "id": "syn-001-dead-code-branch",
+    "category": "maintainability",
+    "title": "Недостижимая ветка кода после return"
+  },
+  {
+    "id": "syn-002-redundant-nested-conditionals",
+    "category": "maintainability",
+    "title": "Избыточно вложенные условия вместо единого выражения"
+  },
+  {
+    "id": "syn-003-unnecessary-wrapper-function",
+    "category": "maintainability",
+    "title": "Функция-обёртка без добавленной логики"
+  },
+  {
+    "id": "syn-004-overengineered-trivial-abstraction",
+    "category": "maintainability",
+    "title": "Избыточная абстракция (Strategy) для константного вычисления"
+  },
+  {
+    "id": "clean-001-well-factored-handler",
+    "category": "clean",
+    "title": "Корректная параметризованная выборка с обработкой отсутствия строки"
+  },
+  {
+    "id": "clean-002-simple-validation-function",
+    "category": "clean",
+    "title": "Простая и корректная проверка диапазона"
+  },
+  {
+    "id": "clean-003-straightforward-data-transform",
+    "category": "clean",
+    "title": "Корректное постраничное разбиение"
+  },
+  {
+    "id": "clean-004-resource-managed-with-context-manager",
+    "category": "clean",
+    "title": "Корректное закрытие файла через контекстный менеджер"
+  }
+]

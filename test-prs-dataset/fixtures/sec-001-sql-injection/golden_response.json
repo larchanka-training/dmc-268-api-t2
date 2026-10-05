@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/search.py",
+      "side": "NEW",
+      "start_line": 3,
+      "end_line": 4,
+      "category": "security",
+      "severity": "critical",
+      "title": "SQL-инъекция через конкатенацию пользовательского ввода",
+      "explanation": "Параметр name подставляется в текст запроса конкатенацией строк, что позволяет злоумышленнику внедрить произвольный SQL (например, завершить строку и добавить UNION SELECT).",
+      "evidence": "query = \"SELECT id, email FROM users WHERE name = '\" + name + \"'\"",
+      "recommendation": "Использовать параметризованный запрос: cursor.execute(\"SELECT id, email FROM users WHERE name = %s\", (name,))."
+    }
+  ],
+  "limitations": []
+}

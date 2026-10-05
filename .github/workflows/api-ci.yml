@@ -46,6 +46,19 @@ jobs:
       - name: Pytest
         run: uv run pytest
 
+      - name: Eval harness (offline/replay, gold benchmark dataset)
+        run: >-
+          uv run python -m scripts.eval_harness
+          --mode offline
+          --dataset-dir test-prs-dataset
+          --report-out eval_report.json
+
+      - name: Upload eval harness report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval_report.json
+
   docker:
     name: Docker build
     runs-on: ubuntu-24.04

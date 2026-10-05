@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/healthchecks/tcp_probe.py",
+      "side": "NEW",
+      "start_line": 4,
+      "end_line": 7,
+      "category": "performance",
+      "severity": "medium",
+      "title": "Сокет никогда не закрывается",
+      "explanation": "sock создаётся через socket.socket(...), но close() не вызывается ни при успешном, ни при неуспешном подключении. При частых healthcheck-вызовах накапливаются открытые файловые дескрипторы.",
+      "evidence": "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
+      "recommendation": "Использовать 'with socket.socket(...) as sock:' или явный sock.close() в блоке finally."
+    }
+  ],
+  "limitations": []
+}

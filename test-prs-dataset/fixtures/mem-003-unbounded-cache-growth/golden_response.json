@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/geo/cache.py",
+      "side": "NEW",
+      "start_line": 7,
+      "end_line": 7,
+      "category": "performance",
+      "severity": "medium",
+      "title": "Кэш в памяти процесса растёт без ограничения",
+      "explanation": "_GEOCODE_CACHE — обычный dict без верхней границы размера и TTL. При большом количестве уникальных адресов процесс со временем исчерпает память (утечка в рамках времени жизни процесса).",
+      "evidence": "_GEOCODE_CACHE[address] = result",
+      "recommendation": "Использовать ограниченный по размеру кэш с вытеснением (например, functools.lru_cache(maxsize=...) или cachetools.LRUCache)."
+    }
+  ],
+  "limitations": []
+}

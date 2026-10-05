@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.example/eval-harness/review_result.schema.json",
+  "title": "Review result",
+  "description": "Expected shape of an LLM code-review response for the gold benchmark eval harness.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "limitations"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "side",
+        "start_line",
+        "end_line",
+        "category",
+        "severity",
+        "title",
+        "explanation",
+        "evidence",
+        "recommendation"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "side": { "enum": ["OLD", "NEW"] },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "category": {
+          "enum": ["security", "correctness", "performance", "maintainability"]
+        },
+        "severity": {
+          "enum": ["critical", "high", "medium", "low"]
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

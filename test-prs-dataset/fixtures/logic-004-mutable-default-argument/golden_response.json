@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/events/tags.py",
+      "side": "NEW",
+      "start_line": 1,
+      "end_line": 1,
+      "category": "correctness",
+      "severity": "medium",
+      "title": "Изменяемый дефолт tags=[] переиспользуется между вызовами",
+      "explanation": "Список по умолчанию создаётся один раз при определении функции и переиспользуется во всех вызовах без явного tags=. Теги из предыдущих, не связанных между собой вызовов накапливаются в одном и том же списке.",
+      "evidence": "def add_tag(tag, tags=[]):",
+      "recommendation": "Использовать tags=None и создавать новый список внутри функции: 'if tags is None: tags = []'."
+    }
+  ],
+  "limitations": []
+}

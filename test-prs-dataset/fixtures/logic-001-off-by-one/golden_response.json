@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/pagination/slice.py",
+      "side": "NEW",
+      "start_line": 3,
+      "end_line": 4,
+      "category": "correctness",
+      "severity": "medium",
+      "title": "Срез теряет последний элемент страницы (off-by-one)",
+      "explanation": "end вычисляется как start + page_size - 1, а Python-срез items[start:end] уже не включает правую границу. В результате каждая страница содержит на один элемент меньше page_size.",
+      "evidence": "end = start + page_size - 1",
+      "recommendation": "Использовать end = start + page_size (без вычитания единицы)."
+    }
+  ],
+  "limitations": []
+}

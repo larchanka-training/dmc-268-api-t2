@@ -1,0 +1,18 @@
+{
+  "summary": "Найдено 1 проблем(а).",
+  "findings": [
+    {
+      "path": "app/authz/checks.py",
+      "side": "NEW",
+      "start_line": 4,
+      "end_line": 4,
+      "category": "correctness",
+      "severity": "high",
+      "title": "'and' вместо 'or' запрещает редактирование владельцам-не-админам",
+      "explanation": "Функция должна разрешать редактирование либо владельцу, либо администратору, но 'and' требует выполнения ОБОИХ условий одновременно, из-за чего обычный владелец ресурса теряет доступ к редактированию собственного ресурса.",
+      "evidence": "return is_owner and is_admin",
+      "recommendation": "Заменить на 'return is_owner or is_admin'."
+    }
+  ],
+  "limitations": []
+}

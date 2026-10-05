@@ -1,0 +1,6 @@
+{
+  "title": "Соединение с БД не возвращается в пул",
+  "description": "Получение количества заказов пользователя.",
+  "language": "python",
+  "category": "performance"
+}

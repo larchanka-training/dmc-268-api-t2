@@ -1,0 +1,6 @@
+{
+  "title": "Функция-обёртка без добавленной логики",
+  "description": "Получение полного имени пользователя.",
+  "language": "python",
+  "category": "maintainability"
+}

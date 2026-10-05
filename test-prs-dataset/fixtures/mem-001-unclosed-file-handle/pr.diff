@@ -1,0 +1,14 @@
+diff --git a/app/logs/count_errors.py b/app/logs/count_errors.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/logs/count_errors.py
+@@ -0,0 +1,8 @@
++def count_errors(paths):
++    total = 0
++    for path in paths:
++        f = open(path)
++        for line in f:
++            if "ERROR" in line:
++                total += 1
++    return total

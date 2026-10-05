@@ -1,0 +1,6 @@
+{
+  "title": "Избыточная абстракция (Strategy) для константного вычисления",
+  "description": "Применение фиксированной скидки 10% к сумме заказа.",
+  "language": "python",
+  "category": "maintainability"
+}

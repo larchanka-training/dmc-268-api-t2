@@ -1,0 +1,14 @@
+diff --git a/app/geo/cache.py b/app/geo/cache.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/geo/cache.py
+@@ -0,0 +1,8 @@
++_GEOCODE_CACHE = {}
++
++def geocode(address, geocoder):
++    if address in _GEOCODE_CACHE:
++        return _GEOCODE_CACHE[address]
++    result = geocoder.lookup(address)
++    _GEOCODE_CACHE[address] = result
++    return result

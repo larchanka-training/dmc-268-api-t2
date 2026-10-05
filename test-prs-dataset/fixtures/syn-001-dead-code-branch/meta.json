@@ -1,0 +1,6 @@
+{
+  "title": "Недостижимая ветка кода после return",
+  "description": "Форматирование статуса заказа для отображения.",
+  "language": "python",
+  "category": "maintainability"
+}

@@ -20,6 +20,12 @@ on:
     workflows: ["API CI"]
     types:
       - completed
+    # Event-level filter: PR-triggered "API CI" runs (head_branch is the PR
+    # branch) create no Deploy run at all, instead of a skipped run queued on
+    # the deploy concurrency group.
+    branches:
+      - main
+      - develop
 
 permissions:
   contents: read
@@ -39,9 +45,10 @@ jobs:
     # workflow_dispatch must run from main (the workflow's canonical version);
     # workflow_run must be a successful push-triggered "API CI" run on main
     # (deploys staging) or develop (deploys the develop environment). The
-    # event filter excludes PR runs: they publish no image and their
-    # head_branch is the PR branch, not a deployable branch. github.ref is
-    # always the default branch for workflow_run.
+    # workflow_run "branches" filter drops PR runs at the event level; the
+    # event == 'push' check keeps dispatch-triggered "API CI" runs out (they
+    # publish no image). github.ref is always the default branch for
+    # workflow_run.
     if: >-
       (
         github.event_name == 'workflow_dispatch' &&
@@ -60,10 +67,10 @@ jobs:
       SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       UI_SHA: ${{ inputs.ui_sha }}
-      # ENV_NAME, DEPLOY_PATH, ENV_FILE, WEB_PORT and API_SHA are resolved per
-      # environment in the "Resolve deployment target" step: only the
-      # initiating side's image changes, the other side's deployed version is
-      # kept from the VPS state (ADR 0001).
+      # ENV_NAME, DEPLOY_PATH, ENV_FILE, WEB_PORT, COMPOSE_PROJECT and
+      # API_SHA are resolved per environment in the "Resolve deployment
+      # target" step: only the initiating side's image changes, the other
+      # side's deployed version is kept from the VPS state (ADR 0001).
 
     steps:
       - name: Checkout repository
@@ -95,12 +102,14 @@ jobs:
               env_file='.env.staging'
               web_port='80'
               ci_branch='main'
+              compose_project='dmc-268-t2-staging'
               ;;
             develop)
               deploy_path='/opt/dmc-268-t2-develop'
               env_file='.env.staging.develop'
               web_port='8080'
               ci_branch='develop'
+              compose_project='dmc-268-t2-develop'
               ;;
           esac
 
@@ -126,11 +135,13 @@ jobs:
             echo "DEPLOY_PATH=${deploy_path}"
             echo "ENV_FILE=${env_file}"
             echo "WEB_PORT=${web_port}"
+            echo "COMPOSE_PROJECT=${compose_project}"
             echo "API_SHA=${api_sha}"
           } >> "${GITHUB_ENV}"
 
           echo "Deploy target: ${env_name} (${deploy_path}, API CI branch: ${ci_branch})"
           echo "API commit: ${api_sha}"
+          echo "Compose project: ${compose_project}"
 
       - name: Validate deployment configuration
         env:
@@ -365,14 +376,20 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' bash -s" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' bash -s" \
             <<'REMOTE'
           set -euo pipefail
 
           cd "${DEPLOY_PATH}"
 
+          # -p pins the Compose project name per environment (staging vs
+          # develop). Without it both deployments would fall back to the
+          # "name:" from docker-compose.staging.yml and share containers,
+          # network and db-data volume — a develop deploy would touch
+          # staging resources.
           compose() {
             docker compose \
+              -p "${COMPOSE_PROJECT}" \
               --env-file "${ENV_FILE}" \
               -f docker-compose.staging.yml \
               "$@"

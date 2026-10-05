@@ -1,3 +1,7 @@
+# Default project name for ad-hoc local runs of this file; the deploy
+# workflow overrides it per environment with `-p` (staging:
+# dmc-268-t2-staging, develop: dmc-268-t2-develop), so the two environments
+# never share containers, network or volumes.
 name: dmc-268-t2-staging
 
 services:

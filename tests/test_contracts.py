@@ -432,6 +432,21 @@ def test_settings_contract_accepts_canonical_values() -> None:
     )
 
 
+def test_settings_contracts_reject_non_normalized_globs() -> None:
+    settings_validator = _validator(SCHEMAS / "settings" / "v1.json")
+    api_validator = _api_validator("Ignores")
+    accepted = []
+    for glob in ("./src/secret", "src/./secret", "src//secret", "src/"):
+        ignores = {"globs": [glob]}
+        if settings_validator.is_valid(
+            {"rules": {"instructions": []}, "ignores": ignores}
+        ):
+            accepted.append(("settings", glob))
+        if api_validator.is_valid(ignores):
+            accepted.append(("openapi", glob))
+    assert accepted == [], f"Non-normalized globs accepted: {accepted}"
+
+
 def test_rules_digest_is_deterministic_and_instruction_order_is_significant() -> None:
     rules = {"instructions": ["First", "Second"]}
     assert compute_rules_digest(rules) == compute_rules_digest(dict(rules))

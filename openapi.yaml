@@ -743,7 +743,7 @@ components:
           items:
             type: string
             minLength: 1
-            pattern: '^(?!/)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\)(?!.*\x00)(?!!).*\S.*$'
+            pattern: '^(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*\x00)(?!.*/$)(?!!).*\S.*$'
             description: Normalized repository-relative POSIX pattern; data only, never a shell argument.
     RepositorySettingsReplacement:
       type: object

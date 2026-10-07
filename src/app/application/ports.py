@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from types import TracebackType
 from typing import Literal, Protocol
 
@@ -23,7 +24,19 @@ class ChangeRequestSnapshot:
 @dataclass(frozen=True, slots=True)
 class BuiltContextPayload:
     schema_version: int
+    review_id: uuid.UUID
+    chunk_id: uuid.UUID
     payload_body: dict[str, object]
+
+    def to_wire(self) -> dict[str, object]:
+        if {"schema_version", "review_id", "chunk_id"} & self.payload_body.keys():
+            raise ValueError("payload_body must not contain envelope fields")
+        return {
+            **self.payload_body,
+            "schema_version": self.schema_version,
+            "review_id": str(self.review_id),
+            "chunk_id": str(self.chunk_id),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +114,19 @@ class StartReviewCommand:
     trace_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewJobSnapshot:
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    change_request_id: uuid.UUID
+    repository_settings_id: uuid.UUID
+    requested_head_sha: str
+    config_digest: str
+    status: str
+    created_at: datetime
+    finished_at: datetime | None
+
+
 class VcsPort(Protocol):
     async def list_open_pull_requests(
         self,
@@ -130,7 +156,7 @@ class PublisherPort(Protocol):
 
 
 class ReviewJobRepositoryPort(Protocol):
-    async def get(self, review_job_id: uuid.UUID) -> object | None: ...
+    async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None: ...
 
     async def add_start_review(
         self, command: StartReviewCommand, *, config_digest: str

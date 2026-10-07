@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - main
+      - develop
 
 permissions:
   contents: read
@@ -19,6 +20,29 @@ jobs:
     name: Quality and tests
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+
+    env:
+      POSTGRES__HOST: localhost
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: dmc268_ci
+      POSTGRES__PASSWORD: dmc268_ci
+      POSTGRES__DB: dmc268_ci
+      DMC268_TEST_DATABASE_URL: postgresql+asyncpg://dmc268_ci:dmc268_ci@localhost:5432/dmc268_ci
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: dmc268_ci
+          POSTGRES_PASSWORD: dmc268_ci
+          POSTGRES_DB: dmc268_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dmc268_ci -d dmc268_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout repository
@@ -43,8 +67,26 @@ jobs:
       - name: Mypy
         run: uv run mypy .
 
+      - name: Apply database migrations
+        run: uv run alembic upgrade head
+
+      - name: Check database migrations
+        run: uv run alembic check
+
       - name: Pytest
         run: uv run pytest
+
+      - name: Downgrade database to base
+        run: uv run alembic downgrade base
+
+      - name: Reapply database migrations
+        run: uv run alembic upgrade head
+
+      - name: Check reapplied migrations
+        run: uv run alembic check
+
+      - name: PostgreSQL integration tests after migration roundtrip
+        run: uv run pytest tests/test_postgres_integration.py
 
   docker:
     name: Docker build
@@ -60,6 +102,23 @@ jobs:
       - name: Build API image
         run: docker build -t dmc-268-api-t2:${{ github.sha }} .
 
+  compose:
+    name: Compose config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate dev compose file
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+
+      - name: Validate staging compose file
+        run: docker compose --env-file .env.staging.example -f docker-compose.staging.yml config -q
+
   publish:
     name: Publish API image
     runs-on: ubuntu-24.04
@@ -67,7 +126,9 @@ jobs:
     needs:
       - quality
       - docker
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Images are published only from deployable branches: main (staging) and
+    # develop (develop environment).
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
 
     permissions:
       contents: read

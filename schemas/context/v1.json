@@ -46,11 +46,11 @@
         "languages": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyString" }, "uniqueItems": true },
         "discussions": {
           "type": "array",
-          "description": "Provider-neutral discussion text only; no provider raw payload.",
-          "items": { "type": "string" }
+          "description": "Provider-neutral discussions; no provider raw payload.",
+          "items": { "$ref": "#/$defs/discussion" }
         },
         "rules_version": { "$ref": "#/$defs/nonEmptyString" },
-        "output_language": { "const": "ru" }
+        "output_language": { "type": "string", "minLength": 1, "description": "Frozen settings language; new settings use ru, historical versions retain their actual language." }
       }
     },
     "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/fileContext" } },
@@ -69,10 +69,21 @@
   },
   "$defs": {
     "nonEmptyString": { "type": "string", "minLength": 1 },
+    "discussion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "body"],
+      "properties": {
+        "author": { "type": "string" },
+        "body": { "type": "string" },
+        "path": { "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "line": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*\\u0000).+$"
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
     },
     "range": {
       "type": "object",
@@ -115,12 +126,16 @@
       "required": ["hunk_id", "old_start", "old_count", "new_start", "new_count", "lines"],
       "properties": {
         "hunk_id": { "$ref": "#/$defs/nonEmptyString" },
-        "old_start": { "type": "integer", "minimum": 1 },
+        "old_start": { "type": "integer", "minimum": 0 },
         "old_count": { "type": "integer", "minimum": 0 },
-        "new_start": { "type": "integer", "minimum": 1 },
+        "new_start": { "type": "integer", "minimum": 0 },
         "new_count": { "type": "integer", "minimum": 0 },
         "lines": { "type": "array", "items": { "$ref": "#/$defs/diffLine" } }
-      }
+      },
+      "allOf": [
+        { "if": { "properties": { "old_count": { "minimum": 1 } } }, "then": { "properties": { "old_start": { "minimum": 1 } } } },
+        { "if": { "properties": { "new_count": { "minimum": 1 } } }, "then": { "properties": { "new_start": { "minimum": 1 } } } }
+      ]
     },
     "fileDiff": {
       "type": "object",
@@ -133,7 +148,7 @@
         "status": { "enum": ["added", "modified", "deleted", "renamed"] },
         "old_blob_sha": { "type": ["string", "null"] },
         "new_blob_sha": { "type": ["string", "null"] },
-        "language": { "$ref": "#/$defs/nonEmptyString" },
+        "language": { "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
         "hunks": { "type": "array", "items": { "$ref": "#/$defs/hunk" } }
       }
     },

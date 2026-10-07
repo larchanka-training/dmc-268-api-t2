@@ -378,14 +378,6 @@ class ReviewEvent(Base):
             "('FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING')",
             name="ck_review_event_phase",
         ),
-        CheckConstraint(
-            "reason_code IS NULL OR reason_code IN "
-            "('QUEUE_DEADLINE_EXCEEDED','VCS_RATE_LIMITED','VCS_UNAVAILABLE',"
-            "'VCS_ACCESS_DENIED','PR_STALE_OR_CLOSED','DIFF_UNTRUSTWORTHY',"
-            "'SOURCE_BLOB_UNAVAILABLE','AST_PARSE_FAILED','LLM_TIMEOUT',"
-            "'LLM_UNAVAILABLE','LLM_OUTPUT_INVALID','ANALYSIS_DEADLINE_EXCEEDED')",
-            name="ck_review_event_reason_code",
-        ),
         CheckConstraint("attempt >= 1", name="ck_review_event_attempt_positive"),
         CheckConstraint(
             "safe_details IS NULL OR jsonb_typeof(safe_details) = 'object'",
@@ -411,11 +403,21 @@ class ContextPayload(Base):
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="context_payloads")
     chunk_result: Mapped[ChunkResult | None] = relationship(
-        back_populates="context_payload", uselist=False, passive_deletes=True
+        back_populates="context_payload",
+        primaryjoin=(
+            "and_(ContextPayload.review_job_id == ChunkResult.review_job_id, "
+            "ContextPayload.id == ChunkResult.context_payload_id)"
+        ),
+        foreign_keys="[ChunkResult.context_payload_id]",
+        uselist=False,
+        passive_deletes=True,
     )
 
     __table_args__ = (
         CheckConstraint("schema_version > 0", name="ck_context_payload_schema_version"),
+        UniqueConstraint(
+            "review_job_id", "id", name="uq_context_payload_review_job_id_id"
+        ),
     )
 
 
@@ -430,11 +432,6 @@ class ChunkResult(Base):
     )
     context_payload_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey(
-            "context_payload.id",
-            name="fk_chunk_result_context_payload",
-            ondelete="SET NULL",
-        ),
         nullable=True,
     )
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -448,13 +445,24 @@ class ChunkResult(Base):
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="chunk_results")
     context_payload: Mapped[ContextPayload | None] = relationship(
-        back_populates="chunk_result"
+        back_populates="chunk_result",
+        primaryjoin=(
+            "and_(ChunkResult.review_job_id == ContextPayload.review_job_id, "
+            "ChunkResult.context_payload_id == ContextPayload.id)"
+        ),
+        foreign_keys=[context_payload_id],
     )
     findings: Mapped[list[Finding]] = relationship(back_populates="chunk_result")
 
     __table_args__ = (
         CheckConstraint("schema_version > 0", name="ck_chunk_result_schema_version"),
         CheckConstraint("latency_ms >= 0", name="ck_chunk_result_latency_nonnegative"),
+        ForeignKeyConstraint(
+            ["review_job_id", "context_payload_id"],
+            ["context_payload.review_job_id", "context_payload.id"],
+            name="fk_chunk_result_context_payload_same_review",
+            ondelete="SET NULL (context_payload_id)",
+        ),
         UniqueConstraint("context_payload_id", name="uq_chunk_result_context_payload"),
     )
 

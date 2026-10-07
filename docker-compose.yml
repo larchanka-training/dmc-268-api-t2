@@ -24,6 +24,18 @@ services:
       redis:
         condition: service_healthy
 
+  worker:
+    build: .
+    # Заглушка вместо реального воркера: юнит деплоя существует уже сейчас,
+    # логику очереди добавит задача про фоновые воркеры.
+    command: ["sleep", "infinity"]
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   db:
     image: postgres:18-alpine
     environment:

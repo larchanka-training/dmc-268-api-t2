@@ -110,7 +110,7 @@ erDiagram
 
     ContextPayload {
         UUID id PK
-        UUID review_job_id FK
+        UUID review_job_id FK "UNIQUE with id"
         INT schema_version
         JSONB payload_body
         TIMESTAMPTZ created_at
@@ -119,7 +119,7 @@ erDiagram
     ChunkResult {
         UUID id PK
         UUID review_job_id FK
-        UUID context_payload_id FK "nullable, ON DELETE SET NULL"
+        UUID context_payload_id FK "nullable, composite FK"
         INT schema_version
         TEXT summary
         JSONB limitations
@@ -242,7 +242,8 @@ erDiagram
 | ReviewJob repository/settings | composite FKs require ChangeRequest and frozen RepositorySettings to belong to `ReviewJob.repository_id` |
 | ReviewJob → ContextPayload   | `1:N`                                    |
 | ReviewJob → ChunkResult      | `1:N`; durable result ownership          |
-| ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, `ON DELETE SET NULL` |
+| ContextPayload | `UNIQUE(review_job_id, id)` for composite reference |
+| ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, composite FK `(review_job_id, context_payload_id) → ContextPayload(review_job_id, id)`, `ON DELETE SET NULL (context_payload_id)` |
 | ChunkResult → Finding        | `1:N`                                    |
 | ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
 | ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
@@ -250,6 +251,15 @@ erDiagram
 | RepositoryAccess             | `UNIQUE(repository_id, user_id)`         |
 | WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |
 | IdempotencyRecord            | `UNIQUE(scope, idempotency_key)`         |
+
+Текущий GitHub connection flow использует существующие `Repository` и
+`RepositoryAccess`, а не отдельную таблицу подключения. `Repository` уникален
+по provider/external ID; связь `(repository_id, user_id)` создаётся атомарно
+после проверки актуального GitHub доступа. Role backend выводит из provider
+permissions. Новому repository создаётся первая settings version, но повторное
+подключение другого или того же пользователя не переписывает существующие
+settings и их frozen references. `GET /repositories` выбирает только связи
+текущего пользователя; наличие строки Repository само по себе не даёт доступ.
 
 Допустимые значения:
 
@@ -267,8 +277,10 @@ erDiagram
 `ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED`,
 `FETCHING_DIFF`, `PARSING_CONTEXT` и `LLM_PROCESSING` требуют
 `finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и `SKIPPED` требуют
-`finished_at IS NOT NULL`. Terminal-переход записывает status и `finished_at` в
-одной транзакции. Отдельного current/public `stage` нет.
+`finished_at IS NOT NULL`. Terminal-переход записывает status и
+`finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого
+statement, одной транзакции с двумя отдельными обновлениями недостаточно.
+Отдельного current/public `stage` нет.
 
 `Repository.current_settings_id` изначально равен `NULL`. После создания первой
 версии настроек составной FK разрешает назначить только настройки того же
@@ -283,9 +295,13 @@ SQLAlchemy `use_alter` разрывает только DDL-цикл создан
 и lifecycle/result поля исключены.
 
 После retention cleanup `ChunkResult.context_payload_id` становится `NULL`;
-долговременный путь — `ReviewJob -> ChunkResult -> Finding`. Будущий persistence
-path обязан выводить `ChunkResult.review_job_id` из owning ContextPayload/review,
-а не принимать несвязанный review ID.
+долговременный путь — `ReviewJob -> ChunkResult -> Finding`. Если context указан,
+составной FK `fk_chunk_result_context_payload_same_review` требует совпадения
+`review_job_id` у результата и context. При удалении context PostgreSQL обнуляет
+только `context_payload_id`, сохраняя владельца результата. Миграция `0003` после
+`0002` добавляет это ограничение без изменения старой миграции. При наличии
+несогласованных исторических строк создание FK завершается ошибкой и транзакция
+миграции откатывается без исправления данных.
 
 ---
 
@@ -305,31 +321,61 @@ path обязан выводить `ChunkResult.review_job_id` из owning Conte
 - `RepositorySettings.ignores`.
 
 `ContextPayload.payload_body` содержит `snapshot`, `metadata`, `files`,
-`related_symbols`, `coverage`, `budget`. Значения `review_id`, `chunk_id` и
-`schema_version` представлены отдельными колонками `review_job_id`, `id`,
-`schema_version`. Полный контракт задан `schemas/context/v1.json`.
+`related_symbols`, `coverage`, `budget`, но не дублирует `review_id`, `chunk_id`
+или `schema_version`. Их authoritative значения находятся в колонках
+`review_job_id`, `id`, `schema_version`. Полный wire payload по
+`schemas/context/v1.json` собирается из этих колонок и body перед валидацией
+и вызовом LLM; при записи body валидируется без доверия к идентификаторам из
+внешнего JSON. Application value `BuiltContextPayload` содержит body, версию,
+`review_id` и `chunk_id`; `to_wire()` отклоняет envelope-поля в body и собирает
+wire payload из этих значений.
+`metadata.output_language` в wire context может сохранить непустой язык
+исторической версии; новые версии настроек принимают только `ru`.
 
 `ChunkResult.limitations` содержит JSON array строк. `usage` nullable и при
 наличии содержит только non-negative `input_tokens` и `output_tokens`. Finding
 сохраняет nullable `proposed_diff_fix`; это предложение никогда не применяется
 автоматически.
 
-Forward migration 0003 нормализует legacy `ChunkResult.limitations = {}` в `[]`
-и canonical empty rules одновременно обновляет `rules_digest`. Legacy
-`ReviewEvent.stage` преобразуется для всех событий: snapshot/context/inference/
-validation становятся соответствующими active phase, а done становится `NULL`;
-status меняется только у legacy `RUNNING`. Downgrade намеренно lossy: точное
-canonical empty `limitations = []` возвращается в legacy `{}`, canonical empty
-rules/ignores возвращаются в `{}`; исторический rules digest восстановить
-невозможно, поэтому downgrade записывает детерминированный SHA-256 compact sorted
-`{}` (`44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`).
-`done` из nullable phase не восстанавливается.
+Миграция `0004` идёт после `0003_result_context_ownership`. Она не меняет
+существующие `RepositorySettings.rules`, `ignores`, `rules_digest`,
+`output_language`, а также frozen settings/digests в ReviewJob. Legacy `{}`
+проецируется на чтении как пустые canonical rules/ignores без UPDATE; исходный
+`output_language` старой версии, включая не-`ru`, возвращается без подмены.
+Сохранённый `rules_digest` не пересчитывается. Иные noncanonical legacy
+settings дают `GET /settings` ответ `409 LEGACY_SETTINGS_UNSUPPORTED` с opaque
+ETag и новый start `409` до quota/outbox; принятые jobs и idempotency replay
+остаются на frozen версии. Admin full canonical PUT с `If-Match` атомарно
+создаёт новую `ru`-версию и переключает current pointer без наследования
+старого JSON.
 
-`RepositorySettings.rules` имеет canonical форму `{"instructions": []}`, а
-`ignores` — `{"globs": []}`. Строки уникальны и непусты; порядок instructions
-семантически значим. Globs — normalized repository-relative POSIX patterns без
-absolute path, `..`, backslash, NUL и negation. `rules_digest` создаёт backend из
-canonical serialization правил.
+Для `ChunkResult.limitations` миграция `0004` переводит legacy `{}` в `[]` и
+ровно `{"warnings": [<строки>]}` в массив тех же строк; `usage={}` становится
+`NULL`. Неизвестная непустая JSON-форма останавливает upgrade на preflight с
+идентификатором записи и инструкцией оператору, без содержимого JSON; вся
+миграция откатывается. Preflight и преобразование выполняются в одной
+транзакции после раннего
+`LOCK TABLE review_job, chunk_result IN ACCESS EXCLUSIVE MODE`, чтобы запись
+не прошла между проверкой и обновлением. Перед
+deployment нужно остановить старые writes/workers; длительность ожидания lock
+ограничивает операторский timeout. При downgrade `limitations=[]` становится
+`{}`, а непустой массив строк становится `{"warnings": [строки]}` без потери строк.
+Legacy `ReviewEvent.reason_code` сохраняется в audit-БД:
+новые записи используют ограниченный enum, неизвестный исторический код в
+публичной проекции становится `null`, не raw-текстом.
+
+Legacy `ReviewJob.status=RUNNING` преобразуется по stage в новый active status;
+`ReviewEvent.stage` становится `phase` с отображением snapshot/context/inference/
+validation на active phase, а done на `NULL`. Downgrade status/phase намеренно
+теряет различие исходных `validation` и `done`; frozen settings остаются
+нетронутыми и при downgrade.
+
+Новые `RepositorySettings.rules` имеют canonical форму
+`{"instructions": []}`, а `ignores` — `{"globs": []}`. Строки уникальны и
+непусты; порядок instructions семантически значим. Globs — normalized
+repository-relative POSIX patterns без absolute path, `..`, backslash, NUL и
+negation. `rules_digest` создаёт backend из canonical serialization при записи
+новой версии, но исторический digest не пересчитывается.
 
 ---
 
@@ -353,7 +399,11 @@ canonical serialization правил.
 - место хранения GitHub `installation_id`;
 - физическая модель OAuth identity/access и обязательного PostgreSQL
   `AuthSession`; accepted контракт требует 30-минутную JWT cookie с уникальным
-  `sid`, server-side revocation и CSRF verifier;
+  `sid`, server-side revocation и CSRF verifier. Refresh продлевает только
+  действующую unexpired session атомарно с выдачей cookie на тот же `sid` и
+  сохранением CSRF token; отдельный refresh token не нужен;
+- HTTP adapters для provider-backed списка доступных repository, атомарного
+  подключения и session refresh по `openapi.yaml`;
 - полные worker/dispatcher/recovery adapters.
 
 ---

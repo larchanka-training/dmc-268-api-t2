@@ -1,7 +1,7 @@
 """Align persistence with the authoritative contract foundation.
 
-Revision ID: 0003
-Revises: 0002
+Revision ID: 0004
+Revises: 0003
 """
 
 from collections.abc import Sequence
@@ -10,13 +10,48 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0003"
-down_revision: str | None = "0002"
+revision: str = "0004"
+down_revision: str | None = "0003"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.execute("LOCK TABLE review_job, chunk_result IN ACCESS EXCLUSIVE MODE")
+    op.execute(
+        """
+        DO $$
+        DECLARE incompatible_id uuid;
+        BEGIN
+            SELECT id INTO incompatible_id FROM chunk_result
+            WHERE (
+                limitations = '{}'::jsonb
+                OR (jsonb_typeof(limitations) = 'array'
+                    AND NOT jsonb_path_exists(limitations, '$[*] ? (@.type() != "string")'))
+                OR (CASE WHEN jsonb_typeof(limitations) = 'object' THEN
+                        limitations - 'warnings' = '{}'::jsonb
+                        AND jsonb_typeof(limitations->'warnings') = 'array'
+                        AND NOT jsonb_path_exists(limitations->'warnings', '$[*] ? (@.type() != "string")')
+                    ELSE false END)
+            ) IS NOT TRUE
+            OR (
+                usage IS NULL OR usage = '{}'::jsonb
+                OR (jsonb_typeof(usage) = 'object'
+                    AND usage = jsonb_build_object(
+                        'input_tokens', usage->'input_tokens',
+                        'output_tokens', usage->'output_tokens')
+                    AND jsonb_typeof(usage->'input_tokens') = 'number'
+                    AND jsonb_typeof(usage->'output_tokens') = 'number'
+                    AND usage->>'input_tokens' ~ '^[0-9]+$'
+                    AND usage->>'output_tokens' ~ '^[0-9]+$')
+            ) IS NOT TRUE
+            ORDER BY id LIMIT 1;
+            IF incompatible_id IS NOT NULL THEN
+                RAISE EXCEPTION '0004 preflight: incompatible chunk_result id=%. Back up and explicitly convert limitations/usage to the v1 schema, then retry. No data was changed.', incompatible_id;
+            END IF;
+        END $$
+        """
+    )
     op.drop_constraint(
         op.f("ck_review_job_status_finished_at"), "review_job", type_="check"
     )
@@ -111,15 +146,6 @@ def upgrade() -> None:
         "('FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING')",
     )
     op.create_check_constraint(
-        "ck_review_event_reason_code",
-        "review_event",
-        "reason_code IS NULL OR reason_code IN "
-        "('QUEUE_DEADLINE_EXCEEDED','VCS_RATE_LIMITED','VCS_UNAVAILABLE',"
-        "'VCS_ACCESS_DENIED','PR_STALE_OR_CLOSED','DIFF_UNTRUSTWORTHY',"
-        "'SOURCE_BLOB_UNAVAILABLE','AST_PARSE_FAILED','LLM_TIMEOUT',"
-        "'LLM_UNAVAILABLE','LLM_OUTPUT_INVALID','ANALYSIS_DEADLINE_EXCEEDED')",
-    )
-    op.create_check_constraint(
         "ck_review_event_attempt_positive", "review_event", "attempt >= 1"
     )
     op.create_check_constraint(
@@ -133,40 +159,27 @@ def upgrade() -> None:
         "UPDATE chunk_result SET limitations = '[]'::jsonb "
         "WHERE limitations = '{}'::jsonb"
     )
+    op.execute(
+        "UPDATE chunk_result SET limitations = limitations->'warnings' "
+        "WHERE jsonb_typeof(limitations) = 'object' "
+        "AND limitations - 'warnings' = '{}'::jsonb "
+        "AND jsonb_typeof(limitations->'warnings') = 'array' "
+        "AND NOT jsonb_path_exists(limitations->'warnings', '$[*] ? (@.type() != \"string\")')"
+    )
+    op.execute("UPDATE chunk_result SET usage = NULL WHERE usage = '{}'::jsonb")
     op.add_column(
         "finding", sa.Column("proposed_diff_fix", sa.Text(), nullable=True)
     )
 
-    op.execute(
-        "UPDATE repository_settings "
-        "SET rules = '{\"instructions\": []}'::jsonb, "
-        "rules_digest = "
-        "'76eb80bcc51fe28db9c1489e104e7237950feb72b9495062186c4488de69ebbf' "
-        "WHERE rules = '{}'::jsonb"
-    )
-    op.execute(
-        "UPDATE repository_settings SET ignores = '{\"globs\": []}'::jsonb "
-        "WHERE ignores = '{}'::jsonb"
-    )
-
-
 def downgrade() -> None:
-    op.execute(
-        "UPDATE repository_settings "
-        "SET rules = '{}'::jsonb, "
-        "rules_digest = "
-        "'44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a' "
-        "WHERE rules = '{\"instructions\": []}'::jsonb"
-    )
-    op.execute(
-        "UPDATE repository_settings SET ignores = '{}'::jsonb "
-        "WHERE ignores = '{\"globs\": []}'::jsonb"
-    )
-
     op.drop_column("finding", "proposed_diff_fix")
     op.execute(
         "UPDATE chunk_result SET limitations = '{}'::jsonb "
         "WHERE limitations = '[]'::jsonb"
+    )
+    op.execute(
+        "UPDATE chunk_result SET limitations = jsonb_build_object('warnings', limitations) "
+        "WHERE jsonb_typeof(limitations) = 'array'"
     )
     op.execute("UPDATE chunk_result SET usage = '{}'::jsonb WHERE usage IS NULL")
     op.alter_column("chunk_result", "usage", existing_type=postgresql.JSONB(), nullable=False)
@@ -175,7 +188,6 @@ def downgrade() -> None:
         "ck_review_event_safe_details_object", "review_event", type_="check"
     )
     op.drop_constraint("ck_review_event_attempt_positive", "review_event", type_="check")
-    op.drop_constraint("ck_review_event_reason_code", "review_event", type_="check")
     op.drop_constraint("ck_review_event_phase", "review_event", type_="check")
     op.drop_constraint("ck_review_event_status", "review_event", type_="check")
     op.execute(

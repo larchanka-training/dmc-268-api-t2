@@ -67,6 +67,37 @@ paths:
             Set-Cookie:
               schema: { type: string }
               description: Session establishment or cookie clearing directive
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refreshSession
+      description: >-
+        Browser calls before the authoritative session expiry. Requires a
+        valid JWT cookie and its active, unexpired, non-revoked PostgreSQL
+        AuthSession, an allowlisted Origin and CSRF token. Atomically extends
+        that session expiry to now + 30 minutes and issues a matching JWT
+        cookie with the same sid; never clears revocation or renews an expired
+        session. Preserves the session CSRF token so concurrent tabs keep
+        working. Returns updated Me including authoritative expires_at.
+        Expiry or revocation returns 401 and requires OAuth again. No separate
+        browser-readable refresh token is issued.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '200':
+          description: Renewed active session
+          headers:
+            Set-Cookie:
+              required: true
+              schema: { type: string }
+              description: Secure, HttpOnly, SameSite=Lax renewed JWT cookie
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/auth/logout:
     post:
       tags: [auth]
@@ -118,11 +149,69 @@ paths:
         - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Accessible repositories
+          description: Connected repositories accessible to the current user
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RepositoryPage' }
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/repositories/available:
+    get:
+      tags: [repositories]
+      operationId: listAvailableRepositories
+      description: >-
+        Provider-backed GitHub repositories with current read access that are
+        not connected for this user. Provider cursor ordering is preserved.
+        Existing local Repository rows alone do not grant access or make a
+        repository connected for another user.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Available repositories
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AvailableRepositoryPage' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/repositories/connect:
+    post:
+      tags: [repositories]
+      operationId: connectRepository
+      description: >-
+        Revalidates current GitHub access and atomically creates or reuses the
+        Repository and grants this user RepositoryAccess. Role derives from
+        provider permissions (admin for current provider administrators,
+        reviewer for read access); never trusts a client role, owner or name.
+        Initial settings are created only for a new repository. Existing
+        settings are not reset. Repeated connection returns 200, a new user
+        connection returns 201. Concurrent requests cannot create duplicate
+        provider/external_id rows or repository/user access pairs.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConnectRepositoryRequest' }
+      responses:
+        '200':
+          description: Existing connection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Repository' }
+        '201':
+          description: New connection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Repository' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/repositories/{id}/pull-requests:
     get:
       tags: [repositories]
@@ -150,7 +239,12 @@ paths:
     get:
       tags: [repositories]
       operationId: getRepositorySettings
-      description: Admin role required.
+      description: >-
+        Admin role required. Exact legacy empty rules/ignores objects are
+        projected as canonical empty values without changing storage/digest.
+        Other noncanonical legacy settings return LEGACY_SETTINGS_UNSUPPORTED
+        with the current opaque ETag, never raw legacy JSON. Admin can use that
+        ETag for a full canonical PUT creating a new version.
       security: [{ cookieAuth: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryId'
@@ -167,11 +261,15 @@ paths:
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '409': { $ref: '#/components/responses/LegacySettingsUnsupported' }
     put:
       tags: [repositories]
       operationId: replaceRepositorySettings
       summary: Fully replace editable repository settings
-      description: Admin role required.
+      description: >-
+        Admin role required. Validates a full canonical replacement, then
+        atomically compares If-Match and switches current_settings_id to a new
+        immutable version. Never inherits or rewrites arbitrary legacy fields.
       security: [{ cookieAuth: [], csrfHeader: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryId'
@@ -210,6 +308,10 @@ paths:
         Starts an asynchronous review. The server chooses and freezes settings,
         model, and prompt versions. A new run returns 202; a same-key/same-body
         replay returns 200. Same-key/different-body returns IDEMPOTENCY_CONFLICT.
+        New runs with unsupported current legacy settings return
+        LEGACY_SETTINGS_UNSUPPORTED before quota/outbox writes. Previously
+        accepted runs and idempotent replays remain pinned to their frozen
+        version, not the new current-settings pointer.
       security: [{ cookieAuth: [], csrfHeader: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryId'
@@ -240,7 +342,7 @@ paths:
         '403': { $ref: '#/components/responses/AccessDenied' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
         '409':
-          description: Idempotency, head, or equivalent-active-review conflict
+          description: Idempotency, head, active-review, or unsupported-legacy-settings conflict
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -248,6 +350,7 @@ paths:
                 idempotency: { value: { code: IDEMPOTENCY_CONFLICT, message: Idempotency key conflicts with the request., request_id: req_123, retryable: false, retry_after: null } }
                 head: { value: { code: PR_HEAD_MISMATCH, message: Pull request head does not match., request_id: req_123, retryable: false, retry_after: null } }
                 active: { value: { code: REVIEW_ALREADY_ACTIVE, message: An equivalent review is already active., request_id: req_123, retryable: false, retry_after: null } }
+                legacy_settings: { value: { code: LEGACY_SETTINGS_UNSUPPORTED, message: Create a new supported settings version before starting a review., request_id: req_123, retryable: false, retry_after: null } }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/QuotaExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -490,6 +593,33 @@ components:
       required: true
       schema: { type: string, minLength: 1 }
   schemas:
+    ConnectRepositoryRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, external_id]
+      properties:
+        provider: { const: github }
+        external_id: { type: string, pattern: '^[1-9][0-9]*$' }
+    AvailableRepository:
+      type: object
+      additionalProperties: false
+      required: [provider, external_id, owner, name]
+      properties:
+        provider: { const: github }
+        external_id: { type: string, pattern: '^[1-9][0-9]*$' }
+        owner: { type: string }
+        name: { type: string }
+    AvailableRepositoryPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AvailableRepository' } }
+        next_cursor: { type: [string, 'null'] }
+    RepositoryPath:
+      type: string
+      minLength: 1
+      pattern: '^(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*\u0000)(?!.*/$).+$'
     ReviewStatus:
       type: string
       enum: [QUEUED, FETCHING_DIFF, PARSING_CONTEXT, LLM_PROCESSING, COMPLETED, PARTIAL, FAILED, SKIPPED]
@@ -498,7 +628,7 @@ components:
       enum: [NOT_READY, PENDING, PUBLISHED, PARTIAL, FAILED, UNKNOWN, SKIPPED]
     ErrorCode:
       type: string
-      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE]
+      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE]
     Error:
       type: object
       additionalProperties: false
@@ -636,7 +766,7 @@ components:
         ignores: { $ref: '#/components/schemas/Ignores' }
         max_starts_per_hour: { type: integer, minimum: 0 }
         max_active_jobs: { type: integer, minimum: 0 }
-        output_language: { const: ru }
+        output_language: { type: string, minLength: 1, description: Actual stored language; historical versions are not rewritten }
         surrounding_lines: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
     StartReviewRequest:
@@ -693,14 +823,14 @@ components:
       additionalProperties: false
       required: [path, ranges]
       properties:
-        path: { type: string }
+        path: { $ref: '#/components/schemas/RepositoryPath' }
         ranges: { type: array, items: { $ref: '#/components/schemas/LineRange' } }
     SkippedCoverageEntry:
       type: object
       additionalProperties: false
       required: [path, ranges, reason]
       properties:
-        path: { type: string }
+        path: { $ref: '#/components/schemas/RepositoryPath' }
         ranges: { type: array, items: { $ref: '#/components/schemas/LineRange' } }
         reason: { enum: [policy, unsupported_language, unavailable_blob, provider_truncated, token_budget, file_limit, line_limit, context_error] }
     Coverage:
@@ -771,7 +901,7 @@ components:
       properties:
         id: { type: string }
         fingerprint: { type: string }
-        path: { type: string }
+        path: { $ref: '#/components/schemas/RepositoryPath' }
         side: { enum: [OLD, NEW] }
         start_line: { type: integer, minimum: 1 }
         end_line: { type: integer, minimum: 1, description: Must be greater than or equal to start_line }
@@ -799,23 +929,35 @@ components:
         content: { type: string }
         old_line: { type: [integer, 'null'], minimum: 1 }
         new_line: { type: [integer, 'null'], minimum: 1 }
+      allOf:
+        - if: { properties: { kind: { const: added } } }
+          then: { properties: { old_line: { type: 'null' }, new_line: { type: integer } } }
+        - if: { properties: { kind: { const: deleted } } }
+          then: { properties: { old_line: { type: integer }, new_line: { type: 'null' } } }
+        - if: { properties: { kind: { const: context } } }
+          then: { properties: { old_line: { type: integer }, new_line: { type: integer } } }
     DiffHunk:
       type: object
       additionalProperties: false
       required: [old_start, old_lines, new_start, new_lines, lines]
       properties:
-        old_start: { type: integer, minimum: 1 }
+        old_start: { type: integer, minimum: 0 }
         old_lines: { type: integer, minimum: 0 }
-        new_start: { type: integer, minimum: 1 }
+        new_start: { type: integer, minimum: 0 }
         new_lines: { type: integer, minimum: 0 }
         lines: { type: array, items: { $ref: '#/components/schemas/DiffLine' } }
+      allOf:
+        - if: { properties: { old_lines: { minimum: 1 } } }
+          then: { properties: { old_start: { minimum: 1 } } }
+        - if: { properties: { new_lines: { minimum: 1 } } }
+          then: { properties: { new_start: { minimum: 1 } } }
     DiffFile:
       type: object
       additionalProperties: false
       required: [path, previous_path, status, hunks]
       properties:
-        path: { type: string }
-        previous_path: { type: [string, 'null'] }
+        path: { $ref: '#/components/schemas/RepositoryPath' }
+        previous_path: { oneOf: [{ $ref: '#/components/schemas/RepositoryPath' }, { type: 'null' }] }
         status: { enum: [added, modified, deleted, renamed] }
         hunks: { type: array, items: { $ref: '#/components/schemas/DiffHunk' } }
     Diff:
@@ -871,6 +1013,17 @@ components:
             analysis_dispatch: { type: boolean }
             publication: { type: boolean }
   responses:
+    LegacySettingsUnsupported:
+      description: Unsupported historical settings require a full canonical replacement
+      headers:
+        ETag:
+          required: true
+          schema: { type: string }
+          description: Opaque current-settings version for conditional PUT
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: LEGACY_SETTINGS_UNSUPPORTED, message: Create a new supported settings version before starting a review., request_id: req_123, retryable: false, retry_after: null }
     AuthenticationRequired:
       description: AUTHENTICATION_REQUIRED — active authenticated session required
       content:

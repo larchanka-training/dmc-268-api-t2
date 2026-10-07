@@ -175,9 +175,13 @@ def test_one_chunk_result_per_context_payload() -> None:
         constraint
         for constraint in table.constraints
         if isinstance(constraint, ForeignKeyConstraint)
-        and constraint.name == "fk_chunk_result_context_payload"
+        and constraint.name == "fk_chunk_result_context_payload_same_review"
     )
-    assert context_fk.ondelete == "SET NULL"
+    assert tuple(column.name for column in context_fk.columns) == (
+        "review_job_id",
+        "context_payload_id",
+    )
+    assert context_fk.ondelete == "SET NULL (context_payload_id)"
 
 
 def test_one_publication_and_one_live_lease_per_review_job() -> None:
@@ -202,6 +206,6 @@ def test_review_event_and_finding_match_contract_foundation() -> None:
         if isinstance(constraint, CheckConstraint)
     }
     assert "ck_review_event_ck_review_event_phase" in check_names
-    assert "ck_review_event_ck_review_event_reason_code" in check_names
+    assert "ck_review_event_ck_review_event_reason_code" not in check_names
     assert "ck_review_event_ck_review_event_attempt_positive" in check_names
     assert "ck_review_event_ck_review_event_safe_details_object" in check_names

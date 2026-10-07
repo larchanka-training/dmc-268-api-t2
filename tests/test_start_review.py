@@ -11,7 +11,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.application.use_cases.start_review as start_review_module
-from app.application.ports import ReviewJobRepositoryPort, StartReviewCommand
+from app.application.ports import (
+    ReviewJobRepositoryPort,
+    ReviewJobSnapshot,
+    StartReviewCommand,
+)
 from app.application.use_cases.start_review import (
     compute_config_digest,
     start_review,
@@ -117,7 +121,7 @@ class FakeReviewJobRepository:
         self.review_id = review_id
         self.calls: list[tuple[StartReviewCommand, str]] = []
 
-    async def get(self, review_job_id: uuid.UUID) -> object | None:
+    async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None:
         return None
 
     async def add_start_review(

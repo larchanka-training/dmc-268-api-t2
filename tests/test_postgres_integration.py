@@ -326,13 +326,14 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
         "fk_review_job_change_request_same_repository": "f",
         "fk_review_job_settings_same_repository": "f",
         "ck_review_job_status_finished_at": "c",
-        "fk_chunk_result_context_payload": "f",
+        "uq_context_payload_review_job_id_id": "u",
+        "fk_chunk_result_context_payload_same_review": "f",
         "uq_chunk_result_context_payload": "u",
     }
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0003"
+        ).scalar_one() == "0004"
 
         result = await connection.execute(
             text(
@@ -380,9 +381,14 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
             "REFERENCES repository_settings(repository_id, id)"
         )
         assert all(not row[2] and not row[3] for row in constraints.values())
-        assert constraints["fk_chunk_result_context_payload"][4] == "n"
-        assert constraints["fk_chunk_result_context_payload"][5].endswith(
-            "ON DELETE SET NULL"
+        assert constraints["uq_context_payload_review_job_id_id"][5] == (
+            "UNIQUE (review_job_id, id)"
+        )
+        assert constraints["fk_chunk_result_context_payload_same_review"][4] == "n"
+        assert constraints["fk_chunk_result_context_payload_same_review"][5] == (
+            "FOREIGN KEY (review_job_id, context_payload_id) "
+            "REFERENCES context_payload(review_job_id, id) "
+            "ON DELETE SET NULL (context_payload_id)"
         )
 
         status_check = constraints["ck_review_job_status_finished_at"][5]
@@ -541,6 +547,60 @@ async def test_context_cleanup_retains_results_and_findings(
             )
         ).one()
         assert other_row == (other_context, review_job_id)
+
+
+@pytest.mark.parametrize("operation", ["insert", "result_owner", "context_owner"])
+async def test_chunk_result_context_must_share_review_owner(
+    postgres: PostgresHarness,
+    operation: str,
+) -> None:
+    async with postgres.engine.begin() as connection:
+        _, review_a = await _create_review_fixture(postgres, connection)
+        _, review_b = await _create_review_fixture(postgres, connection)
+        context_id, result_id, _ = await _create_retained_result(
+            postgres, connection, review_a
+        )
+
+        with pytest.raises(IntegrityError) as ownership_error:
+            async with connection.begin_nested():
+                if operation == "insert":
+                    other_context = postgres.track("context_payload", uuid.uuid4())
+                    await connection.execute(
+                        insert(models.ContextPayload).values(
+                            id=other_context,
+                            review_job_id=review_a,
+                            schema_version=1,
+                            payload_body={},
+                        )
+                    )
+                    await connection.execute(
+                        insert(models.ChunkResult).values(
+                            id=postgres.track("chunk_result", uuid.uuid4()),
+                            review_job_id=review_b,
+                            context_payload_id=other_context,
+                            schema_version=1,
+                            summary="Wrong owner",
+                            limitations={},
+                            usage={},
+                            latency_ms=0,
+                        )
+                    )
+                elif operation == "result_owner":
+                    await connection.execute(
+                        update(models.ChunkResult)
+                        .where(models.ChunkResult.id == result_id)
+                        .values(review_job_id=review_b)
+                    )
+                else:
+                    await connection.execute(
+                        update(models.ContextPayload)
+                        .where(models.ContextPayload.id == context_id)
+                        .values(review_job_id=review_b)
+                    )
+
+        assert "fk_chunk_result_context_payload_same_review" in str(
+            ownership_error.value
+        )
 
 
 @dataclass(frozen=True)

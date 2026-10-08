@@ -8,6 +8,7 @@ dependencies = [
     "alembic>=1.19.2",
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "pydantic-settings>=2.15.0",
     "sqlalchemy[asyncio]>=2.0.52",
     "structlog>=26.1.0",
@@ -25,7 +26,7 @@ packages = ["src/app"]
 line-length = 88
 target-version = "py314"
 src = ["src"]
-extend-exclude = ["migrations"]
+extend-exclude = ["migrations", "docs"]
 
 [tool.ruff.lint]
 select = [

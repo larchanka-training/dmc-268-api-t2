@@ -67,6 +67,14 @@ jobs:
       SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       UI_SHA: ${{ inputs.ui_sha }}
+      # LLM gateway (docs/llm-gateway-review-pipeline.md §6a). Until Ollama is
+      # deployed to staging, the chain is Eurorouter only.
+      LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
+      LLM_FALLBACK_ENABLED: ${{ vars.STAGING_LLM_FALLBACK_ENABLED || 'false' }}
+      EUROROUTER_BASE_URL: ${{ vars.STAGING_EUROROUTER_BASE_URL }}
+      EUROROUTER_MODEL: ${{ vars.STAGING_EUROROUTER_MODEL }}
+      OLLAMA_BASE_URL: ${{ vars.STAGING_OLLAMA_BASE_URL || 'http://ollama:11434' }}
+      OLLAMA_MODEL: ${{ vars.STAGING_OLLAMA_MODEL }}
       # ENV_NAME, DEPLOY_PATH, ENV_FILE, WEB_PORT, COMPOSE_PROJECT and
       # API_SHA are resolved per environment in the "Resolve deployment
       # target" step: only the initiating side's image changes, the other
@@ -148,6 +156,7 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSH_PASSWORD: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -171,6 +180,51 @@ jobs:
             echo "::error::STAGING_POSTGRES_PASSWORD is not available"
             exit 1
           fi
+
+          # Provider chain from the flags (same rule as LLM.provider_chain).
+          case "${LLM_PRIMARY_PROVIDER}" in
+            eurorouter) secondary=ollama ;;
+            ollama) secondary=eurorouter ;;
+            *)
+              echo "::error::STAGING_LLM_PRIMARY_PROVIDER must be eurorouter or ollama"
+              exit 1
+              ;;
+          esac
+          case "${LLM_FALLBACK_ENABLED}" in
+            true) chain="${LLM_PRIMARY_PROVIDER} ${secondary}" ;;
+            false) chain="${LLM_PRIMARY_PROVIDER}" ;;
+            *)
+              echo "::error::STAGING_LLM_FALLBACK_ENABLED must be true or false"
+              exit 1
+              ;;
+          esac
+
+          if [[ " ${chain} " == *" eurorouter "* ]]; then
+            # The key value is never printed, only its presence is checked.
+            if [[ -z "${EUROROUTER_API_KEYS:-}" ]]; then
+              echo "::error::STAGING_EUROROUTER_API_KEYS is not available"
+              exit 1
+            fi
+            if [[ -z "${EUROROUTER_BASE_URL:-}" ]]; then
+              echo "::error::STAGING_EUROROUTER_BASE_URL is not available"
+              exit 1
+            fi
+            if [[ "${EUROROUTER_BASE_URL}" != https://* ]]; then
+              echo "::error::STAGING_EUROROUTER_BASE_URL must use https://"
+              exit 1
+            fi
+            if [[ -z "${EUROROUTER_MODEL:-}" ]]; then
+              echo "::error::STAGING_EUROROUTER_MODEL is not available"
+              exit 1
+            fi
+          fi
+
+          if [[ " ${chain} " == *" ollama "* && -z "${OLLAMA_MODEL:-}" ]]; then
+            echo "::error::STAGING_OLLAMA_MODEL is not available"
+            exit 1
+          fi
+
+          echo "LLM provider chain: ${chain}"
 
           if [[ ! "${API_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::API commit SHA must be a full 40-character Git SHA, got: ${API_SHA}"
@@ -306,8 +360,7 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSHPASS: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
-          LLM_API_KEY: ${{ secrets.LLM__API_KEY }}
-          LLM_API_BASE: ${{ secrets.LLM__API_BASE }}
+          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
         shell: bash
         run: |
@@ -327,11 +380,16 @@ jobs:
             printf 'POSTGRES__USER=dmc\n'
             printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
+            printf 'LLM__PRIMARY_PROVIDER=%s\n' "${LLM_PRIMARY_PROVIDER}"
+            printf 'LLM__FALLBACK_ENABLED=%s\n' "${LLM_FALLBACK_ENABLED}"
+            printf 'LLM__EUROROUTER__BASE_URL=%s\n' "${EUROROUTER_BASE_URL}"
+            printf 'LLM__EUROROUTER__MODEL=%s\n' "${EUROROUTER_MODEL}"
+            printf 'LLM__EUROROUTER__API_KEYS=%s\n' "${EUROROUTER_API_KEYS}"
+            printf 'LLM__OLLAMA__BASE_URL=%s\n' "${OLLAMA_BASE_URL}"
+            printf 'LLM__OLLAMA__MODEL=%s\n' "${OLLAMA_MODEL}"
             # Runtime secrets passthrough: GitHub Encrypted Secrets ->
             # container env. Forwarded only when the secret is defined;
             # naming convention in docs/staging-deployment.md.
-            append_optional 'LLM__API_KEY' "${LLM_API_KEY:-}"
-            append_optional 'LLM__API_BASE' "${LLM_API_BASE:-}"
             append_optional 'WEBHOOK__SECRET' "${WEBHOOK_SECRET:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \

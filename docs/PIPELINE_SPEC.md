@@ -149,6 +149,23 @@ The dispatcher selects unpublished outbox records. It marks
 unsupported schema versions, unknown task kinds, and otherwise invalid envelopes
 before domain work begins.
 
+The minimal PostgreSQL dispatcher is `PostgresOutboxDispatcher.dispatch_batch()`
+in `src/app/adapters/outbox_dispatcher.py`. It accepts the existing session factory
+and `QueuePort`, selects oldest unpublished events with `FOR UPDATE SKIP LOCKED`,
+and defaults to a batch of 100 (the supplied batch size must be positive). It
+copies authoritative event columns into `QueueTaskEnvelope` and closes the
+selection transaction before Redis enqueue. Each confirmed enqueue is marked in
+its own short transaction, updating only a still-unpublished event.
+
+Selection locks are not claims across Redis I/O: overlapping dispatcher runs may
+enqueue duplicates after those locks are released. A crash after enqueue but
+before the marker commits also permits a duplicate. Both paths retain the same
+event ID and envelope; delivery is at-least-once, not exactly-once. The method
+returns the number of confirmed enqueues, including concurrent duplicates, and
+propagates the first enqueue or database error. Earlier publication markers stay
+committed; failed and remaining events stay eligible for the next invocation.
+There is no dispatcher retry loop or long-running process in this slice.
+
 ## 5. Leases and fencing
 
 At most one live `TaskLease` exists per review. A worker must acquire or renew the

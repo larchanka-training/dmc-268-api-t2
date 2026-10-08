@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -10,8 +11,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import delete, func, insert, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -20,6 +25,9 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
+from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
+from app.adapters.redis_queue import RedisQueue
+from app.application.ports import QueueTaskEnvelope, TaskKind
 from app.db import models
 from app.db.base import Base
 
@@ -233,6 +241,396 @@ async def _create_review_fixture(
         ReviewScope(repository_id, change_request_id, settings_id),
     )
     return ReviewScope(repository_id, change_request_id, settings_id), review_job_id
+
+
+@pytest_asyncio.fixture
+async def dispatcher_redis() -> AsyncIterator[tuple[Redis, str]]:
+    # An explicit test Redis is required; never fall back to application settings.
+    url = os.environ["DMC268_TEST_REDIS_URL"]
+    prefix = f"dmc268:test:outbox:{uuid.uuid4().hex}"
+    async with Redis.from_url(url, decode_responses=True) as client:
+        try:
+            yield client, prefix
+        finally:
+            await client.delete(f"{prefix}:analyze", f"{prefix}:publish")
+
+
+async def _create_outbox_event(
+    postgres: PostgresHarness, *, task_kind: TaskKind = "analyze"
+) -> tuple[uuid.UUID, uuid.UUID]:
+    async with postgres.engine.begin() as connection:
+        _, review_id = await _create_review_fixture(postgres, connection)
+        event_id = postgres.track("outbox_event", uuid.uuid4())
+        await connection.execute(
+            insert(models.OutboxEvent).values(
+                id=event_id,
+                review_job_id=review_id,
+                schema_version=1,
+                task_kind=task_kind,
+                attempt=2,
+                trace_id="trace-outbox-test",
+                broker_published_at=None,
+            )
+        )
+    return event_id, review_id
+
+
+async def _stream_envelopes(client: Redis, stream: str) -> list[dict[str, object]]:
+    messages = await client.xrange(stream)
+    assert messages is not None
+    payloads: list[dict[str, object]] = []
+    for _, fields in messages:
+        assert fields is not None
+        payload = json.loads(fields["envelope"])
+        assert isinstance(payload, dict)
+        payloads.append(payload)
+    return payloads
+
+
+@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
+async def test_dispatcher_preserves_outbox_identity_in_correct_redis_stream(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    task_kind: TaskKind,
+) -> None:
+    event_id, review_id = await _create_outbox_event(postgres, task_kind=task_kind)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
+    )
+
+    assert await dispatcher.dispatch_batch() == 1
+
+    payloads = await _stream_envelopes(client, f"{prefix}:{task_kind}")
+    assert len(payloads) == 1
+    assert payloads[0] == {
+        "schema_version": 1,
+        "event_id": str(event_id),
+        "review_id": str(review_id),
+        "task_kind": task_kind,
+        "attempt": 2,
+        "trace_id": "trace-outbox-test",
+    }
+    other_kind = "publish" if task_kind == "analyze" else "analyze"
+    assert await client.xlen(f"{prefix}:{other_kind}") == 0
+
+
+async def test_dispatcher_releases_postgres_transaction_before_redis_enqueue(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    event_id, _ = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+
+    class InspectingQueue(RedisQueue):
+        async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
+            async with postgres.engine.begin() as connection:
+                # Must be lockable and still unpublished before Redis confirms.
+                row = (
+                    await connection.execute(
+                        select(models.OutboxEvent.broker_published_at)
+                        .where(models.OutboxEvent.id == event_id)
+                        .with_for_update(nowait=True)
+                    )
+                ).one()
+                assert row.broker_published_at is None
+            return await super().enqueue(envelope)
+
+    dispatcher = PostgresOutboxDispatcher(
+        async_sessionmaker(postgres.engine),
+        InspectingQueue(client, stream_prefix=prefix),
+    )
+
+    # Another connection's transaction must not affect this row-lock assertion.
+    async with postgres.engine.begin() as unrelated:
+        await unrelated.execute(text("SELECT 1"))
+        assert await dispatcher.dispatch_batch() == 1
+
+
+async def test_dispatcher_keeps_redis_failure_unpublished_until_successful_retry(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    event_id, _ = await _create_outbox_event(postgres)
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+    # A refused local connection exercises the real Redis adapter's error path.
+    async with Redis(
+        host="127.0.0.1", port=1, retry=Retry(NoBackoff(), 0)
+    ) as unavailable:
+        dispatcher = PostgresOutboxDispatcher(
+            factory, RedisQueue(unavailable, stream_prefix=prefix)
+        )
+        with pytest.raises(RedisConnectionError):
+            await dispatcher.dispatch_batch()
+
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        assert event.broker_published_at is None
+    assert await client.xlen(f"{prefix}:analyze") == 0
+
+    retry = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
+    assert await retry.dispatch_batch() == 1
+
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        assert event.broker_published_at is not None
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
+    assert [payload["event_id"] for payload in payloads] == [str(event_id)]
+
+
+async def test_dispatcher_invalid_envelope_stays_unpublished_with_healthy_redis(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    invalid_id, review_id = await _create_outbox_event(postgres)
+    async with postgres.engine.begin() as connection:
+        # PostgreSQL permits this value, but the canonical v1 envelope does not.
+        await connection.execute(
+            update(models.OutboxEvent)
+            .where(models.OutboxEvent.id == invalid_id)
+            .values(trace_id="")
+        )
+    later_id, _ = await _create_outbox_event(postgres, task_kind="publish")
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+
+    # Unlike a connection failure, restoring Redis cannot repair the envelope.
+    for _ in range(2):
+        assert await client.ping()
+        dispatcher = PostgresOutboxDispatcher(
+            factory, RedisQueue(client, stream_prefix=prefix)
+        )
+        with pytest.raises(ValueError, match=r"^Invalid queue task envelope$"):
+            await dispatcher.dispatch_batch()
+
+        async with factory() as session:
+            invalid = await session.get(models.OutboxEvent, invalid_id)
+            later = await session.get(models.OutboxEvent, later_id)
+            assert invalid is not None and later is not None
+            assert invalid.broker_published_at is None
+            assert later.broker_published_at is None
+            assert (
+                invalid.id,
+                invalid.review_job_id,
+                invalid.schema_version,
+                invalid.task_kind,
+                invalid.attempt,
+                invalid.trace_id,
+            ) == (invalid_id, review_id, 1, "analyze", 2, "")
+        assert await client.xlen(f"{prefix}:analyze") == 0
+        assert await client.xlen(f"{prefix}:publish") == 0
+
+
+async def test_dispatcher_does_not_resend_published_events(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    event_id, _ = await _create_outbox_event(postgres)
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        factory, RedisQueue(client, stream_prefix=prefix)
+    )
+    assert await dispatcher.dispatch_batch() == 1
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        published_at = event.broker_published_at
+
+    restarted = PostgresOutboxDispatcher(
+        factory, RedisQueue(client, stream_prefix=prefix)
+    )
+    assert await restarted.dispatch_batch() == 0
+
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        assert event.broker_published_at == published_at
+
+
+async def test_dispatcher_limits_batches_oldest_first(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    first_id, _ = await _create_outbox_event(postgres)
+    second_id, _ = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
+    )
+
+    assert await dispatcher.dispatch_batch(batch_size=1) == 1
+
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
+    assert [payload["event_id"] for payload in payloads] == [str(first_id)]
+    async with postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(models.OutboxEvent.broker_published_at).where(
+                    models.OutboxEvent.id == second_id
+                )
+            )
+            is None
+        )
+    assert await dispatcher.dispatch_batch(batch_size=1) == 1
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
+    assert [payload["event_id"] for payload in payloads] == [
+        str(first_id),
+        str(second_id),
+    ]
+
+
+async def test_dispatcher_skips_locked_events_without_waiting(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    locked_id, _ = await _create_outbox_event(postgres)
+    available_id, _ = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
+    )
+    async with postgres.engine.begin() as locker:
+        await locker.execute(
+            select(models.OutboxEvent.id)
+            .where(models.OutboxEvent.id == locked_id)
+            .with_for_update()
+        )
+
+        assert await asyncio.wait_for(dispatcher.dispatch_batch(batch_size=1), 2) == 1
+
+        payloads = await _stream_envelopes(client, f"{prefix}:analyze")
+        assert [payload["event_id"] for payload in payloads] == [str(available_id)]
+    assert await dispatcher.dispatch_batch() == 1
+
+
+async def test_dispatcher_crash_retries_same_event_without_losing_progress(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    first_id, _ = await _create_outbox_event(postgres)
+    crashed_id, review_id = await _create_outbox_event(postgres, task_kind="publish")
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        factory, RedisQueue(client, stream_prefix=prefix)
+    )
+    trigger_name = f"outbox_crash_{uuid.uuid4().hex}"
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            text(f"""
+            CREATE FUNCTION {trigger_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'simulated publication failure'; END $$
+        """)
+        )
+        await connection.execute(
+            text(f"""
+            CREATE TRIGGER {trigger_name} BEFORE UPDATE ON outbox_event
+            FOR EACH ROW WHEN (NEW.id = '{crashed_id}'::uuid)
+            EXECUTE FUNCTION {trigger_name}()
+        """)
+        )
+    try:
+        with pytest.raises(DBAPIError, match="simulated publication failure"):
+            await dispatcher.dispatch_batch()
+    finally:
+        async with postgres.engine.begin() as connection:
+            await connection.execute(
+                text(f"DROP TRIGGER {trigger_name} ON outbox_event")
+            )
+            await connection.execute(text(f"DROP FUNCTION {trigger_name}()"))
+
+    async with factory() as session:
+        first = await session.get(models.OutboxEvent, first_id)
+        crashed = await session.get(models.OutboxEvent, crashed_id)
+        assert first is not None and crashed is not None
+        assert first.broker_published_at is not None
+        assert crashed.broker_published_at is None
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert await client.xlen(f"{prefix}:publish") == 1
+
+    restarted = PostgresOutboxDispatcher(
+        factory, RedisQueue(client, stream_prefix=prefix)
+    )
+    assert await restarted.dispatch_batch() == 1
+
+    payloads = await _stream_envelopes(client, f"{prefix}:publish")
+    expected_payload = {
+        "schema_version": 1,
+        "event_id": str(crashed_id),
+        "review_id": str(review_id),
+        "task_kind": "publish",
+        "attempt": 2,
+        "trace_id": "trace-outbox-test",
+    }
+    assert payloads == [expected_payload, expected_payload]
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, crashed_id)
+        assert event is not None
+        assert event.broker_published_at is not None
+
+
+async def test_parallel_dispatchers_allow_duplicates_but_preserve_first_publication(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
+) -> None:
+    event_id, _ = await _create_outbox_event(postgres)
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class PausedQueue(RedisQueue):
+        async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
+            entered.set()
+            await release.wait()
+            return await super().enqueue(envelope)
+
+    slow = PostgresOutboxDispatcher(factory, PausedQueue(client, stream_prefix=prefix))
+    fast = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
+    slow_run = asyncio.create_task(slow.dispatch_batch())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert await asyncio.wait_for(fast.dispatch_batch(), 2) == 1
+        async with factory() as session:
+            event = await session.get(models.OutboxEvent, event_id)
+            assert event is not None
+            first_published_at = event.broker_published_at
+            assert first_published_at is not None
+        release.set()
+        assert await asyncio.wait_for(slow_run, 2) == 1
+    finally:
+        release.set()
+        if not slow_run.done():
+            slow_run.cancel()
+        with suppress(asyncio.CancelledError):
+            await slow_run
+
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
+    assert [payload["event_id"] for payload in payloads] == [
+        str(event_id),
+        str(event_id),
+    ]
+    assert payloads[0] == payloads[1]
+    assert payloads[0]["event_id"] == str(event_id)
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        assert event.broker_published_at == first_published_at
+    assert await fast.dispatch_batch() == 0
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+async def test_dispatcher_rejects_nonpositive_batch_without_enqueue(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str], batch_size: int
+) -> None:
+    await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        await dispatcher.dispatch_batch(batch_size=batch_size)
+
+    assert await client.xlen(f"{prefix}:analyze") == 0
 
 
 async def test_repository_settings_isolation_and_frozen_history(

@@ -32,7 +32,8 @@ GitHub
                          |     |     +-- /api/* -> FastAPI
                          |     |     +-- /healthcheck -> FastAPI
                          |     +-- FastAPI :8000
-                         |     +-- worker (очередь, тот же API-образ)
+                         |     +-- worker (заглушка review-очереди, тот же API-образ)
+                         |     +-- webhook-worker (GitHub intake, тот же API-образ)
                          |     +-- PostgreSQL, Redis
                          |
                          +-- develop: /opt/dmc-268-t2-develop  :8080
@@ -42,7 +43,7 @@ GitHub
 
 Из application-сервисов публично доступен только web-контейнер каждого окружения: staging — порт `80`, develop — порт `8080`.
 
-FastAPI, воркер, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
+FastAPI, оба воркера, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
 
 DNS и TLS/HTTPS пока не настроены (HTTP по IP).
 
@@ -182,6 +183,7 @@ docker-compose.staging.yml
 web
 api
 worker
+webhook-worker
 db
 redis
 ```
@@ -238,11 +240,11 @@ web -> api:8000
 
 ### Worker
 
-Воркер запускается из того же immutable API-образа, что и FastAPI, и обновляется тем же деплоем: API-образ — одна деплой-единица репозитория (один образ, два сервиса: `api` и `worker`).
+Оба воркера запускаются из того же immutable API-образа, что и FastAPI, и обновляются тем же деплоем: API-образ — одна деплой-единица репозитория (один образ, три сервиса: `api`, `worker` и `webhook-worker`).
 
-Команда воркера сейчас — заглушка (`sleep infinity`): юнит деплоя существует, а логика фоновой обработки очереди появится в задаче про очередь задач (воркеры на Redis). После её реализации менять деплой не придётся — воркер уже обновляется автоматически вместе с API.
+Команда `worker` сейчас — заглушка (`sleep infinity`): логику review-очереди на Redis добавит отдельная задача. `webhook-worker` уже выполняет восстановление GitHub intake и не заменяет review-worker.
 
-Воркер не публикует порт наружу и доступен только внутри Docker network.
+Воркеры не публикуют порты наружу и доступны только внутри Docker network.
 
 ### PostgreSQL
 
@@ -393,7 +395,7 @@ Workflow:
 
 Деплой выполняется в окружение, соответствующее ветке-источнику: пуш в `main` обновляет staging, пуш в `develop` — develop-окружение.
 
-### Автоматический деплой backend и воркера
+### Автоматический деплой backend и воркеров
 
 ```text
 merge API -> main (или develop)
@@ -403,7 +405,7 @@ API CI (quality, build, publish)
 Deploy (workflow_run после успешного API CI)
 ```
 
-Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main` или `develop`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`). Обновляются и API, и воркер (один образ), версия UI сохраняется (см. ниже).
+Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main` или `develop`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`). Обновляются API и оба воркера (один образ), версия UI сохраняется (см. ниже).
 
 Версия UI при этом сохраняется: если `ui_sha` не указан, workflow читает текущий `UI_IMAGE` из env-файла окружения на VPS и обновляет только `API_IMAGE` (см. ADR `docs/adr/0001-autonomous-cd.md`).
 
@@ -423,12 +425,16 @@ Actions
 UI-репозиторий может запускать этот же workflow автоматически после публикации своего образа:
 
 ```bash
-gh workflow run deploy-staging --repo larchanka-training/dmc-268-api-t2 --ref main -f ui_sha=<full-ui-commit-sha>
+gh workflow run deploy-staging.yml \
+  --repo larchanka-training/dmc-268-api-t2 \
+  --ref main \
+  -f environment=staging \
+  -f "ui_sha=${UI_SHA}"
 ```
 
-Для этого в секретах UI-репозитория хранится PAT с правом запуска workflow в API-репозитории; настройка триггера находится в UI-репозитории.
+Здесь `UI_SHA` — полный SHA опубликованного UI-образа из `main`. Для `develop` тот же вызов использует `-f environment=develop` и SHA UI-образа из `develop`. Для этого в секретах UI-репозитория хранится PAT с правом запуска workflow в API-репозитории; настройка триггера находится в UI-репозитории.
 
-Версия API при таком деплое сохраняется: `API_IMAGE` читается из текущего `.env.staging`, обновляется только `UI_IMAGE`.
+Версия API при таком деплое сохраняется: `API_IMAGE` читается из env-файла выбранного окружения, обновляется только `UI_IMAGE`.
 
 ### Правила и крайние случаи
 
@@ -459,7 +465,7 @@ alembic upgrade head
 
 13. запускает API;
 14. ждёт Docker healthcheck API;
-15. запускает воркер и проверяет, что он в состоянии running;
+15. запускает `worker` и `webhook-worker` и проверяет, что оба в состоянии running;
 16. запускает web/Nginx;
 17. проверяет web endpoint окружения (`http://127.0.0.1/` для staging, `http://127.0.0.1:8080/` для develop);
 18. выполняет logout из GHCR.
@@ -496,7 +502,7 @@ Docker build
 GHCR API image sha-<api-commit>
 ```
 
-Backend и воркер деплоятся автоматически: после успешного API CI workflow `Deploy` обновляет `API_IMAGE` в окружении, соответствующем ветке, сохраняя текущую версию UI.
+Backend и оба воркера деплоятся автоматически: после успешного API CI workflow `Deploy` обновляет `API_IMAGE` в окружении, соответствующем ветке, сохраняя текущую версию UI.
 
 Frontend после публикации образа инициирует деплой своей версии: UI-репозиторий запускает `Deploy` с `ui_sha` через PAT (см. `docs/ui-cd-handoff.md`), либо деплой запускается вручную.
 

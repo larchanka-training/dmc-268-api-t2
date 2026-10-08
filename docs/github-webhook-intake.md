@@ -81,9 +81,40 @@ UI ingress также должен содержать точный webhook locat
 Без него прежний nginx отклоняет тела больше 1 МиБ до API. Документальный
 PR #22 не содержит этого runtime-изменения.
 `WEBHOOK__SECRET` обязателен для приёма. `GITHUB__TOKEN` — опциональный
-внешний read token для private repositories (PAT или GitHub App installation
-token); OAuth/login flow эта задача не реализует. Секреты
+внешний read token для private repositories. Для постоянного runtime этой
+итерации используйте ограниченный нужными repositories read PAT. GitHub App
+installation token [истекает через час](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app):
+он подходит для короткого smoke либо при внешней ротации с обновлением
+окружения и перезапуском API/webhook-worker до истечения. Автоматического
+mint/refresh installation token и OAuth/login flow здесь нет. Секреты
 передаются окружением/secret store, не добавляются в репозиторий.
+
+## Handoff другим ролям
+
+- **Backend worker #13:** `GithubPort.fetch` и `parse_diff` доступны для
+  авторизованного review pipeline. Не передавайте intake artifact напрямую в
+  Gateway: его `schema_version="1.0"` — внутренняя версия, а wire
+  `ContextPayload` требует integer `1`, backend-assigned review/chunk IDs,
+  frozen `rules_version`/`output_language`, `related_symbols` и budget.
+  Повторное использование receipt допустимо только при совпадении repository,
+  PR, base/head SHA и frozen ignore policy; иначе повторно capture/parse по
+  настройкам конкретного ReviewJob. Пустой artifact не является валидным
+  полным ContextPayload. Redis envelope содержит IDs, а не raw diff.
+- **Frontend #15/#16:** endpoint webhook не заменяет auth/review REST API и
+  не меняет их контракты. HTTP projection владельца #13 преобразует
+  `old_count/new_count` в `old_lines/new_lines`, `text` в `content`, убирает
+  внутренние IDs hunks и выбирает `path=new_path or old_path`;
+  `previous_path=old_path` только для rename. UI adapter использует canonical
+  `deleted`/`kind`/snake_case, не текущие mock `removed`/`type`/camelCase.
+- **Architecture/UI #22:** status-only lifecycle относится к ReviewJob,
+  состояния receipt — отдельный intake. Общая диаграмма `UI/webhook ->
+  ReviewJob + outbox` описывает целевой review pipeline, а не автоматический
+  side effect реализованного webhook. Actor/access/quota и создание ReviewJob
+  остаются во владении #13.
+- **LLM PR #18:** rebase/adaptation на принятый #21 и этот PR сохраняет
+  canonical schemas, миграцию `0005`, GitHub config/token passthrough,
+  independent webhook-worker, безопасный env encoder и integration CI.
+  Runtime Gateway сюда не переносится; совместный pipeline требует adapter.
 
 ## Локальная и ручная проверка
 
@@ -141,6 +172,13 @@ WHERE provider_name = 'github' AND delivery_id = 'local-delivery-1';
 
 Для end-to-end ручной проверки настройте GitHub webhook на публичный HTTPS URL
 того же маршрута, JSON content type, тот же secret и событие Pull requests.
+Текущий CD #20 предоставляет HTTP на IP и сознательно не добавляет TLS.
+Для этой проверки оператор должен подготовить HTTPS ingress/forwarder с
+валидным сертификатом и не отключать SSL verification
+([рекомендация GitHub](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks)).
+Сначала задеплойте API и UI nginx-fix; одного документального UI PR #22
+недостаточно. Конфигурация TLS, секретов и webhook в GitHub не менялась
+автоматически при локальной проверке.
 Откройте PR или обновите head, проверьте `202` в GitHub Recent Deliveries и
 одну запись на delivery GUID. Затем используйте **Redeliver** для проверки
 дедупликации; `READY` должен содержать зафиксированные SHA, diff и Level 1

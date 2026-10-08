@@ -120,11 +120,11 @@ async def _create_settings(
         insert(models.RepositorySettings).values(
             id=settings_id,
             repository_id=repository_id,
-            rules={},
-            ignores={},
+            rules={"instructions": []},
+            ignores={"globs": []},
             max_starts_per_hour=10,
             max_active_jobs=4,
-            output_language="en",
+            output_language="ru",
             surrounding_lines=5,
             created_at=datetime.now(UTC),
             rules_digest=rules_digest or f"rules-{settings_id.hex}",
@@ -190,7 +190,6 @@ def _review_values(
         "created_at": now,
         "finished_at": None,
         "status": "QUEUED",
-        "stage": None,
         "queue_deadline_at": now + timedelta(minutes=15),
         "coverage": {},
     }
@@ -334,7 +333,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0003"
+        ).scalar_one() == "0004"
 
         result = await connection.execute(
             text(
@@ -395,7 +394,9 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
         status_check = constraints["ck_review_job_status_finished_at"][5]
         for status in (
             "QUEUED",
-            "RUNNING",
+            "FETCHING_DIFF",
+            "PARSING_CONTEXT",
+            "LLM_PROCESSING",
             "COMPLETED",
             "PARTIAL",
             "FAILED",
@@ -809,7 +810,7 @@ async def test_active_run_variations_and_status_finished_check(
         await connection.execute(
             update(models.ReviewJob)
             .where(models.ReviewJob.id == original_review)
-            .values(status="RUNNING")
+            .values(status="LLM_PROCESSING")
         )
         protected_duplicate = postgres.track("review_job", uuid.uuid4())
         with pytest.raises(IntegrityError) as active_duplicate_error:

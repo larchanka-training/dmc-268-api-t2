@@ -89,7 +89,6 @@ erDiagram
         TIMESTAMPTZ started_at
         TIMESTAMPTZ finished_at
         TEXT status
-        TEXT stage
         TIMESTAMPTZ queue_deadline_at
         TIMESTAMPTZ analysis_deadline_at
         JSONB coverage
@@ -102,8 +101,11 @@ erDiagram
         TIMESTAMPTZ occurred_at
         TEXT event_type
         TEXT status
-        TEXT stage
+        TEXT phase "nullable"
         TEXT reason_code
+        BOOLEAN retryable
+        INT attempt
+        JSONB safe_details "nullable"
     }
 
     ContextPayload {
@@ -140,6 +142,7 @@ erDiagram
         TEXT explanation
         TEXT evidence
         TEXT recommendation
+        TEXT proposed_diff_fix "nullable"
         TIMESTAMPTZ created_at
     }
 
@@ -249,10 +252,19 @@ erDiagram
 | WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |
 | IdempotencyRecord            | `UNIQUE(scope, idempotency_key)`         |
 
+Текущий GitHub connection flow использует существующие `Repository` и
+`RepositoryAccess`, а не отдельную таблицу подключения. `Repository` уникален
+по provider/external ID; связь `(repository_id, user_id)` создаётся атомарно
+после проверки актуального GitHub доступа. Role backend выводит из provider
+permissions. Новому repository создаётся первая settings version, но повторное
+подключение другого или того же пользователя не переписывает существующие
+settings и их frozen references. `GET /repositories` выбирает только связи
+текущего пользователя; наличие строки Repository само по себе не даёт доступ.
+
 Допустимые значения:
 
-- `ReviewJob.status`: `QUEUED | RUNNING | COMPLETED | PARTIAL | FAILED | SKIPPED`;
-- `ReviewJob.stage`: `snapshot | context | inference | validation | done | NULL`;
+- `ReviewJob.status`: `QUEUED | FETCHING_DIFF | PARSING_CONTEXT | LLM_PROCESSING | COMPLETED | PARTIAL | FAILED | SKIPPED`;
+- `ReviewEvent.phase`: `FETCHING_DIFF | PARSING_CONTEXT | LLM_PROCESSING | NULL`;
 - `Publication.status`: `NOT_READY | PENDING | PUBLISHED | PARTIAL | FAILED | UNKNOWN | SKIPPED`;
 - `Finding.side`: `OLD | NEW`;
 - `Finding.category`: `security | correctness | performance | maintainability`;
@@ -262,12 +274,13 @@ erDiagram
 - `RepositoryAccess.role`: `reviewer | admin`.
 
 Именованный CHECK `ck_review_job_status_finished_at` использует
-`ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED` и
-`RUNNING` требуют `finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и
-`SKIPPED` требуют `finished_at IS NOT NULL`. Terminal-переход записывает status и
+`ReviewJob.finished_at` как DB-маркер активности. Статусы `QUEUED`,
+`FETCHING_DIFF`, `PARSING_CONTEXT` и `LLM_PROCESSING` требуют
+`finished_at IS NULL`; `COMPLETED`, `PARTIAL`, `FAILED` и `SKIPPED` требуют
+`finished_at IS NOT NULL`. Terminal-переход записывает status и
 `finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого
 statement, одной транзакции с двумя отдельными обновлениями недостаточно.
-`stage` в этот invariant не входит.
+Отдельного current/public `stage` нет.
 
 `Repository.current_settings_id` изначально равен `NULL`. После создания первой
 версии настроек составной FK разрешает назначить только настройки того же
@@ -302,11 +315,67 @@ SQLAlchemy `use_alter` разрывает только DDL-цикл создан
 - `ContextPayload.payload_body`;
 - `ChunkResult.limitations`;
 - `ChunkResult.usage`;
+- `ReviewEvent.safe_details`;
 - `Publication.provider_metadata`;
 - `RepositorySettings.rules`;
 - `RepositorySettings.ignores`.
 
-`ContextPayload.payload_body` содержит `snapshot`, `metadata`, `files`, `related_symbols`, `coverage`, `budget`. Значения `review_id`, `chunk_id` и `schema_version` представлены отдельными колонками `review_job_id`, `id`, `schema_version`.
+`ContextPayload.payload_body` содержит `snapshot`, `metadata`, `files`,
+`related_symbols`, `coverage`, `budget`, но не дублирует `review_id`, `chunk_id`
+или `schema_version`. Их authoritative значения находятся в колонках
+`review_job_id`, `id`, `schema_version`. Полный wire payload по
+`schemas/context/v1.json` собирается из этих колонок и body перед валидацией
+и вызовом LLM; при записи body валидируется без доверия к идентификаторам из
+внешнего JSON. Application value `BuiltContextPayload` содержит body, версию,
+`review_id` и `chunk_id`; `to_wire()` отклоняет envelope-поля в body и собирает
+wire payload из этих значений.
+`metadata.output_language` в wire context может сохранить непустой язык
+исторической версии; новые версии настроек принимают только `ru`.
+
+`ChunkResult.limitations` содержит JSON array строк. `usage` nullable и при
+наличии содержит только non-negative `input_tokens` и `output_tokens`. Finding
+сохраняет nullable `proposed_diff_fix`; это предложение никогда не применяется
+автоматически.
+
+Миграция `0004` идёт после `0003_result_context_ownership`. Она не меняет
+существующие `RepositorySettings.rules`, `ignores`, `rules_digest`,
+`output_language`, а также frozen settings/digests в ReviewJob. Legacy `{}`
+проецируется на чтении как пустые canonical rules/ignores без UPDATE; исходный
+`output_language` старой версии, включая не-`ru`, возвращается без подмены.
+Сохранённый `rules_digest` не пересчитывается. Иные noncanonical legacy
+settings дают `GET /settings` ответ `409 LEGACY_SETTINGS_UNSUPPORTED` с opaque
+ETag и новый start `409` до quota/outbox; принятые jobs и idempotency replay
+остаются на frozen версии. Admin full canonical PUT с `If-Match` атомарно
+создаёт новую `ru`-версию и переключает current pointer без наследования
+старого JSON.
+
+Для `ChunkResult.limitations` миграция `0004` переводит legacy `{}` в `[]` и
+ровно `{"warnings": [<строки>]}` в массив тех же строк; `usage={}` становится
+`NULL`. Неизвестная непустая JSON-форма останавливает upgrade на preflight с
+идентификатором записи и инструкцией оператору, без содержимого JSON; вся
+миграция откатывается. Preflight и преобразование выполняются в одной
+транзакции после раннего
+`LOCK TABLE review_job, chunk_result IN ACCESS EXCLUSIVE MODE`, чтобы запись
+не прошла между проверкой и обновлением. Перед
+deployment нужно остановить старые writes/workers; длительность ожидания lock
+ограничивает операторский timeout. При downgrade `limitations=[]` становится
+`{}`, а непустой массив строк становится `{"warnings": [строки]}` без потери строк.
+Legacy `ReviewEvent.reason_code` сохраняется в audit-БД:
+новые записи используют ограниченный enum, неизвестный исторический код в
+публичной проекции становится `null`, не raw-текстом.
+
+Legacy `ReviewJob.status=RUNNING` преобразуется по stage в новый active status;
+`ReviewEvent.stage` становится `phase` с отображением snapshot/context/inference/
+validation на active phase, а done на `NULL`. Downgrade status/phase намеренно
+теряет различие исходных `validation` и `done`; frozen settings остаются
+нетронутыми и при downgrade.
+
+Новые `RepositorySettings.rules` имеют canonical форму
+`{"instructions": []}`, а `ignores` — `{"globs": []}`. Строки уникальны и
+непусты; порядок instructions семантически значим. Globs — normalized
+repository-relative POSIX patterns без absolute path, `..`, backslash, NUL и
+negation. `rules_digest` создаёт backend из canonical serialization при записи
+новой версии, но исторический digest не пересчитывается.
 
 ---
 
@@ -324,14 +393,18 @@ SQLAlchemy `use_alter` разрывает только DDL-цикл создан
 
 ---
 
-## 6. Открытые вопросы
+## 6. Отложенная реализация
 
-- структура `ReviewJob.error/reason`;
 - семантика `Repository.enabled`;
 - место хранения GitHub `installation_id`;
-- JSON schema для `RepositorySettings.rules/ignores`;
-- модель хранения OAuth/access для `User`;
-- необходимость `ChunkResult.schema_version` после окончательной сверки с canonical review-result schema.
+- физическая модель OAuth identity/access и обязательного PostgreSQL
+  `AuthSession`; accepted контракт требует 30-минутную JWT cookie с уникальным
+  `sid`, server-side revocation и CSRF verifier. Refresh продлевает только
+  действующую unexpired session атомарно с выдачей cookie на тот же `sid` и
+  сохранением CSRF token; отдельный refresh token не нужен;
+- HTTP adapters для provider-backed списка доступных repository, атомарного
+  подключения и session refresh по `openapi.yaml`;
+- полные worker/dispatcher/recovery adapters.
 
 ---
 

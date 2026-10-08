@@ -55,8 +55,12 @@ asyncio_mode = "auto"
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.25,<5",
     "mypy>=2.3.1",
+    "openapi-spec-validator>=0.7,<0.8",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.6",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-pyyaml>=6.0.12.20260906",
 ]

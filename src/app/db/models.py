@@ -660,10 +660,30 @@ class WebhookReceipt(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
+    processing_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="IGNORED"
+    )
+    request_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    snapshot_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    raw_diff: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
             "provider_name", "delivery_id", name="uq_webhook_receipt_provider_delivery"
+        ),
+        Index(
+            "ix_webhook_receipt_pending",
+            "received_at",
+            "id",
+            postgresql_where=text("processing_status IN ('PENDING','PROCESSING')"),
         ),
     )
 

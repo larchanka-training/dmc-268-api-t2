@@ -504,7 +504,7 @@ paths:
           application/json:
             schema: { type: object, additionalProperties: true }
       responses:
-        '202': { description: 'Valid delivery accepted, ignored, or already processed' }
+        '202': { description: 'Valid delivery accepted durably for capture, ignored, or already processed' }
         '401':
           description: Missing or invalid signature; both use the same safe shape
           content:
@@ -512,6 +512,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
               example: { code: AUTHENTICATION_REQUIRED, message: Authentication is required., request_id: req_123, retryable: false, retry_after: null }
         '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /healthcheck:
     get:
       tags: [diagnostics]

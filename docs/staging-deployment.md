@@ -307,6 +307,10 @@ POSTGRES__DB=dmc
 | `LLM__API_KEY` | `LLM__API_KEY` | Ключ LLM-провайдера (LLM Gateway) |
 | `LLM__API_BASE` | `LLM__API_BASE` | Базовый URL LLM API |
 | `WEBHOOK__SECRET` | `WEBHOOK__SECRET` | HMAC-секрет входящих VCS webhooks |
+| `GITHUB__TOKEN` | `GITHUB__TOKEN` | Read token GitHub API для PR/compare; не Actions `GITHUB_TOKEN` |
+
+`webhook-worker` запускает recovery GitHub intake отдельно от ReviewJob worker.
+Нужны PostgreSQL и доступ к GitHub API; подробности: [GitHub intake](github-webhook-intake.md).
 
 Чтобы добавить секрет из таблицы, достаточно создать его в GitHub — деплой менять не нужно. Новая переменная вне таблицы — это одна строка в шаге «Write runtime environment» деплой-workflow и одна строка в `environment:` сервисов compose.
 

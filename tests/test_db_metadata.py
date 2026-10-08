@@ -7,6 +7,20 @@ from app.db import models
 from app.db.base import Base
 
 
+def test_webhook_recovery_has_partial_pending_index() -> None:
+    table = Base.metadata.tables["webhook_receipt"]
+    index = next(
+        (item for item in table.indexes if item.name == "ix_webhook_receipt_pending"),
+        None,
+    )
+    assert index is not None
+    assert tuple(column.name for column in index.columns) == ("received_at", "id")
+    assert (
+        str(index.dialect_options["postgresql"]["where"])
+        == "processing_status IN ('PENDING','PROCESSING')"
+    )
+
+
 def test_expected_core_tables_are_registered() -> None:
     expected = {
         "user",

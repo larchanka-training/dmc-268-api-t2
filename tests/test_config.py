@@ -59,3 +59,17 @@ def test_postgres_url_quotes_special_characters() -> None:
     )
 
     assert postgres.url == "postgresql+asyncpg://svc:p%40ss+w%3Ard@db:5433/dmc"
+
+
+def test_webhook_secret_is_loaded_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEBHOOK__SECRET", "webhook-test-secret")
+    settings = Settings()
+    assert settings.webhook.secret.get_secret_value() == "webhook-test-secret"
+    assert "webhook-test-secret" not in repr(settings)
+
+
+def test_github_token_is_loaded_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB__TOKEN", "github-test-token")
+    settings = Settings()
+    assert settings.github.token.get_secret_value() == "github-test-token"
+    assert "github-test-token" not in repr(settings)

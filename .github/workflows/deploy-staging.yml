@@ -309,6 +309,7 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM__API_KEY }}
           LLM_API_BASE: ${{ secrets.LLM__API_BASE }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
+          GITHUB_API_TOKEN: ${{ secrets.GITHUB__TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -316,7 +317,10 @@ jobs:
           append_optional() {
             local name="$1" value="$2"
             if [[ -n "${value}" ]]; then
-              printf '%s=%s\n' "${name}" "${value}"
+              local encoded
+              encoded="$(printf '%s' "${value}" | python3 -c \
+                'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False).replace("$", "$$"))')"
+              printf '%s=%s\n' "${name}" "${encoded}"
             fi
           }
 
@@ -325,7 +329,7 @@ jobs:
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
             printf 'WEB_PORT=%s\n' "${WEB_PORT}"
             printf 'POSTGRES__USER=dmc\n'
-            printf 'POSTGRES__PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
+            append_optional 'POSTGRES__PASSWORD' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
             # Runtime secrets passthrough: GitHub Encrypted Secrets ->
             # container env. Forwarded only when the secret is defined;
@@ -333,6 +337,7 @@ jobs:
             append_optional 'LLM__API_KEY' "${LLM_API_KEY:-}"
             append_optional 'LLM__API_BASE' "${LLM_API_BASE:-}"
             append_optional 'WEBHOOK__SECRET' "${WEBHOOK_SECRET:-}"
+            append_optional 'GITHUB__TOKEN' "${GITHUB_API_TOKEN:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
@@ -461,30 +466,32 @@ jobs:
             sleep 2
           done
 
-          echo "Starting worker..."
-          compose up -d worker
+          echo "Starting workers..."
+          compose up -d worker webhook-worker
 
-          echo "Waiting for worker..."
-          for attempt in $(seq 1 30); do
-            worker_id="$(compose ps -q worker)"
+          for service in worker webhook-worker; do
+            echo "Waiting for ${service}..."
+            for attempt in $(seq 1 30); do
+              worker_id="$(compose ps -q "${service}")"
 
-            worker_state="$(docker inspect \
-              --format='{{.State.Status}}' \
-              "${worker_id}" 2>/dev/null || true)"
+              worker_state="$(docker inspect \
+                --format='{{.State.Status}}' \
+                "${worker_id}" 2>/dev/null || true)"
 
-            if [[ "${worker_state}" == "running" ]]; then
-              echo "Worker is running"
-              break
-            fi
+              if [[ "${worker_state}" == "running" ]]; then
+                echo "${service} is running"
+                break
+              fi
 
-            if [[ "${attempt}" -eq 30 ]]; then
-              echo "ERROR: Worker did not reach running state"
-              compose ps
-              compose logs --tail=100 worker
-              exit 1
-            fi
+              if [[ "${attempt}" -eq 30 ]]; then
+                echo "ERROR: ${service} did not reach running state"
+                compose ps
+                compose logs --tail=100 "${service}"
+                exit 1
+              fi
 
-            sleep 2
+              sleep 2
+            done
           done
 
           echo "Starting web..."

@@ -36,6 +36,7 @@ services:
       LLM__API_KEY: ${LLM__API_KEY:-}
       LLM__API_BASE: ${LLM__API_BASE:-}
       WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
     depends_on:
       db:
         condition: service_healthy
@@ -82,6 +83,26 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  webhook-worker:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    restart: unless-stopped
+    command: ["python", "-m", "app.webhook_worker"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+    depends_on:
+      db:
         condition: service_healthy
     networks:
       - backend

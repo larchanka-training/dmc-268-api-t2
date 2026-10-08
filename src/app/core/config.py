@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,14 @@ class Redis(BaseModel):
     """Redis connection settings (REDIS__* env variables)."""
 
     url: str = "redis://localhost:6379/0"
+
+
+class Webhook(BaseModel):
+    secret: SecretStr = SecretStr("")
+
+
+class Github(BaseModel):
+    token: SecretStr = SecretStr("")
 
 
 class Logging(BaseModel):
@@ -63,6 +71,8 @@ class Settings(BaseSettings):
 
     postgres: Postgres = Field(default_factory=Postgres)
     redis: Redis = Field(default_factory=Redis)
+    webhook: Webhook = Field(default_factory=Webhook)
+    github: Github = Field(default_factory=Github)
     logging: Logging = Field(default_factory=Logging)
 
 

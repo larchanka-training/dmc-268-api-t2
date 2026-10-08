@@ -9,6 +9,34 @@ from typing import Literal, Protocol
 
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 
+type TaskKind = Literal["analyze", "publish"]
+
+
+@dataclass(frozen=True, slots=True)
+class QueueTaskEnvelope:
+    schema_version: int
+    event_id: str
+    review_id: str
+    task_kind: TaskKind
+    attempt: int
+    trace_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class QueueDelivery:
+    message_id: str
+    envelope: QueueTaskEnvelope
+
+
+class QueuePort(Protocol):
+    async def enqueue(self, envelope: QueueTaskEnvelope) -> str: ...
+
+    async def receive(
+        self, *, task_kind: TaskKind, consumer_name: str
+    ) -> QueueDelivery | None: ...
+
+    async def ack(self, delivery: QueueDelivery) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ChangeRequestSnapshot:

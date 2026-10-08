@@ -85,6 +85,34 @@ docker stop dmc268-api-test-db
 на выделенной тестовой базе; переменные `POSTGRES__*` и
 `DMC268_TEST_DATABASE_URL` должны указывать на один и тот же контейнер.
 
+### Интеграционные тесты Redis queue adapter
+
+Используйте отдельный Redis без рабочих данных. Тесты создают уникальные stream
+keys и удаляют только их; `FLUSHDB` не вызывается. CI запускает их с Redis 8.
+
+```bash
+docker run --rm -d --name dmc268-api-test-redis \
+  -p 127.0.0.1:56379:6379 redis:8-alpine
+DMC268_TEST_REDIS_URL=redis://localhost:56379/0 uv run pytest tests/test_redis_queue.py
+docker stop dmc268-api-test-redis
+```
+
+Без `DMC268_TEST_REDIS_URL` эти тесты пропускаются, как PostgreSQL integration
+tests без отдельной тестовой БД.
+
+`RedisQueue` принимает `redis.asyncio.Redis.from_url(settings.redis.url)`;
+создание и закрытие клиента остаётся обязанностью вызывающего кода. Application
+`QueuePort` предоставляет `enqueue`, `receive` и явный `ack`. Canonical envelope
+отделён от transport message ID в `QueueDelivery`. Analyze и publish используют
+разные streams, а `receive` читает одну новую задачу без ожидания. Полученная
+задача остаётся pending до `ack`, который вызывающий worker должен делать только
+после durable processing decision. Повторный ACK возвращает `False`.
+
+Этот этап не включает recovery pending work, worker pipeline, outbox dispatcher,
+leases/fencing, retries, task expiry, DLQ и REST API. Их гарантии остаются
+определены в `docs/PIPELINE_SPEC.md`; сохранение pending само по себе ещё не
+обеспечивает полный цикл at-least-once processing.
+
 ## Staging
 
 Инфраструктура, Terraform, CI/CD (автодеплой `main` → staging, `develop` → develop-окружение) и процедура деплоя описаны в

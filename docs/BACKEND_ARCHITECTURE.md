@@ -54,6 +54,7 @@ src/app/
 │  ├─ session.py                  # асинхронный движок SQLAlchemy и сессия БД
 │  ├─ models.py                   # ORM-модели предметной схемы
 │  ├─ repositories.py             # SQLAlchemy persistence adapter
+│  ├─ task_leases.py              # analyze/publish lease и transactional fencing
 │  ├─ webhook_inbox.py            # durable GitHub intake
 │  └─ uow.py                      # граница commit/rollback
 ├─ domain/
@@ -78,7 +79,8 @@ migrations/
    ├─ 0002_backend_core.py
    ├─ 0003_result_context_ownership.py
    ├─ 0004_contract_foundation.py
-   └─ 0005_github_webhook_inbox.py
+   ├─ 0005_github_webhook_inbox.py
+   └─ 0006_task_lease_kind.py
 
 docs/
 ├─ BACKEND_ARCHITECTURE.md
@@ -219,6 +221,10 @@ summary, findings и limitations по `schemas/llm-output/v1.json`; gateway до
 ```text
 Publication: PENDING
  ↓
+TaskLease(publish) + новый fencing_token
+ ↓
+сериализация публикаций по ChangeRequest
+ ↓
 проверка состояния PR / SHA / доступа
  ↓
 Publisher
@@ -231,6 +237,26 @@ PUBLISHED | PARTIAL | FAILED | UNKNOWN | SKIPPED
 ```
 
 Lifecycle анализа и lifecycle публикации независимы. Повторная попытка публикации не запускает inference LLM повторно.
+
+Одна таблица TaskLease обслуживает analyze и publish, сохраняя единственный lease
+на ReviewJob и обязательный task_kind с CHECK. Миграция 0006 после 0005 заполняет
+старые lease как analyze, сохраняя owner, expiry и fencing_token. Analyze
+захватывает только активный ReviewJob. Publish захватывает
+COMPLETED/PARTIAL при Publication(PENDING) и неистёкшем publication deadline;
+terminal status и finished_at ReviewJob остаются неизменными. Назначение lease
+должно проверяться по authoritative данным вместе с owner/token/expiry: смена
+lifecycle не превращает существующий analysis lease в publish lease.
+
+Записи Publication, включая подготовку PENDING анализатором и результат работы
+publisher, проверяют соответствующий fencing в той же UoW-транзакции, что и запись.
+Renew разрешён только пока задача своего типа остаётся допустимой; release после
+завершения остаётся доступен текущему владельцу живого lease. UNKNOWN требует
+отдельной reconciliation и исключает автоматическую повторную публикацию.
+Подробный контракт задан в PIPELINE_SPEC.md §5 и §8.
+
+Разные ReviewJob одного ChangeRequest имеют разные lease. Поэтому сериализация
+provider-вызовов для одного PR нужна отдельно от TaskLease; транзакционные locks
+на ReviewJob не заменяют её и не удерживаются во время внешнего I/O.
 
 ### 3.6 Dispatcher и recovery
 
@@ -298,6 +324,8 @@ PostgreSQL хранит долговременное состояние сист
 | `ContextBuilderPort` | snapshot + исходные данные → `ContextPayload` |
 | `LlmGatewayPort` | `ContextPayload` → структурированный `ReviewChunkResult` |
 | `PublisherPort` | сохранённый результат ReviewJob → remote publication IDs |
+| `TaskLeasePort` | явный analyze/publish acquire, heartbeat и release; authoritative тип хранится в PostgreSQL |
+| `PublicationRepositoryPort` | get snapshot, analysis-fenced prepare и publish-fenced update в существующей UoW |
 | repository/UoW ports | операции хранения и управление транзакцией |
 
 `StartReviewCommand` является application value. Use case вычисляет
@@ -308,6 +336,20 @@ UoW commit. SQLAlchemy repository выводит repository anchor из ChangeRe
 `ReviewJobRepositoryPort.get` возвращает immutable `ReviewJobSnapshot` с
 идентификаторами, зафиксированными параметрами запуска и состоянием либо `None`,
 если ReviewJob не найден.
+
+`UnitOfWorkPort.publications` использует ту же session и commit/rollback, что и
+review_jobs. `prepare(analyze_claim)` переводит только NOT_READY в PENDING после
+COMPLETED/PARTIAL и задаёт фиксированный deadline. `update(publish_claim, status,
+provider_metadata)` записывает progress/outcome только из допустимого PENDING,
+не меняя terminal ReviewJob и deadline. Deadline ограничивает новые provider
+attempts и PENDING/progress. Terminal outcome ранее начатой попытки можно
+зафиксировать после deadline под тем же ещё живым publish lease; SQL UPDATE
+по-прежнему проверяет сохранённый kind, owner, token и expiry. started_at — начало
+цикла, а начало каждой внешней попытки до deadline проверяет будущий worker.
+Acquire/renew после deadline запрещены. Отказ возвращается как LeaseLostError;
+обычные методы publisher не выполняют reconciliation UNKNOWN. Completion/outbox
+orchestration остаётся задачей worker: terminal write, prepare и publish event
+должны войти в одну UoW-транзакцию.
 
 Сообщение очереди содержит `schema_version`, `event_id`, `review_id`, `task_kind`, `attempt`, `trace_id`. Diff, prompt и результат LLM в сообщении broker не передаются.
 

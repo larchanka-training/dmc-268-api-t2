@@ -172,6 +172,7 @@ erDiagram
         UUID id PK
         UUID review_job_id FK
         TEXT owner
+        TEXT task_kind
         TIMESTAMPTZ expires_at
         BIGINT fencing_token
     }
@@ -254,7 +255,7 @@ erDiagram
 | ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, composite FK `(review_job_id, context_payload_id) → ContextPayload(review_job_id, id)`, `ON DELETE SET NULL (context_payload_id)` |
 | ChunkResult → Finding        | `1:N`                                    |
 | ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
-| ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
+| ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`; обязательный `task_kind`, CHECK `analyze/publish` |
 | ReviewJob → OutboxEvent      | `1:N`                                    |
 | RepositoryAccess             | `UNIQUE(repository_id, user_id)`         |
 | WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |

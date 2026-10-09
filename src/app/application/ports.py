@@ -7,7 +7,13 @@ from datetime import datetime
 from types import TracebackType
 from typing import Literal, Protocol
 
-from app.domain.enums import FindingCategory, FindingSeverity, FindingSide, ReviewStatus
+from app.domain.enums import (
+    FindingCategory,
+    FindingSeverity,
+    FindingSide,
+    PublicationStatus,
+    ReviewStatus,
+)
 
 type TaskKind = Literal["analyze", "publish"]
 
@@ -161,15 +167,50 @@ class TaskLeaseSnapshot:
     owner: str
     expires_at: datetime
     fencing_token: int
+    task_kind: TaskKind
 
 
 class LeaseLostError(Exception):
     """The worker no longer has authority to persist this review."""
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationSnapshot:
+    review_job_id: uuid.UUID
+    status: str
+    provider_metadata: dict[str, object] | None
+    started_at: datetime | None
+    deadline_at: datetime | None
+    finished_at: datetime | None
+
+
+class PublicationRepositoryPort(Protocol):
+    async def get(self, review_job_id: uuid.UUID) -> PublicationSnapshot | None: ...
+
+    async def prepare(self, lease: TaskLeaseSnapshot) -> None:
+        """Prepare PENDING in the analysis completion UoW; never commit here."""
+        ...
+
+    async def update(
+        self,
+        lease: TaskLeaseSnapshot,
+        *,
+        status: PublicationStatus,
+        provider_metadata: dict[str, object] | None,
+    ) -> None:
+        """Fence progress/outcome in this UoW; refuse lost authority.
+
+        PENDING progress requires a future deadline. Terminal outcomes of an
+        already-started attempt may be recorded after deadline with a live
+        publish lease. The caller must start provider I/O before deadline;
+        this method neither starts an attempt nor verifies its start time.
+        """
+        ...
+
+
 class TaskLeasePort(Protocol):
     async def acquire(
-        self, review_job_id: uuid.UUID, *, owner: str
+        self, review_job_id: uuid.UUID, *, owner: str, task_kind: TaskKind
     ) -> TaskLeaseSnapshot | None: ...
 
     async def renew(self, lease: TaskLeaseSnapshot) -> TaskLeaseSnapshot | None: ...
@@ -226,6 +267,7 @@ class ReviewJobRepositoryPort(Protocol):
 
 class UnitOfWorkPort(Protocol):
     review_jobs: ReviewJobRepositoryPort
+    publications: PublicationRepositoryPort
 
     async def __aenter__(self) -> UnitOfWorkPort: ...
     async def __aexit__(

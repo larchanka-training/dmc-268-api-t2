@@ -101,12 +101,17 @@ not the wire contract.
 
 - Queue deadline: 15 minutes from creation.
 - Analysis deadline: 10 minutes including generic retries and format repair.
-- Publication deadline: 5 minutes for a publication cycle.
+- Publication deadline: 5 minutes for starting attempts in a publication cycle.
+  It forbids new external publication attempts and PENDING/progress writes after
+  expiry, but does not discard the outcome of an attempt started before expiry.
+  Recording that outcome still requires the original live publish lease.
 - Context and model token budgets are fixed in the persisted ContextPayload.
 
-Exceeding a deadline records the corresponding reason event and applies terminal
-semantics based on whether useful validated output exists. Retry scheduling must
-never extend an accepted deadline.
+Exceeding a queue or analysis deadline records the corresponding reason event
+and applies terminal semantics based on whether useful validated output exists.
+Publication expiry blocks new attempts while preserving the ability to record
+an in-flight outcome under its live lease. Retry scheduling must never extend an
+accepted deadline.
 
 ## 4. Transactional outbox and Redis queue behavior
 
@@ -138,7 +143,8 @@ issue #13 owns the concrete worker/DLQ implementation:
 
 The Redis enqueue acknowledgement is not proof that a job completed. PostgreSQL
 outbox/job/lease state remains authoritative; recovery re-enqueues eligible work
-when a message is lost after enqueue, without reviving a terminal job.
+when a message is lost after enqueue. Analyze recovery must not revive a terminal
+job; publish recovery may operate on a completed analysis without reopening it.
 
 The v1 serializer emits only the canonical envelope fields. V1 consumers ignore
 unknown optional fields. Breaking envelope changes require a new major version
@@ -168,14 +174,104 @@ There is no dispatcher retry loop or long-running process in this slice.
 
 ## 5. Leases and fencing
 
-At most one live `TaskLease` exists per review. A worker must acquire or renew the
-lease and use a monotonically increasing fencing token. Every persistence write
-for snapshot, context, chunk result, findings, terminal state, or publication
-must verify the current lease and fencing token. External calls occur outside an
-open PostgreSQL transaction.
+One `TaskLease` table serves both `analyze` and `publish`, with one persistent row
+per ReviewJob and at most one live owner. `TaskLease.task_kind` is a required
+persisted `analyze`/`publish` value protected by a PostgreSQL CHECK. Migration
+`0006` follows `0005` and backfills existing leases as `analyze`, preserving their
+owner, expiry, and fencing token. No permanent database default is retained;
+new grants explicitly supply their kind. Acquisition is task-specific:
 
-Recovery considers missing/expired leases, `retry_at`, lifecycle status, and all
-deadlines. It must not revive terminal work or create equivalent pending work.
+- `analyze` requires an active ReviewJob (`QUEUED`, `FETCHING_DIFF`,
+  `PARSING_CONTEXT`, or `LLM_PROCESSING`) with `finished_at IS NULL`.
+- `publish` requires a terminal `COMPLETED` or `PARTIAL` ReviewJob, a `PENDING`
+  Publication, and a non-null `Publication.deadline_at` strictly later than the
+  PostgreSQL clock. A missing publication/deadline is ineligible. Acquisition
+  does not change the terminal ReviewJob status or `finished_at`.
+
+Every new acquisition, including an analyze-to-publish handoff, increments the
+persisted fencing token (the first token is one). A live lease cannot be taken
+over, even by the same owner or a different task kind. Release expires the row;
+it never deletes it or resets the counter. Expired leases are replaced in place.
+
+Lease authority must bind the task kind as well as review ID, owner, token, and
+live database expiry. The current ReviewJob lifecycle alone is insufficient to
+prove the kind of an existing lease: an analyze lease can remain live after its
+terminal write. Merely adding a task kind to an in-memory claim is insufficient,
+because the database must reject a claim whose kind was changed by its caller.
+An analyze claim cannot authorize a publisher's writes, and a publish claim
+cannot authorize analysis writes or reopen a completed ReviewJob.
+
+Renewal keeps the owner, task kind, and token, and extends expiry to database
+time plus 90 seconds. Analysis renewal requires an active ReviewJob; publication
+renewal requires the same lifecycle/publication/deadline eligibility as publish
+acquisition. Release checks the bound live claim independently of lifecycle,
+so an analyzer can release after completing analysis and a publisher can release
+after writing `PUBLISHED`, `PARTIAL`, `FAILED`, `UNKNOWN`, or `SKIPPED`.
+
+Every persistence write for snapshot, context, chunk result, findings, terminal
+state, or publication verifies the appropriate current lease in the same UoW
+transaction as the write. Locks remain held through commit/rollback. Mutation
+predicates also recheck expiry at the actual SQL write, including after waiting
+for a database lock; a prior successful standalone check is insufficient.
+Acquisition and renewal evaluate lifecycle and deadline after awaited locks.
+External calls occur outside an open PostgreSQL transaction.
+
+The analysis-to-publication handoff initializes `Publication(PENDING)` and its
+five-minute deadline under the analysis fencing token, in the same transaction
+as terminal analysis completion and the publish outbox event. After release or
+expiry of the analysis lease, a publisher must acquire a new publish lease before
+recording publication progress, provider metadata, or its outcome. These writes fence in their own
+short UoW; they never mutate ReviewJob's terminal lifecycle or extend the accepted
+publication deadline. Progress requires a future deadline; terminal outcomes
+may be recorded after it under the current live publish lease, as specified below.
+
+Recovery considers missing/expired leases, `retry_at`, task-specific lifecycle,
+and all deadlines. It must not restart terminal analysis or create equivalent
+pending work. Eligible publication work on completed analysis remains recoverable.
+
+A lease per ReviewJob does **not** serialize publications from different
+ReviewJobs for the same PR. Publication workers additionally require serialization
+by the authoritative ChangeRequest identity across the external publication
+cycle. This is a separate worker requirement; TaskLease acquisition alone is not
+permission to make concurrent provider calls for one PR.
+
+The stage 4B persistence seams are `TaskLeasePort.acquire(..., task_kind=...)` and
+`UnitOfWorkPort.publications` (`PublicationRepositoryPort`): `get(review_id)`
+returns a snapshot, `prepare(analyze_claim)` allows only `NOT_READY -> PENDING`
+after useful terminal analysis, and `update(publish_claim, status=...,
+provider_metadata=...)` records progress or an outcome only from PENDING with
+COMPLETED/PARTIAL analysis and a non-null accepted deadline.
+`prepare` initializes `started_at` and a fixed five-minute deadline; `update`
+keeps both timestamps and sets `finished_at` at the actual SQL write for an
+outcome. PENDING/progress additionally requires an unexpired deadline both
+after awaited locks and in the SQL UPDATE. Terminal targets PUBLISHED, PARTIAL,
+FAILED, UNKNOWN and SKIPPED do not require that deadline to remain in the future:
+the worker may finish an already-started operation or record that it will make
+no further attempt. They still require source PENDING and authoritative publish
+kind, owner, fencing token, and live lease in that same SQL UPDATE. An expired
+or replaced lease forbids all writes, even a remote success. These methods
+never commit internally and raise `LeaseLostError` on refusal. Ordinary
+publisher writes cannot set `NOT_READY`, reconcile UNKNOWN, or reset the cycle.
+
+Before every provider attempt, the worker must establish live publish authority
+and a future publication deadline, then start external I/O outside a PostgreSQL
+transaction. A late terminal write is persistence of that attempt's known
+outcome, not permission for another provider call, acquire, renewal, or retry.
+Acquire and renewal remain deadline-gated; a late result has only the remaining
+lease lifetime in which to be recorded. UNKNOWN still requires reconciliation.
+Publication.started_at records cycle initialization, not the time a provider
+call starts. This persistence-only seam does not prove external call timing;
+the caller owns that precondition. No call-start marker or provider orchestration
+is introduced in stage 4B.
+
+Initial `Publication(NOT_READY)` creation remains part of the start-review
+aggregate transaction before any worker lease exists. Worker completion/outbox
+orchestration and PR serialization remain separate integration work; callers
+must put terminal analysis, preparation and the publish outbox event in one UoW.
+
+The 0006 rollout must replace old lease writers, which cannot insert without the
+required kind. Workers must be stopped before downgrading to 0005, because that
+downgrade preserves lease rows but removes task-kind isolation.
 
 ## 6. Dead-letter behavior
 
@@ -223,6 +319,14 @@ retry.
 Reconciliation checks provider state before changing `UNKNOWN` or retrying work.
 Provider references are stored as provider metadata but only safe opaque
 references may cross the public boundary.
+
+`UNKNOWN` is never eligible for automatic publish acquisition, heartbeat, or a
+transition back to `PENDING`. Reconciliation is a separate fenced persistence
+operation, not an exception that lets a publish worker reuse its old lease.
+Any operator/reconciliation change to Publication must protect both its claim
+and the write within the same database transaction. Analysis `PARTIAL` may be
+published initially; publication `PARTIAL` is a distinct state and does not
+permit automatic republishing.
 
 ## 9. Dependency degradation
 

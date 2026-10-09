@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.application.use_cases.start_review as start_review_module
 from app.application.ports import (
+    PublicationRepositoryPort,
     ReviewJobRepositoryPort,
     ReviewJobSnapshot,
     StartReviewCommand,
@@ -140,6 +141,7 @@ class FakeReviewJobRepository:
 
 class FakeUnitOfWork:
     review_jobs: ReviewJobRepositoryPort
+    publications: PublicationRepositoryPort
 
     def __init__(self, repository: FakeReviewJobRepository) -> None:
         self.review_jobs = repository

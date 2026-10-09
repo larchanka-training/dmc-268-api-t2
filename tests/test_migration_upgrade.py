@@ -352,3 +352,65 @@ async def test_upgrade_preflight_sees_old_writer_committing_during_migration(
         if process.returncode is None:
             process.terminate()
             await process.communicate()
+
+
+async def test_task_kind_upgrade_and_downgrade_preserve_existing_leases(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0005")
+    lease_id = uuid.uuid4()
+    await database.connection.execute(
+        "INSERT INTO task_lease (id,review_job_id,owner,expires_at,fencing_token) "
+        "VALUES ($1,$2,'existing-worker',clock_timestamp()+interval '90 seconds',17)",
+        lease_id,
+        job_id,
+    )
+    before = await database.connection.fetchrow(
+        "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+    )
+    database.migrate("upgrade", "head")
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0006"
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT task_kind FROM task_lease WHERE id=$1", lease_id
+        )
+        == "analyze"
+    )
+    after = await database.connection.fetchrow(
+        "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+    )
+    assert after == before
+    for kind in (None, "other"):
+        with pytest.raises(asyncpg.PostgresError):
+            await database.connection.execute(
+                "UPDATE task_lease SET task_kind=$1 WHERE id=$2", kind, lease_id
+            )
+    await database.connection.execute(
+        "UPDATE task_lease SET task_kind='publish' WHERE id=$1", lease_id
+    )
+    database.migrate("downgrade", "0005")
+    assert (
+        await database.connection.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name='task_lease' AND column_name='task_kind'"
+        )
+        == 0
+    )
+    assert (
+        await database.connection.fetchrow(
+            "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+        )
+        == before
+    )
+    database.migrate("upgrade", "head")
+    assert (
+        await database.connection.fetchval(
+            "SELECT task_kind FROM task_lease WHERE id=$1", lease_id
+        )
+        == "analyze"
+    )

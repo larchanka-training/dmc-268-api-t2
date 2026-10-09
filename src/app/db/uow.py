@@ -4,8 +4,11 @@ from types import TracebackType
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.application.ports import ReviewJobRepositoryPort
-from app.db.repositories import SqlAlchemyReviewJobRepository
+from app.application.ports import PublicationRepositoryPort, ReviewJobRepositoryPort
+from app.db.repositories import (
+    SqlAlchemyPublicationRepository,
+    SqlAlchemyReviewJobRepository,
+)
 from app.db.session import async_session_factory
 
 
@@ -13,6 +16,7 @@ class SqlAlchemyUnitOfWork:
     """Own one SQLAlchemy session and its transaction boundary."""
 
     review_jobs: ReviewJobRepositoryPort
+    publications: PublicationRepositoryPort
 
     def __init__(
         self,
@@ -24,6 +28,7 @@ class SqlAlchemyUnitOfWork:
     async def __aenter__(self) -> SqlAlchemyUnitOfWork:
         self._session = self._session_factory()
         self.review_jobs = SqlAlchemyReviewJobRepository(self._session)
+        self.publications = SqlAlchemyPublicationRepository(self._session)
         return self
 
     async def __aexit__(

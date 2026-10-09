@@ -588,6 +588,7 @@ class TaskLease(Base):
         UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=False, unique=True
     )
     owner: Mapped[str] = mapped_column(Text, nullable=False)
+    task_kind: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -597,6 +598,9 @@ class TaskLease(Base):
 
     __table_args__ = (
         CheckConstraint("fencing_token > 0", name="ck_task_lease_fencing_positive"),
+        CheckConstraint(
+            "task_kind IN ('analyze','publish')", name="ck_task_lease_task_kind"
+        ),
         Index("ix_task_lease_expires_at", "expires_at"),
     )
 

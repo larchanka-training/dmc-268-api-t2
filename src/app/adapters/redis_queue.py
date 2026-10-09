@@ -12,6 +12,7 @@ from redis.client import NEVER_DECODE
 from redis.exceptions import ResponseError
 
 from app.application.ports import (
+    MAX_QUEUE_ENVELOPE_BYTES,
     QueueDelivery,
     QueueEnvelopeReason,
     QueueEnvelopeValidationError,
@@ -19,7 +20,6 @@ from app.application.ports import (
     TaskKind,
 )
 
-_MAX_ENVELOPE_BYTES = 16 * 1024
 _DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 type _StreamMessage = tuple[str | bytes, dict[str | bytes, str | bytes]]
 type _ReadResponse = list[tuple[str | bytes, list[_StreamMessage]]]
@@ -51,7 +51,7 @@ def _source_identity(serialized: str | bytes | None) -> _SourceIdentity:
     if serialized is None:
         return _SourceIdentity()
     encoded = serialized.encode("utf-8") if isinstance(serialized, str) else serialized
-    if len(encoded) > _MAX_ENVELOPE_BYTES:
+    if len(encoded) > MAX_QUEUE_ENVELOPE_BYTES:
         return _SourceIdentity()
     try:
         payload = json.loads(serialized)
@@ -89,7 +89,7 @@ class InvalidQueueMessageError(ValueError):
 
 def _decode_envelope(serialized: str | bytes) -> QueueTaskEnvelope:
     encoded = serialized.encode("utf-8") if isinstance(serialized, str) else serialized
-    if len(encoded) > _MAX_ENVELOPE_BYTES:
+    if len(encoded) > MAX_QUEUE_ENVELOPE_BYTES:
         raise QueueEnvelopeValidationError(
             "INVALID_ENVELOPE", "Queue task envelope exceeds 16 KiB"
         )
@@ -152,13 +152,9 @@ class RedisQueue:
         self._group_name = group_name
 
     async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
-        payload = json.dumps(
-            asdict(envelope), ensure_ascii=False, separators=(",", ":")
-        )
+        payload = envelope.to_json()
         canonical = _decode_envelope(payload)
-        payload = json.dumps(
-            asdict(canonical), ensure_ascii=False, separators=(",", ":")
-        )
+        payload = canonical.to_json()
         message_id = await self._client.xadd(
             f"{self._stream_prefix}:{canonical.task_kind}", {"envelope": payload}
         )

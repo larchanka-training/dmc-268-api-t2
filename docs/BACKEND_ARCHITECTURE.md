@@ -258,6 +258,16 @@ Renew разрешён только пока задача своего типа 
 provider-вызовов для одного PR нужна отдельно от TaskLease; транзакционные locks
 на ReviewJob не заменяют её и не удерживаются во время внешнего I/O.
 
+Stage 5A предоставляет только bounded `PostgresReviewWorker.run_once()` с
+обязательным `TaskHandlerPort`: одна Redis delivery, authoritative identity,
+task-specific acquire, повторная проверка перед callback, fenced release и ACK
+после проверенного durable outcome. Реального обработчика и production
+entrypoint нет. Обычный return, промежуточный commit и захват lease не разрешают
+ACK. Консервативные completion proofs и pending-классификация определены в
+PIPELINE_SPEC.md §4.2; PostgreSQL outbox marker может оставаться NULL при delivery.
+Тестовый harness фиксирует реальные fenced terminal решения и атомарный publish
+handoff без внешних provider calls. Pending recovery и heartbeat относятся к 5B.
+
 ### 3.6 Dispatcher и recovery
 
 Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, передаёт

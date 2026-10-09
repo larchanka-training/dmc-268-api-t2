@@ -219,6 +219,63 @@ still enter Redis after quarantine; its ACK is counted but cannot overwrite the
 quarantine marker. These guarantees concern authoritative PostgreSQL states,
 not exactly-once broker I/O.
 
+### 4.2 Bounded worker execution — stage 5A
+
+`PostgresReviewWorker.run_once()` receives at most one new Redis delivery for
+its configured task kind and consumer group. Construction requires a typed
+`TaskHandlerPort`; there is no default handler, CLI, service, or production
+worker loop. The callback is a bounded persistence seam, not permission to call
+VCS, LLM, or a publisher.
+
+The worker validates every canonical envelope field against the PostgreSQL
+OutboxEvent and its ReviewJob. Unparseable UUID identity, a missing command, or
+a mismatch raises `QueueIdentityError` and leaves the delivery pending; these
+are not JSON/schema errors and must not enter Redis DLQ. A NULL
+`broker_published_at` is accepted because enqueue precedes the marker commit.
+A quarantined PostgreSQL command remains pending without executing its handler:
+outbox quarantine is not proof of a Redis processing decision.
+
+Acquisition uses the stage 4B task-specific lifecycle rules and a new fencing
+token. After acquisition, the worker rechecks command identity, live authority,
+and lifecycle/deadline after awaited locks before invoking the callback. The
+callback must use transaction-local fenced persistence and commit before
+reporting `DurableTaskOutcome.COMPLETED`. An ordinary successful return (`None`),
+an intermediate commit, and even a false COMPLETED assertion cannot authorize
+ACK. The worker independently reads committed state in a new locked transaction
+and verifies its claim. It attempts fenced release in `finally`; lost authority
+or unsuccessful release prevents ACK as the current processing success.
+
+The conservative stage 5A completion proofs are:
+
+- Analyze FAILED/SKIPPED with terminal `finished_at`.
+- Analyze COMPLETED/PARTIAL with prepared Publication (non-NOT_READY and
+  non-null cycle start/deadline) and a canonical, nonquarantined publish outbox
+  command. The handler must commit terminal analysis, preparation, and that
+  command atomically, as required by §5. Successor proof includes the same 16 KiB
+  serialized UTF-8 envelope bound as Redis enqueue, including JSON escaping.
+- Publish PUBLISHED/PARTIAL/SKIPPED with persisted cycle timestamps and
+  `finished_at`. These states require no automatic republishing.
+
+An authoritative existing completion proof also permits ACK of a duplicate
+without acquiring a lease or executing a handler. If commit succeeded but ACK
+failed, redelivery uses this proof rather than repeating the effect. This is
+lifecycle-level deduplication, not a new event processing receipt.
+
+All other decisions retain pending work: contention, lease loss, handler errors,
+incomplete handoff, expired PENDING, missing publication/deadline, FAILED or
+UNKNOWN publication, and other ineligible states. Invalid Redis envelopes alone
+use the existing safe Redis quarantine; failure propagates without an unsafe ACK.
+The worker neither deletes stream entries nor changes outbox delivery markers.
+
+There is currently no durable per-event receipt or retry-successor verification
+contract. A future retry ACK must prove an atomic replacement outbox command and
+accepted scheduling/budget state; a `retry_at` write or callback assertion alone
+is insufficient. Deadline expiry and UNKNOWN need the separate recovery and
+reconciliation decisions described below. Stage 5B will provide pending recovery
+(XAUTOCLAIM), heartbeat, and periodic recovery. Before real provider integration,
+call-start authority/deadline checks and ChangeRequest publication serialization
+must additionally be implemented; this seam does not supply those guarantees.
+
 ## 5. Leases and fencing
 
 One `TaskLease` table serves both `analyze` and `publish`, with one persistent row

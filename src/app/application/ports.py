@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from enum import Enum
 from types import TracebackType
 from typing import Literal, Protocol
 
@@ -16,6 +18,7 @@ from app.domain.enums import (
 )
 
 type TaskKind = Literal["analyze", "publish"]
+MAX_QUEUE_ENVELOPE_BYTES = 16 * 1024
 
 
 type QueueEnvelopeReason = Literal[
@@ -47,6 +50,15 @@ class QueueTaskEnvelope:
     task_kind: TaskKind
     attempt: int
     trace_id: str
+
+    def to_json(self) -> str:
+        """Encode the bounded canonical wire representation; validate on enqueue."""
+        payload = json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > MAX_QUEUE_ENVELOPE_BYTES:
+            raise QueueEnvelopeValidationError(
+                "INVALID_ENVELOPE", "Queue task envelope exceeds 16 KiB"
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +251,24 @@ class TaskLeasePort(Protocol):
     async def renew(self, lease: TaskLeaseSnapshot) -> TaskLeaseSnapshot | None: ...
 
     async def release(self, lease: TaskLeaseSnapshot) -> bool: ...
+
+
+class DurableTaskOutcome(Enum):
+    """Explicit handler assertion; the worker must verify committed DB state."""
+
+    COMPLETED = "completed"
+
+
+class TaskHandlerPort(Protocol):
+    async def handle(
+        self, task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        """Use fenced UoW writes; report COMPLETED only after durable commit.
+
+        This bounded seam does not authorize external provider calls. None means
+        recovery is required, even when the callback returned without error.
+        """
+        ...
 
 
 class VcsPort(Protocol):

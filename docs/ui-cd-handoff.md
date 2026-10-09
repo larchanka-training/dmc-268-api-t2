@@ -2,28 +2,35 @@
 
 API-репозиторий деплоит фронтенд по модели ADR-0001 «каждый репозиторий деплоит себя»: UI-репозиторий инициирует деплой своей свежей версии запуском workflow `Deploy` в API-репозитории. Доступа к VPS и его секретов UI-репозиторию не нужно.
 
-## Что нужно сделать в `dmc-268-ui-t2` (один раз)
+## Текущий контракт `dmc-268-ui-t2`
 
-1. Создать fine-grained PAT:
+После merge UI PR #19 публикация образов из `main` и `develop` и шаг `Trigger API deploy` уже находятся в `ui-ci.yml`. Для работы триггера нужен fine-grained PAT:
+
+1. Создать PAT:
    - Repository access → только `larchanka-training/dmc-268-api-t2`;
    - Permissions → Actions: **Read and write**.
-2. Добавить PAT как секрет UI-репозитория, например `API_DEPLOY_PAT`.
-3. Добавить шаг в job `publish` workflow `ui-ci.yml` (после пуша образа в GHCR):
+2. Добавить PAT как секрет UI-репозитория `API_DEPLOY_PAT`.
+
+После публикации образа job `publish` выполняет:
 
 ```yaml
       - name: Trigger API deploy
-        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.API_DEPLOY_PAT }}
         run: |
-          gh workflow run deploy-staging \
+          case "${GITHUB_REF_NAME}" in
+            main) environment=staging ;;
+            develop) environment=develop ;;
+            *) echo "Unexpected ref: ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+          gh workflow run deploy-staging.yml \
             --repo larchanka-training/dmc-268-api-t2 \
             --ref main \
-            -f environment=staging \
-            -f ui_sha=${{ github.sha }}
+            -f "environment=${environment}" \
+            -f "ui_sha=${GITHUB_SHA}"
 ```
 
-Когда в UI-репозитории появится ветка `develop` с публикацией образов (аналог API CI), добавить симметричный шаг с `-f environment=develop` и `ui_sha` коммита develop-образа — он будет обновлять develop-окружение.
+Пуш в `main` обновляет staging, пуш в `develop` — develop-окружение. Для обеих веток UI CI сначала публикует immutable image, затем запускает `Deploy` API-репозитория.
 
 ## Как это работает
 

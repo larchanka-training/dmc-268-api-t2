@@ -214,6 +214,14 @@ erDiagram
         TEXT provider_name
         TEXT delivery_id
         TIMESTAMPTZ received_at
+        TEXT processing_status
+        JSONB request_data
+        JSONB snapshot_data
+        INT attempts
+        TEXT raw_diff
+        TIMESTAMPTZ lease_until
+        TIMESTAMPTZ retry_at
+        TEXT reason_code
     }
 
     IdempotencyRecord {
@@ -331,6 +339,17 @@ SQLAlchemy `use_alter` разрывает только DDL-цикл создан
 wire payload из этих значений.
 `metadata.output_language` в wire context может сохранить непустой язык
 исторической версии; новые версии настроек принимают только `ru`.
+
+Миграция `0005_github_webhook_inbox` расширяет существующий `WebhookReceipt`
+для GitHub-only intake. `request_data` хранит выбранные поля PR и frozen
+`ignore_globs`, `snapshot_data` — Level 1 artifact, `raw_diff` — исходный diff.
+Это не `ContextPayload`: запись receipt не создаёт ReviewJob и может иметь
+пустой список файлов. `processing_status` принимает application-состояния
+`PENDING`, `PROCESSING`, `READY`, `FAILED`, `IGNORED` (legacy default);
+`attempts` ограничиваются
+worker-политикой (максимум три), lease — 90 секунд, `retry_at` и `reason_code`
+сохраняют recovery decision. Детали HTTP и worker — в
+[`github-webhook-intake.md`](./github-webhook-intake.md).
 
 `ChunkResult.limitations` содержит JSON array строк. `usage` nullable и при
 наличии содержит только non-negative `input_tokens` и `output_tokens`. Finding

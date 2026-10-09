@@ -1,10 +1,13 @@
 # Sprint 2 contract handoff
 
-Состояние на 7 октября 2026 года. Это рабочая передача контрактов между
-задачами, а не отметка о полном командном approval PR #21. HTTP-контракт
+Базовое состояние tracker на 7 октября 2026 года; дополнения #14 и merge #21
+от 8 октября. [PR #21](https://github.com/larchanka-training/dmc-268-api-t2/pull/21)
+влит в `main`; остальные tracker-статусы ниже остаются снимком на 7 октября.
+HTTP-контракт
 определяется `openapi.yaml`, lifecycle и доставка — `PIPELINE_SPEC.md`, физическая
 модель — `BACKEND_ERD.md`. Старый UI `SYSTEM_DESIGN.md` ещё содержит
-`RUNNING + stage` и требует синхронизации с целевым status-only lifecycle.
+`RUNNING + stage`; его синхронизация со status-only lifecycle и Redis находится
+в открытом [UI PR #22](https://github.com/larchanka-training/dmc-268-ui-t2/pull/22).
 
 ## Решения текущей итерации
 
@@ -33,9 +36,9 @@
 | Задача | Состояние и граница передачи |
 | --- | --- |
 | [API #11](https://github.com/larchanka-training/dmc-268-api-t2/issues/11) LLM Gateway | In Progress, открытый [PR #18](https://github.com/larchanka-training/dmc-268-api-t2/pull/18). После согласования #21 автор #18 адаптирует Pydantic models/ports к проверяемому wire context/result, а provider-level retry/failover учитывает общий deadline и бюджет worker. |
-| [API #12](https://github.com/larchanka-training/dmc-268-api-t2/issues/12) контракты | Tracker Todo, открытый [PR #21](https://github.com/larchanka-training/dmc-268-api-t2/pull/21) с requested changes. Status-only lifecycle принят как целевое направление; merge требует новой миграционной цепочки, тестов legacy data и согласования потребителей. Командный approval ещё не зафиксирован. |
+| [API #12](https://github.com/larchanka-training/dmc-268-api-t2/issues/12) контракты | [PR #21](https://github.com/larchanka-training/dmc-268-api-t2/pull/21) влит 8 октября. Status-only lifecycle, миграция `0004` после ownership `0003` и legacy-data проверки составляют принятую основу реализации #14. Потребители должны использовать эти контракты; UI-документ обновляется отдельно в PR #22. |
 | [API #13](https://github.com/larchanka-training/dmc-268-api-t2/issues/13) очередь/API | Tracker Todo. Redis adapter обязан подтвердить постановку outbox command, обеспечить at-least-once delivery, ack после durable processing decision, recovery незавершённой работы и safe DLQ. Конкретная реализация выбирается владельцем #13; RabbitMQ/Celery topology не является контрактом этой итерации. |
-| [API #14](https://github.com/larchanka-training/dmc-268-api-t2/issues/14) VCS/diff | In Progress. Для текущего спринта — подписанный GitHub webhook, дедуп delivery, зафиксированный SHA snapshot, raw diff/metadata, parser files/hunks/line map и фильтрация binary/generated/lock/minified JS. GitLab требуется позже, несмотря на старый текст issue. Валидные zero-length стороны hunk допускают start 0; semantic validator проверяет counts/ranges/coordinates до persistence или inference. |
+| [API #14](https://github.com/larchanka-training/dmc-268-api-t2/issues/14) VCS/diff | In Progress. GitHub-only подписанный intake сохраняет durable `WebhookReceipt` и SHA-pinned Level 1 artifact без автоматического `ReviewJob`; отдельный worker восстанавливает pending/expired leases. Parser ограничивает 50 files/2000 changed rows, фильтрует binary/generated/lock/minified JS и допускает пустой artifact. GitLab — позже. Подробный контракт и ручная проверка: [`github-webhook-intake.md`](./github-webhook-intake.md). Redis #13, открытый LLM PR #18 и открытый UI #22 остаются отдельными интеграциями. |
 | [API #15](https://github.com/larchanka-training/dmc-268-api-t2/issues/15) QA/Eval | Tracker Todo. Benchmark и Eval Harness используют тот же checked-in JSON Schema и fixtures, что Gateway и parser; auth/ReviewJob API tests не должны предполагать старый `RUNNING + stage`. |
 | [UI #15](https://github.com/larchanka-training/dmc-268-ui-t2/issues/15) OAuth/App Shell | In Progress, [UI PR #17](https://github.com/larchanka-training/dmc-268-ui-t2/pull/17) — подтверждённый mock-only этап. Реальный клиент должен разобрать nested `/me`, paginated connected/available repositories, отправлять `external_id` и Origin/CSRF при connect, а также вызывать refresh до истечения session. Backend handlers ещё не реализованы. |
 | [UI #16](https://github.com/larchanka-training/dmc-268-ui-t2/issues/16) PR/Diff Viewer | Tracker Todo. Потребляет `GET /reviews/{id}`, findings и bounded diff из OpenAPI. `Finding.side` и номера строк относятся к конкретной стороне snapshot; UI не должен вычислять их из строки текста. Текущая mock-страница не подтверждает совместимость с backend API. |

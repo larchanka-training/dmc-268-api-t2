@@ -53,6 +53,7 @@ class PostgresHarness:
                 )
 
             for table_name in (
+                "webhook_receipt",
                 "idempotency_record",
                 "outbox_event",
                 "publication",
@@ -333,7 +334,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0004"
+        ).scalar_one() == "0005"
 
         result = await connection.execute(
             text(

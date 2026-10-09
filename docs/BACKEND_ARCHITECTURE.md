@@ -54,14 +54,22 @@ src/app/
 │  ├─ session.py                  # асинхронный движок SQLAlchemy и сессия БД
 │  ├─ models.py                   # ORM-модели предметной схемы
 │  ├─ repositories.py             # SQLAlchemy persistence adapter
+│  ├─ webhook_inbox.py            # durable GitHub intake
 │  └─ uow.py                      # граница commit/rollback
 ├─ domain/
 │  └─ enums.py                    # значения lifecycle и domain enum
 ├─ application/
 │  ├─ ports.py                    # контракты внешних границ и хранения данных
+│  ├─ github_ports.py             # контракт SHA-pinned GitHub capture
+│  ├─ webhook_ports.py            # контракт durable inbox
 │  └─ use_cases/
-│     └─ start_review.py          # создание начального состояния ReviewJob
+│     ├─ start_review.py          # создание начального состояния ReviewJob
+│     └─ process_webhook.py       # Level 1 artifact без ReviewJob
+├─ vcs/
+│  ├─ github.py                   # GitHub REST snapshot
+│  └─ diff.py                     # bounded unified diff parser
 ├─ workers/                       # dispatcher/analysis/publication/recovery; в разработке
+├─ webhook_worker.py              # отдельный recovery intake #14
 └─ main.py                        # инициализация FastAPI
 
 migrations/
@@ -69,12 +77,14 @@ migrations/
    ├─ 0001_baseline.py
    ├─ 0002_backend_core.py
    ├─ 0003_result_context_ownership.py
-   └─ 0004_contract_foundation.py
+   ├─ 0004_contract_foundation.py
+   └─ 0005_github_webhook_inbox.py
 
 docs/
 ├─ BACKEND_ARCHITECTURE.md
 ├─ BACKEND_ERD.md
 ├─ PIPELINE_SPEC.md
+├─ github-webhook-intake.md
 └─ sprint2-contract-handoff.md
 ```
 
@@ -103,7 +113,18 @@ active PostgreSQL `AuthSession`, allowlisted Origin и CSRF. Одна атома
 token не вводится. Это согласованный HTTP-контракт, а не утверждение, что
 handlers и физическая AuthSession уже реализованы.
 
-### 3.2 Запуск ReviewJob
+### 3.2 GitHub webhook intake
+
+Подписанный `POST /api/v1/webhooks/github` принимает `opened`/`synchronize`
+только для подключённого GitHub repository и дедуплицирует delivery в
+PostgreSQL `WebhookReceipt`. Отдельный worker снимает SHA-pinned GitHub
+snapshot и сохраняет raw diff и Level 1 artifact; этот путь **не создаёт
+ReviewJob** и не собирает полный LLM `ContextPayload`. Пустой/полностью
+отфильтрованный diff допустим как Level 1 artifact. Retry, lease и локальная
+проверка описаны в [`github-webhook-intake.md`](./github-webhook-intake.md).
+Redis worker #13 и LLM Gateway #18 остаются отдельными интеграциями.
+
+### 3.3 Запуск ReviewJob
 
 ```text
 HTTP-команда
@@ -138,7 +159,7 @@ digest.
 эквивалентный запуск. DB adapter создаёт ReviewJob, Publication и OutboxEvent в
 одной session, но не делает commit; commit/rollback принадлежит application UoW.
 
-### 3.3 Worker анализа
+### 3.4 Worker анализа
 
 ```text
 команда очереди Redis
@@ -193,7 +214,7 @@ summary, findings и limitations по `schemas/llm-output/v1.json`; gateway до
 Результат LLM и данные Change Request проходят validation перед сохранением и
 публикацией.
 
-### 3.4 Worker публикации
+### 3.5 Worker публикации
 
 ```text
 Publication: PENDING
@@ -211,7 +232,7 @@ PUBLISHED | PARTIAL | FAILED | UNKNOWN | SKIPPED
 
 Lifecycle анализа и lifecycle публикации независимы. Повторная попытка публикации не запускает inference LLM повторно.
 
-### 3.5 Dispatcher и recovery
+### 3.6 Dispatcher и recovery
 
 Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, передаёт
 небольшую команду в очередь Redis и устанавливает `broker_published_at` только
@@ -259,7 +280,7 @@ DB CHECK запрещает active status с заполненным
 | `TaskLease` | текущий lease worker с fencing token |
 | `RepositoryAccess` | локальная роль пользователя в repository |
 | `QuotaUsage` | состояние технических квот |
-| `WebhookReceipt` | дедупликация webhook delivery |
+| `WebhookReceipt` | durable GitHub delivery intake, дедупликация, lease/retry и Level 1 artifact |
 | `IdempotencyRecord` | идемпотентность ручных API-команд |
 
 PostgreSQL хранит долговременное состояние системы. Redis используется для
@@ -272,7 +293,8 @@ PostgreSQL хранит долговременное состояние сист
 
 | Port | Контракт |
 | --- | --- |
-| `VcsPort` | сейчас: provider-backed cursor list текущих OPEN PR и capture snapshot; получение raw diff/кода добавляется адаптером задачи #14 |
+| `VcsPort` | provider-neutral список OPEN PR и capture snapshot для авторизованного ReviewJob; интеграция с worker остаётся отдельной |
+| `GithubPort` / `WebhookInbox` | SHA-pinned GitHub capture и durable intake #14, отдельно от авторизованного ReviewJob |
 | `ContextBuilderPort` | snapshot + исходные данные → `ContextPayload` |
 | `LlmGatewayPort` | `ContextPayload` → структурированный `ReviewChunkResult` |
 | `PublisherPort` | сохранённый результат ReviewJob → remote publication IDs |
@@ -353,6 +375,9 @@ ORM-модели не используются как публичные HTTP DT
 - тесты метаданных и интеграционные тесты PostgreSQL для ограничений схемы;
 - CI с PostgreSQL 18, `alembic check` и циклом downgrade/upgrade на отдельной
   тестовой базе.
+- GitHub-only webhook intake #14: HMAC route, durable `WebhookReceipt`,
+  SHA-pinned GitHub capture, bounded diff parser и отдельный recovery worker;
+  delivery не создаёт ReviewJob.
 
 Миграция `0003` проверяет существующие пары ChunkResult/ContextPayload при
 создании составного FK. Если данные уже имеют разных владельцев, PostgreSQL
@@ -361,8 +386,8 @@ ORM-модели не используются как публичные HTTP DT
 В разработке:
 
 - остальные реализации repositories и Unit of Work;
-- HTTP-обработчики и DTO;
-- GitHub/VCS adapter;
+- остальные HTTP-обработчики и DTO;
+- интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder;
 - LLM Gateway и validation canonical schema;
 - Redis queue dispatcher и DLQ adapter по согласованному контракту #13;
@@ -375,7 +400,7 @@ ORM-модели не используются как публичные HTTP DT
   authoritative PostgreSQL `AuthSession` и refresh только действующей сессии
   с Origin/CSRF; полная реализация auth отложена;
 - provider-specific данные установки;
-- HTTP handlers, DTO и session/CSRF/Origin middleware.
+- остальные HTTP handlers, DTO и session/CSRF/Origin middleware.
 
 Новые версии `RepositorySettings.rules` имеют форму `{"instructions": [...]}`,
 где элементы — уникальные непустые строки, а порядок значим. `ignores` имеет

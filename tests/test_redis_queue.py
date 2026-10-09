@@ -10,11 +10,12 @@ from typing import Any, cast
 
 import pytest
 import pytest_asyncio
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from redis.asyncio import Redis
+from redis.exceptions import NoPermissionError
 from redis.typing import EncodableT, FieldT
 
-from app.adapters.redis_queue import RedisQueue
+from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
 from app.application.ports import QueueTaskEnvelope, TaskKind
 
 _REDIS_URL = os.environ.get("DMC268_TEST_REDIS_URL")
@@ -39,7 +40,10 @@ async def stream_prefix(redis_client: Redis) -> AsyncIterator[str]:
         yield prefix
     finally:
         await redis_client.delete(
-            f"{prefix}:analyze", f"{prefix}:publish", f"{prefix}:unknown"
+            f"{prefix}:analyze",
+            f"{prefix}:publish",
+            f"{prefix}:unknown",
+            f"{prefix}:dead",
         )
 
 
@@ -324,3 +328,278 @@ async def test_decode_errors_are_safe_and_leave_message_pending_with_byte_client
         )
         assert [entry["message_id"] for entry in pending] == [message_id]
         assert pending[0]["consumer"] == b"worker-1"
+
+
+async def test_rejection_exposes_transport_identity_without_raw_payload(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": "private-source: not JSON"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(ValueError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert getattr(rejected.value, "message_id", None) == message_id
+    assert getattr(rejected.value, "source_routing_key", None) == "analyze"
+    assert getattr(rejected.value, "reason_code", None) == "INVALID_ENVELOPE"
+    assert "private-source" not in str(rejected.value)
+
+
+@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
+async def test_quarantine_writes_only_canonical_diagnostic_dead_v1(
+    redis_client: Redis, stream_prefix: str, task_kind: TaskKind
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:{task_kind}",
+        {"envelope": "private-source: not JSON", "prompt": "private-prompt"},
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind=task_kind, consumer_name="worker-1")
+
+    dead_id = await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and len(messages) == 1
+    assert messages[0][0] == dead_id
+    fields = messages[0][1]
+    assert fields is not None and set(fields) == {"envelope"}
+    payload = json.loads(fields["envelope"])
+    assert set(payload) == {
+        "schema_version",
+        "quarantine_id",
+        "reason_code",
+        "quarantined_at",
+        "source_routing_key",
+    }
+    assert payload["schema_version"] == 1
+    assert payload["reason_code"] == "INVALID_ENVELOPE"
+    assert payload["source_routing_key"] == task_kind
+    assert "private-" not in fields["envelope"]
+    schema_path = Path(__file__).parents[1] / "schemas/queue/dead/v1.json"
+    Draft202012Validator(
+        json.loads(schema_path.read_text()), format_checker=FormatChecker()
+    ).validate(payload)
+
+
+async def test_quarantine_acks_source_only_after_successful_dead_write(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:publish", {"envelope": "not JSON"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="publish", consumer_name="worker-1")
+    # Permit cleanup and ACK but make the actual DLQ write fail in real Redis.
+    username, password = uuid.uuid4().hex, uuid.uuid4().hex
+    await redis_client.acl_setuser(
+        username,
+        enabled=True,
+        passwords=[f"+{password}"],
+        commands=["+@all", "-xadd"],
+        keys=[f"{stream_prefix}:*"],
+    )
+    assert _REDIS_URL is not None
+    try:
+        async with Redis.from_url(
+            _REDIS_URL, username=username, password=password, decode_responses=True
+        ) as denied_client:
+            denied_queue = RedisQueue(denied_client, stream_prefix=stream_prefix)
+            with pytest.raises(NoPermissionError, match="xadd"):
+                await denied_queue.quarantine(rejected.value)
+    finally:
+        await redis_client.acl_deluser(username)
+
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:publish", "review-workers", "-", "+", 10
+    )
+    assert [entry["message_id"] for entry in pending] == [message_id]
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+    await queue.quarantine(rejected.value)
+
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 1
+    pending_summary = await redis_client.xpending(
+        f"{stream_prefix}:publish", "review-workers"
+    )
+    assert pending_summary["pending"] == 0
+
+
+@pytest.mark.parametrize("version", [2, 2.0])
+async def test_quarantine_classifies_unsupported_source_schema_version(
+    redis_client: Redis, stream_prefix: str, version: int | float
+) -> None:
+    payload = {**asdict(envelope()), "schema_version": version, "task_kind": "unknown"}
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": json.dumps(payload)}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert rejected.value.reason_code == "UNSUPPORTED_SCHEMA_VERSION"
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    assert json.loads(messages[0][1]["envelope"])["reason_code"] == (
+        "UNSUPPORTED_SCHEMA_VERSION"
+    )
+
+
+async def test_quarantine_classifies_unknown_task_kind(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:publish",
+        {"envelope": json.dumps({**asdict(envelope()), "task_kind": "future"})},
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="publish", consumer_name="worker-1")
+
+    assert rejected.value.reason_code == "UNKNOWN_TASK_KIND"
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    assert payload["reason_code"] == "UNKNOWN_TASK_KIND"
+    assert payload["source_routing_key"] == "publish"
+
+
+async def test_quarantine_copies_only_valid_allowlisted_source_identities(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze",
+        {
+            "envelope": json.dumps(
+                {
+                    **asdict(envelope()),
+                    "schema_version": 2.0,
+                    "source": "private-source",
+                    "prompt": "private-prompt",
+                    "stack_trace": "private-stack",
+                    "payload": {"secret": "private-secret"},
+                    "source_event_id": "forged-id",
+                    "exception": "private-exception",
+                }
+            )
+        },
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    for field in ("quarantine_id", "quarantined_at"):
+        assert payload.pop(field)
+    assert payload == {
+        "schema_version": 1,
+        "reason_code": "UNSUPPORTED_SCHEMA_VERSION",
+        "source_routing_key": "analyze",
+        "source_event_id": "event_123",
+        "review_id": "rev_123",
+        "trace_id": "trace_123",
+        "attempt": 1,
+        "source_schema_version": 2,
+    }
+
+
+async def test_quarantine_retains_id_with_corrupt_utf8_on_decoding_client(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": b"\xff", b"\xfe": b"\xfd"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert rejected.value.message_id == message_id
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    assert "source_event_id" not in payload
+    assert payload["reason_code"] == "INVALID_ENVELOPE"
+
+
+@pytest.mark.parametrize("operation", ["receive", "quarantine"])
+async def test_unknown_dead_schema_is_never_recursively_quarantined(
+    redis_client: Redis, stream_prefix: str, operation: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:dead", {"envelope": '{"schema_version":2}'}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(ValueError, match=r"^Unsupported source task channel$"):
+        if operation == "receive":
+            await queue.receive(
+                task_kind=cast(TaskKind, "dead"), consumer_name="operator"
+            )
+        else:
+            await queue.quarantine(
+                InvalidQueueMessageError(
+                    "Invalid queue task envelope",
+                    message_id=cast(str, message_id),
+                    source_routing_key=cast(TaskKind, "dead"),
+                )
+            )
+
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 1
+    assert await redis_client.xinfo_groups(f"{stream_prefix}:dead") == []
+
+
+async def test_dead_retention_removes_individually_expired_entries_only(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    seconds, _ = await redis_client.time()
+    old_id = f"{(seconds - 8 * 86_400) * 1000}-0"
+    recent_id = f"{(seconds - 6 * 86_400) * 1000}-0"
+    for message_id in (old_id, recent_id):
+        await redis_client.xadd(
+            f"{stream_prefix}:dead", {"envelope": "safe-metadata"}, id=message_id
+        )
+    newest_id = await redis_client.xadd(
+        f"{stream_prefix}:dead", {"envelope": "safe-metadata"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    assert await queue.trim_dead_letters() == 1
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None
+    assert [message[0] for message in messages] == [recent_id, newest_id]
+    assert await redis_client.ttl(f"{stream_prefix}:dead") == -1
+    assert await queue.trim_dead_letters() == 0
+
+
+async def test_new_quarantine_does_not_extend_older_dead_entry_retention(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    seconds, _ = await redis_client.time()
+    old_id = f"{(seconds - 8 * 86_400) * 1000}-0"
+    recent_id = f"{(seconds - 6 * 86_400) * 1000}-0"
+    for message_id in (old_id, recent_id):
+        await redis_client.xadd(
+            f"{stream_prefix}:dead", {"envelope": "safe-metadata"}, id=message_id
+        )
+    await redis_client.xadd(f"{stream_prefix}:analyze", {"envelope": "not JSON"})
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    newest_id = await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None
+    assert [message[0] for message in messages] == [recent_id, newest_id]
+    assert await redis_client.ttl(f"{stream_prefix}:dead") == -1

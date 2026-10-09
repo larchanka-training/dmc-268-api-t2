@@ -5,27 +5,25 @@ import uuid
 from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import cast
 
 from redis.asyncio import Redis
 from redis.client import NEVER_DECODE
 from redis.exceptions import ResponseError
 
-from app.application.ports import QueueDelivery, QueueTaskEnvelope, TaskKind
+from app.application.ports import (
+    QueueDelivery,
+    QueueEnvelopeReason,
+    QueueEnvelopeValidationError,
+    QueueTaskEnvelope,
+    TaskKind,
+)
 
 _MAX_ENVELOPE_BYTES = 16 * 1024
 _DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 type _StreamMessage = tuple[str | bytes, dict[str | bytes, str | bytes]]
 type _ReadResponse = list[tuple[str | bytes, list[_StreamMessage]]]
-type DeadReason = Literal[
-    "UNSUPPORTED_SCHEMA_VERSION", "UNKNOWN_TASK_KIND", "INVALID_ENVELOPE"
-]
-
-
-class _EnvelopeError(ValueError):
-    def __init__(self, reason_code: DeadReason) -> None:
-        super().__init__("Invalid queue task envelope")
-        self.reason_code = reason_code
+type DeadReason = QueueEnvelopeReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,43 +90,45 @@ class InvalidQueueMessageError(ValueError):
 def _decode_envelope(serialized: str | bytes) -> QueueTaskEnvelope:
     encoded = serialized.encode("utf-8") if isinstance(serialized, str) else serialized
     if len(encoded) > _MAX_ENVELOPE_BYTES:
-        raise ValueError("Queue task envelope exceeds 16 KiB")
+        raise QueueEnvelopeValidationError(
+            "INVALID_ENVELOPE", "Queue task envelope exceeds 16 KiB"
+        )
     try:
         payload = json.loads(serialized)
     except ValueError:
-        raise ValueError("Invalid queue task envelope") from None
+        raise QueueEnvelopeValidationError("INVALID_ENVELOPE") from None
     if isinstance(payload, dict):
         version = _positive_integer(payload.get("schema_version"))
         if version is not None and version != 1:
-            raise _EnvelopeError("UNSUPPORTED_SCHEMA_VERSION")
+            raise QueueEnvelopeValidationError("UNSUPPORTED_SCHEMA_VERSION")
         task_kind = payload.get("task_kind")
         if (
             isinstance(task_kind, str)
             and task_kind
             and task_kind not in ("analyze", "publish")
         ):
-            raise _EnvelopeError("UNKNOWN_TASK_KIND")
+            raise QueueEnvelopeValidationError("UNKNOWN_TASK_KIND")
     required = {field.name for field in dataclass_fields(QueueTaskEnvelope)}
     if not isinstance(payload, dict) or not required <= payload.keys():
-        raise ValueError("Invalid queue task envelope")
+        raise QueueEnvelopeValidationError("INVALID_ENVELOPE")
     if (
         type(payload["schema_version"]) not in (int, float)
         or payload["schema_version"] != 1
         or payload["task_kind"] not in ("analyze", "publish")
     ):
-        raise ValueError("Invalid queue task envelope")
+        raise QueueEnvelopeValidationError("INVALID_ENVELOPE")
     attempt = payload["attempt"]
     if (
         type(attempt) not in (int, float)
         or attempt < 1
         or (isinstance(attempt, float) and not attempt.is_integer())
     ):
-        raise ValueError("Invalid queue task envelope")
+        raise QueueEnvelopeValidationError("INVALID_ENVELOPE")
     if any(
         not isinstance(payload[name], str) or not payload[name]
         for name in ("event_id", "review_id", "trace_id")
     ):
-        raise ValueError("Invalid queue task envelope")
+        raise QueueEnvelopeValidationError("INVALID_ENVELOPE")
     payload["schema_version"] = 1
     payload["attempt"] = int(attempt)
     return QueueTaskEnvelope(
@@ -210,7 +210,7 @@ class RedisQueue:
                 else message_id,
                 source_routing_key=task_kind,
                 reason_code=error.reason_code
-                if isinstance(error, _EnvelopeError)
+                if isinstance(error, QueueEnvelopeValidationError)
                 else "INVALID_ENVELOPE",
                 source_identity=_source_identity(serialized),
             ) from None

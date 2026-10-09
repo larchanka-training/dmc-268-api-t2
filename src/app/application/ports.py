@@ -18,6 +18,27 @@ from app.domain.enums import (
 type TaskKind = Literal["analyze", "publish"]
 
 
+type QueueEnvelopeReason = Literal[
+    "UNSUPPORTED_SCHEMA_VERSION", "UNKNOWN_TASK_KIND", "INVALID_ENVELOPE"
+]
+
+
+class QueueEnvelopeValidationError(ValueError):
+    """Permanent canonical-envelope rejection before any broker I/O.
+
+    Queue adapters must reserve this error for validation, never transport errors.
+    Only the safe contract code may be persisted as a quarantine reason.
+    """
+
+    def __init__(
+        self,
+        reason_code: QueueEnvelopeReason,
+        message: str = "Invalid queue task envelope",
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 @dataclass(frozen=True, slots=True)
 class QueueTaskEnvelope:
     schema_version: int
@@ -35,7 +56,9 @@ class QueueDelivery:
 
 
 class QueuePort(Protocol):
-    async def enqueue(self, envelope: QueueTaskEnvelope) -> str: ...
+    async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
+        """Confirm enqueue or reject before I/O via QueueEnvelopeValidationError."""
+        ...
 
     async def receive(
         self, *, task_kind: TaskKind, consumer_name: str

@@ -6,7 +6,12 @@ from typing import cast
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.application.ports import QueuePort, QueueTaskEnvelope, TaskKind
+from app.application.ports import (
+    QueueEnvelopeValidationError,
+    QueuePort,
+    QueueTaskEnvelope,
+    TaskKind,
+)
 from app.db.models import OutboxEvent
 
 
@@ -27,10 +32,11 @@ class PostgresOutboxDispatcher:
     async def dispatch_batch(self, *, batch_size: int = 100) -> int:
         """Return confirmed enqueues; propagate errors and retain unsent work.
 
-        Each publication marker commits separately. An error stops the batch,
-        preserving earlier progress; the failed event remains eligible for retry.
-        The count includes duplicates sent by concurrent runs, even if another
-        run has already set the marker by the time this run updates it.
+        Each publication or quarantine marker commits separately. A known
+        canonical-envelope rejection is quarantined and skipped. Other errors
+        stop the batch while preserving earlier progress and retry eligibility.
+        The count includes concurrent duplicate ACKs, even if another run has
+        already committed a terminal marker. Quarantine does not add to it.
         """
 
         if batch_size <= 0:
@@ -39,7 +45,10 @@ class PostgresOutboxDispatcher:
             events = (
                 await session.scalars(
                     select(OutboxEvent)
-                    .where(OutboxEvent.broker_published_at.is_(None))
+                    .where(
+                        OutboxEvent.broker_published_at.is_(None),
+                        OutboxEvent.quarantined_at.is_(None),
+                    )
                     .order_by(OutboxEvent.created_at, OutboxEvent.id)
                     .limit(batch_size)
                     .with_for_update(skip_locked=True)
@@ -59,15 +68,34 @@ class PostgresOutboxDispatcher:
                 )
                 for event in events
             ]
+        confirmed = 0
         for event_id, envelope in tasks:
-            await self._queue.enqueue(envelope)
+            try:
+                await self._queue.enqueue(envelope)
+            except QueueEnvelopeValidationError as error:
+                async with self._session_factory.begin() as session:
+                    await session.execute(
+                        update(OutboxEvent)
+                        .where(
+                            OutboxEvent.id == event_id,
+                            OutboxEvent.broker_published_at.is_(None),
+                            OutboxEvent.quarantined_at.is_(None),
+                        )
+                        .values(
+                            quarantined_at=datetime.now(UTC),
+                            quarantine_reason_code=error.reason_code,
+                        )
+                    )
+                continue
             async with self._session_factory.begin() as session:
                 await session.execute(
                     update(OutboxEvent)
                     .where(
                         OutboxEvent.id == event_id,
                         OutboxEvent.broker_published_at.is_(None),
+                        OutboxEvent.quarantined_at.is_(None),
                     )
                     .values(broker_published_at=datetime.now(UTC))
                 )
-        return len(tasks)
+            confirmed += 1
+        return confirmed

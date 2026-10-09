@@ -150,27 +150,74 @@ The v1 serializer emits only the canonical envelope fields. V1 consumers ignore
 unknown optional fields. Breaking envelope changes require a new major version
 and corresponding consumer.
 
-The dispatcher selects unpublished outbox records. It marks
-`broker_published_at` only after the queue adapter confirms enqueue. Consumers reject
-unsupported schema versions, unknown task kinds, and otherwise invalid envelopes
-before domain work begins.
+The dispatcher selects unpublished outbox records that are not quarantined. It
+marks `broker_published_at` only after the queue adapter confirms Redis enqueue.
+Consumers reject unsupported schema versions, unknown task kinds, and otherwise
+invalid envelopes before domain work begins.
+
+### 4.1 PostgreSQL outbox quarantine — stage 3B contract proposal
+
+The quarantine rules in this subsection are a change to the shared pipeline
+contract proposed for Tech Lead review. They do not change the canonical queue
+or dead-letter JSON Schemas.
+
+An authoritative `OutboxEvent` whose canonical envelope is permanently invalid
+is retained in PostgreSQL with nullable `quarantined_at` and
+`quarantine_reason_code`. The only accepted reason codes are
+`UNSUPPORTED_SCHEMA_VERSION`, `UNKNOWN_TASK_KIND`, and `INVALID_ENVELOPE`, shared
+with the canonical queue/dead-letter contract. Canonical validation occurs before
+Redis I/O and reports these known failures with a typed validation error. Other
+errors, including unknown `ValueError` sources, Redis failures, and PostgreSQL
+failures, propagate without quarantining the event or treating it as delivered.
+
+Quarantine sets both metadata fields atomically while preserving the existing
+event ID, review/task/trace identity, attempt, schema version, timestamps, and
+all other source data. It stores only the accepted reason code, never payloads,
+exception text, stack traces, or secrets. A quarantined event keeps
+`broker_published_at IS NULL`; a published event has no quarantine metadata.
+PostgreSQL CHECK constraints enforce paired quarantine metadata, accepted reason
+codes, and mutual exclusion of publication and quarantine. Both terminal writes
+conditionally update only an event that is still unpublished and unquarantined,
+so repeated quarantine is idempotent and concurrent dispatchers cannot commit
+both terminal states for the same event.
+
+Quarantine records a producer rejection before Redis enqueue for that snapshot.
+It is not a Redis dead-letter record, does not enqueue a Redis DLQ message, and
+does not acknowledge any Redis delivery. A successfully quarantined event is
+excluded from normal dispatch selection; dispatch continues to later events in
+the selected batch. If the quarantine transaction fails, the event remains ordinary
+unpublished work and the database error stops the invocation.
+
+Migration `0007` follows `0006`, adds the nullable metadata and constraints, and
+preserves existing rows and publication markers. Stop dispatcher writers before
+downgrading to `0006`: downgrade removes quarantine metadata and makes previously
+quarantined unpublished records eligible for normal selection again. Downgrade
+does not provide a validated operator replay operation.
 
 The minimal PostgreSQL dispatcher is `PostgresOutboxDispatcher.dispatch_batch()`
 in `src/app/adapters/outbox_dispatcher.py`. It accepts the existing session factory
-and `QueuePort`, selects oldest unpublished events with `FOR UPDATE SKIP LOCKED`,
-and defaults to a batch of 100 (the supplied batch size must be positive). It
+and `QueuePort`, selects oldest unpublished, unquarantined events with
+`FOR UPDATE SKIP LOCKED`, and defaults to a batch of 100 (the supplied batch size must be positive). It
 copies authoritative event columns into `QueueTaskEnvelope` and closes the
 selection transaction before Redis enqueue. Each confirmed enqueue is marked in
-its own short transaction, updating only a still-unpublished event.
+its own short transaction, updating only a still-unpublished, unquarantined event.
 
 Selection locks are not claims across Redis I/O: overlapping dispatcher runs may
 enqueue duplicates after those locks are released. A crash after enqueue but
 before the marker commits also permits a duplicate. Both paths retain the same
 event ID and envelope; delivery is at-least-once, not exactly-once. The method
-returns the number of confirmed enqueues, including concurrent duplicates, and
-propagates the first enqueue or database error. Earlier publication markers stay
-committed; failed and remaining events stay eligible for the next invocation.
-There is no dispatcher retry loop or long-running process in this slice.
+returns the number of confirmed Redis enqueues, including concurrent duplicates;
+quarantined events do not increase that count. It continues after a known
+canonical validation failure has been durably quarantined and propagates the
+first other enqueue or database error. Earlier publication/quarantine markers
+stay committed; failed and remaining ordinary unpublished events stay eligible
+for the next invocation. There is no transaction spanning PostgreSQL and Redis,
+dispatcher retry loop, or long-running process in this slice. A dispatcher that
+already copied an envelope is not cancelled by another run's terminal write.
+If source columns are concurrently corrected, an in-flight valid snapshot can
+still enter Redis after quarantine; its ACK is counted but cannot overwrite the
+quarantine marker. These guarantees concern authoritative PostgreSQL states,
+not exactly-once broker I/O.
 
 ## 5. Leases and fencing
 
@@ -275,6 +322,14 @@ downgrade preserves lease rows but removes task-kind isolation.
 
 ## 6. Dead-letter behavior
 
+Redis dead-letter quarantine handles invalid messages already present in Redis.
+The consumer writes a safe dead-letter record before acknowledging the source
+delivery; a Redis failure propagates and cannot be treated as a successful
+acknowledgement. This mechanism is separate from PostgreSQL outbox quarantine
+(§4.1), which retains an invalid source event before Redis enqueue. The seven-day
+dead-letter retention applies to Redis records, not authoritative quarantined
+`OutboxEvent` rows.
+
 Dead-letter records use the independently versioned schema
 `schemas/queue/dead/v1.json` and one of:
 
@@ -296,7 +351,10 @@ version. An unsupported dead-schema version is not recursively quarantined.
 
 ## 7. Operator replay
 
-Replay is operator-only and accepts a `source_event_id`. The operator service:
+Replay remains future operator-only work; stage 3B does not implement an operator
+service or automatically reopen PostgreSQL quarantine. The proposed replay
+contract accepts a `source_event_id` from either PostgreSQL quarantine or a Redis
+dead-letter record. The operator service:
 
 1. resolves the authoritative PostgreSQL `OutboxEvent`;
 2. rejects unsupported source schema versions;
@@ -307,6 +365,8 @@ Replay is operator-only and accepts a `source_event_id`. The operator service:
 7. sets `attempt` to the source attempt plus one.
 
 Raw dead messages are never replayed.
+The original quarantined/published source event and its identity are retained;
+replay creates new work rather than clearing its quarantine or publication marker.
 
 ## 8. Publication recovery and reconciliation
 

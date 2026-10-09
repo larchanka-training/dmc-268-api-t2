@@ -370,7 +370,7 @@ async def test_task_kind_upgrade_and_downgrade_preserve_existing_leases(
     before = await database.connection.fetchrow(
         "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
     )
-    database.migrate("upgrade", "head")
+    database.migrate("upgrade", "0006")
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
         == "0006"
@@ -414,3 +414,168 @@ async def test_task_kind_upgrade_and_downgrade_preserve_existing_leases(
         )
         == "analyze"
     )
+
+
+async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0006")
+    unpublished_id, published_id = uuid.uuid4(), uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at,
+         broker_published_at)
+        VALUES ($1,$3,1,'analyze',2,'',now(),NULL),
+               ($2,$3,1,'publish',3,'existing-trace',now(),now())""",
+        unpublished_id,
+        published_id,
+        job_id,
+    )
+    original_columns = (
+        "id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at,"
+        "broker_published_at"
+    )
+    before = await database.connection.fetch(
+        f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+    )
+
+    database.migrate("upgrade", "head")
+
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0007"
+    )
+    assert (
+        await database.connection.fetch(
+            f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+        )
+        == before
+    )
+    assert await database.connection.fetchval(
+        "SELECT count(*) FROM outbox_event "
+        "WHERE quarantined_at IS NULL AND quarantine_reason_code IS NULL"
+    ) == len(before)
+    await database.connection.execute(
+        "UPDATE outbox_event SET quarantined_at=now(), "
+        "quarantine_reason_code='INVALID_ENVELOPE' WHERE id=$1",
+        unpublished_id,
+    )
+    quarantined = await database.connection.fetchrow(
+        "SELECT quarantined_at,quarantine_reason_code,broker_published_at "
+        "FROM outbox_event WHERE id=$1",
+        unpublished_id,
+    )
+    assert quarantined is not None
+    assert quarantined["quarantined_at"] is not None
+    assert quarantined["quarantine_reason_code"] == "INVALID_ENVELOPE"
+    assert quarantined["broker_published_at"] is None
+    database.migrate("check")
+
+    database.migrate("downgrade", "0006")
+
+    assert (
+        await database.connection.fetch(
+            f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+        )
+        == before
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name='outbox_event' "
+            "AND column_name IN ('quarantined_at','quarantine_reason_code')"
+        )
+        == 0
+    )
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+
+
+@pytest.mark.parametrize("field", ["quarantined_at", "quarantine_reason_code"])
+async def test_outbox_quarantine_requires_timestamp_and_safe_reason_together(
+    migration_database: MigrationDatabase,
+    field: str,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+    value = "now()" if field == "quarantined_at" else "'INVALID_ENVELOPE'"
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            f"UPDATE outbox_event SET {field}={value} WHERE id=$1", event_id
+        )
+
+
+async def test_outbox_quarantine_and_publication_are_mutually_exclusive(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code='INVALID_ENVELOPE',broker_published_at=now() "
+            "WHERE id=$1",
+            event_id,
+        )
+
+
+async def test_outbox_quarantine_persists_only_contract_reason_codes(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code='unsafe exception or payload' WHERE id=$1",
+            event_id,
+        )
+    for code in (
+        "UNSUPPORTED_SCHEMA_VERSION",
+        "UNKNOWN_TASK_KIND",
+        "INVALID_ENVELOPE",
+    ):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code=$1 WHERE id=$2",
+            code,
+            event_id,
+        )
+        assert (
+            await database.connection.fetchval(
+                "SELECT quarantine_reason_code FROM outbox_event WHERE id=$1", event_id
+            )
+            == code
+        )

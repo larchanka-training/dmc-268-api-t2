@@ -16,7 +16,11 @@ from redis.exceptions import NoPermissionError
 from redis.typing import EncodableT, FieldT
 
 from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
-from app.application.ports import QueueTaskEnvelope, TaskKind
+from app.application.ports import (
+    QueueEnvelopeValidationError,
+    QueueTaskEnvelope,
+    TaskKind,
+)
 
 _REDIS_URL = os.environ.get("DMC268_TEST_REDIS_URL")
 if not _REDIS_URL:
@@ -603,3 +607,28 @@ async def test_new_quarantine_does_not_extend_older_dead_entry_retention(
     assert messages is not None
     assert [message[0] for message in messages] == [recent_id, newest_id]
     assert await redis_client.ttl(f"{stream_prefix}:dead") == -1
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"schema_version": 2}, "UNSUPPORTED_SCHEMA_VERSION"),
+        ({"task_kind": "unknown"}, "UNKNOWN_TASK_KIND"),
+        ({"trace_id": ""}, "INVALID_ENVELOPE"),
+        ({"trace_id": "x" * (16 * 1024)}, "INVALID_ENVELOPE"),
+    ],
+)
+async def test_producer_validation_exposes_only_typed_safe_rejection(
+    redis_client: Redis,
+    stream_prefix: str,
+    changes: dict[str, Any],
+    reason: str,
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(QueueEnvelopeValidationError) as rejected:
+        await queue.enqueue(replace(envelope(), **changes))
+
+    assert rejected.value.reason_code == reason
+    assert "x" * 100 not in str(rejected.value)
+    assert await redis_client.xlen(f"{stream_prefix}:analyze") == 0
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0

@@ -565,6 +565,10 @@ class OutboxEvent(Base):
     broker_published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    quarantined_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    quarantine_reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="outbox_events")
 
@@ -574,6 +578,19 @@ class OutboxEvent(Base):
             "task_kind IN ('analyze','publish')", name="ck_outbox_task_kind"
         ),
         CheckConstraint("attempt > 0", name="ck_outbox_attempt_positive"),
+        CheckConstraint(
+            "(quarantined_at IS NULL) = (quarantine_reason_code IS NULL)",
+            name=conv("ck_outbox_quarantine_pair"),
+        ),
+        CheckConstraint(
+            "broker_published_at IS NULL OR quarantined_at IS NULL",
+            name=conv("ck_outbox_delivery_state"),
+        ),
+        CheckConstraint(
+            "quarantine_reason_code IS NULL OR quarantine_reason_code IN "
+            "('UNSUPPORTED_SCHEMA_VERSION','UNKNOWN_TASK_KIND','INVALID_ENVELOPE')",
+            name=conv("ck_outbox_quarantine_reason_code"),
+        ),
         Index("ix_outbox_unpublished", "broker_published_at", "created_at"),
     )
 

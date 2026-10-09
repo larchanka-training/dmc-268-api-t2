@@ -316,6 +316,30 @@ DB CHECK запрещает active status с заполненным
 
 ---
 
+### 3.7 Чтение результатов ревью
+
+`GET /api/v1/reviews/{id}` и `GET /api/v1/reviews/{id}/findings` читают
+сохранённые результаты из PostgreSQL согласно `openapi.yaml`. Detail выводит
+status `ReviewJob`, отдельно status `Publication`, сохранённый snapshot,
+coverage и подтверждённые token counts. Detail использует единый PostgreSQL
+snapshot `REPEATABLE READ` при конкурентной записи результата. Progress считает
+сохранённые contexts
+и results; завершённый result с удалённым context сохраняет известный planned
+chunk. Неизвестный исторический reason code и недоступные nullable данные
+проецируются в null. Raw context, prompts, provider metadata и lease не выдаются.
+
+Findings используют bounded SQL keyset pagination по `(created_at, id)`, default
+20, максимум 100, opaque cursor с проверкой review и anchor. Пока отсутствует
+согласованная сохранённая связь Finding с provider reference,
+`publication_reference` всегда null.
+
+Типизированная dependency `get_authenticated_principal` по умолчанию возвращает
+canonical 401. Реальная проверка cookie и PostgreSQL session ещё не подключена:
+эти endpoints пока недоступны реальным пользователям. Test principal задаётся
+только через FastAPI dependency override. После principal обязательно проверяется
+`RepositoryAccess`; отсутствующий review и отсутствие доступа возвращают одинаковый
+canonical 404. Production bypass и чтение user ID из запроса отсутствуют.
+
 ## 4. Модель хранения данных
 
 Физическая модель приведена в [`BACKEND_ERD.md`](./BACKEND_ERD.md).

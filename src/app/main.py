@@ -7,6 +7,7 @@ import structlog
 from fastapi import FastAPI
 
 from app.api import api_router
+from app.api.errors import ApiError, api_error_response
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.core.middleware import RequestIdMiddleware
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestIdMiddleware)
     app.include_router(api_router)
+    app.add_exception_handler(ApiError, api_error_response)
 
     @app.get("/")
     async def read_root() -> dict[str, str]:

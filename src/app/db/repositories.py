@@ -3,11 +3,17 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.ports import ReviewJobSnapshot, StartReviewCommand
-from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob
+from app.application.ports import (
+    LeaseLostError,
+    ReviewJobSnapshot,
+    StartReviewCommand,
+    TaskLeaseSnapshot,
+)
+from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob, TaskLease
+from app.db.task_leases import lock_owned_lease
 from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
 
 
@@ -91,3 +97,34 @@ class SqlAlchemyReviewJobRepository:
             ]
         )
         return review_id
+
+    async def update_status(
+        self, lease: TaskLeaseSnapshot, *, status: ReviewStatus
+    ) -> None:
+        locked = await lock_owned_lease(self._session, lease)
+        if locked is None or locked[0].finished_at is not None:
+            raise LeaseLostError("Review lease is no longer current")
+        _, _, now = locked
+        terminal = status in {
+            ReviewStatus.COMPLETED,
+            ReviewStatus.PARTIAL,
+            ReviewStatus.FAILED,
+            ReviewStatus.SKIPPED,
+        }
+        updated = await self._session.scalar(
+            update(ReviewJob)
+            .where(
+                ReviewJob.id == lease.review_job_id,
+                ReviewJob.finished_at.is_(None),
+                exists().where(
+                    TaskLease.review_job_id == lease.review_job_id,
+                    TaskLease.owner == lease.owner,
+                    TaskLease.fencing_token == lease.fencing_token,
+                    TaskLease.expires_at > func.clock_timestamp(),
+                ),
+            )
+            .values(status=status.value, finished_at=now if terminal else None)
+            .returning(ReviewJob.id)
+        )
+        if updated is None:
+            raise LeaseLostError("Review lease expired before the write")

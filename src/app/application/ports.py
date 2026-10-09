@@ -7,7 +7,7 @@ from datetime import datetime
 from types import TracebackType
 from typing import Literal, Protocol
 
-from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
+from app.domain.enums import FindingCategory, FindingSeverity, FindingSide, ReviewStatus
 
 type TaskKind = Literal["analyze", "publish"]
 
@@ -155,6 +155,28 @@ class ReviewJobSnapshot:
     finished_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class TaskLeaseSnapshot:
+    review_job_id: uuid.UUID
+    owner: str
+    expires_at: datetime
+    fencing_token: int
+
+
+class LeaseLostError(Exception):
+    """The worker no longer has authority to persist this review."""
+
+
+class TaskLeasePort(Protocol):
+    async def acquire(
+        self, review_job_id: uuid.UUID, *, owner: str
+    ) -> TaskLeaseSnapshot | None: ...
+
+    async def renew(self, lease: TaskLeaseSnapshot) -> TaskLeaseSnapshot | None: ...
+
+    async def release(self, lease: TaskLeaseSnapshot) -> bool: ...
+
+
 class VcsPort(Protocol):
     async def list_open_pull_requests(
         self,
@@ -189,6 +211,17 @@ class ReviewJobRepositoryPort(Protocol):
     async def add_start_review(
         self, command: StartReviewCommand, *, config_digest: str
     ) -> uuid.UUID: ...
+
+    async def update_status(
+        self, lease: TaskLeaseSnapshot, *, status: ReviewStatus
+    ) -> None:
+        """Fence and write in this UoW transaction; raise LeaseLostError on refusal.
+
+        Commit/rollback before external I/O. Other worker persistence methods must
+        use the same transaction-local locking and verification, never a prior
+        standalone check.
+        """
+        ...
 
 
 class UnitOfWorkPort(Protocol):

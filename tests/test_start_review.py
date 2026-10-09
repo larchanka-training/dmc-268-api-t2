@@ -15,6 +15,7 @@ from app.application.ports import (
     ReviewJobRepositoryPort,
     ReviewJobSnapshot,
     StartReviewCommand,
+    TaskLeaseSnapshot,
 )
 from app.application.use_cases.start_review import (
     compute_config_digest,
@@ -23,6 +24,7 @@ from app.application.use_cases.start_review import (
 from app.db.models import OutboxEvent, Publication, ReviewJob
 from app.db.repositories import SqlAlchemyReviewJobRepository
 from app.db.uow import SqlAlchemyUnitOfWork
+from app.domain.enums import ReviewStatus
 
 
 def make_command() -> StartReviewCommand:
@@ -120,6 +122,11 @@ class FakeReviewJobRepository:
     def __init__(self, review_id: uuid.UUID) -> None:
         self.review_id = review_id
         self.calls: list[tuple[StartReviewCommand, str]] = []
+
+    async def update_status(
+        self, lease: TaskLeaseSnapshot, *, status: ReviewStatus
+    ) -> None:
+        raise NotImplementedError("Start-review tests do not perform worker writes")
 
     async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None:
         return None

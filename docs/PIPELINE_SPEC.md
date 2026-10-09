@@ -92,7 +92,7 @@ and maps model output to `ReviewChunkResult`, adding the schema version, measure
 gateway latency, and usage only when both token counts are available. Review/chunk
 identity remains authoritative in context and persisted aggregates; status is a
 ReviewJob field, while provider/model provenance, request counts, and safe errors
-are backend-owned outside the model output. The open PR #18 gateway adapter must
+are backend-owned outside the model output. Any gateway adapter must
 align its typed models with the checked-in schemas and shared fixtures in
 `schemas/examples/`; textual equality with a separately generated schema is
 not the wire contract.
@@ -124,8 +124,10 @@ The normal queue envelope is validated against
 attempt, and trace identity. Source, diff, prompt, and model result are never sent
 in the envelope.
 
-The v1 Redis-backed queue adapter must provide these observable guarantees;
-issue #13 owns the concrete worker/DLQ implementation:
+`RedisQueue` implements enqueue, receive, acknowledgement and safe dead-letter
+quarantine. Automatic heartbeat, pending-delivery claiming and periodic review
+recovery are not implemented. The v1 Redis-backed queue adapter and workers must
+provide these observable guarantees:
 
 - separate analyze, publish, and dead-letter task kinds/channels;
 - acknowledged enqueue before marking the PostgreSQL outbox event published;
@@ -155,11 +157,10 @@ marks `broker_published_at` only after the queue adapter confirms Redis enqueue.
 Consumers reject unsupported schema versions, unknown task kinds, and otherwise
 invalid envelopes before domain work begins.
 
-### 4.1 PostgreSQL outbox quarantine — stage 3B contract proposal
+### 4.1 PostgreSQL outbox quarantine
 
-The quarantine rules in this subsection are a change to the shared pipeline
-contract proposed for Tech Lead review. They do not change the canonical queue
-or dead-letter JSON Schemas.
+PostgreSQL outbox quarantine is implemented by `PostgresOutboxDispatcher`.
+It does not change the canonical queue or dead-letter JSON Schemas.
 
 An authoritative `OutboxEvent` whose canonical envelope is permanently invalid
 is retained in PostgreSQL with nullable `quarantined_at` and
@@ -212,20 +213,21 @@ canonical validation failure has been durably quarantined and propagates the
 first other enqueue or database error. Earlier publication/quarantine markers
 stay committed; failed and remaining ordinary unpublished events stay eligible
 for the next invocation. There is no transaction spanning PostgreSQL and Redis,
-dispatcher retry loop, or long-running process in this slice. A dispatcher that
+dispatcher retry loop, or long-running dispatcher process. A dispatcher that
 already copied an envelope is not cancelled by another run's terminal write.
 If source columns are concurrently corrected, an in-flight valid snapshot can
 still enter Redis after quarantine; its ACK is counted but cannot overwrite the
 quarantine marker. These guarantees concern authoritative PostgreSQL states,
 not exactly-once broker I/O.
 
-### 4.2 Bounded worker execution — stage 5A
+### 4.2 Bounded worker execution
 
 `PostgresReviewWorker.run_once()` receives at most one new Redis delivery for
 its configured task kind and consumer group. Construction requires a typed
 `TaskHandlerPort`; there is no default handler, CLI, service, or production
-worker loop. The callback is a bounded persistence seam, not permission to call
-VCS, LLM, or a publisher.
+worker loop. The generic callback supplies no provider call-start authority;
+`PostgresAnalysisHandler` adds the checks described in §4.3. Publisher
+call-start checks and serialization remain separate.
 
 The worker validates every canonical envelope field against the PostgreSQL
 OutboxEvent and its ReviewJob. Unparseable UUID identity, a missing command, or
@@ -235,7 +237,7 @@ are not JSON/schema errors and must not enter Redis DLQ. A NULL
 A quarantined PostgreSQL command remains pending without executing its handler:
 outbox quarantine is not proof of a Redis processing decision.
 
-Acquisition uses the stage 4B task-specific lifecycle rules and a new fencing
+Acquisition uses the task-specific lifecycle rules in §5 and a new fencing
 token. After acquisition, the worker rechecks command identity, live authority,
 and lifecycle/deadline after awaited locks before invoking the callback. The
 callback must use transaction-local fenced persistence and commit before
@@ -245,7 +247,7 @@ ACK. The worker independently reads committed state in a new locked transaction
 and verifies its claim. It attempts fenced release in `finally`; lost authority
 or unsuccessful release prevents ACK as the current processing success.
 
-The conservative stage 5A completion proofs are:
+The worker's conservative completion proofs are:
 
 - Analyze FAILED/SKIPPED with terminal `finished_at`.
 - Analyze COMPLETED/PARTIAL with prepared Publication (non-NOT_READY and
@@ -268,13 +270,61 @@ use the existing safe Redis quarantine; failure propagates without an unsafe ACK
 The worker neither deletes stream entries nor changes outbox delivery markers.
 
 There is currently no durable per-event receipt or retry-successor verification
-contract. A future retry ACK must prove an atomic replacement outbox command and
+contract. A retry ACK must prove an atomic replacement outbox command and
 accepted scheduling/budget state; a `retry_at` write or callback assertion alone
 is insufficient. Deadline expiry and UNKNOWN need the separate recovery and
-reconciliation decisions described below. Stage 5B will provide pending recovery
-(XAUTOCLAIM), heartbeat, and periodic recovery. Before real provider integration,
-call-start authority/deadline checks and ChangeRequest publication serialization
-must additionally be implemented; this seam does not supply those guarantees.
+reconciliation decisions described below. Pending-delivery recovery
+(XAUTOCLAIM), automatic heartbeat, and periodic review recovery are not
+implemented. The orchestration seam supplies no provider-call guarantees itself.
+`PostgresAnalysisHandler` implements analysis call-start checks; ChangeRequest
+publication serialization and publish call-start checks are not implemented
+and remain requirements for publisher integration.
+
+### 4.3 Analysis handler and publication handoff
+
+`PostgresAnalysisHandler` implements the existing `TaskHandlerPort`. Composition
+must explicitly supply `GithubPort`, `LlmGatewayPort` and the checked-in schemas
+directory; there is no default LLM provider or production worker entrypoint.
+It checks canonical command identity, live lease and accepted deadlines before
+GitHub/LLM invocations, closes all PostgreSQL transactions before external I/O,
+and uses existing transaction-local fenced repositories for writes.
+
+The first capture uses the authoritative ChangeRequest base SHA after checking
+its open state and requested head compatibility. A captured ReviewJob base SHA
+is retained on resumption. No WebhookReceipt supplies implicit analysis input.
+The existing GitHub client and diff parser produce the snapshot, hunks and
+policy coverage. Level 1 leaves source windows, whole files and related symbols
+empty. The complete wire context passes canonical schema and semantic validation
+before persistence/inference. Budget uses a conservative UTF-8 byte estimate of
+the complete wire and fixed input/output limits, persisted with the context.
+An empty, fully excluded or wholly over-budget diff records SKIPPED with snapshot
+and coverage, without ContextPayload or LLM invocation. Token-budget exclusion
+uses the existing coverage reason. A saved context is reused after provider or
+result-commit failure; accepted analysis deadlines and budgets are not reset.
+
+Context v1 has only `metadata.rules_version`, populated with the immutable
+RepositorySettings UUID, plus the frozen output language. It has no instructions
+field. The supplied real gateway must resolve frozen rules/model/prompt by
+authoritative review/settings identity. A real gateway and this resolution are
+not implemented; gateway test doubles exist only in integration tests.
+The current port also has no distinct format-repair operation. The handler
+reserves at most one second `review` invocation using a fenced durable
+FORMAT_REPAIR audit event. Actual provider repair semantics and shared internal
+retry/request budget are not implemented and remain gateway requirements; a
+second call alone is not claimed to implement provider prompt repair.
+
+Results pass both review-result and llm-output schemas, ordered range checks and
+path/side/coordinate checks against the captured hunks. Findings carry backend
+SHA-256 fingerprints over canonical path/side/range/category/title fields.
+Invalid output after the reserved second invocation fails with LLM_OUTPUT_INVALID
+without ChunkResult/Findings. Useful output with limitations, or returning after
+the analysis deadline, is PARTIAL; otherwise it is COMPLETED. Useful terminal
+status, summary, ChunkResult/Findings, Publication preparation and canonical
+publish outbox commit atomically. Publication remains PENDING, never fake success.
+Permanent GitHub/diff errors record safe terminal decisions; retryable GitHub
+failures record an active failure event and retain pending work. Unknown gateway
+and DB errors propagate and retain pending work. Retry scheduling, recovery and
+real gateway error mapping are not implemented by this handler.
 
 ## 5. Leases and fencing
 
@@ -339,7 +389,7 @@ by the authoritative ChangeRequest identity across the external publication
 cycle. This is a separate worker requirement; TaskLease acquisition alone is not
 permission to make concurrent provider calls for one PR.
 
-The stage 4B persistence seams are `TaskLeasePort.acquire(..., task_kind=...)` and
+The persistence seams are `TaskLeasePort.acquire(..., task_kind=...)` and
 `UnitOfWorkPort.publications` (`PublicationRepositoryPort`): `get(review_id)`
 returns a snapshot, `prepare(analyze_claim)` allows only `NOT_READY -> PENDING`
 after useful terminal analysis, and `update(publish_claim, status=...,
@@ -365,13 +415,14 @@ Acquire and renewal remain deadline-gated; a late result has only the remaining
 lease lifetime in which to be recorded. UNKNOWN still requires reconciliation.
 Publication.started_at records cycle initialization, not the time a provider
 call starts. This persistence-only seam does not prove external call timing;
-the caller owns that precondition. No call-start marker or provider orchestration
-is introduced in stage 4B.
+the caller owns that precondition. These persistence methods implement neither
+a call-start marker nor provider orchestration.
 
 Initial `Publication(NOT_READY)` creation remains part of the start-review
-aggregate transaction before any worker lease exists. Worker completion/outbox
-orchestration and PR serialization remain separate integration work; callers
-must put terminal analysis, preparation and the publish outbox event in one UoW.
+aggregate transaction before any worker lease exists. `PostgresAnalysisHandler`
+puts terminal analysis, preparation and the publish outbox event in one UoW
+as described in §4.3. Other analysis handlers must preserve that atomic handoff.
+Publisher orchestration and PR serialization are not implemented.
 
 The 0006 rollout must replace old lease writers, which cannot insert without the
 required kind. Workers must be stopped before downgrading to 0005, because that
@@ -408,10 +459,9 @@ version. An unsupported dead-schema version is not recursively quarantined.
 
 ## 7. Operator replay
 
-Replay remains future operator-only work; stage 3B does not implement an operator
-service or automatically reopen PostgreSQL quarantine. The proposed replay
-contract accepts a `source_event_id` from either PostgreSQL quarantine or a Redis
-dead-letter record. The operator service:
+Operator replay is not implemented, and PostgreSQL quarantine is not
+automatically reopened. The replay contract requires a `source_event_id` from
+either PostgreSQL quarantine or a Redis dead-letter record. The operator service:
 
 1. resolves the authoritative PostgreSQL `OutboxEvent`;
 2. rejects unsupported source schema versions;

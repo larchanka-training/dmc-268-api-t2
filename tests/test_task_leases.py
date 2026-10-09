@@ -158,14 +158,17 @@ async def test_only_current_owner_and_token_can_renew_a_live_lease(
     assert renewed.expires_at > lease.expires_at
 
     async with postgres.engine.begin() as connection:
-        await connection.execute(
-            update(TaskLease)
-            .where(TaskLease.review_job_id == review_id)
-            .values(
-                expires_at=func.clock_timestamp()
-                + timedelta(seconds=0.3 if expire_while_waiting else -1)
+        cutoff = (
+            await connection.execute(
+                update(TaskLease)
+                .where(TaskLease.review_job_id == review_id)
+                .values(
+                    expires_at=func.clock_timestamp()
+                    + timedelta(seconds=0.3 if expire_while_waiting else -1)
+                )
+                .returning(TaskLease.expires_at)
             )
-        )
+        ).scalar_one()
     if expire_while_waiting:
         async with postgres.engine.begin() as blocker:
             await blocker.execute(
@@ -176,7 +179,7 @@ async def test_only_current_owner_and_token_can_renew_a_live_lease(
             blocker_pid = await blocker.scalar(select(func.pg_backend_pid()))
             task = asyncio.create_task(store.renew(renewed))
             await _wait_for_blocked_operation(postgres, blocker_pid)
-            await blocker.execute(text("SELECT pg_sleep(0.4)"))
+            await _wait_for_database_clock(blocker, cutoff)
         assert await task is None
     else:
         assert await store.renew(renewed) is None
@@ -862,7 +865,15 @@ async def test_publisher_persistence_is_atomic_and_preserves_completed_review(
     assert await release
     async with SqlAlchemyUnitOfWork(factory) as uow:
         assert await uow.publications.get(review_id) == before
-    replacement = await store.acquire(review_id, owner="publisher", task_kind="publish")
+    # Release uses DB wall time, which can move backwards before reacquisition.
+    # Keep the public acquire assertion, but wait for eligibility in that clock.
+    async with asyncio.timeout(15):
+        while (
+            replacement := await store.acquire(
+                review_id, owner="publisher", task_kind="publish"
+            )
+        ) is None:
+            await asyncio.sleep(0.05)
     assert replacement is not None
     async with SqlAlchemyUnitOfWork(factory) as uow:
         with pytest.raises(LeaseLostError):

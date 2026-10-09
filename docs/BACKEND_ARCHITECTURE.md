@@ -1,9 +1,10 @@
 # Архитектура backend — DMC-268 API (Team 2)
 
 Документ фиксирует архитектуру серверной части сервиса асинхронного AI-assisted
-code review. Основания: задачи второго спринта, `BACKEND_ERD.md` и структура
-репозитория `dmc-268-api-t2`. UI `SYSTEM_DESIGN.md` пока ожидает синхронизации
-нового lifecycle и не заменяет `openapi.yaml` как HTTP-контракт.
+code review. Источники контрактов: `openapi.yaml`, `PIPELINE_SPEC.md`,
+`BACKEND_ERD.md` и структура репозитория `dmc-268-api-t2`.
+UI `SYSTEM_DESIGN.md` содержит прежний lifecycle
+и не заменяет `openapi.yaml` как HTTP-контракт.
 
 ---
 
@@ -69,7 +70,11 @@ src/app/
 ├─ vcs/
 │  ├─ github.py                   # GitHub REST snapshot
 │  └─ diff.py                     # bounded unified diff parser
-├─ workers/                       # dispatcher/analysis/publication/recovery; в разработке
+├─ adapters/
+│  ├─ redis_queue.py              # Redis queue и safe dead-letter quarantine
+│  ├─ outbox_dispatcher.py        # bounded PostgreSQL outbox dispatch
+│  ├─ review_worker.py            # bounded analyze/publish orchestration
+│  └─ analysis_handler.py         # анализ и атомарный publication handoff
 ├─ webhook_worker.py              # отдельный recovery intake #14
 └─ main.py                        # инициализация FastAPI
 
@@ -112,8 +117,8 @@ active PostgreSQL `AuthSession`, allowlisted Origin и CSRF. Одна атома
 операция продлевает DB expiry до now + 30 минут и выдаёт новую cookie с тем же
 `sid` и тем же CSRF token; expired/revoked session не восстанавливается и
 возвращает `401`, после чего нужен OAuth. Отдельный browser-readable refresh
-token не вводится. Это согласованный HTTP-контракт, а не утверждение, что
-handlers и физическая AuthSession уже реализованы.
+token не вводится. Это согласованный HTTP-контракт; handlers и физическая
+AuthSession не реализованы.
 
 ### 3.2 GitHub webhook intake
 
@@ -124,7 +129,8 @@ snapshot и сохраняет raw diff и Level 1 artifact; этот путь *
 ReviewJob** и не собирает полный LLM `ContextPayload`. Пустой/полностью
 отфильтрованный diff допустим как Level 1 artifact. Retry, lease и локальная
 проверка описаны в [`github-webhook-intake.md`](./github-webhook-intake.md).
-Redis worker #13 и LLM Gateway #18 остаются отдельными интеграциями.
+Redis review worker не использует WebhookReceipt как неявный источник входных
+данных. Реальный LLM Gateway не реализован.
 
 ### 3.3 Запуск ReviewJob
 
@@ -258,15 +264,27 @@ Renew разрешён только пока задача своего типа 
 provider-вызовов для одного PR нужна отдельно от TaskLease; транзакционные locks
 на ReviewJob не заменяют её и не удерживаются во время внешнего I/O.
 
-Stage 5A предоставляет только bounded `PostgresReviewWorker.run_once()` с
+Реализован bounded `PostgresReviewWorker.run_once()` с
 обязательным `TaskHandlerPort`: одна Redis delivery, authoritative identity,
 task-specific acquire, повторная проверка перед callback, fenced release и ACK
-после проверенного durable outcome. Реального обработчика и production
-entrypoint нет. Обычный return, промежуточный commit и захват lease не разрешают
+после проверенного durable outcome. Production entrypoint отсутствует.
+Обычный return, промежуточный commit и захват lease не разрешают
 ACK. Консервативные completion proofs и pending-классификация определены в
 PIPELINE_SPEC.md §4.2; PostgreSQL outbox marker может оставаться NULL при delivery.
 Тестовый harness фиксирует реальные fenced terminal решения и атомарный publish
-handoff без внешних provider calls. Pending recovery и heartbeat относятся к 5B.
+handoff без внешних provider calls. Pending-delivery recovery и автоматический
+heartbeat не реализованы; продление lease доступно через `TaskLeasePort`.
+
+`PostgresAnalysisHandler` подключается через тот же `TaskHandlerPort`:
+authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` →
+canonical Level 1 ContextPayload → injected `LlmGatewayPort.review` → fenced
+PostgreSQL result и atomic publication handoff. ACK/lease orchestration не
+дублируется. Call-start guards проверяют authority/deadlines; внешние вызовы
+проходят вне DB transactions. Реальный gateway, его разрешение frozen rules по
+settings identity и provider repair/error mapping не реализованы.
+Fake существует только в integration tests. Детали и ограничения —
+PIPELINE_SPEC.md §4.3; обработчик использует существующие canonical schemas и
+fenced persistence contracts.
 
 ### 3.6 Dispatcher и recovery
 
@@ -274,7 +292,10 @@ Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, пе
 небольшую команду в очередь Redis и устанавливает `broker_published_at` только
 после подтверждения постановки queue adapter. PostgreSQL остаётся источником
 истины; recovery восстанавливает потерянную доставку по состоянию job/outbox,
-lease и deadlines. Конкретный Redis worker/DLQ adapter выбирается в задаче #13.
+lease и deadlines. Реализованы `PostgresOutboxDispatcher.dispatch_batch()` и
+`RedisQueue` с enqueue, receive, ACK и safe dead-letter quarantine. Production
+entrypoints dispatcher/review worker и периодический review recovery отсутствуют;
+отдельный webhook worker реализует recovery только для intake.
 
 Recovery обрабатывает expired/no lease с учётом `retry_at` и deadline-полей.
 
@@ -355,7 +376,8 @@ provider_metadata)` записывает progress/outcome только из до
 attempts и PENDING/progress. Terminal outcome ранее начатой попытки можно
 зафиксировать после deadline под тем же ещё живым publish lease; SQL UPDATE
 по-прежнему проверяет сохранённый kind, owner, token и expiry. started_at — начало
-цикла, а начало каждой внешней попытки до deadline проверяет будущий worker.
+цикла. Проверка начала каждой внешней попытки до deadline — требование к
+publisher worker; этот обработчик не реализован.
 Acquire/renew после deadline запрещены. Отказ возвращается как LeaseLostError;
 обычные методы publisher не выполняют reconciliation UNKNOWN. Completion/outbox
 orchestration остаётся задачей worker: terminal write, prepare и publish event
@@ -373,13 +395,13 @@ Dead-letter содержит только безопасные метаданн�
 ## 6. Граница API
 
 HTTP-маршруты и DTO определяются `openapi.yaml`; lifecycle, retry и доставка
-задаются [`PIPELINE_SPEC.md`](./PIPELINE_SPEC.md). UI `SYSTEM_DESIGN.md` пока
+задаются [`PIPELINE_SPEC.md`](./PIPELINE_SPEC.md). UI `SYSTEM_DESIGN.md`
 содержит прежние `RUNNING + stage` и требует синхронизации с status-only
 контрактом, прежде чем его можно использовать как источник текущих API DTO.
-GitHub-only scope текущего спринта подтверждён пользователем 7 октября;
-GitLab остаётся последующей итерацией. Backend-mediated session refresh и
+Поддерживаемый VCS provider — GitHub; GitLab не реализован.
+Backend-mediated session refresh и
 явное подключение repository являются частью текущего OpenAPI, но их HTTP
-handlers ещё не реализованы.
+handlers не реализованы.
 
 Требования:
 
@@ -430,27 +452,37 @@ ORM-модели не используются как публичные HTTP DT
 - GitHub-only webhook intake #14: HMAC route, durable `WebhookReceipt`,
   SHA-pinned GitHub capture, bounded diff parser и отдельный recovery worker;
   delivery не создаёт ReviewJob.
+- `RedisQueue`: enqueue, receive, ACK, safe dead-letter quarantine и очистка DLQ;
+- bounded `PostgresOutboxDispatcher.dispatch_batch()` с PostgreSQL quarantine;
+- analyze/publish lease acquire, renew, release и transactional fencing;
+- bounded `PostgresReviewWorker.run_once()` с проверкой durable completion;
+- `PostgresAnalysisHandler`: GitHub snapshot, Level 1 context, canonical schema
+  и semantic validation, вызов внедряемого LLM-порта, сохранение результата и
+  атомарная подготовка publication/outbox;
+- интеграционные тесты Redis queue, dispatcher, worker и analysis handler.
 
 Миграция `0003` проверяет существующие пары ChunkResult/ContextPayload при
 создании составного FK. Если данные уже имеют разных владельцев, PostgreSQL
 отклоняет миграцию целиком; автоматического исправления таких строк нет.
 
-В разработке:
+Не реализовано:
 
 - остальные реализации repositories и Unit of Work;
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
-- Context Builder;
-- LLM Gateway и validation canonical schema;
-- Redis queue dispatcher и DLQ adapter по согласованному контракту #13;
-- workers анализа, публикации и recovery;
+- Context Builder с source windows, whole files и related symbols сверх Level 1;
+- реальный LLM Gateway, разрешение frozen settings, provider repair/error mapping
+  и общий provider retry/request budget;
+- production entrypoints dispatcher/review worker, pending-delivery claiming,
+  автоматический heartbeat и периодический review recovery;
+- publisher worker с call-start guards и сериализацией по ChangeRequest;
 - Publisher reconciliation;
-- интеграционные тесты Redis queue adapter и recovery;
+- интеграционные тесты периодического review recovery;
 - readiness endpoint;
 - модель хранения OAuth/access и HTTP handlers для connection flow;
 - обязательная accepted auth-модель включает 30-минутную JWT cookie с `sid`,
   authoritative PostgreSQL `AuthSession` и refresh только действующей сессии
-  с Origin/CSRF; полная реализация auth отложена;
+  с Origin/CSRF; полная реализация auth отсутствует;
 - provider-specific данные установки;
 - остальные HTTP handlers, DTO и session/CSRF/Origin middleware.
 

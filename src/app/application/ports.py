@@ -265,8 +265,9 @@ class TaskHandlerPort(Protocol):
     ) -> DurableTaskOutcome | None:
         """Use fenced UoW writes; report COMPLETED only after durable commit.
 
-        This bounded seam does not authorize external provider calls. None means
-        recovery is required, even when the callback returned without error.
+        The orchestrator supplies no provider call-start authority. An analysis
+        handler must check live authority/deadlines before external I/O. None
+        means recovery is required, even when the callback returned without error.
         """
         ...
 

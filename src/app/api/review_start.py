@@ -55,7 +55,7 @@ from app.db.review_starts import (
     settings_identity,
 )
 from app.db.session import get_session
-from app.domain.settings import compute_rules_digest
+from app.domain.settings import compute_rules_digest, project_historical_empty_settings
 
 
 class ReviewStartRoute(APIRoute):
@@ -340,7 +340,12 @@ async def start_review_http(  # noqa: PLR0913 -- explicit HTTP and injected boun
     if (
         not settings.output_language
         or not _SETTINGS_VALIDATOR.is_valid(
-            {"rules": settings.rules, "ignores": settings.ignores}
+            {
+                "rules": project_historical_empty_settings(
+                    settings.rules, "instructions"
+                ),
+                "ignores": project_historical_empty_settings(settings.ignores, "globs"),
+            }
         )
         or settings.rules_digest != compute_rules_digest(settings.rules)
     ):

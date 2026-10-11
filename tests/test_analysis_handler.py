@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -310,7 +310,9 @@ async def test_invalid_llm_location_never_persists_findings(
     elif mutation == "usage":
         llm.result = replace(llm.result, usage=TokenUsage(-1, 0))
     elif mutation == "summary":
-        llm.result = replace(llm.result, summary="x" * 2001)
+        llm.result = replace(
+            llm.result, summary=cast(str, {"invalid": "summary must be a string"})
+        )
     else:
         changes: dict[str, dict[str, Any]] = {
             "path": {"path": "src/other.py"},
@@ -1314,3 +1316,175 @@ async def test_queue_deadline_crossing_db_lock_blocks_analysis_start(
         review is not None and review.status == "FAILED" and review.started_at is None
     )
     assert "QUEUE_DEADLINE_EXCEEDED" in reasons
+
+
+async def test_worker_uses_frozen_historical_empty_settings(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+    async with factory.begin() as session:
+        review = await session.get(ReviewJob, review_id)
+        assert review is not None
+        frozen_id = review.repository_settings_id
+        identity = (frozen_id, review.rules_digest, review.config_digest)
+        await session.execute(
+            update(RepositorySettings)
+            .where(RepositorySettings.id == frozen_id)
+            .values(rules={}, ignores={}, output_language="en")
+        )
+        async with postgres.engine.begin() as conn:
+            current_id = await _create_settings(postgres, conn, review.repository_id)
+            await conn.execute(
+                update(RepositorySettings)
+                .where(RepositorySettings.id == current_id)
+                .values(ignores={"globs": ["src/a.py"]})
+            )
+            await conn.execute(
+                update(Repository)
+                .where(Repository.id == review.repository_id)
+                .values(current_settings_id=current_id)
+            )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
+    llm = DeterministicLlm()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        worker = PostgresReviewWorker(
+            factory,
+            queue,
+            PostgresAnalysisHandler(
+                factory, GithubClient(client), llm, schemas_dir=SCHEMAS
+            ),
+            owner="analysis",
+            task_kind="analyze",
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) == 1
+    metadata = cast(dict[str, Any], llm.payloads[0].payload_body["metadata"])
+    assert metadata["rules_version"] == str(frozen_id)
+    assert metadata["output_language"] == "en"
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        settings = await session.get(RepositorySettings, frozen_id)
+        assert review is not None and settings is not None
+        assert review.status == "COMPLETED" and review.finished_at is not None
+        assert (
+            review.repository_settings_id,
+            review.rules_digest,
+            review.config_digest,
+        ) == identity
+        assert (settings.rules, settings.ignores) == ({}, {})
+        assert settings.rules_digest == identity[1] and settings.output_language == "en"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Finding)
+                .join(ChunkResult)
+                .where(ChunkResult.review_job_id == review_id)
+            )
+            == 1
+        )
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        assert publication.status == "PENDING"
+        publish = (
+            await session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.review_job_id == review_id,
+                    OutboxEvent.task_kind == "publish",
+                )
+            )
+        ).one()
+        assert publish.broker_published_at is None
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == 0
+
+
+async def test_backend_limitation_preserves_valid_result_without_repair(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
+    llm = DeterministicLlm()
+    model_limitations = [f"Model limitation {number}" for number in range(10)]
+    raw = {
+        "summary": llm.result.summary,
+        "findings": [asdict(finding) for finding in llm.result.findings],
+        "limitations": model_limitations,
+    }
+    _validator(SCHEMAS / "llm-output/v1.json").validate(raw)
+    llm.result = replace(
+        llm.result,
+        limitations=[*model_limitations, "Backend note: PR metadata was shortened."],
+    )
+    _validator(SCHEMAS / "review-result/v1.json").validate(asdict(llm.result))
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        worker = PostgresReviewWorker(
+            factory,
+            queue,
+            PostgresAnalysisHandler(
+                factory, GithubClient(client), llm, schemas_dir=SCHEMAS
+            ),
+            owner="analysis",
+            task_kind="analyze",
+        )
+        assert await worker.run_once() is True
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        assert review is not None and review.status == "PARTIAL"
+        assert (
+            review.finished_at is not None
+            and review.final_summary == llm.result.summary
+        )
+        chunk = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).one()
+        assert chunk.limitations == llm.result.limitations
+        finding = (
+            await session.scalars(
+                select(Finding).where(Finding.chunk_result_id == chunk.id)
+            )
+        ).one()
+        assert finding.title == llm.result.findings[0].title
+        assert finding.explanation == llm.result.findings[0].explanation
+        assert finding.recommendation == llm.result.findings[0].recommendation
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        assert publication.status == "PENDING"
+        publish = (
+            await session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.review_job_id == review_id,
+                    OutboxEvent.task_kind == "publish",
+                )
+            )
+        ).one()
+        assert publish.broker_published_at is None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ReviewEvent)
+                .where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.reason_code == "LLM_OUTPUT_INVALID",
+                )
+            )
+            == 0
+        )
+    assert len(llm.payloads) == 1
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == 0

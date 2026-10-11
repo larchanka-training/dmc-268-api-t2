@@ -302,14 +302,20 @@ async def test_closed_saved_pr_is_not_found(
     assert_schema(response, "Error")
 
 
+@pytest.mark.parametrize("field", ["rules", "ignores"])
+@pytest.mark.parametrize("value", [{"legacy": "keep"}, None, [], "", {"globs": None}])
 async def test_legacy_settings_are_rejected_without_rewriting(
-    client: httpx.AsyncClient, scope: StartScope, postgres: PostgresHarness
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    postgres: PostgresHarness,
+    field: str,
+    value: object,
 ) -> None:
     async with postgres.engine.begin() as conn:
         await conn.execute(
             update(models.RepositorySettings)
             .where(models.RepositorySettings.id == scope.settings)
-            .values(rules={"legacy": "keep"})
+            .values(**{field: value})
         )
     response = await client.post(
         scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
@@ -317,11 +323,14 @@ async def test_legacy_settings_are_rejected_without_rewriting(
     assert response.status_code == HTTPStatus.CONFLICT
     assert response.json()["code"] == "LEGACY_SETTINGS_UNSUPPORTED"
     async with postgres.engine.connect() as conn:
-        assert await conn.scalar(
-            select(models.RepositorySettings.rules).where(
-                models.RepositorySettings.id == scope.settings
+        assert (
+            await conn.scalar(
+                select(getattr(models.RepositorySettings, field)).where(
+                    models.RepositorySettings.id == scope.settings
+                )
             )
-        ) == {"legacy": "keep"}
+            == value
+        )
         assert not (
             await conn.execute(
                 select(models.ReviewJob.id).where(
@@ -1887,3 +1896,64 @@ async def test_empty_stored_output_language_is_unsupported_without_rewrites(
                 )
             )
         ).all()
+
+
+@pytest.mark.parametrize(
+    ("rules", "ignores"),
+    [
+        ({"instructions": []}, {"globs": []}),
+        ({}, {"globs": []}),
+        ({"instructions": []}, {}),
+        ({}, {}),
+    ],
+    ids=["canonical", "empty-rules", "empty-ignores", "both-empty"],
+)
+@pytest.mark.usefixtures("configured")
+async def test_start_preserves_exact_historical_empty_settings(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    postgres: PostgresHarness,
+    rules: dict[str, object],
+    ignores: dict[str, object],
+) -> None:
+    digest = compute_rules_digest(rules)
+    async with postgres.engine.begin() as conn:
+        await conn.execute(
+            update(models.RepositorySettings)
+            .where(models.RepositorySettings.id == scope.settings)
+            .values(
+                rules=rules, ignores=ignores, rules_digest=digest, output_language="en"
+            )
+        )
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.ACCEPTED
+    replay = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert replay.status_code == HTTPStatus.OK
+    assert replay.json()["review_id"] == response.json()["review_id"]
+    async with async_sessionmaker(postgres.engine)() as session:
+        settings = await session.get(models.RepositorySettings, scope.settings)
+        review = await session.get(
+            models.ReviewJob, uuid.UUID(response.json()["review_id"])
+        )
+        assert settings is not None and review is not None
+        assert (settings.rules, settings.ignores, settings.rules_digest) == (
+            rules,
+            ignores,
+            digest,
+        )
+        assert settings.output_language == "en"
+        assert review.repository_settings_id == scope.settings
+        assert review.rules_digest == digest
+        quota = (
+            await session.scalars(
+                select(models.QuotaUsage).where(
+                    models.QuotaUsage.repository_id == scope.repository,
+                    models.QuotaUsage.type == "starts",
+                )
+            )
+        ).one()
+        assert quota.value == 1

@@ -44,6 +44,7 @@ from app.db.task_leases import lock_owned_lease
 from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.contract_validation import validate_hunks, validate_ranges
 from app.domain.enums import ReviewReasonCode, ReviewStatus
+from app.domain.settings import project_historical_empty_settings
 from app.vcs.diff import InvalidDiff, parse_diff
 
 
@@ -79,12 +80,12 @@ class PostgresAnalysisHandler:
         self._reserved = reserved_output_tokens
         documents = [
             json.loads((schemas_dir / name / "v1.json").read_text(encoding="utf-8"))
-            for name in ("context", "review-result", "llm-output")
+            for name in ("context", "review-result")
         ]
         registry: Registry[Any] = Registry().with_resources(
             (doc["$id"], Resource.from_contents(doc)) for doc in documents
         )
-        self._context_validator, self._result_validator, self._output_validator = (
+        self._context_validator, self._result_validator = (
             Draft202012Validator(doc, registry=registry, format_checker=FormatChecker())
             for doc in documents
         )
@@ -224,7 +225,9 @@ class PostgresAnalysisHandler:
             )
             settings_id = settings.id
             language = settings.output_language
-            ignores = list(settings.ignores["globs"])
+            ignores = list(
+                project_historical_empty_settings(settings.ignores, "globs")["globs"]
+            )
             expected_source = change.source_repository_external_id
 
         if saved is not None:
@@ -397,6 +400,7 @@ class PostgresAnalysisHandler:
                 )
             )
             await session.flush()
+            seen_fingerprints: set[str] = set()
             for finding in result.findings:
                 values = asdict(finding)
                 # Backend fingerprint v1: canonical location/category/title identity.
@@ -419,6 +423,9 @@ class PostgresAnalysisHandler:
                         separators=(",", ":"),
                     ).encode("utf-8")
                 ).hexdigest()
+                if fingerprint in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fingerprint)
                 session.add(
                     Finding(chunk_result_id=chunk_id, fingerprint=fingerprint, **values)
                 )
@@ -526,9 +533,6 @@ class PostgresAnalysisHandler:
         try:
             wire = asdict(result)
             self._result_validator.validate(wire)
-            self._output_validator.validate(
-                {key: wire[key] for key in ("summary", "findings", "limitations")}
-            )
             validate_ranges(wire)
             allowed: dict[tuple[str, str], set[int]] = {}
             for file in files:

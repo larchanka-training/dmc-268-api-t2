@@ -4,8 +4,8 @@
       "system": "v1/system.md",
       "few_shots": "v1/few_shots.json",
       "sha256": {
-        "v1/system.md": "e2e7090a6b2285440a1cf4e4342d8f296b5bc6b41478743587d23992fbde8877",
-        "v1/few_shots.json": "13613d2103d206dcf8e7c89504a13660df040d58b289e7c8890d3977510e50e9"
+        "v1/system.md": "81ff225b4ad43eafe0a2c1ee8e7ef089d090bc6c560f4db111630baf393bbcd7",
+        "v1/few_shots.json": "10979e736d31cc99ba35b2ce9b926a153d030ee7e6462c98616beddc1f0fd15a"
       }
     }
   }

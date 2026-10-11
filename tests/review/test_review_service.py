@@ -1,22 +1,28 @@
 """ReviewService.review_chunk end to end over mocked providers (spec §8)."""
 
+import dataclasses
 import json
 import random
+import uuid
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import SecretStr
 
+from app.application.ports import BuiltContextPayload, LlmGatewayPort
 from app.core.config import LLM, Eurorouter, Ollama
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.providers import build_gateway
 from app.llm.tokens import ConservativeTokenCounter
+from app.review.port_adapter import ChunkReviewFailedError, LlmGatewayAdapter
 from app.review.prompt import PromptBuilder
 from app.review.schemas.context import ContextPayload
-from app.review.schemas.result import ChunkStatus, ReviewChunkResult
+from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome
 from app.review.service import ReviewService
 from app.review.validation import FindingValidator
 
@@ -25,18 +31,17 @@ _PROMPTS = Path(__file__).resolve().parents[2] / ".agents" / "reviewer"
 
 def _finding(line: int) -> dict[str, Any]:
     return {
-        "location": {
-            "path": "src/review.py",
-            "side": "NEW",
-            "line": line,
-            "end_line": None,
-        },
+        "path": "src/review.py",
+        "side": "NEW",
+        "start_line": line,
+        "end_line": line,
         "category": "correctness",
         "severity": "high",
         "title": f"Проблема в строке {line}",
         "explanation": "ValidationError роняет обработчик.",
         "evidence": f"Строка {line} вызывает model_validate без обработки ошибок.",
         "recommendation": "Перехватить ValidationError.",
+        "proposed_diff_fix": None,
     }
 
 
@@ -141,9 +146,9 @@ async def test_valid_answer_gives_completed_result(
 
     result = await service.review_chunk(payload, _budget())
 
-    assert isinstance(result, ReviewChunkResult)
+    assert isinstance(result, ReviewChunkOutcome)
     assert result.status == ChunkStatus.COMPLETED
-    assert [f.location.line for f in result.findings] == [39]
+    assert [f.start_line for f in result.findings] == [39]
     assert result.rejected_findings_count == 1  # line 38 is a context line
     assert (result.review_id, result.chunk_id) == ("rev_01", "chunk_001")
     assert (result.provider, result.model) == ("eurorouter", "euro-routed")
@@ -189,7 +194,7 @@ async def test_invalid_output_is_repaired_once(
     result = await service.review_chunk(payload, budget)
 
     assert result.status == ChunkStatus.COMPLETED
-    assert [f.location.line for f in result.findings] == [39]
+    assert [f.start_line for f in result.findings] == [39]
     assert result.usage.requests == 2  # noqa: PLR2004
     repair = providers.requests[1]["messages"]
     assert repair[-2] == {"role": "assistant", "content": '{"summary": "x"}'}
@@ -359,3 +364,56 @@ async def test_failure_without_any_answer_reports_the_primary_provider(
     assert (result.status, result.error_code) == (ChunkStatus.FAILED, "llm_unavailable")
     assert (result.provider, result.model) == ("ollama", "qwen")
     assert providers.hosts == ["ollama", "ollama"]
+
+
+def _built(payload_data: dict[str, Any]) -> BuiltContextPayload:
+    envelope = {"schema_version", "review_id", "chunk_id"}
+    return BuiltContextPayload(
+        schema_version=1,
+        review_id=uuid.uuid4(),
+        chunk_id=uuid.uuid4(),
+        payload_body={k: v for k, v in payload_data.items() if k not in envelope},
+    )
+
+
+async def test_port_adapter_returns_canonical_review_chunk_result(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload_data: dict[str, Any],
+    canonical_validator: Callable[[str], Draft202012Validator],
+) -> None:
+    providers.script.append(_output(_finding(39), _finding(38)))
+    port: LlmGatewayPort = LlmGatewayAdapter(service, _budget())
+
+    result = await port.review(_built(payload_data))
+
+    wire = dataclasses.asdict(result)
+    canonical_validator("review-result/v1.json").validate(wire)
+    assert [f["start_line"] for f in wire["findings"]] == [39]
+    assert wire["usage"] == {"input_tokens": 1500, "output_tokens": 120}
+    assert wire["summary"] == "Сводка"
+
+
+async def test_port_adapter_omits_usage_without_both_token_counts(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload_data: dict[str, Any],
+    canonical_validator: Callable[[str], Draft202012Validator],
+) -> None:
+    providers.script.extend([503, 503, _output()])  # Ollama: no prompt tokens
+
+    result = await LlmGatewayAdapter(service, _budget()).review(_built(payload_data))
+
+    assert result.usage is None
+    canonical_validator("review-result/v1.json").validate(dataclasses.asdict(result))
+
+
+async def test_port_adapter_raises_for_a_failed_chunk(
+    service: ReviewService, providers: ScriptedProviders, payload_data: dict[str, Any]
+) -> None:
+    providers.script.extend([503, 503, 503])
+
+    with pytest.raises(ChunkReviewFailedError) as error:
+        await LlmGatewayAdapter(service, _budget()).review(_built(payload_data))
+
+    assert error.value.outcome.error_code == "llm_unavailable"

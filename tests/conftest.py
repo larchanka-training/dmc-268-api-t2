@@ -1,9 +1,13 @@
 """Shared fixtures: a minimal L1-only ContextPayload (SD §6 example)."""
 
+import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator, FormatChecker
+from referencing import Registry, Resource
 
 from app.review.schemas.context import FileDiff, FileStatus, Hunk, HunkLine, LineKind
 
@@ -148,3 +152,29 @@ MakeDiff = Callable[..., FileDiff]
 def make_diff() -> MakeDiff:
     """Factory for FileDiff test data (see ``_make_diff``)."""
     return _make_diff
+
+
+SCHEMAS = Path(__file__).resolve().parents[1] / "schemas"
+
+
+def _canonical_validator(relative_path: str) -> Draft202012Validator:
+    """Validator for a checked-in schema, resolving cross-schema ``$ref``s."""
+    documents = [
+        json.loads(path.read_text(encoding="utf-8")) for path in SCHEMAS.rglob("*.json")
+    ]
+    registry = Registry().with_resources(
+        (doc["$id"], Resource.from_contents(doc)) for doc in documents if "$id" in doc
+    )
+    schema = json.loads((SCHEMAS / relative_path).read_text(encoding="utf-8"))
+    return Draft202012Validator(
+        schema, format_checker=FormatChecker(), registry=registry
+    )
+
+
+CanonicalValidator = Callable[[str], Draft202012Validator]
+
+
+@pytest.fixture
+def canonical_validator() -> CanonicalValidator:
+    """Factory: ``canonical_validator("review-result/v1.json")``."""
+    return _canonical_validator

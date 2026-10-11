@@ -1,4 +1,4 @@
-"""ReviewService: one chunk from ContextPayload to ReviewChunkResult (spec §8).
+"""ReviewService: one chunk from ContextPayload to ReviewChunkOutcome (spec §8).
 
 Expected provider, budget and format failures become a FAILED result with a
 safe ``error_code``; programming and configuration errors propagate.
@@ -25,7 +25,7 @@ from app.review.schemas.context import ContextPayload
 from app.review.schemas.result import (
     ChunkStatus,
     LLMReviewOutput,
-    ReviewChunkResult,
+    ReviewChunkOutcome,
     Usage,
 )
 from app.review.validation import FindingValidator, ValidationOutcome
@@ -70,7 +70,7 @@ class ReviewService:
 
     async def review_chunk(
         self, payload: ContextPayload, budget: RunBudget
-    ) -> ReviewChunkResult:
+    ) -> ReviewChunkOutcome:
         attempt = _Attempt(time.monotonic(), budget.state().requests_used)
         try:
             prompt = self._prompts.build(
@@ -175,9 +175,9 @@ class ReviewService:
         outcome: ValidationOutcome | None = None,
         limitations: list[str] | None = None,
         error_code: str | None = None,
-    ) -> ReviewChunkResult:
+    ) -> ReviewChunkOutcome:
         last = attempt.calls[-1] if attempt.calls else None
-        result = ReviewChunkResult(
+        result = ReviewChunkOutcome(
             review_id=payload.review_id,
             chunk_id=payload.chunk_id,
             status=ChunkStatus.FAILED if error_code else ChunkStatus.COMPLETED,

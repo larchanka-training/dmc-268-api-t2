@@ -44,28 +44,27 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class Location(_Strict):
+class LLMFinding(_Strict):
+    """Flat finding of ``schemas/review-result/v1.json#/$defs/finding``."""
+
     path: RelPath
     side: Side
-    line: int = Field(ge=1)
-    end_line: int | None = Field(ge=1)  # same side, end_line >= line
-
-    @model_validator(mode="after")
-    def _ordered(self) -> Self:
-        if self.end_line is not None and self.end_line < self.line:
-            msg = "end_line must not be less than line"
-            raise ValueError(msg)
-        return self
-
-
-class LLMFinding(_Strict):
-    location: Location
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)  # same side; equals start_line for one line
     category: Category
     severity: Severity
     title: str = Field(min_length=1, max_length=200)
     explanation: str = Field(min_length=1, max_length=2000)
     evidence: str = Field(min_length=1, max_length=1000)
     recommendation: str = Field(min_length=1, max_length=2000)
+    proposed_diff_fix: str | None = Field(max_length=4000)  # never auto-applied
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Self:
+        if self.end_line < self.start_line:
+            msg = "end_line must not be less than start_line"
+            raise ValueError(msg)
+        return self
 
 
 class ValidatedFinding(LLMFinding):

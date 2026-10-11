@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from app.review.schemas.context import ContextPayload, Hunk, LineKind
 from app.review.schemas.finding import LLMFinding, Side, ValidatedFinding
-from app.review.schemas.result import ReviewChunkResult
+from app.review.schemas.result import ReviewChunkOutcome
 
 # Baseline secret patterns (SD §12): AWS keys, GitHub tokens, password=..., PEM.
 _SECRET_PATTERNS = (
@@ -31,6 +31,7 @@ _SECRET_PATTERNS = (
     ),
 )
 _TEXT_FIELDS = ("title", "explanation", "evidence", "recommendation")
+_OPTIONAL_TEXT_FIELDS = ("proposed_diff_fix",)
 
 _CHANGED_KIND = {Side.NEW: LineKind.ADDED, Side.OLD: LineKind.DELETED}
 
@@ -43,14 +44,13 @@ class ValidationOutcome:
 
 def fingerprint(finding: LLMFinding) -> str:
     """Hash of normalized path/side/range/category/title (SD §7)."""
-    loc = finding.location
     title = _normalize(finding.title)
     key = "|".join(
         [
-            loc.path,
-            loc.side,
-            str(loc.line),
-            str(loc.end_line or loc.line),
+            finding.path,
+            finding.side,
+            str(finding.start_line),
+            str(finding.end_line),
             finding.category,
             title,
         ]
@@ -68,11 +68,13 @@ class FindingValidator:
             if not _hits_changed_lines(finding, payload) or not _has_evidence(finding):
                 rejected += 1
                 continue
-            masked = finding.model_copy(
-                update={
-                    name: mask_secrets(getattr(finding, name)) for name in _TEXT_FIELDS
-                }
-            )
+            update: dict[str, str | None] = {
+                name: mask_secrets(getattr(finding, name)) for name in _TEXT_FIELDS
+            }
+            for name in _OPTIONAL_TEXT_FIELDS:
+                value = getattr(finding, name)
+                update[name] = mask_secrets(value) if value is not None else None
+            masked = finding.model_copy(update=update)
             accepted.append(
                 ValidatedFinding(**masked.model_dump(), fingerprint=fingerprint(masked))
             )
@@ -93,7 +95,7 @@ def merge_findings(groups: list[list[ValidatedFinding]]) -> list[ValidatedFindin
     return merged
 
 
-def merge_chunk_results(results: list[ReviewChunkResult]) -> list[ValidatedFinding]:
+def merge_chunk_results(results: list[ReviewChunkOutcome]) -> list[ValidatedFinding]:
     """Run-level dedup across chunks (spec §8); the run summary is the caller's."""
     return merge_findings([result.findings for result in results])
 
@@ -114,19 +116,19 @@ def _has_evidence(finding: LLMFinding) -> bool:
 
 
 def _hits_changed_lines(finding: LLMFinding, payload: ContextPayload) -> bool:
-    """``line`` is a changed line of its side; the whole ``line..end_line``
-    range lies inside the same hunk (context lines allowed after the start)."""
-    loc = finding.location
-    end = loc.end_line or loc.line
+    """``start_line`` is a changed line of its side; the whole
+    ``start_line..end_line`` range lies inside the same hunk (context lines
+    allowed after the start)."""
+    side, start = finding.side, finding.start_line
     for file in payload.files:
         diff = file.diff
-        path = diff.new_path if loc.side == Side.NEW else diff.old_path
-        if path != loc.path:
+        path = diff.new_path if side == Side.NEW else diff.old_path
+        if path != finding.path:
             continue
         for hunk in diff.hunks:
-            numbers = _side_lines(hunk, loc.side)
-            if numbers.get(loc.line) == _CHANGED_KIND[loc.side] and all(
-                n in numbers for n in range(loc.line, end + 1)
+            numbers = _side_lines(hunk, side)
+            if numbers.get(start) == _CHANGED_KIND[side] and all(
+                n in numbers for n in range(start, finding.end_line + 1)
             ):
                 return True
     return False

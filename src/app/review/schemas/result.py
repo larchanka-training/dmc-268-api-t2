@@ -1,4 +1,9 @@
-"""Model output (`LLMReviewOutput`) and backend chunk result (`ReviewChunkResult`)."""
+"""Model output (`LLMReviewOutput`) and the internal chunk outcome.
+
+`ReviewChunkOutcome` keeps backend-only provenance (status, provider, model,
+request count, fingerprints). The canonical wire result is
+`app.application.ports.ReviewChunkResult`, built by `review.port_adapter`.
+"""
 
 from enum import StrEnum
 from typing import Literal
@@ -36,8 +41,8 @@ class Usage(BaseModel):
     latency_ms: int = Field(ge=0)
 
 
-class ReviewChunkResult(BaseModel):
-    """Chunk result filled by the backend after validation (SD §7)."""
+class ReviewChunkOutcome(BaseModel):
+    """Internal chunk outcome filled by the backend after validation (SD §7)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

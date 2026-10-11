@@ -33,13 +33,17 @@
       "summary": "Изменение убрало обработку отсутствующей записи.",
       "findings": [
         {
-          "location": {"path": "app/settings.py", "side": "NEW", "line": 12, "end_line": null},
+          "path": "app/settings.py",
+          "side": "NEW",
+          "start_line": 12,
+          "end_line": 12,
           "category": "correctness",
           "severity": "high",
           "title": "AttributeError для пользователя без настроек",
           "explanation": "repo.get возвращает None, если записи нет. Тогда row.settings бросает AttributeError, и запрос завершается ошибкой 500 вместо значений по умолчанию.",
           "evidence": "Строка 12 обращается к row.settings без проверки; удалённая строка 11 возвращала DEFAULTS для этого случая.",
-          "recommendation": "Вернуть DEFAULTS, если row is None, например: return row.settings if row else DEFAULTS."
+          "recommendation": "Вернуть DEFAULTS, если row is None.",
+          "proposed_diff_fix": "-    return row.settings\n+    return row.settings if row else DEFAULTS"
         }
       ],
       "limitations": []
@@ -78,13 +82,17 @@
       "summary": "Новый поиск заказов строит SQL из пользовательского ввода.",
       "findings": [
         {
-          "location": {"path": "src/orders/search.ts", "side": "NEW", "line": 2, "end_line": null},
+          "path": "src/orders/search.ts",
+          "side": "NEW",
+          "start_line": 2,
+          "end_line": 2,
           "category": "security",
           "severity": "critical",
           "title": "SQL-инъекция через параметр name",
           "explanation": "Значение name подставляется в текст запроса без экранирования. Строка вида ' OR '1'='1 возвращает все заказы, а более сложный ввод позволяет изменять данные.",
           "evidence": "Строка 2 интерполирует name в шаблонную строку SQL внутри db.query.",
-          "recommendation": "Использовать параметризованный запрос: db.query('SELECT * FROM orders WHERE customer = $1', [name])."
+          "recommendation": "Использовать параметризованный запрос: db.query('SELECT * FROM orders WHERE customer = $1', [name]).",
+          "proposed_diff_fix": null
         }
       ],
       "limitations": []

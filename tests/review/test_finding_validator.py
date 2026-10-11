@@ -24,18 +24,17 @@ def payload(payload_data: dict[str, Any]) -> ContextPayload:
 
 def _finding(**overrides: Any) -> LLMFinding:
     data: dict[str, Any] = {
-        "location": {
-            "path": "src/review.py",
-            "side": "NEW",
-            "line": 39,
-            "end_line": None,
-        },
+        "path": "src/review.py",
+        "side": "NEW",
+        "start_line": 39,
+        "end_line": 39,
         "category": "correctness",
         "severity": "high",
         "title": "Ошибка валидации не обрабатывается",
         "explanation": "ValidationError роняет обработчик.",
         "evidence": "Строка 39 вызывает model_validate без обработки ошибок.",
         "recommendation": "Перехватить ValidationError.",
+        "proposed_diff_fix": None,
     }
     data.update(overrides)
     return LLMFinding.model_validate(data)
@@ -54,9 +53,7 @@ def test_finding_on_a_changed_line_is_accepted_with_fingerprint(
 
 
 def _at(path: str, side: str, line: int, end_line: int | None = None) -> LLMFinding:
-    return _finding(
-        location={"path": path, "side": side, "line": line, "end_line": end_line}
-    )
+    return _finding(path=path, side=side, start_line=line, end_line=end_line or line)
 
 
 @pytest.mark.parametrize(
@@ -119,12 +116,15 @@ def test_evidence_repeating_the_title_is_rejected(payload: ContextPayload) -> No
 def test_secret_like_values_are_masked(
     payload: ContextPayload, leak: str, secret: str
 ) -> None:
-    finding = _finding(explanation=leak, evidence=f"Строка 39: {leak}")
+    finding = _finding(
+        explanation=leak, evidence=f"Строка 39: {leak}", proposed_diff_fix=leak
+    )
 
     accepted = FindingValidator().validate([finding], payload).accepted[0]
 
     assert secret not in accepted.explanation
     assert secret not in accepted.evidence
+    assert secret not in (accepted.proposed_diff_fix or "")
     assert "***" in accepted.explanation
 
 
@@ -146,4 +146,4 @@ def test_merge_chunk_results_deduplicates_across_chunks(
 
     merged = merge_findings([first.accepted, second.accepted])
 
-    assert [f.location.line for f in merged] == [39, 41]
+    assert [f.start_line for f in merged] == [39, 41]

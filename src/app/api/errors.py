@@ -6,10 +6,20 @@ from structlog.contextvars import get_contextvars
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_after: int | None = None,
+    ) -> None:
         self.status = status
         self.code = code
         self.message = message
+        self.retryable = retryable
+        self.retry_after = retry_after
 
 
 async def api_error_response(request: Request, error: Exception) -> JSONResponse:
@@ -20,7 +30,7 @@ async def api_error_response(request: Request, error: Exception) -> JSONResponse
             "code": error.code,
             "message": error.message,
             "request_id": get_contextvars()["request_id"],
-            "retryable": False,
-            "retry_after": None,
+            "retryable": error.retryable,
+            "retry_after": error.retry_after,
         },
     )

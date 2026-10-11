@@ -67,6 +67,7 @@ class SqlAlchemyReviewJobRepository:
                     trigger_type=command.trigger_type,
                     initiator_user_id=command.initiator_user_id,
                     requested_head_sha=command.requested_head_sha,
+                    rerun_of=command.rerun_of,
                     model_ref=command.model_ref,
                     model_digest=command.model_digest,
                     model_settings=command.model_settings,

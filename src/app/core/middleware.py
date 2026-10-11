@@ -1,5 +1,6 @@
 """ASGI middleware tagging every request with a Request ID."""
 
+import re
 from uuid import uuid4
 
 import structlog
@@ -7,6 +8,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 REQUEST_ID_HEADER = "x-request-id"
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 
 
 class RequestIdMiddleware:
@@ -22,8 +24,8 @@ class RequestIdMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Reuse the caller's Request ID when one is provided.
-        request_id = Headers(scope=scope).get(REQUEST_ID_HEADER) or uuid4().hex
+        incoming = Headers(scope=scope).get(REQUEST_ID_HEADER, "")
+        request_id = incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else uuid4().hex
         structlog.contextvars.bind_contextvars(request_id=request_id)
 
         async def send_with_request_id(message: Message) -> None:

@@ -51,6 +51,13 @@ class SqlAlchemyUnitOfWork:
             raise RuntimeError("Unit of work has not been entered")
         await self._session.commit()
 
+    @property
+    def session(self) -> AsyncSession:
+        """Share the owned transaction with additional persistence adapters."""
+        if self._session is None:
+            raise RuntimeError("Unit of work has not been entered")
+        return self._session
+
     async def rollback(self) -> None:
         if self._session is None:
             raise RuntimeError("Unit of work has not been entered")

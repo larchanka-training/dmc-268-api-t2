@@ -9,8 +9,9 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from app.domain.enums import FindingSide
 from app.review.schemas.context import ContextPayload, Hunk, LineKind
-from app.review.schemas.finding import LLMFinding, Side, ValidatedFinding
+from app.review.schemas.finding import LLMFinding, ValidatedFinding
 from app.review.schemas.result import ReviewChunkOutcome
 
 # Baseline secret patterns (SD §12): AWS keys, GitHub tokens, password=..., PEM.
@@ -33,7 +34,10 @@ _SECRET_PATTERNS = (
 _TEXT_FIELDS = ("title", "explanation", "evidence", "recommendation")
 _OPTIONAL_TEXT_FIELDS = ("proposed_diff_fix",)
 
-_CHANGED_KIND = {Side.NEW: LineKind.ADDED, Side.OLD: LineKind.DELETED}
+_CHANGED_KIND = {
+    FindingSide.NEW: LineKind.ADDED,
+    FindingSide.OLD: LineKind.DELETED,
+}
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,7 @@ def _hits_changed_lines(finding: LLMFinding, payload: ContextPayload) -> bool:
     side, start = finding.side, finding.start_line
     for file in payload.files:
         diff = file.diff
-        path = diff.new_path if side == Side.NEW else diff.old_path
+        path = diff.new_path if side == FindingSide.NEW else diff.old_path
         if path != finding.path:
             continue
         for hunk in diff.hunks:
@@ -134,8 +138,8 @@ def _hits_changed_lines(finding: LLMFinding, payload: ContextPayload) -> bool:
     return False
 
 
-def _side_lines(hunk: Hunk, side: Side) -> dict[int, LineKind]:
-    attr = "new_line" if side == Side.NEW else "old_line"
+def _side_lines(hunk: Hunk, side: FindingSide) -> dict[int, LineKind]:
+    attr = "new_line" if side == FindingSide.NEW else "old_line"
     return {
         number: line.kind
         for line in hunk.lines

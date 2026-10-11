@@ -12,7 +12,6 @@ from app.application.ports import (
     ReviewFinding,
     TokenUsage,
 )
-from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.llm.budget import RunBudget
 from app.review.schemas.context import ContextPayload
 from app.review.schemas.finding import ValidatedFinding
@@ -68,11 +67,11 @@ def to_port_result(outcome: ReviewChunkOutcome) -> ReviewChunkResult:
 def _to_port_finding(finding: ValidatedFinding) -> ReviewFinding:
     return ReviewFinding(
         path=finding.path,
-        side=FindingSide(finding.side),
+        side=finding.side,
         start_line=finding.start_line,
         end_line=finding.end_line,
-        category=FindingCategory(finding.category),
-        severity=FindingSeverity(finding.severity),
+        category=finding.category,
+        severity=finding.severity,
         title=finding.title,
         explanation=finding.explanation,
         evidence=finding.evidence,

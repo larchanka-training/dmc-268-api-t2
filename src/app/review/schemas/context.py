@@ -7,11 +7,23 @@ at 1, ranges are inclusive and a missing side is ``None``, never ``0``.
 from datetime import datetime
 from enum import StrEnum
 from itertools import pairwise
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from app.review.schemas.finding import RelPath, Side
+from app.domain.enums import FindingSide
+from app.review.schemas.finding import RelPath
+
+
+def _check_unique[T](items: list[T]) -> list[T]:
+    if len(set(items)) != len(items):
+        msg = "items must be unique"
+        raise ValueError(msg)
+    return items
+
+
+NonEmptyStr = Annotated[str, Field(min_length=1)]
+UniqueStrs = Annotated[list[NonEmptyStr], AfterValidator(_check_unique)]
 
 
 def _check_order(start: int, end: int) -> None:
@@ -54,15 +66,20 @@ class ContextQuality(StrEnum):
     DIFF_ONLY = "diff_only"
 
 
+class ProviderMetadata(_Frozen):
+    pull_number: int = Field(ge=1)
+    diff_version: NonEmptyStr
+
+
 class Snapshot(_Frozen):
-    provider: str
-    base_repository_id: str
-    head_repository_id: str
-    base_sha: str
-    merge_base_sha: str
-    head_sha: str
+    provider: Literal["github"]
+    base_repository_id: NonEmptyStr
+    head_repository_id: NonEmptyStr
+    base_sha: NonEmptyStr
+    merge_base_sha: NonEmptyStr
+    head_sha: NonEmptyStr
     captured_at: datetime
-    provider_metadata: dict[str, JsonValue]
+    provider_metadata: ProviderMetadata
 
 
 class Discussion(_Frozen):
@@ -77,13 +94,14 @@ class Discussion(_Frozen):
 class Metadata(_Frozen):
     title: str
     body: str | None
-    base_ref: str
-    head_ref: str
+    base_ref: NonEmptyStr
+    head_ref: NonEmptyStr
     commit_messages: list[str]
-    languages: list[str]
+    languages: UniqueStrs
     discussions: list[Discussion]
-    rules_version: str
-    output_language: Literal["ru"]
+    rules_version: NonEmptyStr
+    # New settings use "ru"; frozen historical versions keep their language.
+    output_language: NonEmptyStr
 
 
 class HunkLine(_Frozen):
@@ -107,7 +125,7 @@ class HunkLine(_Frozen):
 
 
 class Hunk(_Frozen):
-    hunk_id: str
+    hunk_id: NonEmptyStr
     old_start: int = Field(ge=0)
     old_count: int = Field(ge=0)
     new_start: int = Field(ge=0)
@@ -121,6 +139,11 @@ class Hunk(_Frozen):
         if (old, new) != (self.old_count, self.new_count):
             msg = "hunk old_count/new_count do not match its lines"
             raise ValueError(msg)
+        if (self.old_count and not self.old_start) or (
+            self.new_count and not self.new_start
+        ):
+            msg = "a nonempty hunk side must start at line 1 or later"
+            raise ValueError(msg)
         for side in ("old_line", "new_line"):
             numbers = [n for line in self.lines if (n := getattr(line, side))]
             if any(b <= a for a, b in pairwise(numbers)):
@@ -130,13 +153,13 @@ class Hunk(_Frozen):
 
 
 class FileDiff(_Frozen):
-    file_id: str
+    file_id: NonEmptyStr
     old_path: RelPath | None
     new_path: RelPath | None
     status: FileStatus
     old_blob_sha: str | None
     new_blob_sha: str | None
-    language: str | None
+    language: NonEmptyStr | None
     hunks: list[Hunk]
 
 
@@ -152,12 +175,12 @@ class LineRange(_Frozen):
 
 class SourceWindow(_Frozen):
     path: RelPath
-    side: Side
-    commit_sha: str
+    side: FindingSide
+    commit_sha: NonEmptyStr
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     text: str
-    covered_hunk_ids: list[str]
+    covered_hunk_ids: UniqueStrs
 
     @model_validator(mode="after")
     def _ordered(self) -> Self:
@@ -167,8 +190,8 @@ class SourceWindow(_Frozen):
 
 class WholeFile(_Frozen):
     path: RelPath
-    side: Side
-    commit_sha: str
+    side: FindingSide
+    commit_sha: NonEmptyStr
     text: str
     changed_ranges: list[LineRange]
 
@@ -180,15 +203,15 @@ class FileContext(_Frozen):
 
 
 class RelatedSymbol(_Frozen):
-    qualified_name: str
-    kind: str
-    signature: str | None
-    path: RelPath | None
-    commit_sha: str | None
-    range: LineRange | None
-    relation: str
-    relation_to_change: str
-    source_excerpt: str | None = None
+    qualified_name: NonEmptyStr
+    kind: NonEmptyStr
+    signature: str
+    path: RelPath
+    commit_sha: NonEmptyStr
+    range: LineRange
+    relation: NonEmptyStr
+    relation_to_change: NonEmptyStr
+    source_excerpt: str
 
 
 class CoveredFile(_Frozen):
@@ -216,8 +239,8 @@ class Budget(_Frozen):
 
 class ContextPayload(_Frozen):
     schema_version: Literal[1]
-    review_id: str
-    chunk_id: str
+    review_id: NonEmptyStr
+    chunk_id: NonEmptyStr
     snapshot: Snapshot
     metadata: Metadata
     files: list[FileContext] = Field(min_length=1)

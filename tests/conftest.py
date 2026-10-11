@@ -57,7 +57,7 @@ def payload_data() -> dict[str, Any]:
             "merge_base_sha": "merge-base-sha",
             "head_sha": "head-commit-sha",
             "captured_at": "2026-09-13T18:00:00Z",
-            "provider_metadata": {"pull_number": 42},
+            "provider_metadata": {"pull_number": 42, "diff_version": "diff-v1"},
         },
         "metadata": {
             "title": "Validate review payload",

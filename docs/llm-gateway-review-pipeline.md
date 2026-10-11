@@ -11,7 +11,7 @@
 Реализовать в backend (`dmc-268-api-t2`) два модуля из SD §3 «Внутренние компоненты backend»:
 
 1. **LLM gateway** — владеет шаблонами промптов, сериализацией, лимитами и таймаутами; вызывает модель и возвращает строго типизированный результат (SD §3, §7).
-2. **Review pipeline** — для одного чанка `ContextPayload` собирает промпт в пределах бюджета, вызывает gateway, валидирует ответ схемой и доменными правилами, возвращает `ReviewChunkResult` либо типизированную ошибку чанка.
+2. **Review pipeline** — для одного чанка `ContextPayload` собирает промпт в пределах бюджета, вызывает gateway, валидирует ответ схемой и доменными правилами, возвращает `ReviewChunkOutcome` (`COMPLETED`/`FAILED`); адаптер `LlmGatewayPort` превращает его в канонический `ReviewChunkResult`.
 
 Результат задачи — библиотечный слой, который позже вызывает analyze worker. Пользовательских HTTP-эндпоинтов задача не добавляет: по SD §3 API не выполняет длительное ревью внутри HTTP-запроса.
 
@@ -104,7 +104,7 @@ flowchart TD
         Service["service.py<br/>ReviewService"]
         Prompt["prompt.py<br/>PromptBuilder"]
         Valid["validation.py<br/>доменная проверка и дедуп"]
-        Schemas["schemas/<br/>ContextPayload<br/>LLMReviewOutput<br/>ReviewChunkResult"]
+        Schemas["schemas/<br/>ContextPayload<br/>LLMReviewOutput<br/>ReviewChunkOutcome"]
     end
 
     subgraph LLM["src/app/llm"]
@@ -138,7 +138,7 @@ flowchart TD
     OLC -->|"резервный"| Ollama
     Service --> Valid
     Service -.->|"типы"| Schemas
-    Service -->|"ReviewChunkResult"| Worker
+    Service -->|"ReviewChunkOutcome"| Worker
     Worker --> Store
     Store --> Pub
 
@@ -192,7 +192,7 @@ sequenceDiagram
     end
     S->>V: validate(findings, payload)
     V-->>S: принятые findings и число отброшенных
-    S-->>W: ReviewChunkResult COMPLETED или FAILED
+    S-->>W: ReviewChunkOutcome COMPLETED или FAILED
 ```
 
 ---
@@ -230,13 +230,14 @@ src/app/
     __init__.py
     schemas/
       context.py            # ContextPayload v1 и вложенные модели
-      finding.py            # Severity, Category, Side, Location, LLMFinding
-      result.py             # LLMReviewOutput, ReviewChunkResult, Usage, ChunkStatus
+      finding.py            # RelPath, LLMFinding, ValidatedFinding (enum-ы из app.domain.enums)
+      result.py             # LLMReviewOutput, ReviewChunkOutcome, Usage, ChunkStatus
     filtering.py            # ignore policy (SD §6, шаг 1)
     chunking.py             # приоритизация и разбиение на чанки
     prompt.py               # PromptBuilder, загрузка версионированных промптов
     validation.py           # доменный валидатор и дедупликация findings
     service.py              # ReviewService
+    port_adapter.py         # LlmGatewayAdapter: LlmGatewayPort → канонический ReviewChunkResult
 .agents/reviewer/
   manifest.json             # prompt_version → файлы + SHA-256
   v1/system.md
@@ -245,7 +246,7 @@ tests/
   llm/…  review/…
 ```
 
-Каталог `schemas/` в корне репозитория зарезервирован под нормативные JSON Schema (`schemas/context/v1.json`, `schemas/review-result/v1.json`, SD §6); их генерация из Pydantic-моделей — п. 3.4.
+Каталог `schemas/` в корне репозитория содержит канонические JSON Schema (`schemas/context/v1.json`, `schemas/review-result/v1.json`, `schemas/llm-output/v1.json`, SD §6); модели сверяются с ними тестами — п. 3.4.
 
 ---
 
@@ -262,16 +263,16 @@ tests/
 
 Точная реализация контракта SD §6 «Общий контракт», включая таблицу ограничений:
 
-- `schema_version: Literal[1]`, `review_id`, `chunk_id`;
-- `snapshot`: `provider`, `base_repository_id`, `head_repository_id`, `base_sha`, `merge_base_sha`, `head_sha`, `captured_at`, `provider_metadata`;
-- `metadata`: `title`, `body: str | None`, `base_ref`, `head_ref`, `commit_messages: list[str]`, `languages: list[str]`, `discussions`, `rules_version`, `output_language` (v1: `"ru"`);
+- `schema_version: Literal[1]`, `review_id`, `chunk_id` (непустые);
+- `snapshot`: `provider` (`"github"`), `base_repository_id`, `head_repository_id`, `base_sha`, `merge_base_sha`, `head_sha`, `captured_at`, `provider_metadata` (строго `pull_number >= 1`, `diff_version`);
+- `metadata`: `title`, `body: str | None`, `base_ref`, `head_ref`, `commit_messages: list[str]`, `languages` (уникальные), `discussions`, `rules_version`, `output_language` (непустой: новые настройки — `"ru"`, исторические версии сохраняют свой язык);
 - `files: list[FileContext]` — не пуст; `FileContext` = `diff: FileDiff`, `source_windows: list[SourceWindow]`, `whole_file: WholeFile | None` (поле обязательно);
 - `FileDiff`: `file_id`, `old_path`, `new_path`, `status` (`added|modified|deleted|renamed`), `old_blob_sha`, `new_blob_sha`, `language`, `hunks`;
 - `Hunk`: `hunk_id`, `old_start`, `old_count`, `new_start`, `new_count`, `lines: list[HunkLine]`;
 - `HunkLine`: `kind` (`added|deleted|context`), `text`, `old_line: int | None`, `new_line: int | None` — наличие сторон согласовано с `kind` (`added` → только `new_line`, `deleted` → только `old_line`, `context` → обе);
-- `related_symbols`, `coverage` (`included`, `skipped[].reason` из enum SD, `context_quality: full|degraded|diff_only`), `budget` (`estimated_input_tokens`, `reserved_output_tokens`, `limit_input_tokens`, все `>= 0`).
+- `related_symbols` (все поля обязательны и не `null`: `signature`, `path`, `commit_sha`, `range`, `source_excerpt` и др.), `coverage` (`included`, `skipped[].reason` из enum SD, `context_quality: full|degraded|diff_only`), `budget` (`estimated_input_tokens`, `reserved_output_tokens`, `limit_input_tokens`, все `>= 0`).
 
-Валидаторы модели проверяют: согласованность `old_count/new_count` с числом строк hunk; монотонность номеров строк; `start_line <= end_line`.
+Валидаторы модели проверяют: согласованность `old_count/new_count` с числом строк hunk; непустая сторона hunk начинается со строки ≥ 1; монотонность номеров строк; `start_line <= end_line`; идентификаторы и SHA непустые.
 
 > Типы `DiffPayload` / `ReviewContext` из исходной версии ТЗ **не вводятся** — их роль выполняет `ContextPayload`.
 
@@ -280,82 +281,61 @@ tests/
 Это **единственная** схема, передаваемая модели как `format`. Она не содержит полей, которые должен заполнять backend (usage, модель, ID, fingerprint — SD §7).
 
 ```python
-class Severity(StrEnum):
-    CRITICAL = "critical"
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"          # "info" в v1 не является finding (SD §7, §14)
+from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 
-class Category(StrEnum):
-    SECURITY = "security"
-    CORRECTNESS = "correctness"
-    PERFORMANCE = "performance"
-    MAINTAINABILITY = "maintainability"   # стиль/форматирование не является категорией
-
-class Side(StrEnum):
-    OLD = "OLD"   # удалённые строки — координаты старой стороны
-    NEW = "NEW"   # добавленные/контекстные — новой
-
-class Location(BaseModel):
-    path: str                       # нормализованный относительный путь
-    side: Side
-    line: int = Field(ge=1)
-    end_line: int | None = Field(default=None, ge=1)   # та же сторона, end_line >= line
-
-class LLMFinding(BaseModel):
-    location: Location
-    category: Category
-    severity: Severity
+class LLMFinding(BaseModel):          # = schemas/review-result/v1.json#/$defs/finding
+    path: RelPath                     # нормализованный относительный путь
+    side: FindingSide                 # OLD — координаты старой стороны, NEW — новой
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)       # та же сторона, end_line >= start_line; для одной строки равен start_line
+    category: FindingCategory         # стиль/форматирование не является категорией
+    severity: FindingSeverity         # "info" в v1 не является finding (SD §7, §14)
     title: str = Field(min_length=1, max_length=200)
     explanation: str = Field(min_length=1, max_length=2000)    # условия проявления и последствия
     evidence: str = Field(min_length=1, max_length=1000)       # ссылка на строку/символ из контекста + обоснование
     recommendation: str = Field(min_length=1, max_length=2000) # текст; автоприменения нет
+    proposed_diff_fix: str | None = Field(max_length=4000)     # обязательное nullable; только подсказка
 
-class LLMReviewOutput(BaseModel):
+class LLMReviewOutput(BaseModel):     # = schemas/llm-output/v1.json
     summary: str = Field(max_length=2000)
     findings: list[LLMFinding] = Field(max_length=50)
-    limitations: list[str] = Field(default_factory=list, max_length=10)
+    limitations: list[str] = Field(max_length=10)
 ```
 
-Конкретные значения `max_length` — стартовые; фиксируются в PR и в `schemas/review-result/v1.json`.
+Enum-ы общие с доменом (`app.domain.enums`). Ограничения `max_length` у полей finding строже канонической схемы: любой принятый ответ ей соответствует.
 
-### 3.3. Результат чанка: `ReviewChunkResult` (`review/schemas/result.py`)
+### 3.3. Результат чанка
 
-Заполняется backend после валидации (SD §7):
+Два типа с разными ролями (`docs/sprint2-contract-handoff.md` §2):
+
+- **`ReviewChunkResult`** (`app.application.ports`) — канонический результат по `schemas/review-result/v1.json`: `schema_version`, `summary`, `findings` (плоские, без `fingerprint`), `limitations`, `usage` (`input_tokens`/`output_tokens` только если известны оба, иначе `null`), `latency_ms`. Его возвращает `LlmGatewayPort.review`.
+- **`ReviewChunkOutcome`** (`review/schemas/result.py`) — внутренний результат `ReviewService`. Сверх канонических полей хранит то, что принадлежит backend: `status` (`completed|failed`), `rejected_findings_count`, `usage.requests`, `provider`, `model`, `model_digest`, `prompt_version`, `error_code`, а findings — как `ValidatedFinding` с `fingerprint`.
 
 ```python
-class ChunkStatus(StrEnum):
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-class Usage(BaseModel):
-    input_tokens: int | None = Field(ge=0)     # None, если провайдер не вернул usage
-    output_tokens: int | None = Field(ge=0)
-    requests: int = Field(ge=0)                # фактические запросы, включая retry и repair
-    latency_ms: int = Field(ge=0)
-
-class ReviewChunkResult(BaseModel):
+class ReviewChunkOutcome(BaseModel):
     schema_version: Literal[1] = 1
     review_id: str
     chunk_id: str
-    status: ChunkStatus
+    status: ChunkStatus                        # COMPLETED | FAILED
     summary: str | None                        # None при FAILED
     findings: list[ValidatedFinding]           # LLMFinding + fingerprint, назначенный backend
     rejected_findings_count: int = Field(ge=0) # отброшены доменным валидатором
     limitations: list[str]
-    usage: Usage
-    model: str                                 # имя модели
-    model_digest: str | None                   # digest Ollama, если доступен
-    provider: str                              # имя провайдера из конфигурации
+    usage: Usage                               # input/output (None, если нет), requests, latency_ms
+    model: str
+    model_digest: str | None
+    provider: str
     prompt_version: str
     error_code: str | None                     # безопасный код при FAILED, без текста ответа модели
 ```
 
-`ValidatedFinding` = поля `LLMFinding` + `fingerprint: str` (хеш нормализованных `path/side/range/category/title`, SD §7). ID finding и lifecycle назначает слой хранения (вне задачи).
+`ValidatedFinding` = поля `LLMFinding` + `fingerprint: str` (хеш нормализованных `path/side/range/category/title`, SD §7). ID finding и lifecycle назначает слой хранения.
+
+`LlmGatewayAdapter` (`review/port_adapter.py`) реализует `LlmGatewayPort` поверх `ReviewService`: один экземпляр на запуск (общий `RunBudget`), `COMPLETED` маппится в `ReviewChunkResult`, а `FAILED` поднимает `ChunkReviewFailedError` с `outcome` (у канонического результата нет статуса — он хранится в ReviewJob).
 
 ### 3.4. JSON Schema
 
-`LLMReviewOutput.model_json_schema()` сохраняется в `schemas/review-result/v1.json`, `ContextPayload` — в `schemas/context/v1.json`. Тест сверяет файлы со схемами моделей, чтобы расхождение ловилось в CI.
+Нормативные схемы в `schemas/` — канонические контракты, написанные вручную (`context/v1.json`, `review-result/v1.json`, `llm-output/v1.json`); из моделей они **не генерируются**. Тесты сверяют модели с ними: модели принимают общие примеры `schemas/examples/`, ответ модели и результат порта проходят канонические схемы, а для `ContextPayload` набор мутаций проверяет, что модель и схема одинаково принимают или отклоняют данные.
 
 ---
 
@@ -401,7 +381,7 @@ class BaseLLMClient(ABC):
 - `OpenAICompatibleClient` не содержит логики, специфичной для Eurorouter: имя, `base_url`, модель и ключи приходят из конфигурации. Если Eurorouter отклоняет `strict`/`json_schema` для выбранной модели, это ошибка конфигурации (`ProviderRequestError`), а не повод молча перейти на свободный JSON.
 - **Решено (29.09.2026):** Eurorouter предоставляет OpenAI-совместимый API (`/v1/chat/completions`) и принимает стандартные параметры запроса OpenAI, включая Structured Outputs (`response_format.type = "json_schema"`, `json_schema.strict = true`). В работе используются свежие модели, которые это поддерживают. Конкретная модель по-прежнему задаётся GitHub Variable.
 - Поддержка structured output выбранными моделями обоих провайдеров проверяется до допуска модели в конфигурацию (SD §7). Это ручная проверка Agentic/DevOps, не код задачи.
-- Ответы Eurorouter могут содержать поле роутинга с фактической моделью (`model`). Именно оно пишется в `ReviewChunkResult.model`; если поля нет — модель из конфигурации.
+- Ответы Eurorouter могут содержать поле роутинга с фактической моделью (`model`). Именно оно пишется в `ReviewChunkOutcome.model`; если поля нет — модель из конфигурации.
 
 ### 4.3. Классификация ошибок (`llm/errors.py`)
 
@@ -425,7 +405,7 @@ class BaseLLMClient(ABC):
 - **Порядок попыток:** сначала основной провайдер. Переход на резервный — только после ошибок из §4.3, допускающих failover. Резервный провайдер используется до конца **текущего вызова**; следующий вызов снова начинается с основного, если тот не в cooldown.
 - **Ключи Eurorouter:** 1..N ключей, выбор по round-robin с пропуском ключей в cooldown (429) или помеченных недействительными (401/403). Когда все ключи основного провайдера в cooldown или недействительны, вызов идёт на резервный провайдер, а при отключённом резерве — `LLMUnavailableError`.
 - Cooldown ключей и провайдеров хранится в памяти процесса. В v1 это допустимо: один analyze worker с concurrency=1 (SD §9, §14).
-- **Смена модели.** Переход на резервный провайдер всегда означает другую модель. Флаг `LLM__FALLBACK_ENABLED=true` и есть явное разрешение на такую смену. Фактические `provider`, `model` и `model_digest` пишутся в каждый `ReviewChunkResult` (SD §14: модель входит в снимок запуска), а в `limitations` добавляется пометка «чанк обработан резервным провайдером».
+- **Смена модели.** Переход на резервный провайдер всегда означает другую модель. Флаг `LLM__FALLBACK_ENABLED=true` и есть явное разрешение на такую смену. Фактические `provider`, `model` и `model_digest` пишутся в каждый `ReviewChunkOutcome` (SD §14: модель входит в снимок запуска), а в `limitations` добавляется пометка «чанк обработан резервным провайдером».
 - **Backoff:** `min(cap, base * 2**attempt) * uniform(0.5, 1.0)`, `base=1 с`, `cap=20 с`. Если есть `Retry-After`, берётся максимум из него и backoff. Ожидание не превышает остатка дедлайна: если не укладывается, сразу `BudgetExceededError`.
 - **Лимит попыток:** не более `max_attempts_per_call = 3` HTTP-запросов на один логический вызов (SD §9: до трёх попыток на этап), и каждый запрос списывается из `RunBudget` (§4.5).
 - `sleep` и источник случайности инжектируются (`Callable[[float], Awaitable[None]]`, `random.Random`) для детерминированных тестов.
@@ -603,7 +583,7 @@ class ReviewService:
 
     async def review_chunk(
         self, payload: ContextPayload, budget: RunBudget
-    ) -> ReviewChunkResult: ...
+    ) -> ReviewChunkOutcome: ...
 ```
 
 Алгоритм:
@@ -612,15 +592,15 @@ class ReviewService:
 2. `gateway.generate_structured(request, LLMReviewOutput)`.
 3. При `SchemaValidationError`, если format repair в `RunBudget` ещё не израсходован: один повторный запрос с исходными сообщениями, предыдущим ответом (усечённым до лимита) и списком ошибок валидации без исходного кода. Если repair уже потрачен или повтор снова невалиден, чанк получает `FAILED`, `error_code="invalid_llm_output"`.
 4. Доменная валидация (`review/validation.py`, SD §7):
-   - `location.path` принадлежит файлам чанка (`new_path` для `NEW`, `old_path` для `OLD`);
-   - `line..end_line` целиком лежат в строках hunk нужной стороны: `NEW` — `added`; `OLD` — `deleted`. Строки `context` допустимы только внутри диапазона, который начинается на изменённой строке. Точное правило фиксируется тестами;
+   - `path` принадлежит файлам чанка (`new_path` для `NEW`, `old_path` для `OLD`);
+   - `start_line..end_line` целиком лежат в строках hunk нужной стороны: `NEW` — `added`; `OLD` — `deleted`. Строки `context` допустимы только внутри диапазона, который начинается на изменённой строке. Точное правило фиксируется тестами;
    - координаты не переносятся на соседнюю строку «по догадке»;
    - `evidence` не пуст и не совпадает с `title`;
-   - в текстах findings маскируются значения, похожие на секреты (SD §12, базовые шаблоны: ключи AWS/GitHub, `password=`, PEM);
+   - в текстах findings (включая `proposed_diff_fix`) маскируются значения, похожие на секреты (SD §12, базовые шаблоны: ключи AWS/GitHub, `password=`, PEM);
    - невалидные findings отбрасываются и считаются в `rejected_findings_count`;
    - точные дубли внутри чанка объединяются по `fingerprint`.
-5. Вернуть `ReviewChunkResult` со статусом `COMPLETED` (в том числе с пустым списком findings).
-6. `LLMUnavailableError`, `BudgetExceededError`, `ProviderRequestError`, а также неудачная пересборка после `ContextOverflowError` дают `ReviewChunkResult` со статусом `FAILED` и безопасным `error_code`. **Метод не бросает исключений для ожидаемых отказов провайдера, бюджета и формата.** Ошибки программирования и конфигурации пробрасываются.
+5. Вернуть `ReviewChunkOutcome` со статусом `COMPLETED` (в том числе с пустым списком findings).
+6. `LLMUnavailableError`, `BudgetExceededError`, `ProviderRequestError`, а также неудачная пересборка после `ContextOverflowError` дают `ReviewChunkOutcome` со статусом `FAILED` и безопасным `error_code`. **Метод не бросает исключений для ожидаемых отказов провайдера, бюджета и формата.** Ошибки программирования и конфигурации пробрасываются.
 
 Дедупликация между чанками и итоговая сводка запуска (SD §7: собирается приложением без отдельного LLM-вызова) — зона вызывающего кода; в задаче достаточно вспомогательной функции `merge_chunk_results(results) -> list[ValidatedFinding]` с дедупом по `fingerprint`.
 
@@ -640,14 +620,14 @@ class ReviewService:
 
 ## 10. Definition of Done
 
-1. [ ] **Типизированный результат.** `ReviewService.review_chunk` возвращает `ReviewChunkResult`, прошедший схему и доменную валидацию. Сырой JSON, строки ответа модели и провайдерские структуры наружу не выходят. Ожидаемые отказы дают `status=FAILED` с `error_code`, а не исключение.
+1. [ ] **Типизированный результат.** `ReviewService.review_chunk` возвращает `ReviewChunkOutcome`, прошедший схему и доменную валидацию. Сырой JSON, строки ответа модели и провайдерские структуры наружу не выходят. Ожидаемые отказы дают `status=FAILED` с `error_code`, а не исключение. `LlmGatewayAdapter` отдаёт канонический `ReviewChunkResult`.
 2. [ ] **Устойчивость.** 429/5xx/таймауты обрабатываются по таблице §4.3: backoff с jitter, `Retry-After`, round-robin ключей Eurorouter, failover Eurorouter → Ollama. Попытки ограничены (3 на вызов, 8 на запуск), дедлайн соблюдается. 401/403 и 400 не приводят к слепым повторам.
-3. [ ] **Переключение провайдеров.** Все четыре режима §6.1 работают только за счёт `LLM__PRIMARY_PROVIDER` и `LLM__FALLBACK_ENABLED`, без изменения кода. Фактический провайдер и модель видны в каждом `ReviewChunkResult`.
+3. [ ] **Переключение провайдеров.** Все четыре режима §6.1 работают только за счёт `LLM__PRIMARY_PROVIDER` и `LLM__FALLBACK_ENABLED`, без изменения кода. Фактический провайдер и модель видны в каждом `ReviewChunkOutcome`.
 4. [ ] **Ключ из CI/CD.** `deploy-staging.yml`, `docker-compose.staging.yml`, `.env.staging.example` и `docs/staging-deployment.md` обновлены по §6a. Без ключа при Eurorouter в цепочке процесс не стартует, а deploy падает на шаге валидации.
 5. [ ] **Бюджет токенов.** Оценка входа каждого запроса ≤ `max_input_tokens`, `max_input + max_output ≤ context_window`. Не поместившиеся изменения переносятся в другой чанк или попадают в `coverage.skipped` с причиной; скрытого усечения нет. Разбитые hunks сохраняют исходные номера строк и согласованные счётчики.
 6. [ ] **Промпты версионированы.** `.agents/reviewer/manifest.json` с SHA-256; `prompt_version` есть в каждом результате.
 7. [ ] **Безопасность.** Ключи — `SecretStr`; в логах и ошибках нет ключей, промптов, исходников и ответов модели; данные PR отделены от инструкций.
-8. [ ] **JSON Schema.** `schemas/context/v1.json` и `schemas/review-result/v1.json` сгенерированы и сверяются тестом.
+8. [ ] **JSON Schema.** Модели согласованы с каноническими `schemas/context/v1.json`, `schemas/review-result/v1.json`, `schemas/llm-output/v1.json` и примерами `schemas/examples/`; это проверяют тесты.
 9. [ ] **Качество.** `uv run ruff check`, `uv run ruff format --check`, `uv run mypy .`, `uv run pytest` зелёные локально и в `API CI`. Close выполнен по `project-code-review`.
 
 ### 10.1. Обязательные тесты

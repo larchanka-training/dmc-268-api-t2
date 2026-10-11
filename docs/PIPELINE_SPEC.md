@@ -356,8 +356,11 @@ FORMAT_REPAIR audit event. Actual provider repair semantics and shared internal
 retry/request budget are not implemented and remain gateway requirements; a
 second call alone is not claimed to implement provider prompt repair.
 
-Results pass both review-result and llm-output schemas, ordered range checks and
-path/side/coordinate checks against the captured hunks. Findings carry backend
+The gateway must validate raw model output against `schemas/llm-output/v1.json`
+before backend enrichment. The completed `ReviewChunkResult` passes
+`schemas/review-result/v1.json`, ordered range checks and path/side/coordinate
+checks against the captured hunks. Raw-only constraints are not reapplied to
+the enriched backend result. Findings carry backend
 SHA-256 fingerprints over canonical path/side/range/category/title fields.
 Invalid output after the reserved second invocation fails with LLM_OUTPUT_INVALID
 without ChunkResult/Findings. Useful output with limitations, or returning after

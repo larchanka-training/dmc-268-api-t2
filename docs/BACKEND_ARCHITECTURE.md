@@ -75,6 +75,7 @@ src/app/
 │  ├─ outbox_dispatcher.py        # bounded PostgreSQL outbox dispatch
 │  ├─ review_worker.py            # bounded analyze/publish orchestration
 │  └─ analysis_handler.py         # анализ и атомарный publication handoff
+├─ outbox_dispatcher.py            # CLI bounded batch / continuous polling
 ├─ webhook_worker.py              # отдельный recovery intake #14
 └─ main.py                        # инициализация FastAPI
 
@@ -85,7 +86,8 @@ migrations/
    ├─ 0003_result_context_ownership.py
    ├─ 0004_contract_foundation.py
    ├─ 0005_github_webhook_inbox.py
-   └─ 0006_task_lease_kind.py
+   ├─ 0006_task_lease_kind.py
+   └─ 0007_outbox_quarantine.py
 
 docs/
 ├─ BACKEND_ARCHITECTURE.md
@@ -151,6 +153,12 @@ ReviewJob + Publication(NOT_READY) + OutboxEvent(analyze)
  ↓
 COMMIT
 ```
+
+`POST /api/v1/repositories/{id}/pull-requests/{number}/reviews` реализован: scoped
+idempotency, проверка доступа и текущего GitHub snapshot, frozen configuration
+и атомарные quota/job/publication/outbox writes. Реальная session/Origin/CSRF
+проверка и production dependencies для provider authorization и configuration
+ещё не подключены; по умолчанию обработчик закрыт для реальных пользователей.
 
 При создании `ReviewJob` repository adapter выводит `repository_id` из выбранного
 `ChangeRequest`, а составные FK гарантируют принадлежность ChangeRequest и
@@ -267,13 +275,15 @@ provider-вызовов для одного PR нужна отдельно от 
 Реализован bounded `PostgresReviewWorker.run_once()` с
 обязательным `TaskHandlerPort`: одна Redis delivery, authoritative identity,
 task-specific acquire, повторная проверка перед callback, fenced release и ACK
-после проверенного durable outcome. Production entrypoint отсутствует.
+после проверенного durable outcome. Production CLI для analysis worker отсутствует.
 Обычный return, промежуточный commit и захват lease не разрешают
 ACK. Консервативные completion proofs и pending-классификация определены в
 PIPELINE_SPEC.md §4.2; PostgreSQL outbox marker может оставаться NULL при delivery.
 Тестовый harness фиксирует реальные fenced terminal решения и атомарный publish
-handoff без внешних provider calls. Pending-delivery recovery и автоматический
-heartbeat не реализованы; продление lease доступно через `TaskLeasePort`.
+handoff без внешних provider calls. Во время callback worker автоматически
+продлевает TaskLease через `TaskLeasePort`: heartbeat каждые 15 секунд,
+lease на 90 секунд. Потеря lease или ошибка renewal отменяет handler и оставляет
+delivery pending. Pending-delivery recovery (XAUTOCLAIM) не реализован.
 
 `PostgresAnalysisHandler` подключается через тот же `TaskHandlerPort`:
 authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` →
@@ -291,13 +301,15 @@ fenced persistence contracts.
 Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, передаёт
 небольшую команду в очередь Redis и устанавливает `broker_published_at` только
 после подтверждения постановки queue adapter. PostgreSQL остаётся источником
-истины; recovery восстанавливает потерянную доставку по состоянию job/outbox,
+истины; recovery должен восстанавливать потерянную доставку по состоянию job/outbox,
 lease и deadlines. Реализованы `PostgresOutboxDispatcher.dispatch_batch()` и
-`RedisQueue` с enqueue, receive, ACK и safe dead-letter quarantine. Production
-entrypoints dispatcher/review worker и периодический review recovery отсутствуют;
-отдельный webhook worker реализует recovery только для intake.
+`RedisQueue` с enqueue, receive, ACK и safe dead-letter quarantine. Dispatcher CLI
+`python -m app.outbox_dispatcher` поддерживает continuous polling и `--once`,
+но deployment не запускает его автоматически. Production CLI для analysis worker,
+периодический review recovery и retry scheduler отсутствуют; отдельный webhook
+worker реализует recovery только для intake.
 
-Recovery обрабатывает expired/no lease с учётом `retry_at` и deadline-полей.
+Recovery должен обрабатывать expired/no lease с учётом `retry_at` и deadline-полей.
 
 Переход ReviewJob в terminal status записывает terminal `status` и non-null
 `finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого
@@ -477,13 +489,19 @@ ORM-модели не используются как публичные HTTP DT
   SHA-pinned GitHub capture, bounded diff parser и отдельный recovery worker;
   delivery не создаёт ReviewJob.
 - `RedisQueue`: enqueue, receive, ACK, safe dead-letter quarantine и очистка DLQ;
-- bounded `PostgresOutboxDispatcher.dispatch_batch()` с PostgreSQL quarantine;
+- bounded `PostgresOutboxDispatcher.dispatch_batch()` с PostgreSQL quarantine и
+  CLI для single batch / continuous polling; deployment автоматически его
+  не запускает;
 - analyze/publish lease acquire, renew, release и transactional fencing;
-- bounded `PostgresReviewWorker.run_once()` с проверкой durable completion;
+- bounded `PostgresReviewWorker.run_once()` с проверкой durable completion и
+  автоматическим TaskLease heartbeat;
 - `PostgresAnalysisHandler`: GitHub snapshot, Level 1 context, canonical schema
   и semantic validation, вызов внедряемого LLM-порта, сохранение результата и
   атомарная подготовка publication/outbox;
-- интеграционные тесты Redis queue, dispatcher, worker и analysis handler.
+- интеграционные тесты Redis queue, dispatcher, worker и analysis handler;
+- HTTP start ReviewJob со scoped idempotency и атомарными quota/outbox writes;
+- HTTP detail/findings с RepositoryAccess и keyset pagination; до подключения
+  backend session integration endpoints закрыты для реальных пользователей.
 
 Миграция `0003` проверяет существующие пары ChunkResult/ContextPayload при
 создании составного FK. Если данные уже имеют разных владельцев, PostgreSQL
@@ -497,9 +515,10 @@ ORM-модели не используются как публичные HTTP DT
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
 - реальный LLM Gateway, разрешение frozen settings, provider repair/error mapping
   и общий provider retry/request budget;
-- production entrypoints dispatcher/review worker, pending-delivery claiming,
-  автоматический heartbeat и периодический review recovery;
-- publisher worker с call-start guards и сериализацией по ChangeRequest;
+- production CLI для analysis worker, pending-delivery claiming (XAUTOCLAIM),
+  периодический review recovery и retry scheduler;
+- publication executor (publisher worker) с call-start guards и сериализацией
+  по ChangeRequest;
 - Publisher reconciliation;
 - интеграционные тесты периодического review recovery;
 - readiness endpoint;

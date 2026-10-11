@@ -18,7 +18,9 @@ docker compose up --build
 
 API будет доступен на http://localhost:8000, healthcheck — http://localhost:8000/healthcheck.
 
-Рядом поднимаются PostgreSQL, Redis и сервис-заглушка `worker` (логику фоновой очереди добавит задача про воркеры; деплой-юнит уже существует).
+Рядом поднимаются PostgreSQL, Redis и сервис-заглушка `worker` с `sleep infinity`.
+Компоненты очереди реализованы, но compose не запускает dispatcher и analysis
+worker автоматически.
 
 Миграции (после старта compose):
 
@@ -108,10 +110,12 @@ tests без отдельной тестовой БД.
 задача остаётся pending до `ack`, который вызывающий worker должен делать только
 после durable processing decision. Повторный ACK возвращает `False`.
 
-Этот этап не включает recovery pending work, worker pipeline, outbox dispatcher,
-leases/fencing, retries, task expiry, DLQ и REST API. Их гарантии остаются
-определены в `docs/PIPELINE_SPEC.md`; сохранение pending само по себе ещё не
-обеспечивает полный цикл at-least-once processing.
+Реализованы queue/dispatcher, worker orchestration с leases/fencing и heartbeat,
+analysis handler и API запуска/чтения ревью. Полный production pipeline ещё не
+готов: актуальная граница реализации и отложенных интеграций приведена в
+[`BACKEND_ARCHITECTURE.md`, §8](docs/BACKEND_ARCHITECTURE.md#8-состояние-реализации).
+Гарантии доставки и lifecycle определены в
+[`PIPELINE_SPEC.md`](docs/PIPELINE_SPEC.md).
 
 ## Staging
 

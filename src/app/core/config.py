@@ -36,6 +36,14 @@ class Redis(BaseModel):
     url: str = "redis://localhost:6379/0"
 
 
+class Webhook(BaseModel):
+    secret: SecretStr = SecretStr("")
+
+
+class Github(BaseModel):
+    token: SecretStr = SecretStr("")
+
+
 class Logging(BaseModel):
     """Logging settings (LOGGING__* env variables)."""
 
@@ -155,6 +163,8 @@ class Settings(BaseSettings):
 
     postgres: Postgres = Field(default_factory=Postgres)
     redis: Redis = Field(default_factory=Redis)
+    webhook: Webhook = Field(default_factory=Webhook)
+    github: Github = Field(default_factory=Github)
     logging: Logging = Field(default_factory=Logging)
     llm: LLM = Field(default_factory=LLM)
 

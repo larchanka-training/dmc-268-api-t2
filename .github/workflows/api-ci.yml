@@ -33,6 +33,7 @@ jobs:
       LLM__PRIMARY_PROVIDER: ollama
       LLM__FALLBACK_ENABLED: "false"
       LLM__OLLAMA__MODEL: ci-placeholder
+      DMC268_RUN_DOCKER_TESTS: "1"
 
     services:
       postgres:

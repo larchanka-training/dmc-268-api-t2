@@ -29,7 +29,6 @@ class SqlAlchemyReviewJobRepository:
             requested_head_sha=review_job.requested_head_sha,
             config_digest=review_job.config_digest,
             status=review_job.status,
-            stage=review_job.stage,
             created_at=review_job.created_at,
             finished_at=review_job.finished_at,
         )
@@ -69,7 +68,6 @@ class SqlAlchemyReviewJobRepository:
                     created_at=now,
                     finished_at=None,
                     status=ReviewStatus.QUEUED.value,
-                    stage=None,
                     queue_deadline_at=now + timedelta(minutes=15),
                     coverage={},
                 ),

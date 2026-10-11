@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/queue/dead/v1.json",
+  "title": "Dead-letter quarantine envelope v1",
+  "description": "Independently versioned safe quarantine metadata. The v1 consumer accepts future additive optional fields, while the producer allowlist never emits an original/raw payload, arbitrary copied source fields, raw exceptions or stacks, prompts, source, or provider responses. Breaking changes require a new major version. Unsupported dead-schema versions are not recursively quarantined.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "quarantine_id", "reason_code", "quarantined_at", "source_routing_key"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "quarantine_id": { "type": "string", "minLength": 1 },
+    "reason_code": { "enum": ["UNSUPPORTED_SCHEMA_VERSION", "UNKNOWN_TASK_KIND", "INVALID_ENVELOPE"] },
+    "quarantined_at": { "type": "string", "format": "date-time" },
+    "source_routing_key": { "type": "string", "minLength": 1 },
+    "source_event_id": { "type": "string", "minLength": 1 },
+    "review_id": { "type": "string", "minLength": 1 },
+    "trace_id": { "type": "string", "minLength": 1 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "source_schema_version": { "type": "integer", "minimum": 1 }
+  }
+}

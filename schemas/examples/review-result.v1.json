@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "summary": "One correctness issue.",
+  "findings": [
+    {
+      "path": "src/example.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "correctness",
+      "severity": "high",
+      "title": "Value is returned before validation",
+      "explanation": "The new path bypasses validation.",
+      "evidence": "return value",
+      "recommendation": "Validate value before returning.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": [
+    "Related generated sources were excluded."
+  ],
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 40
+  },
+  "latency_ms": 250
+}

@@ -33,7 +33,7 @@ async def test_get_returns_detached_application_snapshot(
     assert result.requested_head_sha == "head-sha"
     assert result.config_digest == "config-digest"
     assert result.status == "QUEUED"
-    assert result.stage is None
+    assert not hasattr(result, "stage")
     assert result.created_at.tzinfo is not None
     assert result.finished_at is None
     status_field = "status"

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/settings/v1.json",
+  "title": "Repository settings rules and ignores v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "ignores"],
+  "properties": {
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instructions"],
+      "properties": {
+        "instructions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
+        }
+      }
+    },
+    "ignores": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["globs"],
+      "properties": {
+        "globs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$)(?!!).*\\S.*$"
+          }
+        }
+      }
+    }
+  }
+}

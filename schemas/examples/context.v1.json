@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "review_id": "rev_123",
+  "chunk_id": "chunk_123",
+  "snapshot": {
+    "provider": "github",
+    "base_repository_id": "repo_base",
+    "head_repository_id": "repo_head",
+    "base_sha": "base123",
+    "merge_base_sha": "merge123",
+    "head_sha": "head123",
+    "captured_at": "2026-10-04T10:00:00Z",
+    "provider_metadata": {
+      "pull_number": 42,
+      "diff_version": "diff-v1"
+    }
+  },
+  "metadata": {
+    "title": "Correct the contract",
+    "body": null,
+    "base_ref": "main",
+    "head_ref": "feature/contracts",
+    "commit_messages": [
+      "Align context contract"
+    ],
+    "languages": [
+      "Python"
+    ],
+    "discussions": [
+      {
+        "author": "reviewer",
+        "body": "Keep provider payload out of model context."
+      }
+    ],
+    "rules_version": "settings-v1",
+    "output_language": "ru"
+  },
+  "files": [
+    {
+      "diff": {
+        "file_id": "file_1",
+        "old_path": "src/example.py",
+        "new_path": "src/example.py",
+        "status": "modified",
+        "old_blob_sha": "oldblob",
+        "new_blob_sha": "newblob",
+        "language": "Python",
+        "hunks": [
+          {
+            "hunk_id": "hunk_1",
+            "old_start": 1,
+            "old_count": 1,
+            "new_start": 1,
+            "new_count": 2,
+            "lines": [
+              {
+                "kind": "context",
+                "text": "value = 1",
+                "old_line": 1,
+                "new_line": 1
+              },
+              {
+                "kind": "added",
+                "text": "return value",
+                "old_line": null,
+                "new_line": 2
+              }
+            ]
+          }
+        ]
+      },
+      "source_windows": [
+        {
+          "path": "src/example.py",
+          "side": "NEW",
+          "commit_sha": "head123",
+          "start_line": 1,
+          "end_line": 2,
+          "text": "value = 1\nreturn value",
+          "covered_hunk_ids": [
+            "hunk_1"
+          ]
+        }
+      ],
+      "whole_file": null
+    }
+  ],
+  "related_symbols": [],
+  "coverage": {
+    "included": [
+      {
+        "path": "src/example.py",
+        "ranges": [
+          {
+            "start_line": 1,
+            "end_line": 2
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "path": "vendor/x.js",
+        "ranges": [],
+        "reason": "policy"
+      }
+    ],
+    "context_quality": "degraded"
+  },
+  "budget": {
+    "estimated_input_tokens": 1000,
+    "reserved_output_tokens": 2000,
+    "limit_input_tokens": 8000
+  }
+}

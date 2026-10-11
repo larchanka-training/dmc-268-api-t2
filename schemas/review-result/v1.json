@@ -1,150 +1,54 @@
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/review-result/v1.json",
+  "title": "ReviewChunkResult v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "summary", "findings", "limitations", "usage", "latency_ms"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "summary": { "type": "string" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "usage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input_tokens", "output_tokens"],
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "latency_ms": { "type": "integer", "minimum": 0 }
+  },
   "$defs": {
-    "Category": {
-      "enum": [
-        "security",
-        "correctness",
-        "performance",
-        "maintainability"
-      ],
-      "title": "Category",
-      "type": "string"
-    },
-    "LLMFinding": {
+    "finding": {
+      "type": "object",
+      "description": "One concrete issue at one repository-relative location or range. end_line must be greater than or equal to start_line.",
       "additionalProperties": false,
-      "properties": {
-        "location": {
-          "$ref": "#/$defs/Location"
-        },
-        "category": {
-          "$ref": "#/$defs/Category"
-        },
-        "severity": {
-          "$ref": "#/$defs/Severity"
-        },
-        "title": {
-          "maxLength": 200,
-          "minLength": 1,
-          "title": "Title",
-          "type": "string"
-        },
-        "explanation": {
-          "maxLength": 2000,
-          "minLength": 1,
-          "title": "Explanation",
-          "type": "string"
-        },
-        "evidence": {
-          "maxLength": 1000,
-          "minLength": 1,
-          "title": "Evidence",
-          "type": "string"
-        },
-        "recommendation": {
-          "maxLength": 2000,
-          "minLength": 1,
-          "title": "Recommendation",
-          "type": "string"
-        }
-      },
-      "required": [
-        "location",
-        "category",
-        "severity",
-        "title",
-        "explanation",
-        "evidence",
-        "recommendation"
-      ],
-      "title": "LLMFinding",
-      "type": "object"
-    },
-    "Location": {
-      "additionalProperties": false,
+      "required": ["path", "side", "start_line", "end_line", "category", "severity", "title", "explanation", "evidence", "recommendation", "proposed_diff_fix"],
       "properties": {
         "path": {
-          "title": "Path",
-          "type": "string"
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
         },
-        "side": {
-          "$ref": "#/$defs/Side"
-        },
-        "line": {
-          "minimum": 1,
-          "title": "Line",
-          "type": "integer"
-        },
-        "end_line": {
-          "anyOf": [
-            {
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "End Line"
-        }
-      },
-      "required": [
-        "path",
-        "side",
-        "line",
-        "end_line"
-      ],
-      "title": "Location",
-      "type": "object"
-    },
-    "Severity": {
-      "enum": [
-        "critical",
-        "high",
-        "medium",
-        "low"
-      ],
-      "title": "Severity",
-      "type": "string"
-    },
-    "Side": {
-      "enum": [
-        "OLD",
-        "NEW"
-      ],
-      "title": "Side",
-      "type": "string"
+        "side": { "enum": ["OLD", "NEW"] },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "category": { "enum": ["security", "correctness", "performance", "maintainability"] },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "title": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 },
+        "proposed_diff_fix": { "type": ["string", "null"], "description": "Suggestion only; never automatically applied." }
+      }
     }
-  },
-  "additionalProperties": false,
-  "description": "The only schema passed to the model as structured-output format (spec §3.2).\n\nEvery field is required (nullable where optional) to stay compatible with\nOpenAI-style ``strict`` JSON Schema.",
-  "properties": {
-    "summary": {
-      "maxLength": 2000,
-      "title": "Summary",
-      "type": "string"
-    },
-    "findings": {
-      "items": {
-        "$ref": "#/$defs/LLMFinding"
-      },
-      "maxItems": 50,
-      "title": "Findings",
-      "type": "array"
-    },
-    "limitations": {
-      "items": {
-        "type": "string"
-      },
-      "maxItems": 10,
-      "title": "Limitations",
-      "type": "array"
-    }
-  },
-  "required": [
-    "summary",
-    "findings",
-    "limitations"
-  ],
-  "title": "LLMReviewOutput",
-  "type": "object"
+  }
 }

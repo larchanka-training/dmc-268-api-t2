@@ -214,12 +214,40 @@ canonical validation failure has been durably quarantined and propagates the
 first other enqueue or database error. Earlier publication/quarantine markers
 stay committed; failed and remaining ordinary unpublished events stay eligible
 for the next invocation. There is no transaction spanning PostgreSQL and Redis,
-dispatcher retry loop, or long-running dispatcher process. A dispatcher that
+retry loop inside `dispatch_batch()`. A dispatcher that
 already copied an envelope is not cancelled by another run's terminal write.
 If source columns are concurrently corrected, an in-flight valid snapshot can
 still enter Redis after quarantine; its ACK is counted but cannot overwrite the
 quarantine marker. These guarantees concern authoritative PostgreSQL states,
 not exactly-once broker I/O.
+
+The standalone runtime is `python -m app.outbox_dispatcher --once` for one
+bounded batch, or `python -m app.outbox_dispatcher` for continuous polling.
+It composes the existing `PostgresOutboxDispatcher`, `RedisQueue`, and database
+session factory using `POSTGRES__*`, `REDIS__URL`, and `LOGGING__*` settings.
+`--batch-size` defaults to 100 and must be a positive integer;
+`--poll-interval` defaults to 5 seconds and must
+be finite and positive. Every continuous iteration, including an empty batch,
+is followed by that interruptible polling delay. Redis PING precedes each batch
+so an unavailable broker is not reported as a successful empty dispatch.
+Redis connect/command timeouts are 5 seconds; client retries are disabled.
+Any other enqueue or database failure exits nonzero with only the error type
+logged, preserving the dispatcher's committed progress and retry eligibility.
+Logs contain batch counts and lifecycle metadata, never envelopes or exception
+text. SIGTERM/SIGINT finish the current bounded batch, prevent a new iteration,
+interrupt the polling wait, close Redis, and dispose the SQLAlchemy engine.
+Shutdown waits for the current database/Redis operation; operators must allow
+the bounded batch to finish before forcibly terminating the process. A forced
+termination after XADD and before the PostgreSQL commit can cause a duplicate.
+
+The standard API Docker image contains this module and its runtime dependencies.
+With PostgreSQL and Redis configured, an operator can invoke
+`docker compose run --rm worker python -m app.outbox_dispatcher --once`
+or omit `--once` for manual continuous execution. This command is documented
+for future operation; deployment does not start the dispatcher automatically.
+Both Compose worker services retain `sleep infinity`. The runtime performs no
+analysis, LLM calls, or Redis task ACKs. Production analysis still depends on
+the LLM Gateway integration and a separate production worker bootstrap.
 
 ### 4.2 Bounded worker execution
 

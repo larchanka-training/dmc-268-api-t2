@@ -13,6 +13,7 @@ import pytest_asyncio
 from redis.asyncio import Redis
 from redis.exceptions import NoPermissionError
 from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_postgres_integration import PostgresHarness, _create_outbox_event
 
@@ -1056,3 +1057,360 @@ async def test_undeliverable_publish_handoff_cannot_authorize_analysis_ack(
     assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
         "pending"
     ] == 1
+
+
+@pytest.mark.parametrize("kind", ["analyze", "publish"])
+async def test_handler_keeps_lease_live_through_automatic_heartbeat(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+    kind: str,
+) -> None:
+    if kind == "publish":
+        task = await prepare_publish(postgres, task)
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == uuid.UUID(task.review_id))
+            .values(
+                analysis_deadline_at=func.clock_timestamp() + timedelta(minutes=10),
+                retry_at=func.clock_timestamp() + timedelta(minutes=1),
+            )
+        )
+    entered, finish = asyncio.Event(), asyncio.Event()
+    handler = (
+        FinishPublication(postgres) if kind == "publish" else SkipAnalysis(postgres)
+    )
+    state = (
+        select(
+            ReviewJob.status,
+            ReviewJob.retry_at,
+            ReviewJob.queue_deadline_at,
+            ReviewJob.analysis_deadline_at,
+            OutboxEvent.attempt,
+            Publication.deadline_at,
+        )
+        .join(OutboxEvent, OutboxEvent.review_job_id == ReviewJob.id)
+        .join(Publication, Publication.review_job_id == ReviewJob.id)
+        .where(OutboxEvent.id == uuid.UUID(task.event_id))
+    )
+    async with postgres.engine.connect() as connection:
+        before = (await connection.execute(state)).one()
+
+    async def hold(
+        task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        entered.set()
+        await finish.wait()
+        return await handler.handle(task, lease)
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(task)
+    worker = PostgresReviewWorker(
+        handler.factory,
+        queue,
+        CallbackHandler(hold),
+        owner="worker-a",
+        task_kind=task.task_kind,
+        heartbeat_interval=0.01,
+    )
+    baseline = asyncio.all_tasks()
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # Shorten a real live DB lease; no 90-second wall-clock wait or fake renew.
+        async with postgres.engine.begin() as connection:
+            cutoff = await connection.scalar(
+                update(TaskLease)
+                .where(TaskLease.review_job_id == uuid.UUID(task.review_id))
+                .values(expires_at=func.clock_timestamp() + timedelta(seconds=30))
+                .returning(TaskLease.expires_at)
+            )
+        assert cutoff is not None
+        async with asyncio.timeout(3):
+            while True:
+                async with postgres.engine.connect() as connection:
+                    expiry = await connection.scalar(
+                        select(TaskLease.expires_at).where(
+                            TaskLease.review_job_id == uuid.UUID(task.review_id)
+                        )
+                    )
+                if expiry is not None and expiry > cutoff + timedelta(seconds=30):
+                    break
+                await asyncio.sleep(0.01)
+        assert (
+            await PostgresTaskLeaseStore(handler.factory).acquire(
+                uuid.UUID(task.review_id), owner="worker-b", task_kind=task.task_kind
+            )
+            is None
+        )
+        async with postgres.engine.connect() as connection:
+            assert (await connection.execute(state)).one() == before
+        assert (
+            await redis_client.xpending(
+                f"{stream_prefix}:{task.task_kind}", "review-workers"
+            )
+        )["pending"] == 1
+        finish.set()
+        assert await asyncio.wait_for(running, timeout=5) is True
+        assert asyncio.all_tasks() <= baseline
+        expiry_query = select(TaskLease.expires_at).where(
+            TaskLease.review_job_id == uuid.UUID(task.review_id)
+        )
+        async with postgres.engine.connect() as connection:
+            released_at = await connection.scalar(expiry_query)
+        await asyncio.sleep(0.05)
+        async with postgres.engine.connect() as connection:
+            assert await connection.scalar(expiry_query) == released_at
+    finally:
+        finish.set()
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "lost_field", ["owner", "fencing_token", "task_kind", "expiry"]
+)
+async def test_heartbeat_loss_cancels_handler_and_fences_late_persistence(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+    lost_field: str,
+) -> None:
+    entered, cancelled, fenced = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    handler = SkipAnalysis(postgres)
+
+    async def external_call(
+        task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Model a provider returning a late result despite cancellation.
+            try:
+                await handler.handle(task, lease)
+            except LeaseLostError:
+                fenced.set()
+            return DurableTaskOutcome.COMPLETED
+        return None
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(task)
+    worker = PostgresReviewWorker(
+        handler.factory,
+        queue,
+        CallbackHandler(external_call),
+        owner="worker-a",
+        task_kind="analyze",
+        heartbeat_interval=0.01,
+    )
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        changes: dict[str, object] = {
+            "owner": "replacement",
+            "fencing_token": 2,
+            "task_kind": "publish",
+            "expiry": func.clock_timestamp() - timedelta(minutes=5),
+        }
+        field = "expires_at" if lost_field == "expiry" else lost_field
+        async with postgres.engine.begin() as connection:
+            await connection.execute(
+                update(TaskLease)
+                .where(TaskLease.review_job_id == uuid.UUID(task.review_id))
+                .values(**{field: changes[lost_field]})
+            )
+        with pytest.raises(LeaseLostError):
+            await asyncio.wait_for(asyncio.shield(running), timeout=3)
+        assert cancelled.is_set() and fenced.is_set()
+        async with postgres.engine.connect() as connection:
+            token = await connection.scalar(
+                select(TaskLease.fencing_token).where(
+                    TaskLease.review_job_id == uuid.UUID(task.review_id)
+                )
+            )
+        assert token == (2 if lost_field == "fencing_token" else 1)
+        async with SqlAlchemyUnitOfWork(handler.factory) as uow:
+            review = await uow.review_jobs.get(uuid.UUID(task.review_id))
+        assert review is not None and review.status == "QUEUED"
+        assert (
+            await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+        )["pending"] == 1
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+async def test_terminal_commit_racing_heartbeat_still_allows_durable_ack(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+) -> None:
+    committed, finish = asyncio.Event(), asyncio.Event()
+    handler = SkipAnalysis(postgres)
+
+    async def finish_after_commit(
+        task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        outcome = await handler.handle(task, lease)
+        committed.set()
+        await finish.wait()
+        return outcome
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(task)
+    worker = PostgresReviewWorker(
+        handler.factory,
+        queue,
+        CallbackHandler(finish_after_commit),
+        owner="worker-a",
+        task_kind="analyze",
+        heartbeat_interval=0.01,
+    )
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(committed.wait(), timeout=5)
+        # Leave the completed handler alive across multiple heartbeat ticks.
+        await asyncio.wait((running,), timeout=0.1)
+        finish.set()
+        assert await asyncio.wait_for(running, timeout=5) is True
+        assert (
+            await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+        )["pending"] == 0
+    finally:
+        finish.set()
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+async def test_postgres_renewal_error_cancels_handler_and_never_acks(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+) -> None:
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    factory = async_sessionmaker(postgres.engine)
+
+    async def external_call(
+        task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Even a provider that returns COMPLETED cannot override renewal error.
+            return DurableTaskOutcome.COMPLETED
+        return None
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(task)
+    worker = PostgresReviewWorker(
+        factory,
+        queue,
+        CallbackHandler(external_call),
+        owner="worker-a",
+        task_kind="analyze",
+        heartbeat_interval=0.01,
+    )
+    # Real PostgreSQL error at the UPDATE, scoped to this fixture row. The release
+    # sets expiry to now, so it remains usable for cleanup after the renewal fails.
+    trigger = f"renewal_failure_{uuid.uuid4().hex}"
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                f"BEGIN IF NEW.review_job_id = '{task.review_id}'::uuid AND "
+                "NEW.owner = OLD.owner AND NEW.fencing_token = OLD.fencing_token AND "
+                "NEW.expires_at > clock_timestamp() + interval '60 seconds' THEN "
+                "RAISE EXCEPTION 'test PostgreSQL renewal failure'; END IF; "
+                "RETURN NEW; END $$"
+            )
+        )
+        await connection.execute(
+            text(
+                f"CREATE TRIGGER {trigger} BEFORE UPDATE ON task_lease "
+                f"FOR EACH ROW EXECUTE FUNCTION {trigger}()"
+            )
+        )
+    baseline = asyncio.all_tasks()
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with pytest.raises(DBAPIError, match="test PostgreSQL renewal failure"):
+            await asyncio.wait_for(asyncio.shield(running), timeout=5)
+        assert cancelled.is_set()
+        assert asyncio.all_tasks() <= baseline
+        assert (
+            await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+        )["pending"] == 1
+        replacement = await PostgresTaskLeaseStore(factory).acquire(
+            uuid.UUID(task.review_id), owner="worker-b", task_kind="analyze"
+        )
+        assert replacement is not None and replacement.fencing_token == 2  # noqa: PLR2004
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        async with postgres.engine.begin() as connection:
+            await connection.execute(text(f"DROP TRIGGER {trigger} ON task_lease"))
+            await connection.execute(text(f"DROP FUNCTION {trigger}()"))
+
+
+async def test_worker_cancellation_joins_blocked_heartbeat_before_release(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+) -> None:
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    factory = async_sessionmaker(postgres.engine)
+
+    async def external_call(
+        task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> DurableTaskOutcome | None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return None
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(task)
+    worker = PostgresReviewWorker(
+        factory,
+        queue,
+        CallbackHandler(external_call),
+        owner="worker-a",
+        task_kind="analyze",
+        heartbeat_interval=0.05,
+    )
+    baseline = asyncio.all_tasks()
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        async with postgres.engine.begin() as blocker:
+            await blocker.execute(text("LOCK TABLE task_lease IN SHARE MODE"))
+            pid = await blocker.scalar(select(func.pg_backend_pid()))
+            await wait_for_blocked_worker(postgres, pid)
+            running.cancel()
+            await asyncio.wait_for(cancelled.wait(), timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=5)
+        assert asyncio.all_tasks() <= baseline
+        assert (
+            await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+        )["pending"] == 1
+        replacement = await PostgresTaskLeaseStore(factory).acquire(
+            uuid.UUID(task.review_id), owner="worker-b", task_kind="analyze"
+        )
+        assert replacement is not None and replacement.fencing_token == 2  # noqa: PLR2004
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)

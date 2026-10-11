@@ -125,7 +125,8 @@ attempt, and trace identity. Source, diff, prompt, and model result are never se
 in the envelope.
 
 `RedisQueue` implements enqueue, receive, acknowledgement and safe dead-letter
-quarantine. Automatic heartbeat, pending-delivery claiming and periodic review
+quarantine. `PostgresReviewWorker` automatically renews its PostgreSQL lease
+while the handler executes. Pending-delivery claiming and periodic review
 recovery are not implemented. The v1 Redis-backed queue adapter and workers must
 provide these observable guarantees:
 
@@ -274,8 +275,22 @@ contract. A retry ACK must prove an atomic replacement outbox command and
 accepted scheduling/budget state; a `retry_at` write or callback assertion alone
 is insufficient. Deadline expiry and UNKNOWN need the separate recovery and
 reconciliation decisions described below. Pending-delivery recovery
-(XAUTOCLAIM), automatic heartbeat, and periodic review recovery are not
-implemented. The orchestration seam supplies no provider-call guarantees itself.
+(XAUTOCLAIM) and periodic review recovery are not implemented.
+After acquisition and the locked readiness check, the worker runs a heartbeat
+alongside the typed handler: every 15 seconds it renews the same live owner,
+task kind, and fencing token to PostgreSQL time plus 90 seconds. Renewal changes
+only lease expiry; accepted deadlines, status, attempts, and retry scheduling
+are unchanged. Each renewal owns a short transaction outside provider calls.
+Lease loss or renewal errors cancel the handler and retain the Redis delivery.
+A refused renewal after terminal commit is accepted only when the existing
+durable completion proof verifies the same live fenced claim. The worker still
+requires the handler's explicit outcome, fresh completion verification, and
+successful fenced release before ACK. Both child tasks are cancelled and joined
+before release, including on error or worker cancellation. Provider cancellation
+is cooperative: a handler that suppresses cancellation is joined, and its writes
+remain fenced; a late result cannot override an observed heartbeat failure.
+There is no reacquisition on behalf of that handler.
+The orchestration seam supplies no provider-call guarantees itself.
 `PostgresAnalysisHandler` implements analysis call-start checks; ChangeRequest
 publication serialization and publish call-start checks are not implemented
 and remain requirements for publisher integration.

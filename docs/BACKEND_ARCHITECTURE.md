@@ -132,7 +132,8 @@ ReviewJob** и не собирает полный LLM `ContextPayload`. Пуст
 отфильтрованный diff допустим как Level 1 artifact. Retry, lease и локальная
 проверка описаны в [`github-webhook-intake.md`](./github-webhook-intake.md).
 Redis review worker не использует WebhookReceipt как неявный источник входных
-данных. Реальный LLM Gateway не реализован.
+данных. LLM Gateway реализован в `app.llm` / `app.review`, но ещё не подключён
+к production review worker.
 
 ### 3.3 Запуск ReviewJob
 
@@ -290,8 +291,9 @@ authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` �
 canonical Level 1 ContextPayload → injected `LlmGatewayPort.review` → fenced
 PostgreSQL result и atomic publication handoff. ACK/lease orchestration не
 дублируется. Call-start guards проверяют authority/deadlines; внешние вызовы
-проходят вне DB transactions. Реальный gateway, его разрешение frozen rules по
-settings identity и provider repair/error mapping не реализованы.
+проходят вне DB transactions. LLM Gateway уже реализован отдельно; его
+подключение к handler, разрешение frozen rules по settings identity и
+согласование provider repair/error mapping ещё не реализованы.
 Fake существует только в integration tests. Детали и ограничения —
 PIPELINE_SPEC.md §4.3; обработчик использует существующие canonical schemas и
 fenced persistence contracts.
@@ -513,8 +515,9 @@ ORM-модели не используются как публичные HTTP DT
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
-- реальный LLM Gateway, разрешение frozen settings, provider repair/error mapping
-  и общий provider retry/request budget;
+- подключение реализованного LLM Gateway к analysis worker, разрешение frozen
+  settings и согласование provider repair/error mapping и общего
+  retry/request budget с handler;
 - production CLI для analysis worker, pending-delivery claiming (XAUTOCLAIM),
   периодический review recovery и retry scheduler;
 - publication executor (publisher worker) с call-start guards и сериализацией

@@ -348,13 +348,16 @@ result-commit failure; accepted analysis deadlines and budgets are not reset.
 Context v1 has only `metadata.rules_version`, populated with the immutable
 RepositorySettings UUID, plus the frozen output language. It has no instructions
 field. The supplied real gateway must resolve frozen rules/model/prompt by
-authoritative review/settings identity. A real gateway and this resolution are
-not implemented; gateway test doubles exist only in integration tests.
+authoritative review/settings identity. The gateway exists in `app.llm` /
+`app.review`, but its integration with this handler and frozen configuration
+resolution are not implemented; this handler uses gateway test doubles only
+in integration tests.
 The current port also has no distinct format-repair operation. The handler
 reserves at most one second `review` invocation using a fenced durable
-FORMAT_REPAIR audit event. Actual provider repair semantics and shared internal
-retry/request budget are not implemented and remain gateway requirements; a
-second call alone is not claimed to implement provider prompt repair.
+FORMAT_REPAIR audit event. The standalone gateway implements provider repair
+and a shared per-run request budget; coordination with this handler remains
+an integration requirement. A second handler call alone is not claimed to
+implement provider prompt repair.
 
 The gateway must validate raw model output against `schemas/llm-output/v1.json`
 before backend enrichment. The completed `ReviewChunkResult` passes

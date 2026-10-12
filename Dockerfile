@@ -17,6 +17,8 @@ COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY schemas/settings ./schemas/settings
+# Промпты LLM gateway (manifest + SHA-256); остальное в .agents — инструменты разработки
+COPY .agents/reviewer ./.agents/reviewer
 RUN uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"

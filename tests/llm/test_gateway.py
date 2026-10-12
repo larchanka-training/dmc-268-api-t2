@@ -8,7 +8,7 @@ import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from app.core.config import LLM, Eurorouter, Ollama
+from app.core.config import LLM, Eurorouter, LLMConfigError, Ollama
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.client import ChatMessage, LLMRequest
 from app.llm.errors import (
@@ -140,6 +140,14 @@ def _request() -> LLMRequest:
         max_output_tokens=2000,
         timeout_s=120,
     )
+
+
+def test_build_gateway_rejects_incomplete_provider_chain() -> None:
+    """LLM settings are checked when the gateway is built, not at app import."""
+    settings = _settings().model_copy(update={"eurorouter": Eurorouter()})
+
+    with pytest.raises(LLMConfigError, match="LLM__EUROROUTER__"):
+        build_gateway(settings, httpx.AsyncClient())
 
 
 async def _call(gateway: LLMGateway, budget: RunBudget) -> str:

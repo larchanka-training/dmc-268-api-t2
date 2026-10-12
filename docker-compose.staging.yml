@@ -31,10 +31,11 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
-      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). The app refuses
-      # to start if a provider in the chain lacks its settings.
-      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:?LLM__PRIMARY_PROVIDER is required}
-      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:?LLM__FALLBACK_ENABLED is required}
+      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
+      # process starts without them; the gateway checks its provider chain
+      # only when it is built.
+      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
+      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
       LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
       LLM__EUROROUTER__MODEL: ${LLM__EUROROUTER__MODEL:-}
       LLM__EUROROUTER__API_KEYS: ${LLM__EUROROUTER__API_KEYS:-}
@@ -81,10 +82,11 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
-      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). The app refuses
-      # to start if a provider in the chain lacks its settings.
-      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:?LLM__PRIMARY_PROVIDER is required}
-      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:?LLM__FALLBACK_ENABLED is required}
+      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
+      # process starts without them; the gateway checks its provider chain
+      # only when it is built.
+      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
+      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
       LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
       LLM__EUROROUTER__MODEL: ${LLM__EUROROUTER__MODEL:-}
       LLM__EUROROUTER__API_KEYS: ${LLM__EUROROUTER__API_KEYS:-}

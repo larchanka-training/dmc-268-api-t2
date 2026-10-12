@@ -26,6 +26,7 @@ def build_gateway(
     clock: Callable[[], float] = time.monotonic,
 ) -> LLMGateway:
     """Gateway over ``settings.provider_chain``: primary first, then fallback."""
+    settings.check_provider_chain()
     timeouts = {
         "eurorouter": settings.eurorouter.timeout_s,
         "ollama": settings.ollama.timeout_s,

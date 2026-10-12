@@ -61,6 +61,10 @@ class Logging(BaseModel):
         return value
 
 
+class LLMConfigError(ValueError):
+    """LLM provider chain is not configured; raised when the gateway is built."""
+
+
 class Eurorouter(BaseModel):
     """OpenAI-compatible primary provider (LLM__EUROROUTER__* env variables)."""
 
@@ -126,10 +130,18 @@ class LLM(BaseModel):
         return [self.primary_provider]
 
     @model_validator(mode="after")
-    def _check_chain_settings(self) -> Self:
+    def _check_token_limits(self) -> Self:
         if self.max_input_tokens + self.max_output_tokens > self.context_window:
             msg = "LLM__MAX_INPUT_TOKENS + LLM__MAX_OUTPUT_TOKENS exceed context window"
             raise ValueError(msg)
+        return self
+
+    def check_provider_chain(self) -> None:
+        """Fail if a provider in the chain lacks its settings.
+
+        Called when the LLM gateway is built, not at Settings() load: the API
+        and workers without LLM calls must start without any LLM__* variables.
+        """
         required: dict[ProviderName, dict[str, object]] = {
             "eurorouter": {
                 "API_KEYS": self.eurorouter.api_keys,
@@ -147,8 +159,7 @@ class LLM(BaseModel):
                 prefix = f"LLM__{provider.upper()}__"
                 names = ", ".join(prefix + name for name in missing)
                 msg = f"{provider} is in the provider chain but {names} is empty"
-                raise ValueError(msg)
-        return self
+                raise LLMConfigError(msg)
 
 
 class Settings(BaseSettings):

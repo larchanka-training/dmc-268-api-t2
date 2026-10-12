@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.core.config import Postgres, Settings
+from app.core.config import LLMConfigError, Postgres, Settings
 
 _TEST_PORT = 5433
 
@@ -18,6 +18,18 @@ def _isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM__PRIMARY_PROVIDER", "ollama")
     monkeypatch.setenv("LLM__FALLBACK_ENABLED", "false")
     monkeypatch.setenv("LLM__OLLAMA__MODEL", "qwen:14b")
+
+
+def test_settings_load_without_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """API and non-LLM workers start without any LLM__* variables."""
+    for name in ("PRIMARY_PROVIDER", "FALLBACK_ENABLED", "OLLAMA__MODEL"):
+        monkeypatch.delenv(f"LLM__{name}")
+
+    llm = Settings().llm
+
+    assert llm.provider_chain == ["eurorouter", "ollama"]
+    with pytest.raises(LLMConfigError, match="LLM__EUROROUTER__API_KEYS"):
+        llm.check_provider_chain()
 
 
 def test_settings_parse_nested_env_variables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,9 +120,10 @@ def test_eurorouter_in_chain_requires_its_settings(
     _set_eurorouter_env(monkeypatch)
     monkeypatch.setenv("LLM__PRIMARY_PROVIDER", primary)
     monkeypatch.setenv(missing, "")
+    llm = Settings().llm
 
-    with pytest.raises(ValidationError) as error:
-        Settings()
+    with pytest.raises(LLMConfigError, match=missing) as error:
+        llm.check_provider_chain()
 
     assert "key-one" not in str(error.value)
 
@@ -120,9 +133,10 @@ def test_ollama_in_chain_requires_its_settings(
     monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
     monkeypatch.setenv(missing, "")
+    llm = Settings().llm
 
-    with pytest.raises(ValidationError, match=missing):
-        Settings()
+    with pytest.raises(LLMConfigError, match=missing):
+        llm.check_provider_chain()
 
 
 def test_ollama_settings_not_required_when_out_of_chain(
@@ -132,7 +146,10 @@ def test_ollama_settings_not_required_when_out_of_chain(
     monkeypatch.setenv("LLM__FALLBACK_ENABLED", "false")
     monkeypatch.setenv("LLM__OLLAMA__MODEL", "")
 
-    assert Settings().llm.provider_chain == ["eurorouter"]
+    llm = Settings().llm
+
+    llm.check_provider_chain()
+    assert llm.provider_chain == ["eurorouter"]
 
 
 def test_eurorouter_base_url_must_be_https(monkeypatch: pytest.MonkeyPatch) -> None:

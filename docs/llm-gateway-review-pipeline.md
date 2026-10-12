@@ -1,6 +1,6 @@
 # ТЗ: LLM Gateway и конвейер структурированного ревью
 
-Статус: черновик на согласование · Дата: 26.09.2026
+Статус: черновик на согласование · Дата: 26.09.2026 · Обновлено: 12.10.2026 (очередь — Redis; запуск без `LLM__*`; промпты в образе; live smoke-тест)
 Нормативная основа: `dmc-268-ui-t2/docs/SYSTEM_DESIGN_RU.md` v1.2 (далее — **SD**), разделы 6, 7, 9, 12–14, 16.
 При расхождении этого ТЗ и SD приоритет у SD; расхождение фиксируется в Issue/PR.
 
@@ -19,7 +19,7 @@
 
 | Не входит | Где будет |
 |---|---|
-| Celery/RabbitMQ, outbox, leases, хранение результатов в PostgreSQL | Отдельные тикеты по SD §9–10 |
+| Очередь (PostgreSQL outbox → Redis queue), dispatcher, leases, хранение результатов в PostgreSQL | #13 и `docs/BACKEND_ARCHITECTURE.md`, `docs/PIPELINE_SPEC.md` |
 | Получение diff из GitHub, VCS adapter, `Snapshot` | SD §5 |
 | Сборка уровней контекста L2–L4 (Surrounding, Whole File, AST/Imports), Redis-кэш | Context builder, SD §6 |
 | Публикация в GitHub, marker, итоговая сводка запуска | Publisher, SD §8 |
@@ -46,7 +46,7 @@
 - **серый, пунктир** — целевое состояние SD, отдельные тикеты;
 - **оранжевый** — внешние системы.
 
-По SD §3 API, worker и dispatcher — процессы одного backend-проекта с общим образом. Поэтому код задачи живёт в `dmc-268-api-t2` и попадает в тот же image. Пока analyze worker не создан, модули вызываются только из тестов, а переменные `LLM__*` передаются контейнеру `api` (§6a).
+По SD §3 API, worker и dispatcher — процессы одного backend-проекта с общим образом. Поэтому код задачи живёт в `dmc-268-api-t2` и попадает в тот же image. Промпты `.agents/reviewer/` копируются в образ (`Dockerfile`). Пока analyze worker не создан, модули вызываются только из тестов, а переменные `LLM__*` передаются контейнеру `api` (§6a) и для его запуска не обязательны (§6.3).
 
 #### 1.3.1. Контейнеры
 
@@ -60,9 +60,9 @@ flowchart TD
     subgraph Private["Закрытая сеть приложения"]
         Proxy --> API["FastAPI API"]
         API --> DB[("PostgreSQL")]
-        API --> Cache[("Redis")]
-        Dispatch["Dispatcher / recovery"] --> DB
-        Dispatch --> MQ["RabbitMQ"]
+        API --> Cache[("Redis<br/>кэш")]
+        Dispatch["Outbox dispatcher / recovery"] --> DB
+        Dispatch --> MQ["Redis queue"]
         MQ --> Analyze["Analyze worker<br/>+ review pipeline<br/>+ LLM gateway"]
         MQ --> Publish["Publish worker"]
         Analyze --> DB
@@ -93,7 +93,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Worker["Analyze task<br/>Celery"]
+    Worker["Analyze worker<br/>задача из Redis queue"]
     CB["Context builder<br/>L1–L4, Redis-кэш"]
     Store["Repositories<br/>PostgreSQL"]
     Pub["Publisher"]
@@ -380,7 +380,7 @@ class BaseLLMClient(ABC):
 - Оба клиента используют общий `httpx.AsyncClient`, который передаётся через конструктор (в тестах — через `MockTransport`). Время жизни клиента привязано к lifespan процесса worker.
 - `OpenAICompatibleClient` не содержит логики, специфичной для Eurorouter: имя, `base_url`, модель и ключи приходят из конфигурации. Если Eurorouter отклоняет `strict`/`json_schema` для выбранной модели, это ошибка конфигурации (`ProviderRequestError`), а не повод молча перейти на свободный JSON.
 - **Решено (29.09.2026):** Eurorouter предоставляет OpenAI-совместимый API (`/v1/chat/completions`) и принимает стандартные параметры запроса OpenAI, включая Structured Outputs (`response_format.type = "json_schema"`, `json_schema.strict = true`). В работе используются свежие модели, которые это поддерживают. Конкретная модель по-прежнему задаётся GitHub Variable.
-- Поддержка structured output выбранными моделями обоих провайдеров проверяется до допуска модели в конфигурацию (SD §7). Это ручная проверка Agentic/DevOps, не код задачи.
+- Поддержка `temperature`, `max_tokens`/`num_predict` и strict JSON Schema выбранными моделями обоих провайдеров проверяется до допуска модели в конфигурацию (SD §7) opt-in smoke-тестом `tests/llm/test_live_provider.py` (`DMC268_LLM_SMOKE=1` + `LLM__*`). Тест вызывает каждый провайдер отдельно, без резерва, и требует `COMPLETED` с одного запроса (без format repair). В CI он пропускается: ключей там нет. **Статус: с реальной моделью ещё не запускался** (§9).
 - Ответы Eurorouter могут содержать поле роутинга с фактической моделью (`model`). Именно оно пишется в `ReviewChunkOutcome.model`; если поля нет — модель из конфигурации.
 
 ### 4.3. Классификация ошибок (`llm/errors.py`)
@@ -497,7 +497,7 @@ class BaseLLMClient(ABC):
 | `ollama` | `true` | Ollama → Eurorouter | Аварийное переключение, когда Eurorouter деградировал |
 | `ollama` | `false` | только Ollama | Локальная разработка без ключа; работа без внешнего провайдера |
 
-Флаги читаются при старте процесса. Переключение выполняется сменой переменных окружения и перезапуском worker; горячей смены в v1 нет. Выбранная цепочка пишется в лог старта (без ключей).
+Флаги читаются при старте процесса. Переключение выполняется сменой переменных окружения и перезапуском worker; горячей смены в v1 нет. Выбранная цепочка пишется в лог при сборке gateway (без ключей).
 
 ### 6.2. Параметры провайдеров
 
@@ -529,8 +529,10 @@ LLM__MAX_CHUNKS=5
 ### 6.3. Правила валидации настроек
 
 - `api_keys: list[SecretStr]`. Значение переменной — строка через запятую; парсится валидатором (`NoDecode` из pydantic-settings), пробелы и пустые элементы отбрасываются. Ключи не попадают в `repr`, логи и ошибки (SD §12).
-- Если `eurorouter` входит в цепочку (основным или резервным), а `API_KEYS`, `BASE_URL` или `MODEL` пусты, процесс **не стартует** с понятной ошибкой конфигурации, в которой ключ не раскрывается.
+- Наличие значений провайдеров проверяет `LLM.check_provider_chain()`; его вызывает `build_gateway`, а не загрузка `Settings`. API, `webhook-worker` и любой процесс без вызовов LLM стартуют без переменных `LLM__*`; процесс, который собирает gateway (analyze worker), падает при сборке с `LLMConfigError`.
+- Если `eurorouter` входит в цепочку (основным или резервным), а `API_KEYS`, `BASE_URL` или `MODEL` пусты, `LLMConfigError` называет пустые переменные; ключ не раскрывается.
 - Если `ollama` входит в цепочку, обязательны `LLM__OLLAMA__BASE_URL` и `LLM__OLLAMA__MODEL`.
+- Формат значений (`https://`, лимиты токенов) по-прежнему проверяется при загрузке `Settings`: заданное, но неверное значение — ошибка конфигурации сразу.
 - `BASE_URL` Eurorouter — только `https://`.
 - Окно ≥ 16 384; `max_input + max_output <= context_window`.
 - В `.env.example` добавляются все переменные, `LLM__EUROROUTER__API_KEYS` — пустым значением; для локального запуска по умолчанию в примере указан режим `ollama` без резерва.
@@ -548,9 +550,9 @@ LLM__MAX_CHUNKS=5
 Изменения в рамках задачи:
 
 1. `.github/workflows/deploy-staging.yml`:
-   - шаг «Validate deployment configuration» проверяет наличие `STAGING_EUROROUTER_API_KEYS`, `…_BASE_URL`, `…_MODEL`, если Eurorouter входит в цепочку; значение ключа не выводится;
+   - шаг «Validate deployment configuration» проверяет наличие `STAGING_EUROROUTER_API_KEYS`, `…_BASE_URL`, `…_MODEL`, если Eurorouter входит в цепочку; отсутствие значений — `::warning::`, а не провал deploy (ни один развёрнутый процесс пока не вызывает LLM); `http://` в `BASE_URL` и неверные флаги — ошибка; значение ключа не выводится;
    - шаг «Write staging environment» дописывает в `.env.staging` переменные `LLM__*` из §6.
-2. `docker-compose.staging.yml`: сервису, который выполняет ревью (сейчас `api`, позже analyze worker — SD §3), передаются `LLM__*` через `${VAR:?…}` для обязательных значений, как это сделано для `POSTGRES__*`.
+2. `docker-compose.staging.yml`: сервису, который выполняет ревью (сейчас `api`, позже analyze worker — SD §3), передаются `LLM__*` через `${VAR:-…}`: флаги имеют значения по умолчанию, отсутствие ключа не мешает поднять контейнер.
 3. `.env.staging.example` и `docs/staging-deployment.md`: новые переменные и правило ротации ключа (обновить Secret → перезапустить deploy).
 4. Ключ не передаётся в UI, в сообщения очереди, в `ContextPayload` и в логи CI (`set +x`, без `echo` значения).
 
@@ -613,6 +615,7 @@ class ReviewService:
 | Вопрос | Предлагаемое решение до согласования | Кто решает |
 |---|---|---|
 | Какая модель Ollama (резерв), её digest и поддержка structured output с `num_ctx ≥ 16384`; когда Ollama появится в staging | До развёртывания — `FALLBACK_ENABLED=false` в staging | Agentic + DevOps (SD §16) |
+| Принимает ли выбранная модель Eurorouter `temperature`, `max_tokens` и `response_format.json_schema.strict` | Прогнать `tests/llm/test_live_provider.py` с ключом staging и приложить вывод к PR; до этого модель в staging не включается | Agentic + DevOps |
 | Точный токенизатор моделей | До выбора моделей — `ConservativeTokenCounter` | Agentic |
 | Сравнимость quality gates (SD §14) при ответах двух разных моделей | Метрики LLM Evaluation считаются по `provider/model` отдельно; данные разных моделей не смешиваются | QA |
 
@@ -623,9 +626,9 @@ class ReviewService:
 1. [ ] **Типизированный результат.** `ReviewService.review_chunk` возвращает `ReviewChunkOutcome`, прошедший схему и доменную валидацию. Сырой JSON, строки ответа модели и провайдерские структуры наружу не выходят. Ожидаемые отказы дают `status=FAILED` с `error_code`, а не исключение. `LlmGatewayAdapter` отдаёт канонический `ReviewChunkResult`.
 2. [ ] **Устойчивость.** 429/5xx/таймауты обрабатываются по таблице §4.3: backoff с jitter, `Retry-After`, round-robin ключей Eurorouter, failover Eurorouter → Ollama. Попытки ограничены (3 на вызов, 8 на запуск), дедлайн соблюдается. 401/403 и 400 не приводят к слепым повторам.
 3. [ ] **Переключение провайдеров.** Все четыре режима §6.1 работают только за счёт `LLM__PRIMARY_PROVIDER` и `LLM__FALLBACK_ENABLED`, без изменения кода. Фактический провайдер и модель видны в каждом `ReviewChunkOutcome`.
-4. [ ] **Ключ из CI/CD.** `deploy-staging.yml`, `docker-compose.staging.yml`, `.env.staging.example` и `docs/staging-deployment.md` обновлены по §6a. Без ключа при Eurorouter в цепочке процесс не стартует, а deploy падает на шаге валидации.
+4. [ ] **Ключ из CI/CD.** `deploy-staging.yml`, `docker-compose.staging.yml`, `.env.staging.example` и `docs/staging-deployment.md` обновлены по §6a. Без ключа API и deploy работают (deploy выводит warning), а `build_gateway` падает с `LLMConfigError`.
 5. [ ] **Бюджет токенов.** Оценка входа каждого запроса ≤ `max_input_tokens`, `max_input + max_output ≤ context_window`. Не поместившиеся изменения переносятся в другой чанк или попадают в `coverage.skipped` с причиной; скрытого усечения нет. Разбитые hunks сохраняют исходные номера строк и согласованные счётчики.
-6. [ ] **Промпты версионированы.** `.agents/reviewer/manifest.json` с SHA-256; `prompt_version` есть в каждом результате.
+6. [ ] **Промпты версионированы.** `.agents/reviewer/manifest.json` с SHA-256; `prompt_version` есть в каждом результате. Каталог входит в Docker-образ (`tests/test_docker_image.py`).
 7. [ ] **Безопасность.** Ключи — `SecretStr`; в логах и ошибках нет ключей, промптов, исходников и ответов модели; данные PR отделены от инструкций.
 8. [ ] **JSON Schema.** Модели согласованы с каноническими `schemas/context/v1.json`, `schemas/review-result/v1.json`, `schemas/llm-output/v1.json` и примерами `schemas/examples/`; это проверяют тесты.
 9. [ ] **Качество.** `uv run ruff check`, `uv run ruff format --check`, `uv run mypy .`, `uv run pytest` зелёные локально и в `API CI`. Close выполнен по `project-code-review`.

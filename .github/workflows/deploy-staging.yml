@@ -199,29 +199,25 @@ jobs:
               ;;
           esac
 
+          # Missing LLM values do not block the deploy: no deployed process
+          # calls an LLM yet, and the gateway checks its chain when it is
+          # built (LLM.check_provider_chain). Malformed values still fail.
+          llm_missing=()
           if [[ " ${chain} " == *" eurorouter "* ]]; then
             # The key value is never printed, only its presence is checked.
-            if [[ -z "${EUROROUTER_API_KEYS:-}" ]]; then
-              echo "::error::STAGING_EUROROUTER_API_KEYS is not available"
-              exit 1
-            fi
-            if [[ -z "${EUROROUTER_BASE_URL:-}" ]]; then
-              echo "::error::STAGING_EUROROUTER_BASE_URL is not available"
-              exit 1
-            fi
-            if [[ "${EUROROUTER_BASE_URL}" != https://* ]]; then
+            [[ -n "${EUROROUTER_API_KEYS:-}" ]] || llm_missing+=(STAGING_EUROROUTER_API_KEYS)
+            [[ -n "${EUROROUTER_BASE_URL:-}" ]] || llm_missing+=(STAGING_EUROROUTER_BASE_URL)
+            [[ -n "${EUROROUTER_MODEL:-}" ]] || llm_missing+=(STAGING_EUROROUTER_MODEL)
+            if [[ -n "${EUROROUTER_BASE_URL:-}" && "${EUROROUTER_BASE_URL}" != https://* ]]; then
               echo "::error::STAGING_EUROROUTER_BASE_URL must use https://"
               exit 1
             fi
-            if [[ -z "${EUROROUTER_MODEL:-}" ]]; then
-              echo "::error::STAGING_EUROROUTER_MODEL is not available"
-              exit 1
-            fi
           fi
-
-          if [[ " ${chain} " == *" ollama "* && -z "${OLLAMA_MODEL:-}" ]]; then
-            echo "::error::STAGING_OLLAMA_MODEL is not available"
-            exit 1
+          if [[ " ${chain} " == *" ollama "* ]]; then
+            [[ -n "${OLLAMA_MODEL:-}" ]] || llm_missing+=(STAGING_OLLAMA_MODEL)
+          fi
+          if (( ${#llm_missing[@]} > 0 )); then
+            echo "::warning::LLM gateway is not configured, missing: ${llm_missing[*]}"
           fi
 
           echo "LLM provider chain: ${chain}"

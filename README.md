@@ -89,3 +89,8 @@ docker stop dmc268-api-test-db
 
 Инфраструктура, Terraform, CI/CD (автодеплой `main` → staging, `develop` → develop-окружение) и процедура деплоя описаны в
 [`docs/staging-deployment.md`](docs/staging-deployment.md).
+
+## Публикация ревью и SSE
+
+Контракты GitHub Publisher, события, учёт lease и точки интеграции с PR #29:
+[`docs/github-review-publication.md`](docs/github-review-publication.md).

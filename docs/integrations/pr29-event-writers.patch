@@ -1,0 +1,311 @@
+--- a/src/app/adapters/analysis_handler.py
++++ b/src/app/adapters/analysis_handler.py
+@@ -31,6 +31,7 @@
+     ContextPayload,
+     Finding,
+     OutboxEvent,
++    Publication,
+     Repository,
+     RepositorySettings,
+     ReviewEvent,
+@@ -40,6 +41,7 @@
+     SqlAlchemyPublicationRepository,
+     SqlAlchemyReviewJobRepository,
+ )
++from app.db.review_events import append_review_event
+ from app.db.task_leases import lock_owned_lease
+ from app.db.worker_tasks import PostgresWorkerTasks
+ from app.domain.contract_validation import validate_hunks, validate_ranges
+@@ -99,22 +101,28 @@
+         reason: ReviewReasonCode | None = None,
+     ) -> None:
+         await SqlAlchemyReviewJobRepository(session).update_status(lease, status=status)
+-        session.add(
+-            ReviewEvent(
+-                review_job_id=lease.review_job_id,
+-                event_type="TRANSITION",
+-                status=status.value,
+-                phase=status.value
+-                if status
+-                in {
+-                    ReviewStatus.FETCHING_DIFF,
+-                    ReviewStatus.PARSING_CONTEXT,
+-                    ReviewStatus.LLM_PROCESSING,
+-                }
+-                else None,
+-                attempt=task.attempt,
+-                reason_code=reason,
+-            )
++        await append_review_event(
++            session,
++            lease.review_job_id,
++            event_type="TRANSITION",
++            publication_status=(
++                await session.scalar(
++                    select(Publication.status).where(
++                        Publication.review_job_id == lease.review_job_id,
++                    )
++                )
++            )
++            or "NOT_READY",
++            phase=status.value
++            if status
++            in {
++                ReviewStatus.FETCHING_DIFF,
++                ReviewStatus.PARSING_CONTEXT,
++                ReviewStatus.LLM_PROCESSING,
++            }
++            else None,
++            attempt=task.attempt,
++            reason_code=reason,
+         )
+ 
+     async def handle(
+@@ -136,16 +144,22 @@
+                     lease,
+                     status=ReviewStatus(review.status),
+                 )
+-                session.add(
+-                    ReviewEvent(
+-                        review_job_id=lease.review_job_id,
+-                        event_type="FAILURE",
+-                        status=review.status,
+-                        phase=review.status,
+-                        reason_code=ReviewReasonCode(failure.reason_code),
+-                        retryable=True,
+-                        attempt=task.attempt,
++                await append_review_event(
++                    session,
++                    lease.review_job_id,
++                    event_type="FAILURE",
++                    publication_status=(
++                        await session.scalar(
++                            select(Publication.status).where(
++                                Publication.review_job_id == lease.review_job_id,
++                            )
++                        )
+                     )
++                    or "NOT_READY",
++                    phase=review.status,
++                    reason_code=ReviewReasonCode(failure.reason_code),
++                    retryable=True,
++                    attempt=task.attempt,
+                 )
+             return None
+         except _AnalysisFailureError as failure:
+@@ -471,15 +485,21 @@
+             )
+             if used is not None:
+                 return False
+-            session.add(
+-                ReviewEvent(
+-                    review_job_id=lease.review_job_id,
+-                    event_type="FORMAT_REPAIR",
+-                    status="LLM_PROCESSING",
+-                    phase="LLM_PROCESSING",
+-                    reason_code=ReviewReasonCode.LLM_OUTPUT_INVALID,
+-                    attempt=task.attempt,
+-                )
++            await append_review_event(
++                session,
++                lease.review_job_id,
++                event_type="FORMAT_REPAIR",
++                publication_status=(
++                    await session.scalar(
++                        select(Publication.status).where(
++                            Publication.review_job_id == lease.review_job_id,
++                        )
++                    )
++                )
++                or "NOT_READY",
++                phase="LLM_PROCESSING",
++                reason_code=ReviewReasonCode.LLM_OUTPUT_INVALID,
++                attempt=task.attempt,
+             )
+         return True
+ 
+--- a/src/app/db/repositories.py
++++ b/src/app/db/repositories.py
+@@ -14,6 +14,7 @@
+     TaskLeaseSnapshot,
+ )
+ from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob, TaskLease
++from app.db.review_events import append_review_event
+ from app.db.task_leases import lock_owned_lease, lock_publication
+ from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
+ 
+@@ -203,6 +204,12 @@
+             raise LeaseLostError(
+                 "Analysis lease expired before publication preparation"
+             )
++        await append_review_event(
++            self._session,
++            lease.review_job_id,
++            event_type="PUBLICATION_PENDING",
++            publication_status="PENDING",
++        )
+ 
+     async def update(
+         self,
+--- a/tests/test_analysis_handler.py
++++ b/tests/test_analysis_handler.py
+@@ -106,6 +106,7 @@
+             return httpx.Response(
+                 200,
+                 json={
++                    "number": 13,
+                     "title": "Fix division",
+                     "body": "Description",
+                     "state": "open",
+@@ -1001,7 +1002,7 @@
+                 )
+             )
+         ).all()
+-    assert len(events) == 1 and events[0].safe_details is None
++    assert len(events) == 1 and events[0].safe_details == {}
+ 
+ 
+ async def test_redelivery_reuses_context_after_provider_failure(
+@@ -1181,7 +1182,7 @@
+         and review.status == "FETCHING_DIFF"
+         and review.finished_at is None
+     )
+-    assert len(events) == 1 and events[0].retryable and events[0].safe_details is None
++    assert len(events) == 1 and events[0].retryable and events[0].safe_details == {}
+     assert llm.payloads == []
+     assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+         "pending"
+--- /dev/null
++++ b/tests/test_pr29_publication_bridge.py
+@@ -0,0 +1,131 @@
++from __future__ import annotations
++
++import json
++import uuid
++from pathlib import Path
++
++import httpx
++from pydantic import SecretStr
++from redis.asyncio import Redis
++from sqlalchemy import delete
++from sqlalchemy.ext.asyncio import async_sessionmaker
++from test_analysis_handler import BASE, HEAD, DeterministicLlm, github_http
++from test_analysis_handler import review_id as review_id  # noqa: PLC0414
++from test_contracts import SCHEMAS
++from test_github_publisher_postgres import FakeGithub
++from test_postgres_integration import PostgresHarness
++
++from app.adapters.analysis_handler import PostgresAnalysisHandler
++from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
++from app.adapters.redis_queue import RedisQueue
++from app.adapters.review_worker import PostgresReviewWorker
++from app.application.ports import DurableTaskOutcome, QueueTaskEnvelope
++from app.core.config import Github, Settings
++from app.core.publication_runtime import make_publication_handler
++from app.db.models import RepositoryAccess, ReviewJob, User
++from app.db.publication_models import PublicationOperation
++from app.db.publications import PostgresPublicationStore
++from app.db.review_events import SqlAlchemyReviewEvents
++from app.db.worker_tasks import PostgresWorkerTasks
++from app.vcs.github import GithubClient
++
++pytest_plugins = ("test_postgres_integration", "test_redis_queue")
++
++
++async def test_analysis_pending_event_and_real_publication_worker_durable_ack(
++    postgres: PostgresHarness,
++    redis_client: Redis,
++    stream_prefix: str,
++    review_id: uuid.UUID,
++) -> None:
++    factory = async_sessionmaker(postgres.engine)
++    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
++    user = uuid.uuid4()
++    async with factory.begin() as session:
++        review = await session.get(ReviewJob, review_id)
++        assert review is not None
++        session.add(User(id=user))
++        await session.flush()
++        session.add(
++            RepositoryAccess(
++                repository_id=review.repository_id, user_id=user, role="reviewer"
++            )
++        )
++    try:
++        assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
++        async with httpx.AsyncClient(transport=github_http()) as client:
++            analysis = PostgresAnalysisHandler(
++                factory,
++                GithubClient(client),
++                DeterministicLlm(),
++                schemas_dir=Path(SCHEMAS),
++            )
++            worker = PostgresReviewWorker(
++                factory, queue, analysis, owner="analysis", task_kind="analyze"
++            )
++            assert await worker.run_once() is True
++        page = await SqlAlchemyReviewEvents(factory).read(review_id, user, after=0)
++        assert page.events[-1].publication_status == "PENDING"
++        assert page.events[-1].status == "COMPLETED"
++        assert [event.sequence for event in page.events] == list(
++            range(1, len(page.events) + 1)
++        )
++
++        assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
++        messages = await redis_client.xrange(f"{stream_prefix}:publish")
++        assert messages is not None and len(messages) == 1
++        fields = messages[0][1]
++        assert fields is not None
++        envelope = QueueTaskEnvelope(**json.loads(fields["envelope"]))
++        assert envelope.task_kind == "publish" and envelope.review_id == str(review_id)
++        provider = FakeGithub()
++
++        def respond(request: httpx.Request) -> httpx.Response:
++            if request.url.path.endswith("/pulls/13"):
++                return httpx.Response(
++                    200,
++                    json={
++                        "number": 13,
++                        "state": "open",
++                        "title": "Fix division",
++                        "body": "Description",
++                        "head": {"repo": {"id": 43}, "sha": HEAD, "ref": "feature"},
++                        "base": {"repo": {"id": 42}, "sha": BASE, "ref": "main"},
++                    },
++                )
++            return provider.respond(request)
++
++        settings = Settings(
++            github=Github(write_token=SecretStr("test-write"), bot_user_id="9002")
++        )
++        async with make_publication_handler(
++            settings,
++            factory,
++            DurableTaskOutcome.COMPLETED,
++            transport=httpx.MockTransport(respond),
++        ) as handler:
++            publishing = PostgresReviewWorker(
++                factory, queue, handler, owner="publisher", task_kind="publish"
++            )
++            assert await publishing.run_once() is True
++        state = await PostgresPublicationStore(factory).get(review_id)
++        assert state is not None and state.status == "PUBLISHED"
++        assert await PostgresWorkerTasks(factory).completed(envelope) is True
++        pending = await redis_client.xpending(
++            f"{stream_prefix}:publish", "review-workers"
++        )
++        assert pending["pending"] == 0
++        assert len(provider.posts) == 1 and len(provider.posts[0]["comments"]) == 1
++        page = await SqlAlchemyReviewEvents(factory).read(review_id, user, after=0)
++        assert page.events[-1].publication_status == "PUBLISHED"
++    finally:
++        async with factory.begin() as session:
++            await session.execute(
++                delete(PublicationOperation).where(
++                    PublicationOperation.review_job_id == review_id
++                )
++            )
++            await session.execute(
++                delete(RepositoryAccess).where(RepositoryAccess.user_id == user)
++            )
++            await session.execute(delete(User).where(User.id == user))

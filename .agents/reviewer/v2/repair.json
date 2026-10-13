@@ -1,0 +1,6 @@
+{
+  "instruction": "Предыдущий ответ не прошёл проверку JSON Schema. Ошибки:\n{errors}\nВерни исправленный ответ целиком: только JSON по схеме, без пояснений.",
+  "answer_chars": 4000,
+  "max_errors": 20,
+  "overflow_shrink": 0.75
+}

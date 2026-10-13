@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from app.core.config import LLM
+from app.domain.frozen_configuration import ExecutionSettings
 from app.llm.errors import BudgetExceededError
 
 
@@ -17,7 +18,7 @@ class BudgetLimits:
     max_format_repairs: int = 1
 
     @classmethod
-    def from_settings(cls, settings: LLM) -> BudgetLimits:
+    def from_settings(cls, settings: LLM | ExecutionSettings) -> BudgetLimits:
         return cls(
             max_requests=settings.run_max_requests,
             max_input_tokens=settings.run_max_input_tokens,

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import structlog
 
 from app.core.config import LLM
+from app.domain.frozen_configuration import ExecutionSettings
 from app.llm.budget import RunBudget
 from app.llm.client import ChatMessage, LLMCallResult, LLMRequest
 from app.llm.errors import (
@@ -20,6 +21,7 @@ from app.llm.errors import (
 )
 from app.llm.gateway import LLMGateway
 from app.llm.tokens import TokenCounter
+from app.review.configuration import ExecutionConfiguration, FrozenConfigurationError
 from app.review.prompt import BuiltPrompt, PromptBuilder, PromptTooLargeError
 from app.review.schemas.context import ContextPayload
 from app.review.schemas.result import (
@@ -45,24 +47,38 @@ class _Attempt:
 
 
 class ReviewService:
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- service ports plus frozen execution authority
         self,
         gateway: LLMGateway,
         prompt_builder: PromptBuilder,
         validator: FindingValidator,
         token_counter: TokenCounter,
-        settings: LLM,
+        settings: LLM | ExecutionSettings,
+        *,
+        frozen_configuration: ExecutionConfiguration | None = None,
     ) -> None:
         self._gateway = gateway
         self._prompts = prompt_builder
         self._validator = validator
         self._counter = token_counter
         self._settings = settings
+        self._frozen = frozen_configuration
 
     async def review_chunk(
         self, payload: ContextPayload, budget: RunBudget
     ) -> ReviewChunkOutcome:
         self._prompts.ensure_verified()
+        if isinstance(self._settings, ExecutionSettings):
+            if self._frozen is None or self._settings != self._frozen.service_settings:
+                raise FrozenConfigurationError("execution_configuration_required")
+            if (self._prompts.prompt_version, self._prompts.prompt_digest) != (
+                self._frozen.prompt_version,
+                self._frozen.prompt_digest,
+            ):
+                raise FrozenConfigurationError("unsupported_prompt_bundle")
+            if self._prompts.repository_instructions != self._frozen.instructions:
+                raise FrozenConfigurationError("repository_instructions_mismatch")
+            self._frozen.validate_context(payload)
         attempt = _Attempt(time.monotonic(), budget.state().requests_used)
         try:
             prompt = self._prompts.build(
@@ -144,6 +160,7 @@ class ReviewService:
     ) -> LLMCallResult[LLMReviewOutput]:
         request = LLMRequest(
             messages=messages,
+            temperature=self._settings.temperature,
             max_output_tokens=self._settings.max_output_tokens,
             timeout_s=self._settings.request_timeout_s,
             output_schema_json=self._prompts.output_schema_json,
@@ -203,6 +220,8 @@ class ReviewService:
         return result
 
     def _configured_model(self) -> str:
+        if self._frozen is not None:
+            return self._frozen.model_ref
         if self._gateway.primary_provider == "eurorouter":
             return self._settings.eurorouter.model
         return self._settings.ollama.model

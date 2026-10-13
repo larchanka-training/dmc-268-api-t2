@@ -20,6 +20,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.frozen_configuration import RepositoryInstructions
 from app.llm.client import ChatMessage
 from app.llm.tokens import ConservativeTokenCounter, TokenCounter
 from app.review.schemas.context import ContextPayload, FileDiff
@@ -76,6 +77,7 @@ class PromptBuilder:
         self._few_shots = few_shots
         self._counter = counter or ConservativeTokenCounter()
         self._verified = False
+        self._repository_instructions: tuple[str, ...] = ()
         self._prompt_digest: str | None = None
         self._output_schema_json: str | None = None
         v1 = importlib.import_module("app.review.renderers.v1")
@@ -87,6 +89,10 @@ class PromptBuilder:
     @property
     def prompt_version(self) -> str:
         return self._prompt_version
+
+    @property
+    def repository_instructions(self) -> tuple[str, ...]:
+        return self._repository_instructions
 
     @property
     def prompt_digest(self) -> str | None:
@@ -114,7 +120,7 @@ class PromptBuilder:
         ]
 
     @classmethod
-    def load(
+    def load(  # noqa: PLR0913 -- verified roots, saved identity and typed user data
         cls,
         root: Path,
         prompt_version: str,
@@ -122,6 +128,7 @@ class PromptBuilder:
         *,
         expected_digest: str | None = None,
         source_root: Path | None = None,
+        repository_instructions: RepositoryInstructions | None = None,
     ) -> PromptBuilder:
         """Load ``prompt_version`` from ``root`` after checking SHA-256 digests."""
         try:
@@ -188,9 +195,25 @@ class PromptBuilder:
         builder._verified = True
         builder._prompt_digest = digest
         builder._renderer_module = module
-        builder._renderer = module.Renderer(
-            prompt_version, system, few_shots, builder._counter, repair
+        instructions = repository_instructions or RepositoryInstructions(
+            instructions=()
         )
+        builder._repository_instructions = instructions.instructions
+        if entry["renderer_version"] == "review-renderer-v1":
+            if instructions.instructions:
+                raise PromptConfigError("v1 cannot render repository instructions")
+            builder._renderer = module.Renderer(
+                prompt_version, system, few_shots, builder._counter, repair
+            )
+        else:
+            builder._renderer = module.Renderer(
+                prompt_version,
+                system,
+                few_shots,
+                builder._counter,
+                repair,
+                instructions.instructions,
+            )
         builder._output_schema_json = schema_json
         return builder
 
@@ -299,6 +322,7 @@ def _verify_artifacts(
 _SOURCE_ROOT = Path(__file__).resolve().parents[3]
 _RENDERERS = {
     "review-renderer-v1": ("app.review.renderers.v1", "src/app/review/renderers/v1.py"),
+    "review-renderer-v2": ("app.review.renderers.v2", "src/app/review/renderers/v2.py"),
 }
 
 

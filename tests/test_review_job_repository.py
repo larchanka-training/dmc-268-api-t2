@@ -7,7 +7,11 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_postgres_integration import PostgresHarness, _create_review_fixture
 
+from app.application.ports import StartReviewCommand
+from app.application.use_cases.start_review import start_review
 from app.db.repositories import SqlAlchemyReviewJobRepository
+from app.db.uow import SqlAlchemyUnitOfWork
+from app.review.configuration import FrozenConfigurationError
 
 pytest_plugins = ("test_postgres_integration",)
 
@@ -49,3 +53,31 @@ async def test_get_returns_none_for_missing_review_job(
         result = await SqlAlchemyReviewJobRepository(session).get(uuid.uuid4())
 
     assert result is None
+
+
+async def test_marked_executable_start_requires_complete_policy(
+    postgres: PostgresHarness,
+) -> None:
+
+    async with postgres.engine.begin() as connection:
+        scope, _ = await _create_review_fixture(postgres, connection)
+    command = StartReviewCommand(
+        scope.change_request_id,
+        scope.settings_id,
+        "new-head",
+        "rules-digest",
+        "manual",
+        None,
+        "test-model",
+        None,
+        {"schema_version": 1},
+        "v2",
+        "0" * 64,
+        "marker-test",
+        frozen_configuration_version=1,
+    )
+    with pytest.raises(FrozenConfigurationError, match="unsupported_model_settings"):
+        await start_review(
+            command,
+            unit_of_work=SqlAlchemyUnitOfWork(async_sessionmaker(postgres.engine)),
+        )

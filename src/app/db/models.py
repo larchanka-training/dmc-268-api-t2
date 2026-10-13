@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    SmallInteger,
     Text,
     UniqueConstraint,
     text,
@@ -254,6 +255,9 @@ class ReviewJob(Base):
     model_settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict
     )
+    frozen_configuration_version: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True
+    )
     prompt_version: Mapped[str] = mapped_column(Text, nullable=False)
     prompt_digest: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -308,6 +312,16 @@ class ReviewJob(Base):
     outbox_events: Mapped[list[OutboxEvent]] = relationship(back_populates="review_job")
 
     __table_args__ = (
+        CheckConstraint(
+            "frozen_configuration_version IS NULL OR frozen_configuration_version = 1",
+            name=conv("ck_review_job_frozen_configuration_version"),
+        ),
+        CheckConstraint(
+            "frozen_configuration_version IS NULL OR "
+            "COALESCE(jsonb_typeof(model_settings) = 'object' "
+            "AND model_settings->>'schema_version' = '1', false)",
+            name=conv("ck_review_job_frozen_settings_shape"),
+        ),
         CheckConstraint(
             "status IN "
             "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING',"

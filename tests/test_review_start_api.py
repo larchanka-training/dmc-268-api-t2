@@ -2,10 +2,11 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 import httpx
@@ -49,8 +50,14 @@ from app.core import github_runtime
 from app.core.config import Settings
 from app.db import models
 from app.db.session import get_session
+from app.domain.frozen_configuration import ModelRoute, admission_policy
 from app.domain.settings import compute_rules_digest
 from app.main import create_app
+from app.review.configuration import (
+    FrozenAdmissionResolver,
+    FrozenConfigurationError,
+    RuntimeProfile,
+)
 
 RETRY_AFTER_SECONDS = 30
 CONCURRENT_REQUESTS = 2
@@ -625,25 +632,30 @@ async def test_production_configuration_resolver_is_fail_closed(
 
 
 @pytest.fixture
-def configured(app: FastAPI, providers: FakeStartGithub) -> FakeStartGithub:
+def configured(
+    app: FastAPI, providers: FakeStartGithub, postgres: PostgresHarness
+) -> FakeStartGithub:
 
-    class Resolver:
-        async def resolve(
-            self,
-            *,
-            repository: RepositoryIdentity,
-            settings_id: uuid.UUID,
-            rules_digest: str,
-        ) -> FrozenAnalysisConfiguration:
-            return FrozenAnalysisConfiguration(
-                "test-model",
-                None,
-                {"temperature": 0},
-                "test-prompt-v1",
-                "test-prompt-digest",
-            )
-
-    app.dependency_overrides[get_review_configuration_resolver] = Resolver
+    app.dependency_overrides[get_review_configuration_resolver] = lambda: (
+        FrozenAdmissionResolver(
+            async_sessionmaker(postgres.engine, expire_on_commit=False),
+            Path(__file__).resolve().parents[1] / ".agents/reviewer",
+            {
+                "eurorouter/review-v1": RuntimeProfile(
+                    provider="eurorouter",
+                    base_url="https://llm.invalid/v1",
+                    api_keys=("synthetic-test-key",),
+                    allowed_models=("test-model",),
+                )
+            },
+            primary=ModelRoute(
+                profile_ref="eurorouter/review-v1",
+                model_ref="test-model",
+                model_digest=None,
+            ),
+            policy=admission_policy("0" * 64),
+        )
+    )
     return providers
 
 
@@ -682,7 +694,7 @@ async def test_new_start_is_durable_and_atomic(
         ) == (
             HEAD,
             "test-model",
-            "test-prompt-v1",
+            "v2",
             compute_rules_digest({"instructions": []}),
         )
         publication = (
@@ -1957,3 +1969,113 @@ async def test_start_preserves_exact_historical_empty_settings(
             )
         ).one()
         assert quota.value == 1
+
+
+async def test_incomplete_server_policy_cannot_admit_executable_job(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    app: FastAPI,
+) -> None:
+    class IncompleteResolver:
+        async def resolve(self, **kwargs: Any) -> FrozenAnalysisConfiguration:
+            return FrozenAnalysisConfiguration(
+                "test-model", None, {"temperature": 0}, "v1", "opaque"
+            )
+
+    app.dependency_overrides[get_review_configuration_resolver] = IncompleteResolver
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["message"] == "Review configuration is unavailable."
+
+
+@pytest.mark.parametrize("defect", ["settings_digest", "prompt_digest", "model_digest"])
+async def test_complete_but_unsupported_admission_identity_is_unavailable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    defect: str,
+) -> None:
+
+    original = app.dependency_overrides[get_review_configuration_resolver]()
+
+    class UnsupportedResolver:
+        async def resolve(self, **kwargs: Any) -> FrozenAnalysisConfiguration:
+            config: FrozenAnalysisConfiguration = await original.resolve(**kwargs)
+            if defect == "settings_digest":
+                values = dict(config.model_settings)
+                values["repository_settings_digest"] = "0" * 64
+                return replace(config, model_settings=values)
+            if defect == "model_digest":
+                return replace(config, model_digest="a" * 64)
+            return replace(config, prompt_digest="0" * 64)
+
+    app.dependency_overrides[get_review_configuration_resolver] = UnsupportedResolver
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["message"] == "Review configuration is unavailable."
+
+
+async def test_trusted_resolver_rejection_is_a_safe_http_unavailable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+) -> None:
+    class UnsupportedResolver:
+        async def resolve(self, **kwargs: Any) -> FrozenAnalysisConfiguration:
+            raise FrozenConfigurationError("model_digest_unattestable")
+
+    app.dependency_overrides[get_review_configuration_resolver] = UnsupportedResolver
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["message"] == "Review configuration is unavailable."
+    assert "model_digest_unattestable" not in response.text
+
+
+async def test_admission_uses_deployment_registry_after_process_cwd_changes(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The trusted resolver retains its absolute registry root; the HTTP gate
+    # must verify the same deployment assets without depending on process CWD.
+    monkeypatch.chdir(tmp_path)
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.ACCEPTED
+
+
+@pytest.mark.parametrize("marker", [True, 1.0])
+async def test_admission_rejects_noninteger_frozen_configuration_marker(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    marker: Any,
+) -> None:
+    original = app.dependency_overrides[get_review_configuration_resolver]()
+
+    class NonintegerMarkerResolver:
+        async def resolve(self, **kwargs: Any) -> FrozenAnalysisConfiguration:
+            config: FrozenAnalysisConfiguration = await original.resolve(**kwargs)
+            return replace(config, frozen_configuration_version=marker)
+
+    app.dependency_overrides[get_review_configuration_resolver] = (
+        NonintegerMarkerResolver
+    )
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["message"] == "Review configuration is unavailable."

@@ -195,7 +195,7 @@ async def test_saved_v1_http_is_unchanged_after_current_v2_deployment(
 ) -> None:
     root = tmp_path / "reviewer"
     shutil.copytree(_PROMPTS, root)
-    shutil.copytree(root / "v1", root / "v2")
+    shutil.copytree(root / "v1", root / "v2", dirs_exist_ok=True)
     manifest = json.loads((root / "manifest.json").read_text("utf-8"))
     current = json.loads(json.dumps(manifest["versions"]["v1"]))
     for artifact in current["artifacts"]:

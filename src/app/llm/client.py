@@ -17,7 +17,9 @@ class LLMRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     messages: list[ChatMessage]
-    temperature: float = 0.0  # SD §7
+    temperature: float = Field(
+        default=0.0, ge=0, le=2, allow_inf_nan=False, strict=True
+    )
     max_output_tokens: int = Field(gt=0)
     timeout_s: float = Field(gt=0)
     # Immutable serialized provider schema supplied by a verified prompt bundle.
@@ -33,6 +35,8 @@ class LLMCallResult[T: BaseModel](BaseModel):
     input_tokens: int | None
     output_tokens: int | None
     model: str
+    # Actual response selector, distinct from the legacy configured-model fallback.
+    reported_model: str | None = None
     model_digest: str | None
     provider: str
     latency_ms: int

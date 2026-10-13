@@ -182,6 +182,7 @@ class StartReviewCommand:
     prompt_digest: str
     trace_id: str
     rerun_of: uuid.UUID | None = None
+    frozen_configuration_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

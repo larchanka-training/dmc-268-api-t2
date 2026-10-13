@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from pydantic import ValidationError
 from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +17,7 @@ from app.application.ports import (
 from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob, TaskLease
 from app.db.task_leases import lock_owned_lease, lock_publication
 from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
+from app.domain.frozen_configuration import FrozenConfigurationError, ModelSettings
 
 
 class SqlAlchemyReviewJobRepository:
@@ -43,6 +45,18 @@ class SqlAlchemyReviewJobRepository:
     async def add_start_review(
         self, command: StartReviewCommand, *, config_digest: str
     ) -> uuid.UUID:
+        if command.frozen_configuration_version is not None:
+            if (
+                type(command.frozen_configuration_version) is not int
+                or command.frozen_configuration_version != 1
+            ):
+                raise FrozenConfigurationError(
+                    "unsupported_frozen_configuration_version"
+                )
+            try:
+                ModelSettings.from_stored(command.model_settings)
+            except ValidationError, TypeError, ValueError:
+                raise FrozenConfigurationError("unsupported_model_settings") from None
         repository_id = await self._session.scalar(
             select(ChangeRequest.repository_id).where(
                 ChangeRequest.id == command.change_request_id
@@ -71,6 +85,7 @@ class SqlAlchemyReviewJobRepository:
                     model_ref=command.model_ref,
                     model_digest=command.model_digest,
                     model_settings=command.model_settings,
+                    frozen_configuration_version=command.frozen_configuration_version,
                     prompt_version=command.prompt_version,
                     prompt_digest=command.prompt_digest,
                     created_at=now,

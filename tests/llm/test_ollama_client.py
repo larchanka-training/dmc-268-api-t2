@@ -96,3 +96,15 @@ async def test_malformed_chat_response_is_transient(body: dict[str, object]) -> 
 
     with pytest.raises(TransientProviderError):
         await _client(lambda _: response).generate_structured(_request(), Answer)
+
+
+async def test_legacy_missing_model_keeps_configured_display_and_known_usage() -> None:
+    body = _chat('{"verdict": "ok"}')
+    del body["model"]
+    result = await _client(
+        lambda _: httpx.Response(200, json=body)
+    ).generate_structured(_request(), Answer)
+    assert result.parsed == Answer(verdict="ok")
+    assert result.model == "qwen2.5-coder:14b"
+    assert result.reported_model is None
+    assert (result.input_tokens, result.output_tokens) == (_PROMPT_EVAL, _EVAL)

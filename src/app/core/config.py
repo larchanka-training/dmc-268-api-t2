@@ -106,6 +106,7 @@ class LLM(BaseModel):
     eurorouter: Eurorouter = Field(default_factory=Eurorouter)
     ollama: Ollama = Field(default_factory=Ollama)
 
+    temperature: float = Field(default=0.0, ge=0, le=2, allow_inf_nan=False)
     prompt_version: str = "v1"
     # Per-call limits (SD §14), shared by both providers (spec §5.4).
     context_window: int = Field(default=16384, ge=16384)

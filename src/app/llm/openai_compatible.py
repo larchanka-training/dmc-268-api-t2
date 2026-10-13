@@ -75,6 +75,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
             model=data.get("model") or self._model,
+            reported_model=data.get("model"),
             model_digest=None,
             provider=self.name,
             latency_ms=latency_ms,

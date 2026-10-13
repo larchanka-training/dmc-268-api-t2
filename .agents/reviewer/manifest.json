@@ -35,6 +35,42 @@
       ],
       "digest_format": "review-prompt-bundle/v1",
       "renderer_version": "review-renderer-v1"
+    },
+    "v2": {
+      "artifacts": [
+        {
+          "role": "system",
+          "path": "v2/system.md",
+          "sha256": "c54e1a537624274b118510bf533ea1c704c932ce176867dfc6ff099130b068ec"
+        },
+        {
+          "role": "few_shots",
+          "path": "v2/few_shots.json",
+          "sha256": "10979e736d31cc99ba35b2ce9b926a153d030ee7e6462c98616beddc1f0fd15a"
+        },
+        {
+          "role": "repair",
+          "path": "v2/repair.json",
+          "sha256": "84a6e0eb101c2c19aa7e76fc0835ae7d953ff94f843c14732b59e7f90d23f225"
+        },
+        {
+          "role": "renderer",
+          "path": "src/app/review/renderers/v2.py",
+          "sha256": "dad9c7cac8560bda2c2c2f7843dd927726326226b348d9c63dd8aed6ed785cc2"
+        },
+        {
+          "role": "llm_output_schema",
+          "path": "schemas/llm-output/v1.json",
+          "sha256": "d1b2590fc3706cdf08c4889c93eb93f363e11721773a14645ee2d6722c3fa7e8"
+        },
+        {
+          "role": "review_result_schema",
+          "path": "schemas/review-result/v1.json",
+          "sha256": "1c7577562b3f9d13b173f5c87630a1ba89e99e27817214510149e103ff51edf1"
+        }
+      ],
+      "digest_format": "review-prompt-bundle/v1",
+      "renderer_version": "review-renderer-v2"
     }
   }
 }

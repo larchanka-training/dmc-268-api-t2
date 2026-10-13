@@ -74,3 +74,9 @@ class LLMUnavailableError(LLMGatewayError):
     def __init__(self, last_error_code: str) -> None:
         super().__init__(f"all providers failed, last error: {last_error_code}")
         self.last_error_code = last_error_code
+
+
+class ModelIdentityError(LLMGatewayError):
+    """The paid response is unusable under the frozen profile's model identity."""
+
+    error_code = "unexpected_model_identity"

@@ -64,6 +64,7 @@ class OllamaClient(BaseLLMClient):
             input_tokens=data.get("prompt_eval_count"),
             output_tokens=data.get("eval_count"),
             model=data.get("model") or self._model,
+            reported_model=data.get("model"),
             model_digest=self._model_digest,
             provider=self.name,
             latency_ms=latency_ms,

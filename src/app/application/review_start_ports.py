@@ -1,7 +1,7 @@
 """External authorization boundary for starting a review."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 
@@ -64,6 +64,7 @@ class FrozenAnalysisConfiguration:
     model_settings: dict[str, object]
     prompt_version: str
     prompt_digest: str
+    frozen_configuration_version: Literal[1] = 1
 
 
 class ReviewConfigurationResolver(Protocol):

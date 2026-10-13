@@ -20,6 +20,7 @@ from app.llm.errors import (
     BudgetExceededError,
     LLMGatewayError,
     LLMUnavailableError,
+    ModelIdentityError,
     RateLimitedError,
     TransientProviderError,
 )
@@ -41,6 +42,7 @@ class Endpoint:
     client: BaseLLMClient
     cooldown_until: float = 0.0
     disabled: bool = False  # 401/403: until process restart
+    expected_model: str | None = None
 
 
 @dataclass
@@ -133,17 +135,22 @@ class LLMGateway:
                 except LLMGatewayError as exc:  # not retried: the caller decides
                     _log_failure(pool.name, attempts, exc)
                     raise
+                budget.settle(
+                    reservation,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                )
+                if (
+                    endpoint.expected_model is not None
+                    and result.reported_model != endpoint.expected_model
+                ):
+                    raise ModelIdentityError
                 logger.info(
                     "llm_attempt_succeeded",
                     provider=pool.name,
                     model=result.model,
                     attempt=attempts,
                     duration_ms=result.latency_ms,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                )
-                budget.settle(
-                    reservation,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                 )

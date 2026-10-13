@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Never
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -55,7 +55,18 @@ from app.db.review_starts import (
     settings_identity,
 )
 from app.db.session import get_session
-from app.domain.settings import compute_rules_digest, project_historical_empty_settings
+from app.domain.frozen_configuration import (
+    ModelRoute,
+    ModelSettings,
+    RepositoryInstructions,
+)
+from app.domain.settings import (
+    compute_repository_settings_digest,
+    compute_rules_digest,
+    project_historical_empty_settings,
+)
+from app.review.configuration import FrozenConfigurationError
+from app.review.prompt import PromptBuilder, PromptConfigError
 
 
 class ReviewStartRoute(APIRoute):
@@ -249,8 +260,70 @@ async def _revalidate_github(
         raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
 
 
+async def _refuse_configuration(
+    session: AsyncSession,
+    *,
+    settings_id: UUID,
+    expected_settings: str,
+) -> Never:
+    # Preserve the existing conflict outcome if resolution observed a changed
+    # row. Successful admissions still use locked revalidation in persist_start.
+    current = await session.get(RepositorySettings, settings_id, populate_existing=True)
+    changed = current is None or settings_identity(current) != expected_settings
+    await session.rollback()
+    if changed:
+        raise ApiError(*_ADMISSION_ERRORS[SettingsVersionChangedError])
+    raise ApiError(
+        503,
+        "SERVICE_UNAVAILABLE",
+        "Review configuration is unavailable.",
+        retryable=True,
+    )
+
+
+def _validate_configuration(
+    config: FrozenAnalysisConfiguration,
+    *,
+    settings_digest: str,
+    instructions: tuple[str, ...],
+) -> ModelSettings:
+    try:
+        if (
+            not isinstance(config, FrozenAnalysisConfiguration)
+            or type(config.frozen_configuration_version) is not int
+            or config.frozen_configuration_version != 1
+        ):
+            raise ValueError("unsupported admission configuration")
+        policy = ModelSettings.from_stored(config.model_settings)
+        ModelRoute(
+            profile_ref=policy.routing.primary_profile_ref,
+            model_ref=config.model_ref,
+            model_digest=config.model_digest,
+        )
+        if (
+            policy.repository_settings_digest != settings_digest
+            or config.model_digest is not None
+            or any(route.model_digest is not None for route in policy.routing.fallback)
+        ):
+            raise ValueError("unsupported admission identity")
+        PromptBuilder.load(
+            Path(__file__).resolve().parents[3] / ".agents/reviewer",
+            config.prompt_version,
+            expected_digest=config.prompt_digest,
+            repository_instructions=RepositoryInstructions(instructions=instructions),
+        )
+        return policy
+    except ValidationError, ValueError, TypeError, PromptConfigError:
+        raise ApiError(
+            503,
+            "SERVICE_UNAVAILABLE",
+            "Review configuration is unavailable.",
+            retryable=True,
+        ) from None
+
+
 @router.post("/{id}/pull-requests/{number}/reviews", operation_id="startReview")
-async def start_review_http(  # noqa: PLR0913 -- explicit HTTP and injected boundaries
+async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admission boundaries and snapshots
     *,
     id: str,
     number: str,
@@ -372,6 +445,19 @@ async def start_review_http(  # noqa: PLR0913 -- explicit HTTP and injected boun
     settings_id, rules_digest, change_id = settings.id, settings.rules_digest, change.id
     expected_change = change_identity(change)
     expected_settings = settings_identity(settings)
+    raw_settings_digest = compute_repository_settings_digest(
+        id=settings.id,
+        repository_id=settings.repository_id,
+        rules=settings.rules,
+        ignores=settings.ignores,
+        output_language=settings.output_language,
+        surrounding_lines=settings.surrounding_lines,
+    )
+    raw_instructions = tuple(
+        project_historical_empty_settings(settings.rules, "instructions")[
+            "instructions"
+        ]
+    )
     await session.rollback()
     await _revalidate_github(
         authorizer,
@@ -380,20 +466,29 @@ async def start_review_http(  # noqa: PLR0913 -- explicit HTTP and injected boun
         github_request,
         expected_change,
     )
-    config = await resolver.resolve(
-        repository=repository_identity,
-        settings_id=settings_id,
-        rules_digest=rules_digest,
-    )
-    if not isinstance(config, FrozenAnalysisConfiguration) or any(
-        not isinstance(value, str) or not value.strip()
-        for value in (config.model_ref, config.prompt_version, config.prompt_digest)
-    ):
-        raise ApiError(
-            503,
-            "SERVICE_UNAVAILABLE",
-            "Review configuration is unavailable.",
-            retryable=True,
+    try:
+        config = await resolver.resolve(
+            repository=repository_identity,
+            settings_id=settings_id,
+            rules_digest=rules_digest,
+        )
+    except FrozenConfigurationError:
+        await _refuse_configuration(
+            session,
+            settings_id=settings_id,
+            expected_settings=expected_settings,
+        )
+    try:
+        model_settings = _validate_configuration(
+            config,
+            settings_digest=raw_settings_digest,
+            instructions=raw_instructions,
+        )
+    except ApiError:
+        await _refuse_configuration(
+            session,
+            settings_id=settings_id,
+            expected_settings=expected_settings,
         )
     command = StartReviewCommand(
         change_request_id=change_id,
@@ -404,7 +499,8 @@ async def start_review_http(  # noqa: PLR0913 -- explicit HTTP and injected boun
         initiator_user_id=identity.user_id,
         model_ref=config.model_ref,
         model_digest=config.model_digest,
-        model_settings=deepcopy(config.model_settings),
+        model_settings=deepcopy(model_settings.model_dump(mode="json")),
+        frozen_configuration_version=1,
         prompt_version=config.prompt_version,
         prompt_digest=config.prompt_digest,
         trace_id=get_contextvars()["request_id"],

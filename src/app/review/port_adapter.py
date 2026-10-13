@@ -6,6 +6,8 @@ provider/model provenance and request counts stay backend-side; ``usage`` is
 reported only when both token counts are known.
 """
 
+import uuid
+
 from app.application.ports import (
     BuiltContextPayload,
     ReviewChunkResult,
@@ -38,9 +40,15 @@ class LlmGatewayAdapter:
     def __init__(self, service: ReviewService, budget: RunBudget) -> None:
         self._service = service
         self._budget = budget
+        self._review_id: uuid.UUID | None = None
 
     async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
         context = ContextPayload.model_validate(payload.to_wire())
+        if self._review_id is None:
+            self._review_id = payload.review_id
+        elif self._review_id != payload.review_id:
+            msg = "LlmGatewayAdapter and its budget belong to one review run"
+            raise ValueError(msg)
         outcome = await self._service.review_chunk(context, self._budget)
         if outcome.status == ChunkStatus.FAILED:
             raise ChunkReviewFailedError(outcome)

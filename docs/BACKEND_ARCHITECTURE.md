@@ -291,10 +291,14 @@ authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` �
 canonical Level 1 ContextPayload → injected `LlmGatewayPort.review` → fenced
 PostgreSQL result и atomic publication handoff. ACK/lease orchestration не
 дублируется. Call-start guards проверяют authority/deadlines; внешние вызовы
-проходят вне DB transactions. LLM Gateway уже реализован отдельно; его
-подключение к handler, разрешение frozen rules по settings identity и
-согласование provider repair/error mapping ещё не реализованы.
-Fake существует только в integration tests. Детали и ограничения —
+проходят вне DB transactions. Этап 8A проверяет handler с настоящими
+LlmGatewayAdapter/ReviewService/LLMGateway, HTTP MockTransport и PostgreSQL.
+Repair принадлежит ReviewService; ожидаемые FAILED исходы Gateway завершаются
+терминально с безопасным error_code, без повторного запуска бюджета из очереди.
+Adapter ограничен одним ReviewJob. Production factory, разрешение frozen rules
+и prompt digest, durable budget recovery ещё не реализованы; composition
+интеграционного теста использует явно аттестованную frozen configuration.
+HTTP mock и fake существуют только в tests. Детали и ограничения —
 PIPELINE_SPEC.md §4.3; обработчик использует существующие canonical schemas и
 fenced persistence contracts.
 
@@ -515,9 +519,8 @@ ORM-модели не используются как публичные HTTP DT
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
-- подключение реализованного LLM Gateway к analysis worker, разрешение frozen
-  settings и согласование provider repair/error mapping и общего
-  retry/request budget с handler;
+- production composition LLM Gateway для analysis worker, разрешение frozen
+  settings/prompt digest и durable retry/request/repair budget с handler;
 - production CLI для analysis worker, pending-delivery claiming (XAUTOCLAIM),
   периодический review recovery и retry scheduler;
 - publication executor (publisher worker) с call-start guards и сериализацией

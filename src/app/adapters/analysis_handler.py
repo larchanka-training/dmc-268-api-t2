@@ -45,6 +45,8 @@ from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.contract_validation import validate_hunks, validate_ranges
 from app.domain.enums import ReviewReasonCode, ReviewStatus
 from app.domain.settings import project_historical_empty_settings
+from app.llm.tokens import ConservativeTokenCounter
+from app.review.port_adapter import ChunkReviewFailedError
 from app.vcs.diff import InvalidDiff, parse_diff
 
 
@@ -90,13 +92,15 @@ class PostgresAnalysisHandler:
             for doc in documents
         )
 
-    async def _transition(
+    async def _transition(  # noqa: PLR0913 — fenced transition with safe diagnostics
         self,
         session: AsyncSession,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
         status: ReviewStatus,
         reason: ReviewReasonCode | None = None,
+        *,
+        error_code: str | None = None,
     ) -> None:
         await SqlAlchemyReviewJobRepository(session).update_status(lease, status=status)
         session.add(
@@ -114,6 +118,7 @@ class PostgresAnalysisHandler:
                 else None,
                 attempt=task.attempt,
                 reason_code=reason,
+                **({"safe_details": {"error_code": error_code}} if error_code else {}),
             )
         )
 
@@ -124,6 +129,25 @@ class PostgresAnalysisHandler:
     ) -> DurableTaskOutcome | None:
         try:
             return await self._execute(task, lease)
+        except ChunkReviewFailedError as failure:
+            # Gateway already owns bounded provider retries/repair. Until durable
+            # budget recovery exists, do not restart them through queue redelivery.
+            error_code = failure.outcome.error_code or "llm_error"
+            reason = (
+                ReviewReasonCode.LLM_OUTPUT_INVALID
+                if error_code == "invalid_llm_output"
+                else ReviewReasonCode.LLM_UNAVAILABLE
+            )
+            async with self._factory.begin() as session:
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    ReviewStatus.FAILED,
+                    reason,
+                    error_code=error_code,
+                )
+            return DurableTaskOutcome.COMPLETED
         except GithubFailure as failure:
             async with self._factory.begin() as session:
                 locked = await lock_owned_lease(session, lease)
@@ -280,11 +304,12 @@ class PostgresAnalysisHandler:
             },
         }
         context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
-        # Conservative UTF-8 byte estimate of the complete wire, including IDs.
-        # Iterate until the decimal estimate's own encoded width is accounted for.
+        # Use the Gateway's token estimator for the complete wire, including IDs.
+        # Iterate until the estimate's own decimal width is accounted for.
+        counter = ConservativeTokenCounter()
         while (
-            estimated := len(
-                json.dumps(context.to_wire(), ensure_ascii=False).encode("utf-8")
+            estimated := counter.count(
+                json.dumps(context.to_wire(), ensure_ascii=False)
             )
         ) > body["budget"]["estimated_input_tokens"]:
             body["budget"]["estimated_input_tokens"] = estimated
@@ -352,22 +377,17 @@ class PostgresAnalysisHandler:
         await self._ensure_call_authority(task, lease)
         result = await self._llm.review(context)
         if not self._valid_result(result, files):
-            # Reserve one second invocation. Provider prompt repair belongs to
-            # the real gateway adaptation; the current port has no repair method.
-            await self._ensure_call_authority(task, lease)
-            if await self._claim_repair(task, lease):
-                await self._ensure_call_authority(task, lease)
-                result = await self._llm.review(context)
-            if not self._valid_result(result, files):
-                async with self._factory.begin() as session:
-                    await self._transition(
-                        session,
-                        task,
-                        lease,
-                        ReviewStatus.FAILED,
-                        ReviewReasonCode.LLM_OUTPUT_INVALID,
-                    )
-                return DurableTaskOutcome.COMPLETED
+            # Raw format repair belongs exclusively to ReviewService. Invalid
+            # backend results fail defensively without another provider call.
+            async with self._factory.begin() as session:
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    ReviewStatus.FAILED,
+                    ReviewReasonCode.LLM_OUTPUT_INVALID,
+                )
+            return DurableTaskOutcome.COMPLETED
         async with self._factory.begin() as session:
             locked = await lock_owned_lease(session, lease)
             if locked is None:
@@ -450,38 +470,6 @@ class PostgresAnalysisHandler:
                 )
             )
         return DurableTaskOutcome.COMPLETED
-
-    async def _claim_repair(
-        self,
-        task: QueueTaskEnvelope,
-        lease: TaskLeaseSnapshot,
-    ) -> bool:
-        async with self._factory.begin() as session:
-            await SqlAlchemyReviewJobRepository(session).update_status(
-                lease,
-                status=ReviewStatus.LLM_PROCESSING,
-            )
-            used = await session.scalar(
-                select(ReviewEvent.id)
-                .where(
-                    ReviewEvent.review_job_id == lease.review_job_id,
-                    ReviewEvent.event_type == "FORMAT_REPAIR",
-                )
-                .limit(1)
-            )
-            if used is not None:
-                return False
-            session.add(
-                ReviewEvent(
-                    review_job_id=lease.review_job_id,
-                    event_type="FORMAT_REPAIR",
-                    status="LLM_PROCESSING",
-                    phase="LLM_PROCESSING",
-                    reason_code=ReviewReasonCode.LLM_OUTPUT_INVALID,
-                    attempt=task.attempt,
-                )
-            )
-        return True
 
     async def _ensure_call_authority(
         self,

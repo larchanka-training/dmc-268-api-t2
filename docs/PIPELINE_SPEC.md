@@ -338,8 +338,10 @@ is retained on resumption. No WebhookReceipt supplies implicit analysis input.
 The existing GitHub client and diff parser produce the snapshot, hunks and
 policy coverage. Level 1 leaves source windows, whole files and related symbols
 empty. The complete wire context passes canonical schema and semantic validation
-before persistence/inference. Budget uses a conservative UTF-8 byte estimate of
-the complete wire and fixed input/output limits, persisted with the context.
+before persistence/inference. Budget uses the Gateway's conservative token
+estimator on the complete wire and explicitly supplied input/output limits,
+persisted with the context. Prompt framing and few-shot tokens are checked
+separately by ReviewService before HTTP.
 An empty, fully excluded or wholly over-budget diff records SKIPPED with snapshot
 and coverage, without ContextPayload or LLM invocation. Token-budget exclusion
 uses the existing coverage reason. A saved context is reused after provider or
@@ -349,15 +351,16 @@ Context v1 has only `metadata.rules_version`, populated with the immutable
 RepositorySettings UUID, plus the frozen output language. It has no instructions
 field. The supplied real gateway must resolve frozen rules/model/prompt by
 authoritative review/settings identity. The gateway exists in `app.llm` /
-`app.review`, but its integration with this handler and frozen configuration
-resolution are not implemented; this handler uses gateway test doubles only
-in integration tests.
-The current port also has no distinct format-repair operation. The handler
-reserves at most one second `review` invocation using a fenced durable
-FORMAT_REPAIR audit event. The standalone gateway implements provider repair
-and a shared per-run request budget; coordination with this handler remains
-an integration requirement. A second handler call alone is not claimed to
-implement provider prompt repair.
+`app.review`. Stage 8A integration tests exercise the actual adapter, service
+and Gateway through HTTP MockTransport into PostgreSQL. Test composition loads
+the stored model/prompt version for an explicitly attested fixture configuration;
+production frozen configuration resolution and prompt-digest policy remain
+unimplemented. There is no implicit fallback to current environment configuration.
+Each adapter is restricted to one review identity and needs its own RunBudget;
+production composition must supply a fresh adapter/budget per job. BudgetState
+is still in memory and is not recovered after crashes or redelivery.
+ReviewService owns the single raw format repair; the handler never performs a
+second `review` call to repair an invalid backend result.
 
 The gateway must validate raw model output against `schemas/llm-output/v1.json`
 before backend enrichment. The completed `ReviewChunkResult` passes
@@ -365,15 +368,20 @@ before backend enrichment. The completed `ReviewChunkResult` passes
 checks against the captured hunks. Raw-only constraints are not reapplied to
 the enriched backend result. Findings carry backend
 SHA-256 fingerprints over canonical path/side/range/category/title fields.
-Invalid output after the reserved second invocation fails with LLM_OUTPUT_INVALID
+Invalid raw output after Gateway repair, or an invalid backend result, fails with LLM_OUTPUT_INVALID
 without ChunkResult/Findings. Useful output with limitations, or returning after
 the analysis deadline, is PARTIAL; otherwise it is COMPLETED. Useful terminal
 status, summary, ChunkResult/Findings, Publication preparation and canonical
 publish outbox commit atomically. Publication remains PENDING, never fake success.
 Permanent GitHub/diff errors record safe terminal decisions; retryable GitHub
-failures record an active failure event and retain pending work. Unknown gateway
-and DB errors propagate and retain pending work. Retry scheduling, recovery and
-real gateway error mapping are not implemented by this handler.
+failures record an active failure event and retain pending work. Expected
+ChunkReviewFailedError outcomes terminate under the live fence: invalid output
+maps to LLM_OUTPUT_INVALID, other Gateway failures to LLM_UNAVAILABLE, retaining
+the safe original error_code in the transition event. Stage 8A deliberately has
+no queue-level retry for these failures, avoiding restarted provider budgets;
+retryable LLM job recovery requires durable budget/repair accounting first.
+Unknown programming and DB errors still propagate and retain pending work.
+This limited error mapping does not implement retry scheduling or recovery.
 
 ## 5. Leases and fencing
 

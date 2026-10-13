@@ -354,7 +354,7 @@ async def test_invalid_llm_location_never_persists_findings(
     )
     assert chunks == [] and review.final_summary is None
     assert len(events) == 1 and events[0].safe_details is None
-    assert len(llm.payloads) == 2  # noqa: PLR2004 — one initial call plus one repair
+    assert len(llm.payloads) == 1  # Repair belongs to ReviewService/Gateway.
 
 
 @pytest.mark.parametrize("policy", ["empty", "default", "frozen"])
@@ -951,18 +951,16 @@ async def test_duplicate_delivery_keeps_one_context_result_and_finding(
     assert len(contexts) == len(chunks) == len(findings) == 1
 
 
-async def test_format_repair_budget_survives_failed_provider_call_and_redelivery(
+async def test_invalid_backend_result_is_terminal_without_handler_repair_on_redelivery(
     postgres: PostgresHarness,
     redis_client: Redis,
     stream_prefix: str,
     review_id: uuid.UUID,
 ) -> None:
 
-    class InterruptedRepair(DeterministicLlm):
+    class InvalidBackendResult(DeterministicLlm):
         async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
             result = await super().review(payload)
-            if len(self.payloads) == 2:  # noqa: PLR2004 — interrupt reserved repair
-                raise RuntimeError("provider private data")
             return replace(
                 result, findings=[replace(result.findings[0], path="outside.py")]
             )
@@ -979,7 +977,7 @@ async def test_format_repair_budget_survives_failed_provider_call_and_redelivery
         task = QueueTaskEnvelope(
             1, str(event.id), str(review_id), "analyze", event.attempt, event.trace_id
         )
-    llm = InterruptedRepair()
+    llm = InvalidBackendResult()
     async with httpx.AsyncClient(transport=github_http()) as client:
         handler = PostgresAnalysisHandler(
             factory, GithubClient(client), llm, schemas_dir=SCHEMAS
@@ -987,11 +985,10 @@ async def test_format_repair_budget_survives_failed_provider_call_and_redelivery
         worker = PostgresReviewWorker(
             factory, queue, handler, owner="analysis", task_kind="analyze"
         )
-        with pytest.raises(RuntimeError, match="provider private data"):
-            await worker.run_once()
+        assert await worker.run_once() is True
         await queue.enqueue(task)
         assert await worker.run_once() is True
-    assert len(llm.payloads) == 3  # noqa: PLR2004 — repair is not repeated on redelivery
+    assert len(llm.payloads) == 1
     async with factory() as session:
         events = (
             await session.scalars(
@@ -1001,7 +998,9 @@ async def test_format_repair_budget_survives_failed_provider_call_and_redelivery
                 )
             )
         ).all()
-    assert len(events) == 1 and events[0].safe_details is None
+        review = await session.get(ReviewJob, review_id)
+    assert events == []
+    assert review is not None and review.status == "FAILED"
 
 
 async def test_redelivery_reuses_context_after_provider_failure(

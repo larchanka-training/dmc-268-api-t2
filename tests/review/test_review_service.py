@@ -417,3 +417,17 @@ async def test_port_adapter_raises_for_a_failed_chunk(
         await LlmGatewayAdapter(service, _budget()).review(_built(payload_data))
 
     assert error.value.outcome.error_code == "llm_unavailable"
+
+
+async def test_port_adapter_refuses_to_spend_one_run_budget_on_another_review(
+    service: ReviewService, providers: ScriptedProviders, payload_data: dict[str, Any]
+) -> None:
+    providers.script.extend([_output(), _output()])
+    adapter = LlmGatewayAdapter(service, _budget())
+    first = _built(payload_data)
+    await adapter.review(first)
+    # A handler can process multiple jobs, but this adapter and budget belong to
+    # one review. It must reject accidental reuse before issuing HTTP.
+    with pytest.raises(ValueError, match="one review run"):
+        await adapter.review(dataclasses.replace(first, review_id=uuid.uuid4()))
+    assert len(providers.requests) == 1

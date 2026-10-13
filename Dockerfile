@@ -16,7 +16,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
-COPY schemas/settings ./schemas/settings
+COPY schemas ./schemas
 # Промпты LLM gateway (manifest + SHA-256); остальное в .agents — инструменты разработки
 COPY .agents/reviewer ./.agents/reviewer
 RUN uv sync --frozen --no-dev

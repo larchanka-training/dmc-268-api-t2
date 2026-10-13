@@ -4,6 +4,7 @@ Nothing here is Eurorouter-specific: name, base URL, model and key come from
 configuration. One instance serves one API key.
 """
 
+import json
 import time
 
 import httpx
@@ -43,7 +44,11 @@ class OpenAICompatibleClient(BaseLLMClient):
                 "json_schema": {
                     "name": "review_output",
                     "strict": True,
-                    "schema": response_model.model_json_schema(),
+                    "schema": (
+                        json.loads(request.output_schema_json)
+                        if request.output_schema_json is not None
+                        else response_model.model_json_schema()
+                    ),
                 },
             },
         }

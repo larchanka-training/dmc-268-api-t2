@@ -1,0 +1,106 @@
+{
+  "title": "LLMReviewOutput v1",
+  "description": "Model-generated fields only. The gateway bundles the local Finding reference before sending a structured-output schema to a provider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "findings",
+    "limitations"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "description": "One concrete issue at one repository-relative location or range. end_line must be greater than or equal to start_line.",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "side",
+          "start_line",
+          "end_line",
+          "category",
+          "severity",
+          "title",
+          "explanation",
+          "evidence",
+          "recommendation",
+          "proposed_diff_fix"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
+          },
+          "side": {
+            "enum": [
+              "OLD",
+              "NEW"
+            ]
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "category": {
+            "enum": [
+              "security",
+              "correctness",
+              "performance",
+              "maintainability"
+            ]
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "explanation": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          },
+          "recommendation": {
+            "type": "string",
+            "minLength": 1
+          },
+          "proposed_diff_fix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Suggestion only; never automatically applied."
+          }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

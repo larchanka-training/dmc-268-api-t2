@@ -1,8 +1,10 @@
 """ReviewService.review_chunk end to end over mocked providers (spec §8)."""
 
 import dataclasses
+import hashlib
 import json
 import random
+import shutil
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -20,9 +22,10 @@ from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.providers import build_gateway
 from app.llm.tokens import ConservativeTokenCounter
 from app.review.port_adapter import ChunkReviewFailedError, LlmGatewayAdapter
-from app.review.prompt import PromptBuilder
+from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.renderers import v1
 from app.review.schemas.context import ContextPayload
-from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome
+from app.review.schemas.result import ChunkStatus, LLMReviewOutput, ReviewChunkOutcome
 from app.review.service import ReviewService
 from app.review.validation import FindingValidator
 
@@ -137,6 +140,131 @@ def _budget(max_requests: int = 8) -> RunBudget:
             deadline_s=600,
         )
     )
+
+
+async def test_unverified_builder_cannot_execute_review(
+    providers: ScriptedProviders, payload: ContextPayload
+) -> None:
+    counter = ConservativeTokenCounter()
+    service = ReviewService(
+        gateway=build_gateway(
+            _settings(),
+            httpx.AsyncClient(transport=httpx.MockTransport(providers.handler)),
+        ),
+        prompt_builder=PromptBuilder(prompt_version="v1", system="test", few_shots=[]),
+        validator=FindingValidator(),
+        token_counter=counter,
+        settings=_settings(),
+    )
+    with pytest.raises(PromptConfigError):
+        await service.review_chunk(payload, _budget())
+    assert providers.requests == []
+
+
+@pytest.mark.parametrize("provider", ["eurorouter", "ollama"])
+async def test_provider_receives_canonical_frozen_schema(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+    provider: str,
+) -> None:
+    if provider == "ollama":
+        providers.script.extend([503, 503])
+    providers.script.append(_output())
+    result = await service.review_chunk(payload, _budget())
+    assert result.status == ChunkStatus.COMPLETED
+    sent = providers.requests[-1]
+    schema = (
+        sent["format"]
+        if provider == "ollama"
+        else sent["response_format"]["json_schema"]["schema"]
+    )
+    expected = json.loads(
+        (Path(__file__).parent / "fixtures/v1-provider-schema.json").read_text("utf-8")
+    )
+    assert schema == expected
+
+
+@pytest.mark.parametrize("provider", ["eurorouter", "ollama"])
+async def test_saved_v1_http_is_unchanged_after_current_v2_deployment(
+    tmp_path: Path,
+    payload: ContextPayload,
+    provider: str,
+    providers: ScriptedProviders,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "reviewer"
+    shutil.copytree(_PROMPTS, root)
+    shutil.copytree(root / "v1", root / "v2")
+    manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    current = json.loads(json.dumps(manifest["versions"]["v1"]))
+    for artifact in current["artifacts"]:
+        if artifact["path"].startswith("v1/"):
+            artifact["path"] = artifact["path"].replace("v1/", "v2/", 1)
+    (root / "v2/system.md").write_text("Current v2 system", "utf-8")
+    for artifact in current["artifacts"]:
+        if artifact["role"] == "system":
+            artifact["sha256"] = hashlib.sha256(
+                (root / artifact["path"]).read_bytes()
+            ).hexdigest()
+    manifest["versions"]["v2"] = current
+    (root / "manifest.json").write_text(json.dumps(manifest), "utf-8")
+    assert (
+        PromptBuilder.load(root, "v2")
+        .build(payload, max_input_tokens=10000)
+        .messages[0]
+        .content
+        == "Current v2 system"
+    )
+    monkeypatch.setattr(v1, "_TRIMMED_BODY_CHARS", 1)
+    monkeypatch.setattr(v1, "_serialize_output", lambda _: "CURRENT SERIALIZER")
+    monkeypatch.setattr(
+        LLMReviewOutput, "model_dump_json", lambda *a, **kw: "CURRENT MODEL"
+    )
+    descriptor = json.loads(
+        (Path(__file__).parent / "fixtures/v1-descriptor.json").read_text("utf-8")
+    )
+    saved_digest = hashlib.sha256(
+        json.dumps(
+            descriptor,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    counter = ConservativeTokenCounter()
+    settings = _settings().model_copy(update={"prompt_version": "v2"})
+    if provider == "ollama":
+        settings = settings.model_copy(update={"primary_provider": "ollama"})
+    service = ReviewService(
+        build_gateway(
+            settings,
+            httpx.AsyncClient(transport=httpx.MockTransport(providers.handler)),
+        ),
+        PromptBuilder.load(root, "v1", counter, expected_digest=saved_digest),
+        FindingValidator(),
+        counter,
+        settings,
+    )
+    providers.script.extend(['{"summary": "x"}', _output()])
+    result = await service.review_chunk(payload, _budget())
+    assert result.status == ChunkStatus.COMPLETED
+    golden = json.loads(
+        (Path(__file__).parent / "fixtures/v1-messages.json").read_text("utf-8")
+    )
+    assert providers.requests[0]["messages"] == golden["initial"]
+    assert providers.requests[1]["messages"] == golden["repair"]
+    schema = json.loads(
+        (Path(__file__).parent / "fixtures/v1-provider-schema.json").read_text("utf-8")
+    )
+    for request in providers.requests:
+        sent_schema = (
+            request["format"]
+            if provider == "ollama"
+            else request["response_format"]["json_schema"]["schema"]
+        )
+        assert sent_schema == schema
 
 
 async def test_valid_answer_gives_completed_result(

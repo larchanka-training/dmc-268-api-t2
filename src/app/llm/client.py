@@ -20,6 +20,9 @@ class LLMRequest(BaseModel):
     temperature: float = 0.0  # SD §7
     max_output_tokens: int = Field(gt=0)
     timeout_s: float = Field(gt=0)
+    # Immutable serialized provider schema supplied by a verified prompt bundle.
+    # Generic/test callers may still use their response model's schema.
+    output_schema_json: str | None = None
 
 
 class LLMCallResult[T: BaseModel](BaseModel):

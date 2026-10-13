@@ -3,6 +3,7 @@
 No authorization: Ollama lives in the closed application network.
 """
 
+import json
 import time
 
 import httpx
@@ -38,7 +39,11 @@ class OllamaClient(BaseLLMClient):
             "model": self._model,
             "messages": [m.model_dump() for m in request.messages],
             "stream": False,
-            "format": response_model.model_json_schema(),
+            "format": (
+                json.loads(request.output_schema_json)
+                if request.output_schema_json is not None
+                else response_model.model_json_schema()
+            ),
             "options": {
                 "temperature": request.temperature,
                 "num_predict": request.max_output_tokens,

@@ -32,16 +32,7 @@ from app.review.validation import FindingValidator, ValidationOutcome
 
 logger = structlog.get_logger(__name__)
 
-_OVERFLOW_SHRINK = 0.75
 _FALLBACK_NOTE = "Чанк обработан резервным провайдером ({}/{})."
-
-# Previous invalid answer kept in the repair request (spec §8 step 3).
-_REPAIR_ANSWER_CHARS = 4000
-_REPAIR_MAX_ERRORS = 20
-_REPAIR_INSTRUCTION = (
-    "Предыдущий ответ не прошёл проверку JSON Schema. Ошибки:\n{errors}\n"
-    "Верни исправленный ответ целиком: только JSON по схеме, без пояснений."
-)
 
 
 @dataclass
@@ -71,6 +62,7 @@ class ReviewService:
     async def review_chunk(
         self, payload: ContextPayload, budget: RunBudget
     ) -> ReviewChunkOutcome:
+        self._prompts.ensure_verified()
         attempt = _Attempt(time.monotonic(), budget.state().requests_used)
         try:
             prompt = self._prompts.build(
@@ -90,7 +82,9 @@ class ReviewService:
             except ContextOverflowError:
                 # One rebuild with a smaller limit: metadata shrinks, the diff
                 # stays; a still-too-large diff is re-chunked by the caller.
-                smaller = int(self._settings.max_input_tokens * _OVERFLOW_SHRINK)
+                smaller = self._prompts.overflow_input_limit(
+                    self._settings.max_input_tokens
+                )
                 try:
                     prompt = self._prompts.build(payload, max_input_tokens=smaller)
                 except PromptTooLargeError:
@@ -134,23 +128,16 @@ class ReviewService:
     ) -> LLMCallResult[LLMReviewOutput]:
         """One repair request: original messages, the truncated invalid answer
         and the validation errors (locations and messages, no source code)."""
-        errors = "\n".join(f"- {d}" for d in error.details[:_REPAIR_MAX_ERRORS])
-        extra = [
-            ChatMessage(
-                role="assistant", content=error.raw_text[:_REPAIR_ANSWER_CHARS]
-            ),
-            ChatMessage(role="user", content=_REPAIR_INSTRUCTION.format(errors=errors)),
-        ]
-        extra_tokens = sum(self._counter.count(m.content) for m in extra)
         try:
-            prompt = self._prompts.build(
-                payload, max_input_tokens=self._settings.max_input_tokens - extra_tokens
+            prompt = self._prompts.build_repair(
+                payload,
+                raw_text=error.raw_text,
+                details=error.details,
+                max_input_tokens=self._settings.max_input_tokens,
             )
         except PromptTooLargeError:
             raise error from None
-        return await self._send(
-            [*prompt.messages, *extra], prompt.estimated_tokens + extra_tokens, budget
-        )
+        return await self._send(prompt.messages, prompt.estimated_tokens, budget)
 
     async def _send(
         self, messages: list[ChatMessage], input_tokens: int, budget: RunBudget
@@ -159,6 +146,7 @@ class ReviewService:
             messages=messages,
             max_output_tokens=self._settings.max_output_tokens,
             timeout_s=self._settings.request_timeout_s,
+            output_schema_json=self._prompts.output_schema_json,
         )
         return await self._gateway.generate_structured(
             request, LLMReviewOutput, budget=budget, input_tokens=input_tokens

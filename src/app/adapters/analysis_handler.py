@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,6 +25,7 @@ from app.application.ports import (
     ReviewChunkResult,
     TaskLeaseSnapshot,
 )
+from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
     ChangeRequest,
     ChunkResult,
@@ -103,6 +104,11 @@ class PostgresAnalysisHandler:
         error_code: str | None = None,
     ) -> None:
         await SqlAlchemyReviewJobRepository(session).update_status(lease, status=status)
+        job = await session.get(ReviewJob, lease.review_job_id)
+        assert job is not None
+        details: dict[str, object] = {"error_code": error_code} if error_code else {}
+        if job.analysis_attempts == 0:
+            details["pre_execution"] = True
         session.add(
             ReviewEvent(
                 review_job_id=lease.review_job_id,
@@ -116,9 +122,9 @@ class PostgresAnalysisHandler:
                     ReviewStatus.LLM_PROCESSING,
                 }
                 else None,
-                attempt=task.attempt,
+                attempt=max(1, job.analysis_attempts),
                 reason_code=reason,
-                **({"safe_details": {"error_code": error_code}} if error_code else {}),
+                **({"safe_details": details} if details else {}),
             )
         )
 
@@ -168,7 +174,7 @@ class PostgresAnalysisHandler:
                         phase=review.status,
                         reason_code=ReviewReasonCode(failure.reason_code),
                         retryable=True,
-                        attempt=task.attempt,
+                        attempt=max(1, review.analysis_attempts),
                     )
                 )
             return None
@@ -182,11 +188,31 @@ class PostgresAnalysisHandler:
                 await self._transition(session, task, lease, status, failure.reason)
             return DurableTaskOutcome.COMPLETED
 
-    async def _execute(  # noqa: PLR0912, PLR0915 — one bounded Level 1 capture
+    async def _execute(  # noqa: PLR0915 — one bounded Level 1 capture
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
     ) -> DurableTaskOutcome:
+        decision = await PostgresAnalysisAttemptStore(self._factory).begin(
+            task=task, lease=lease
+        )
+        if not decision.accepted:
+            reason = {
+                "queue_deadline_exceeded": ReviewReasonCode.QUEUE_DEADLINE_EXCEEDED,
+                "analysis_deadline_exceeded": (
+                    ReviewReasonCode.ANALYSIS_DEADLINE_EXCEEDED
+                ),
+            }.get(decision.error_code or "", ReviewReasonCode.LLM_UNAVAILABLE)
+            async with self._factory.begin() as session:
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    ReviewStatus.FAILED,
+                    reason,
+                    error_code=decision.error_code,
+                )
+            return DurableTaskOutcome.COMPLETED
         await self._ensure_call_authority(task, lease)
         async with self._factory.begin() as session:
             stored = await session.scalar(
@@ -212,17 +238,6 @@ class PostgresAnalysisHandler:
             )
             review = await session.get(ReviewJob, lease.review_job_id)
             assert review is not None
-            if review.started_at is None:
-                locked = await lock_owned_lease(session, lease)
-                if locked is None:
-                    raise LeaseLostError("Analysis lease is no longer current")
-                if locked[0].queue_deadline_at <= locked[2]:
-                    raise _AnalysisFailureError(
-                        ReviewReasonCode.QUEUE_DEADLINE_EXCEEDED
-                    )
-                review.started_at = locked[2]
-                if review.analysis_deadline_at is None:
-                    review.analysis_deadline_at = locked[2] + timedelta(minutes=10)
             repo = await session.get(Repository, review.repository_id)
             change = await session.get(ChangeRequest, review.change_request_id)
             settings = await session.get(

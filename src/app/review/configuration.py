@@ -273,10 +273,15 @@ def build_frozen_gateway(
             ProviderPool(
                 profile.provider,
                 [
-                    Endpoint(client, expected_model=route.model_ref)
+                    Endpoint(
+                        client,
+                        expected_model=route.model_ref,
+                        expected_digest=route.model_digest,
+                    )
                     for client in clients
                 ],
                 timeout_s=config.service_settings.request_timeout_s,
+                profile_ref=route.profile_ref,
             )
         )
     return LLMGateway(pools)

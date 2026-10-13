@@ -82,7 +82,8 @@ async def frozen_adapter(
     async with factory() as session:
         job = await session.get(ReviewJob, review)
         assert job is not None
-        assert job.model_digest is None and job.model_settings == {"temperature": 0}
+        assert job.model_digest is None
+        assert job.model_settings["generation"] == {"temperature": 0.0}
         assert job.prompt_digest == "prompt-digest"
         repository_settings = await session.get(
             RepositorySettings, job.repository_settings_id

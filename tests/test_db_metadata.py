@@ -29,6 +29,7 @@ def test_expected_core_tables_are_registered() -> None:
         "repository_settings",
         "change_request",
         "review_job",
+        "review_llm_attempt",
         "review_event",
         "context_payload",
         "chunk_result",

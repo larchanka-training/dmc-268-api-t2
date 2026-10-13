@@ -50,8 +50,10 @@ from app.db.models import (
     ReviewJob,
     TaskLease,
 )
+from app.db.task_leases import PostgresTaskLeaseStore
 from app.db.uow import SqlAlchemyUnitOfWork
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
+from app.domain.frozen_configuration import admission_policy
 from app.domain.settings import compute_rules_digest
 from app.vcs.github import GithubClient
 
@@ -155,10 +157,11 @@ async def review_id(postgres: PostgresHarness) -> AsyncIterator[uuid.UUID]:
             None,
             "test-model",
             None,
-            {"temperature": 0},
+            admission_policy("0" * 64).model_dump(mode="json"),
             "v1",
             "prompt-digest",
             "trace-analysis",
+            frozen_configuration_version=1,
         ),
         unit_of_work=SqlAlchemyUnitOfWork(factory),
     )
@@ -1266,11 +1269,11 @@ async def test_queue_deadline_crossing_db_lock_blocks_analysis_start(
         )
         async with postgres.engine.begin() as blocker:
             await blocker.execute(
-                text("LOCK TABLE context_payload IN ACCESS EXCLUSIVE MODE")
+                text("LOCK TABLE review_job IN ACCESS EXCLUSIVE MODE")
             )
             execution = asyncio.create_task(worker.run_once())
 
-            async def wait_for_context_lock() -> None:
+            async def wait_for_start_lock() -> None:
                 while True:
                     async with postgres.engine.connect() as observer:
                         blocked = (
@@ -1279,7 +1282,7 @@ async def test_queue_deadline_crossing_db_lock_blocks_analysis_start(
                                     "SELECT count(*) FROM pg_stat_activity "
                                     "WHERE datname = current_database() "
                                     "AND wait_event_type = 'Lock' "
-                                    "AND query LIKE '%context_payload%' "
+                                    "AND query LIKE '%review_job%' "
                                     "AND pid <> pg_backend_pid()"
                                 )
                             )
@@ -1289,7 +1292,7 @@ async def test_queue_deadline_crossing_db_lock_blocks_analysis_start(
                     await asyncio.sleep(0.01)
 
             try:
-                await asyncio.wait_for(wait_for_context_lock(), timeout=5)
+                await asyncio.wait_for(wait_for_start_lock(), timeout=5)
                 await blocker.execute(
                     update(ReviewJob)
                     .where(ReviewJob.id == review_id)
@@ -1487,3 +1490,96 @@ async def test_backend_limitation_preserves_valid_result_without_repair(
     assert len(llm.payloads) == 1
     pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
     assert pending["pending"] == 0
+
+
+async def test_legacy_analysis_begin_blocks_llm(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+    async with factory.begin() as session:
+        await session.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_id)
+            .values(frozen_configuration_version=None)
+        )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = DeterministicLlm()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        worker = PostgresReviewWorker(
+            factory,
+            queue,
+            PostgresAnalysisHandler(
+                factory, GithubClient(client), llm, schemas_dir=SCHEMAS
+            ),
+            owner="legacy-check",
+            task_kind="analyze",
+        )
+        assert await worker.run_once()
+    assert llm.payloads == []
+    async with factory() as session:
+        job = await session.get(ReviewJob, review_id)
+        assert (
+            job is not None
+            and job.started_at is None
+            and job.analysis_deadline_at is None
+        )
+        assert job.status == "FAILED"
+        event = (
+            await session.scalars(
+                select(ReviewEvent).where(
+                    ReviewEvent.review_job_id == review_id,
+                )
+            )
+        ).one()
+        assert event.attempt == 1
+        assert event.safe_details == {
+            "error_code": "historical_budget_unknown",
+            "pre_execution": True,
+        }
+
+
+async def test_failure_audit_uses_durable_execution_attempt(
+    postgres: PostgresHarness,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", 1, event.trace_id
+        )
+    leases = PostgresTaskLeaseStore(factory)
+    first = await leases.acquire(review_id, owner="first", task_kind="analyze")
+    assert first is not None
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(503))
+    ) as github:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(github), DeterministicLlm(), schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, first) is None
+        assert await leases.release(first)
+        second = await leases.acquire(review_id, owner="second", task_kind="analyze")
+        assert second is not None
+        assert await handler.handle(task, second) is None
+    async with factory() as session:
+        events = (
+            await session.scalars(
+                select(ReviewEvent)
+                .where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.event_type == "FAILURE",
+                )
+                .order_by(ReviewEvent.occurred_at)
+            )
+        ).all()
+        assert [event.attempt for event in events] == [1, 2]

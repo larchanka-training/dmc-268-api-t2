@@ -10,7 +10,7 @@ import httpx
 from pydantic import BaseModel
 
 from app.llm._http import parse_structured, post_json
-from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
+from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest, known_token_usage
 from app.llm.errors import TransientProviderError
 
 
@@ -58,11 +58,19 @@ class OllamaClient(BaseLLMClient):
         except KeyError, TypeError:
             msg = "malformed Ollama chat response"
             raise TransientProviderError(msg) from None
+        input_tokens = known_token_usage(data.get("prompt_eval_count"))
+        output_tokens = known_token_usage(data.get("eval_count"))
         return LLMCallResult[T](
-            parsed=parse_structured(content, response_model),
+            parsed=parse_structured(
+                content,
+                response_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+            ),
             raw_text_len=len(content),
-            input_tokens=data.get("prompt_eval_count"),
-            output_tokens=data.get("eval_count"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             model=data.get("model") or self._model,
             reported_model=data.get("model"),
             model_digest=self._model_digest,

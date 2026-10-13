@@ -9,10 +9,12 @@ import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from uuid import UUID, uuid4
 
 import structlog
 from pydantic import BaseModel
 
+from app.application.analysis_ports import AccountingIdentityError, ReviewRunBudgetPort
 from app.llm.budget import RunBudget
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
 from app.llm.errors import (
@@ -43,6 +45,7 @@ class Endpoint:
     cooldown_until: float = 0.0
     disabled: bool = False  # 401/403: until process restart
     expected_model: str | None = None
+    expected_digest: str | None = None
 
 
 @dataclass
@@ -52,6 +55,7 @@ class ProviderPool:
     name: str
     endpoints: list[Endpoint]
     timeout_s: float
+    profile_ref: str | None = None
     _next: int = field(default=0, init=False)
 
     def next_available(self, now: float) -> Endpoint | None:
@@ -82,13 +86,16 @@ class LLMGateway:
     def primary_provider(self) -> str:
         return self._pools[0].name
 
-    async def generate_structured[T: BaseModel](
+    async def generate_structured[T: BaseModel](  # noqa: PLR0913, PLR0912, PLR0915 -- routing and one fenced payment per HTTP
         self,
         request: LLMRequest,
         response_model: type[T],
         *,
-        budget: RunBudget,
+        budget: RunBudget | ReviewRunBudgetPort,
         input_tokens: int,
+        chunk_id: UUID | None = None,
+        operation_id: UUID | None = None,
+        call_kind: str = "initial",
     ) -> LLMCallResult[T]:
         attempts = 0
         last_error: LLMGatewayError | None = None
@@ -101,18 +108,63 @@ class LLMGateway:
                 endpoint = pool.next_available(self._clock())
                 if endpoint is None:
                     break
-                reservation = budget.reserve(
-                    input_tokens=input_tokens, output_tokens=request.max_output_tokens
-                )
+                reservation = None
+                permit = None
+                if isinstance(budget, RunBudget):
+                    reservation = budget.reserve(
+                        input_tokens=input_tokens,
+                        output_tokens=request.max_output_tokens,
+                    )
+                else:
+                    if (
+                        chunk_id is None
+                        or operation_id is None
+                        or pool.profile_ref is None
+                        or endpoint.expected_model is None
+                    ):
+                        raise AccountingIdentityError("durable_call_identity_required")
+                    permit = await budget.reserve_call(
+                        reservation_id=uuid4(),
+                        chunk_id=chunk_id,
+                        operation_id=operation_id,
+                        call_kind=call_kind,
+                        provider_profile_ref=pool.profile_ref,
+                        model_ref=endpoint.expected_model,
+                        model_digest=endpoint.expected_digest,
+                        input_tokens=input_tokens,
+                        output_tokens=request.max_output_tokens,
+                    )
                 attempts += 1
                 # A failed attempt has no usage: its whole reservation stays
                 # charged (SD §14).
-                timeout_s = min(request.timeout_s, pool.timeout_s, budget.remaining_s())
+                timeout_s = min(
+                    request.timeout_s, pool.timeout_s, await _remaining_s(budget)
+                )
                 try:
-                    result = await endpoint.client.generate_structured(
-                        request.model_copy(update={"timeout_s": timeout_s}),
-                        response_model,
-                    )
+                    try:
+                        result = await endpoint.client.generate_structured(
+                            request.model_copy(update={"timeout_s": timeout_s}),
+                            response_model,
+                        )
+                    except LLMGatewayError as exc:
+                        if isinstance(budget, RunBudget):
+                            assert reservation is not None
+                            budget.settle(
+                                reservation,
+                                input_tokens=exc.input_tokens,
+                                output_tokens=exc.output_tokens,
+                            )
+                        else:
+                            assert permit is not None
+                            await budget.settle_call(
+                                reservation_id=permit.reservation_id,
+                                input_tokens=exc.input_tokens,
+                                output_tokens=exc.output_tokens,
+                                outcome="ERROR",
+                                error_code=exc.error_code,
+                                latency_ms=exc.latency_ms,
+                            )
+                        raise
                 except RateLimitedError as exc:
                     _log_failure(pool.name, attempts, exc)
                     endpoint.cooldown_until = self._clock() + max(
@@ -135,11 +187,23 @@ class LLMGateway:
                 except LLMGatewayError as exc:  # not retried: the caller decides
                     _log_failure(pool.name, attempts, exc)
                     raise
-                budget.settle(
-                    reservation,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                )
+                if isinstance(budget, RunBudget):
+                    assert reservation is not None
+                    budget.settle(
+                        reservation,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                    )
+                else:
+                    assert permit is not None
+                    await budget.settle_call(
+                        reservation_id=permit.reservation_id,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        outcome="SUCCEEDED",
+                        error_code=None,
+                        latency_ms=result.latency_ms,
+                    )
                 if (
                     endpoint.expected_model is not None
                     and result.reported_model != endpoint.expected_model
@@ -159,8 +223,10 @@ class LLMGateway:
             last_error.error_code if last_error else "no_available_endpoint"
         )
 
-    async def _wait(self, delay: float, budget: RunBudget) -> None:
-        if delay >= budget.remaining_s():
+    async def _wait(
+        self, delay: float, budget: RunBudget | ReviewRunBudgetPort
+    ) -> None:
+        if delay >= await _remaining_s(budget):
             msg = "backoff does not fit the run deadline"
             raise BudgetExceededError(msg)
         await self._sleep(delay)
@@ -180,3 +246,9 @@ def _log_failure(provider: str, attempt: int, error: LLMGatewayError) -> None:
         # never request or response bodies.
         detail=str(error),
     )
+
+
+async def _remaining_s(budget: RunBudget | ReviewRunBudgetPort) -> float:
+    if isinstance(budget, RunBudget):
+        return budget.remaining_s()
+    return await budget.remaining_s()

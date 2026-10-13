@@ -7,9 +7,11 @@ safe ``error_code``; programming and configuration errors propagate.
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from uuid import UUID, uuid4
 
 import structlog
 
+from app.application.analysis_ports import ReviewRunBudgetPort
 from app.core.config import LLM
 from app.domain.frozen_configuration import ExecutionSettings
 from app.llm.budget import RunBudget
@@ -20,7 +22,7 @@ from app.llm.errors import (
     SchemaValidationError,
 )
 from app.llm.gateway import LLMGateway
-from app.llm.tokens import TokenCounter
+from app.llm.tokens import ConservativeTokenCounter, TokenCounter
 from app.review.configuration import ExecutionConfiguration, FrozenConfigurationError
 from app.review.prompt import BuiltPrompt, PromptBuilder, PromptTooLargeError
 from app.review.schemas.context import ContextPayload
@@ -65,7 +67,7 @@ class ReviewService:
         self._frozen = frozen_configuration
 
     async def review_chunk(
-        self, payload: ContextPayload, budget: RunBudget
+        self, payload: ContextPayload, budget: RunBudget | ReviewRunBudgetPort
     ) -> ReviewChunkOutcome:
         self._prompts.ensure_verified()
         if isinstance(self._settings, ExecutionSettings):
@@ -79,13 +81,13 @@ class ReviewService:
             if self._prompts.repository_instructions != self._frozen.instructions:
                 raise FrozenConfigurationError("repository_instructions_mismatch")
             self._frozen.validate_context(payload)
-        attempt = _Attempt(time.monotonic(), budget.state().requests_used)
+        attempt = _Attempt(time.monotonic(), await _requests_used(budget))
         try:
             prompt = self._prompts.build(
                 payload, max_input_tokens=self._settings.max_input_tokens
             )
         except PromptTooLargeError:
-            return self._result(
+            return await self._result(
                 payload,
                 budget,
                 attempt,
@@ -105,9 +107,11 @@ class ReviewService:
                     prompt = self._prompts.build(payload, max_input_tokens=smaller)
                 except PromptTooLargeError:
                     raise ContextOverflowError from None
-                call = await self._generate(payload, prompt, budget)
+                call = await self._generate(
+                    payload, prompt, budget, call_kind="overflow_rebuild"
+                )
         except LLMGatewayError as exc:
-            return self._result(
+            return await self._result(
                 payload,
                 budget,
                 attempt,
@@ -119,7 +123,7 @@ class ReviewService:
         if call.provider != self._gateway.primary_provider:
             limitations.append(_FALLBACK_NOTE.format(call.provider, call.model))
         outcome = self._validator.validate(call.parsed.findings, payload)
-        return self._result(
+        return await self._result(
             payload,
             budget,
             attempt,
@@ -130,17 +134,32 @@ class ReviewService:
         )
 
     async def _generate(
-        self, payload: ContextPayload, prompt: BuiltPrompt, budget: RunBudget
+        self,
+        payload: ContextPayload,
+        prompt: BuiltPrompt,
+        budget: RunBudget | ReviewRunBudgetPort,
+        *,
+        call_kind: str = "initial",
     ) -> LLMCallResult[LLMReviewOutput]:
         try:
-            return await self._send(prompt.messages, prompt.estimated_tokens, budget)
+            return await self._send(
+                prompt.messages,
+                prompt.estimated_tokens,
+                budget,
+                payload,
+                call_kind=call_kind,
+            )
         except SchemaValidationError as exc:
-            if not budget.try_use_format_repair():
+            # Durable repair permission is fail-closed until Stage 8B-04.
+            if not isinstance(budget, RunBudget) or not budget.try_use_format_repair():
                 raise
             return await self._repair(payload, exc, budget)
 
     async def _repair(
-        self, payload: ContextPayload, error: SchemaValidationError, budget: RunBudget
+        self,
+        payload: ContextPayload,
+        error: SchemaValidationError,
+        budget: RunBudget | ReviewRunBudgetPort,
     ) -> LLMCallResult[LLMReviewOutput]:
         """One repair request: original messages, the truncated invalid answer
         and the validation errors (locations and messages, no source code)."""
@@ -153,10 +172,22 @@ class ReviewService:
             )
         except PromptTooLargeError:
             raise error from None
-        return await self._send(prompt.messages, prompt.estimated_tokens, budget)
+        return await self._send(
+            prompt.messages,
+            prompt.estimated_tokens,
+            budget,
+            payload,
+            call_kind="repair",
+        )
 
     async def _send(
-        self, messages: list[ChatMessage], input_tokens: int, budget: RunBudget
+        self,
+        messages: list[ChatMessage],
+        input_tokens: int,
+        budget: RunBudget | ReviewRunBudgetPort,
+        payload: ContextPayload,
+        *,
+        call_kind: str,
     ) -> LLMCallResult[LLMReviewOutput]:
         request = LLMRequest(
             messages=messages,
@@ -165,14 +196,25 @@ class ReviewService:
             timeout_s=self._settings.request_timeout_s,
             output_schema_json=self._prompts.output_schema_json,
         )
+        # The verified renderer estimates messages; schema is a separate input.
+        counter = ConservativeTokenCounter() if self._frozen else self._counter
+        input_tokens += counter.count(self._prompts.output_schema_json)
         return await self._gateway.generate_structured(
-            request, LLMReviewOutput, budget=budget, input_tokens=input_tokens
+            request,
+            LLMReviewOutput,
+            budget=budget,
+            input_tokens=input_tokens,
+            chunk_id=UUID(payload.chunk_id)
+            if not isinstance(budget, RunBudget)
+            else None,
+            operation_id=uuid4(),
+            call_kind=call_kind,
         )
 
-    def _result(  # noqa: PLR0913
+    async def _result(  # noqa: PLR0913
         self,
         payload: ContextPayload,
-        budget: RunBudget,
+        budget: RunBudget | ReviewRunBudgetPort,
         attempt: _Attempt,
         prompt_version: str,
         *,
@@ -193,7 +235,7 @@ class ReviewService:
             usage=Usage(
                 input_tokens=_sum_known(c.input_tokens for c in attempt.calls),
                 output_tokens=_sum_known(c.output_tokens for c in attempt.calls),
-                requests=budget.state().requests_used - attempt.requests_before,
+                requests=(await _requests_used(budget)) - attempt.requests_before,
                 latency_ms=int((time.monotonic() - attempt.started) * 1000),
             ),
             model=last.model if last else self._configured_model(),
@@ -230,3 +272,9 @@ class ReviewService:
 def _sum_known(values: Iterable[int | None]) -> int | None:
     known = [v for v in values if v is not None]
     return sum(known) if known else None
+
+
+async def _requests_used(budget: RunBudget | ReviewRunBudgetPort) -> int:
+    if isinstance(budget, RunBudget):
+        return budget.state().requests_used
+    return (await budget.snapshot()).requests_used

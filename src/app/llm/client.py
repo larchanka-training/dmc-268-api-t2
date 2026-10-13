@@ -52,3 +52,13 @@ class BaseLLMClient(ABC):
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, response_model: type[T]
     ) -> LLMCallResult[T]: ...
+
+
+MAX_USAGE_TOKENS = 9_223_372_036_854_775_807
+
+
+def known_token_usage(value: object) -> int | None:
+    """Provider data never receives coercion or an unsafe token refund."""
+    if type(value) is int and 0 <= value <= MAX_USAGE_TOKENS:
+        return value
+    return None

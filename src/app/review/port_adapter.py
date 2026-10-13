@@ -8,6 +8,7 @@ reported only when both token counts are known.
 
 import uuid
 
+from app.application.analysis_ports import ReviewRunBudgetPort
 from app.application.ports import (
     BuiltContextPayload,
     ReviewChunkResult,
@@ -37,7 +38,9 @@ class ChunkReviewFailedError(Exception):
 class LlmGatewayAdapter:
     """One instance per review run: ``budget`` is shared by its chunks."""
 
-    def __init__(self, service: ReviewService, budget: RunBudget) -> None:
+    def __init__(
+        self, service: ReviewService, budget: RunBudget | ReviewRunBudgetPort
+    ) -> None:
         self._service = service
         self._budget = budget
         self._review_id: uuid.UUID | None = None

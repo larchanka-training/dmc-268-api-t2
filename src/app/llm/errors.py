@@ -7,6 +7,9 @@ and keys never go into error messages.
 
 class LLMGatewayError(Exception):
     error_code = "llm_error"
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
 
     def __init__(self, message: str = "") -> None:
         super().__init__(message or self.error_code)
@@ -55,8 +58,19 @@ class SchemaValidationError(LLMGatewayError):
 
     error_code = "invalid_llm_output"
 
-    def __init__(self, details: list[str], raw_text: str) -> None:
+    def __init__(
+        self,
+        details: list[str],
+        raw_text: str,
+        *,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+    ) -> None:
         super().__init__()
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.latency_ms = latency_ms
         self.details = details
         # Kept only for the single format-repair request; never logged.
         self.raw_text = raw_text

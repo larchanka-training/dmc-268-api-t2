@@ -103,7 +103,14 @@ def _is_context_overflow(response: httpx.Response) -> bool:
     return any(marker in text for marker in _OVERFLOW_MARKERS)
 
 
-def parse_structured[T: BaseModel](content: str, response_model: type[T]) -> T:
+def parse_structured[T: BaseModel](
+    content: str,
+    response_model: type[T],
+    *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    latency_ms: int | None = None,
+) -> T:
     """Validate model output; errors list locations and messages, not input."""
     try:
         return response_model.model_validate_json(content)
@@ -112,4 +119,10 @@ def parse_structured[T: BaseModel](content: str, response_model: type[T]) -> T:
             f"{'.'.join(str(p) for p in error['loc']) or '<root>'}: {error['msg']}"
             for error in exc.errors(include_input=False, include_url=False)
         ]
-        raise SchemaValidationError(details, content) from None
+        raise SchemaValidationError(
+            details,
+            content,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+        ) from None

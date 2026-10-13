@@ -31,37 +31,12 @@ class PostgresWorkerTasks:
 
     async def validate_identity(self, task: QueueTaskEnvelope) -> bool:
         async with self._session_factory.begin() as session:
-            return await self._validate_identity(session, task)
-
-    async def _validate_identity(
-        self, session: AsyncSession, task: QueueTaskEnvelope
-    ) -> bool:
-        try:
-            event_id, review_id = uuid.UUID(task.event_id), uuid.UUID(task.review_id)
-        except ValueError:
-            raise QueueIdentityError("Queue identity is not authoritative") from None
-        event = await session.scalar(
-            select(OutboxEvent)
-            .where(OutboxEvent.id == event_id)
-            .with_for_update(read=True)
-        )
-        review = await session.get(ReviewJob, review_id)
-        if (
-            event is None
-            or review is None
-            or event.review_job_id != review_id
-            or event.schema_version != task.schema_version
-            or event.task_kind != task.task_kind
-            or event.attempt != task.attempt
-            or event.trace_id != task.trace_id
-        ):
-            raise QueueIdentityError("Queue identity is not authoritative")
-        return event.quarantined_at is None
+            return await validate_task_identity(session, task)
 
     async def ready(self, task: QueueTaskEnvelope, lease: TaskLeaseSnapshot) -> bool:
         async with self._session_factory.begin() as session:
             locked = await lock_owned_lease(session, lease)
-            if locked is None or not await self._validate_identity(session, task):
+            if locked is None or not await validate_task_identity(session, task):
                 return False
             publication = (
                 await lock_publication(session, lease.review_job_id)
@@ -90,7 +65,7 @@ class PostgresWorkerTasks:
                 review = await lock_review_job(session, uuid.UUID(task.review_id))
             if (
                 review is None
-                or not await self._validate_identity(session, task)
+                or not await validate_task_identity(session, task)
                 or review.finished_at is None
             ):
                 return False
@@ -141,3 +116,27 @@ class PostgresWorkerTasks:
                 continue
             return True
         return False
+
+
+async def validate_task_identity(
+    session: AsyncSession, task: QueueTaskEnvelope
+) -> bool:
+    try:
+        event_id, review_id = uuid.UUID(task.event_id), uuid.UUID(task.review_id)
+    except ValueError:
+        raise QueueIdentityError("Queue identity is not authoritative") from None
+    event = await session.scalar(
+        select(OutboxEvent).where(OutboxEvent.id == event_id).with_for_update(read=True)
+    )
+    review = await session.get(ReviewJob, review_id)
+    if (
+        event is None
+        or review is None
+        or event.review_job_id != review_id
+        or event.schema_version != task.schema_version
+        or event.task_kind != task.task_kind
+        or event.attempt != task.attempt
+        or event.trace_id != task.trace_id
+    ):
+        raise QueueIdentityError("Queue identity is not authoritative")
+    return event.quarantined_at is None

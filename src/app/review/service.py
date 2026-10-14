@@ -4,11 +4,13 @@ Expected provider, budget and format failures become a FAILED result with a
 safe ``error_code``; programming and configuration errors propagate.
 """
 
+import json
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import structlog
+from pydantic import BaseModel
 
 from app.core.config import LLM
 from app.domain.settings import render_rules
@@ -21,8 +23,14 @@ from app.llm.errors import (
 )
 from app.llm.gateway import LLMGateway
 from app.llm.tokens import TokenCounter
-from app.review.prompt import BuiltPrompt, PromptBuilder, PromptTooLargeError
+from app.review.prompt import (
+    BuiltPrompt,
+    PromptBuilder,
+    PromptTooLargeError,
+    neutralize,
+)
 from app.review.schemas.context import ContextPayload
+from app.review.schemas.reflection import ReflectionOutput
 from app.review.schemas.result import (
     ChunkStatus,
     LLMReviewOutput,
@@ -47,6 +55,34 @@ _REPAIR_INSTRUCTION = (
     "Предыдущий ответ не прошёл проверку JSON Schema. Ошибки:\n{errors}\n"
     "Верни исправленный ответ целиком: только JSON по схеме, без пояснений."
 )
+
+# Reflection Pass (issue #25): a second structured call re-judges only what the
+# deterministic layer cannot. Failure here never breaks the main result.
+_REFLECTION_SYSTEM = (
+    "Верификатор находок ревью кода. Вход: diff, правила репозитория, "
+    "пронумерованный список находок в блоке <findings>. Для каждой находки верни "
+    "вердикт: confirmed, причина verified, если проблема реальна, внесена этими "
+    "изменениями и заслуживает замечания; rejected — если реальных последствий "
+    "нет (no_real_consequence), проблема существовала до изменений "
+    "(pre_existing) или это стилистика, исправляемая линтером (overflagged_style). "
+    "Новые находки не выдумывай и не оценивай строки вне diff. "
+    "Отвечай только JSON по схеме."
+)
+
+# What the verifier sees per finding (the deterministic layer needs no re-check).
+_FINDING_PROMPT_FIELDS: set[str] = {
+    "path",
+    "side",
+    "start_line",
+    "end_line",
+    "category",
+    "severity",
+    "title",
+    "explanation",
+    "evidence",
+    "recommendation",
+    "rule_ref",
+}
 
 
 @dataclass
@@ -127,6 +163,7 @@ class ReviewService:
         outcome = self._validator.validate(
             call.parsed.findings, payload, rule_refs=rule_refs
         )
+        outcome = await self._reflect(prompt, outcome, budget)
         return self._result(
             payload,
             budget,
@@ -170,16 +207,66 @@ class ReviewService:
             [*prompt.messages, *extra], prompt.estimated_tokens + extra_tokens, budget
         )
 
-    async def _send(
-        self, messages: list[ChatMessage], input_tokens: int, budget: RunBudget
-    ) -> LLMCallResult[LLMReviewOutput]:
+    async def _send[T: BaseModel](
+        self,
+        messages: list[ChatMessage],
+        input_tokens: int,
+        budget: RunBudget,
+        response_model: type[T] = LLMReviewOutput,  # type: ignore[assignment]
+    ) -> LLMCallResult[T]:
         request = LLMRequest(
             messages=messages,
             max_output_tokens=self._settings.max_output_tokens,
             timeout_s=self._settings.request_timeout_s,
         )
         return await self._gateway.generate_structured(
-            request, LLMReviewOutput, budget=budget, input_tokens=input_tokens
+            request, response_model, budget=budget, input_tokens=input_tokens
+        )
+
+    async def _reflect(
+        self, prompt: BuiltPrompt, outcome: ValidationOutcome, budget: RunBudget
+    ) -> ValidationOutcome:
+        """Second structured call; drops findings the verifier rejects.
+
+        Best-effort by design: without a budget slot, or when the verifier
+        fails, the deterministic result stands unchanged.
+        """
+        if not outcome.accepted or not budget.try_use_reflection():
+            return outcome
+        findings = [
+            {"index": index, **finding.model_dump(include=_FINDING_PROMPT_FIELDS)}
+            for index, finding in enumerate(outcome.accepted)
+        ]
+        findings_block = json.dumps(findings, ensure_ascii=False)
+        messages = [
+            ChatMessage(role="system", content=_REFLECTION_SYSTEM),
+            ChatMessage(
+                role="user",
+                content=(
+                    f"{prompt.messages[-1].content}\n\n"
+                    f"<findings>\n{neutralize(findings_block)}\n</findings>"
+                ),
+            ),
+        ]
+        try:
+            call = await self._send(
+                messages, prompt.estimated_tokens, budget, ReflectionOutput
+            )
+        except LLMGatewayError:
+            logger.info("reflection_pass_failed", fallback="deterministic_result")
+            return outcome
+        rejected = {
+            verdict.index
+            for verdict in call.parsed.verdicts
+            if verdict.verdict == "rejected"
+        }
+        kept = [
+            finding
+            for index, finding in enumerate(outcome.accepted)
+            if index not in rejected
+        ]
+        return ValidationOutcome(
+            accepted=kept, rejected_count=outcome.rejected_count + len(rejected)
         )
 
     def _result(  # noqa: PLR0913

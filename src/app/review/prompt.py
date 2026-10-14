@@ -212,18 +212,18 @@ def _render_metadata(
     return "\n".join(lines)
 
 
-def _neutralize(data: str) -> str:
+def neutralize(data: str) -> str:
     return _DELIMITER_TAG.sub(r"[\1\2]", data)
 
 
 def _user_message(
     metadata: str, files: list[FileDiff], rules: str | None = None
 ) -> str:
-    diff = _neutralize("\n\n".join(render_file_diff(f) for f in files))
+    diff = neutralize("\n\n".join(render_file_diff(f) for f in files))
     message = (
-        f"<pr_metadata>\n{_neutralize(metadata)}\n</pr_metadata>\n\n"
+        f"<pr_metadata>\n{neutralize(metadata)}\n</pr_metadata>\n\n"
         f"<diff>\n{diff}\n</diff>"
     )
     if rules:
-        message += f"\n\n<repo_rules>\n{_neutralize(rules)}\n</repo_rules>"
+        message += f"\n\n<repo_rules>\n{neutralize(rules)}\n</repo_rules>"
     return message

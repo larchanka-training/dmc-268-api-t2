@@ -129,13 +129,14 @@ def payload(payload_data: dict[str, Any]) -> ContextPayload:
     return ContextPayload.model_validate(payload_data)
 
 
-def _budget(max_requests: int = 8) -> RunBudget:
+def _budget(max_requests: int = 8, max_reflections: int = 0) -> RunBudget:
     return RunBudget(
         BudgetLimits(
             max_requests=max_requests,
             max_input_tokens=80_000,
             max_output_tokens=16_000,
             deadline_s=600,
+            max_reflections=max_reflections,
         )
     )
 
@@ -158,6 +159,52 @@ async def test_rules_reach_the_prompt_and_unknown_rule_refs_are_rejected(
     sent = providers.requests[0]["messages"][-1]["content"]
     assert "<repo_rules>" in sent
     assert "[SEC-1] Перехватывай ValidationError." in sent
+
+
+async def test_reflection_pass_drops_findings_the_verifier_rejects(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+) -> None:
+    first = _finding(39)
+    second = _finding(39) | {"title": "Придирка без последствий"}
+    providers.script.append(_output(first, second))
+    providers.script.append(
+        json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "verdict": "confirmed", "reason": "verified"},
+                    {
+                        "index": 1,
+                        "verdict": "rejected",
+                        "reason": "no_real_consequence",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = await service.review_chunk(payload, _budget(max_reflections=1))
+
+    assert [f.title for f in result.findings] == [first["title"]]
+    assert result.rejected_findings_count == 1
+    reflection_request = providers.requests[1]["messages"]
+    assert reflection_request[0]["role"] == "system"
+    assert "<findings>" in reflection_request[-1]["content"]
+
+
+async def test_reflection_pass_is_skipped_without_a_budget_slot(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+) -> None:
+    providers.script.append(_output(_finding(39)))
+
+    result = await service.review_chunk(payload, _budget())
+
+    assert len(providers.requests) == 1  # no verifier call
+    assert [f.title for f in result.findings] == ["Проблема в строке 39"]
 
 
 async def test_valid_answer_gives_completed_result(

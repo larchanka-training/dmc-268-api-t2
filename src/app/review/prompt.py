@@ -19,13 +19,14 @@ from app.review.schemas.context import ContextPayload, FileDiff, Metadata
 from app.review.schemas.result import LLMReviewOutput
 
 # Data may not open or close our delimiter tags (prompt injection, SD §12).
-_DELIMITER_TAG = re.compile(r"<(/?)(pr_metadata|diff)>", re.IGNORECASE)
+_DELIMITER_TAG = re.compile(r"<(/?)(pr_metadata|diff|repo_rules)>", re.IGNORECASE)
 
 # Per-message framing tokens added by chat templates.
 _MESSAGE_OVERHEAD_TOKENS = 4
 
 
 _TRIMMED_NOTE = "Метаданные PR сокращены из-за лимита токенов."
+_RULES_DROPPED_NOTE = "Правила репозитория исключены из-за лимита токенов."
 _TRIMMED_BODY_CHARS = 1000
 _TRIMMED_COMMITS = 20
 
@@ -97,15 +98,21 @@ class PromptBuilder:
             counter=counter,
         )
 
-    def build(self, payload: ContextPayload, *, max_input_tokens: int) -> BuiltPrompt:
-        """Assemble the prompt; metadata shrinks first, the diff never does."""
+    def build(
+        self,
+        payload: ContextPayload,
+        *,
+        max_input_tokens: int,
+        rules: str | None = None,
+    ) -> BuiltPrompt:
+        """Assemble the prompt; metadata shrinks, rules drop whole, diff never does."""
         files = [f.diff for f in payload.files]
         shots = self._select_few_shots({f.language for f in files if f.language})
         prefix = self._prefix(shots)
         for level, metadata in enumerate(_metadata_levels(payload.metadata)):
             messages = [
                 *prefix,
-                ChatMessage(role="user", content=_user_message(metadata, files)),
+                ChatMessage(role="user", content=_user_message(metadata, files, rules)),
             ]
             estimated = self._estimate(messages)
             if estimated <= max_input_tokens:
@@ -116,6 +123,24 @@ class PromptBuilder:
                     limitations=[_TRIMMED_NOTE] if level else [],
                     few_shot_ids=[shot.id for shot in shots],
                 )
+        if rules:
+            # Rules are never trimmed: a partial rule changes its meaning (ADR 0002
+            # trust boundary). Drop them whole and say so.
+            for level, metadata in enumerate(_metadata_levels(payload.metadata)):
+                messages = [
+                    *prefix,
+                    ChatMessage(role="user", content=_user_message(metadata, files)),
+                ]
+                estimated = self._estimate(messages)
+                if estimated <= max_input_tokens:
+                    return BuiltPrompt(
+                        messages=messages,
+                        prompt_version=self.prompt_version,
+                        estimated_tokens=estimated,
+                        limitations=([_TRIMMED_NOTE] if level else [])
+                        + [_RULES_DROPPED_NOTE],
+                        few_shot_ids=[shot.id for shot in shots],
+                    )
         msg = "chunk diff does not fit the input token limit"
         raise PromptTooLargeError(msg)
 
@@ -191,9 +216,14 @@ def _neutralize(data: str) -> str:
     return _DELIMITER_TAG.sub(r"[\1\2]", data)
 
 
-def _user_message(metadata: str, files: list[FileDiff]) -> str:
+def _user_message(
+    metadata: str, files: list[FileDiff], rules: str | None = None
+) -> str:
     diff = _neutralize("\n\n".join(render_file_diff(f) for f in files))
-    return (
+    message = (
         f"<pr_metadata>\n{_neutralize(metadata)}\n</pr_metadata>\n\n"
         f"<diff>\n{diff}\n</diff>"
     )
+    if rules:
+        message += f"\n\n<repo_rules>\n{_neutralize(rules)}\n</repo_rules>"
+    return message

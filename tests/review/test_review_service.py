@@ -207,6 +207,33 @@ async def test_reflection_pass_is_skipped_without_a_budget_slot(
     assert [f.title for f in result.findings] == ["Проблема в строке 39"]
 
 
+async def test_out_of_range_verdict_indexes_do_not_inflate_rejected_count(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+) -> None:
+    providers.script.append(_output(_finding(39)))
+    providers.script.append(
+        json.dumps(
+            {
+                "verdicts": [
+                    {
+                        "index": 7,
+                        "verdict": "rejected",
+                        "reason": "no_real_consequence",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = await service.review_chunk(payload, _budget(max_reflections=1))
+
+    assert len(result.findings) == 1  # unknown indexes reject nothing
+    assert result.rejected_findings_count == 0
+
+
 async def test_valid_answer_gives_completed_result(
     service: ReviewService, providers: ScriptedProviders, payload: ContextPayload
 ) -> None:

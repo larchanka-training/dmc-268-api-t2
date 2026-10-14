@@ -256,9 +256,13 @@ class ReviewService:
             logger.info("reflection_pass_failed", fallback="deterministic_result")
             return outcome
         rejected = {
-            verdict.index
-            for verdict in call.parsed.verdicts
-            if verdict.verdict == "rejected"
+            index
+            for index in (
+                verdict.index
+                for verdict in call.parsed.verdicts
+                if verdict.verdict == "rejected"
+            )
+            if index < len(outcome.accepted)  # unknown indexes reject nothing
         }
         kept = [
             finding

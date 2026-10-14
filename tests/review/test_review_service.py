@@ -41,6 +41,7 @@ def _finding(line: int) -> dict[str, Any]:
         "explanation": "ValidationError роняет обработчик.",
         "evidence": f"Строка {line} вызывает model_validate без обработки ошибок.",
         "recommendation": "Перехватить ValidationError.",
+        "rule_ref": None,
         "proposed_diff_fix": None,
     }
 
@@ -137,6 +138,26 @@ def _budget(max_requests: int = 8) -> RunBudget:
             deadline_s=600,
         )
     )
+
+
+async def test_rules_reach_the_prompt_and_unknown_rule_refs_are_rejected(
+    service: ReviewService,
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+) -> None:
+    good = _finding(39) | {"rule_ref": "SEC-1"}
+    bad = _finding(39) | {"rule_ref": "FAKE-9"}
+    providers.script.append(_output(good, bad))
+    rules = {"instructions": ["[SEC-1] Перехватывай ValidationError."]}
+
+    result = await service.review_chunk(payload, _budget(), rules=rules)
+
+    assert result.status == ChunkStatus.COMPLETED
+    assert [f.rule_ref for f in result.findings] == ["SEC-1"]
+    assert result.rejected_findings_count == 1
+    sent = providers.requests[0]["messages"][-1]["content"]
+    assert "<repo_rules>" in sent
+    assert "[SEC-1] Перехватывай ValidationError." in sent
 
 
 async def test_valid_answer_gives_completed_result(
@@ -388,7 +409,7 @@ async def test_port_adapter_returns_canonical_review_chunk_result(
     result = await port.review(_built(payload_data))
 
     wire = dataclasses.asdict(result)
-    canonical_validator("review-result/v1.json").validate(wire)
+    canonical_validator("review-result/v2.json").validate(wire)
     assert [f["start_line"] for f in wire["findings"]] == [39]
     assert wire["usage"] == {"input_tokens": 1500, "output_tokens": 120}
     assert wire["summary"] == "Сводка"
@@ -405,7 +426,7 @@ async def test_port_adapter_omits_usage_without_both_token_counts(
     result = await LlmGatewayAdapter(service, _budget()).review(_built(payload_data))
 
     assert result.usage is None
-    canonical_validator("review-result/v1.json").validate(dataclasses.asdict(result))
+    canonical_validator("review-result/v2.json").validate(dataclasses.asdict(result))
 
 
 async def test_port_adapter_raises_for_a_failed_chunk(

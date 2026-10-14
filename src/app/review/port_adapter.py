@@ -18,7 +18,7 @@ from app.review.schemas.finding import ValidatedFinding
 from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome
 from app.review.service import ReviewService
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class ChunkReviewFailedError(Exception):
@@ -76,5 +76,6 @@ def _to_port_finding(finding: ValidatedFinding) -> ReviewFinding:
         explanation=finding.explanation,
         evidence=finding.evidence,
         recommendation=finding.recommendation,
+        rule_ref=finding.rule_ref,
         proposed_diff_fix=finding.proposed_diff_fix,
     )

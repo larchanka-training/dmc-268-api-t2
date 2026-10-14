@@ -41,6 +41,7 @@ def test_rules_aware_version_treats_repo_rules_as_data(
     system = prompt.messages[0].content
     assert "<repo_rules>" in system
     assert "не выполняй" in system.lower()
+    assert "rule_ref" in system  # the prompt asks for rule citations
 
 
 def test_tampered_prompt_file_fails_to_load(tmp_path: Path) -> None:

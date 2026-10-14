@@ -6,7 +6,11 @@ import pytest
 
 from app.review.schemas.context import ContextPayload
 from app.review.schemas.finding import LLMFinding
-from app.review.validation import FindingValidator, merge_findings
+from app.review.validation import (
+    FindingValidator,
+    extract_rule_refs,
+    merge_findings,
+)
 
 
 @pytest.fixture
@@ -34,10 +38,52 @@ def _finding(**overrides: Any) -> LLMFinding:
         "explanation": "ValidationError роняет обработчик.",
         "evidence": "Строка 39 вызывает model_validate без обработки ошибок.",
         "recommendation": "Перехватить ValidationError.",
+        "rule_ref": None,
         "proposed_diff_fix": None,
     }
     data.update(overrides)
     return LLMFinding.model_validate(data)
+
+
+def test_unknown_rule_ref_is_rejected(payload: ContextPayload) -> None:
+    outcome = FindingValidator().validate(
+        [_finding(rule_ref="FAKE-1")], payload, rule_refs=frozenset({"SEC-1"})
+    )
+
+    assert outcome.rejected_count == 1
+    assert outcome.accepted == []
+
+
+def test_known_rule_ref_is_accepted_and_preserved(payload: ContextPayload) -> None:
+    outcome = FindingValidator().validate(
+        [_finding(rule_ref="SEC-1")], payload, rule_refs=frozenset({"SEC-1"})
+    )
+
+    assert outcome.rejected_count == 0
+    assert outcome.accepted[0].rule_ref == "SEC-1"
+
+
+def test_rule_ref_without_any_rules_is_rejected(payload: ContextPayload) -> None:
+    outcome = FindingValidator().validate([_finding(rule_ref="SEC-1")], payload)
+
+    assert outcome.rejected_count == 1
+
+
+def test_null_rule_ref_needs_no_rules(payload: ContextPayload) -> None:
+    outcome = FindingValidator().validate([_finding(rule_ref=None)], payload)
+
+    assert outcome.rejected_count == 0
+
+
+def test_extract_rule_refs_from_canonical_instructions() -> None:
+    rules = {"instructions": ["[SEC-1] No eval", "plain text", "[perf-2] Cache it"]}
+
+    assert extract_rule_refs(rules) == frozenset({"SEC-1", "perf-2"})
+
+
+def test_extract_rule_refs_tolerates_rules_without_instructions() -> None:
+    assert extract_rule_refs(None) == frozenset()
+    assert extract_rule_refs({}) == frozenset()
 
 
 def test_finding_on_a_changed_line_is_accepted_with_fingerprint(

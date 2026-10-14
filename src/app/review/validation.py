@@ -7,6 +7,7 @@ counted, never moved to a neighbouring line.
 
 import hashlib
 import re
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from app.domain.enums import FindingSide
@@ -33,6 +34,9 @@ _SECRET_PATTERNS = (
 )
 _TEXT_FIELDS = ("title", "explanation", "evidence", "recommendation")
 _OPTIONAL_TEXT_FIELDS = ("proposed_diff_fix",)
+
+# Rule labels like [SEC-1] at any position of an instruction (CONTEXT.md: rule_ref).
+_RULE_LABEL = re.compile(r"\[([A-Za-z][A-Za-z0-9_-]{0,31})\]")
 
 _CHANGED_KIND = {
     FindingSide.NEW: LineKind.ADDED,
@@ -64,12 +68,23 @@ def fingerprint(finding: LLMFinding) -> str:
 
 class FindingValidator:
     def validate(
-        self, findings: list[LLMFinding], payload: ContextPayload
+        self,
+        findings: list[LLMFinding],
+        payload: ContextPayload,
+        *,
+        rule_refs: Collection[str] = (),
     ) -> ValidationOutcome:
         accepted: list[ValidatedFinding] = []
         rejected = 0
         for finding in findings:
-            if not _hits_changed_lines(finding, payload) or not _has_evidence(finding):
+            # A rule_ref the model was not given is a hallucination (SD §12):
+            # reject it the same deterministic way as a missed line.
+            known_ref = finding.rule_ref is None or finding.rule_ref in rule_refs
+            if (
+                not known_ref
+                or not _hits_changed_lines(finding, payload)
+                or not _has_evidence(finding)
+            ):
                 rejected += 1
                 continue
             update: dict[str, str | None] = {
@@ -85,6 +100,16 @@ class FindingValidator:
         return ValidationOutcome(
             accepted=merge_findings([accepted]), rejected_count=rejected
         )
+
+
+def extract_rule_refs(rules: Mapping[str, Sequence[str]] | None) -> frozenset[str]:
+    """Rule labels ([SEC-1] style) from the canonical rules document."""
+    instructions = (rules or {}).get("instructions", [])
+    return frozenset(
+        label
+        for instruction in instructions
+        for label in _RULE_LABEL.findall(instruction)
+    )
 
 
 def merge_findings(groups: list[list[ValidatedFinding]]) -> list[ValidatedFinding]:

@@ -5,12 +5,13 @@ safe ``error_code``; programming and configuration errors propagate.
 """
 
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import structlog
 
 from app.core.config import LLM
+from app.domain.settings import render_rules
 from app.llm.budget import RunBudget
 from app.llm.client import ChatMessage, LLMCallResult, LLMRequest
 from app.llm.errors import (
@@ -28,7 +29,11 @@ from app.review.schemas.result import (
     ReviewChunkOutcome,
     Usage,
 )
-from app.review.validation import FindingValidator, ValidationOutcome
+from app.review.validation import (
+    FindingValidator,
+    ValidationOutcome,
+    extract_rule_refs,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -69,12 +74,20 @@ class ReviewService:
         self._settings = settings
 
     async def review_chunk(
-        self, payload: ContextPayload, budget: RunBudget
+        self,
+        payload: ContextPayload,
+        budget: RunBudget,
+        rules: Mapping[str, Sequence[str]] | None = None,
     ) -> ReviewChunkOutcome:
+        """Review one chunk; ``rules`` is the canonical rules document (ADR 0002)."""
+        rules_text = render_rules(rules) or None
+        rule_refs = extract_rule_refs(rules)
         attempt = _Attempt(time.monotonic(), budget.state().requests_used)
         try:
             prompt = self._prompts.build(
-                payload, max_input_tokens=self._settings.max_input_tokens
+                payload,
+                max_input_tokens=self._settings.max_input_tokens,
+                rules=rules_text,
             )
         except PromptTooLargeError:
             return self._result(
@@ -88,11 +101,14 @@ class ReviewService:
             try:
                 call = await self._generate(payload, prompt, budget)
             except ContextOverflowError:
-                # One rebuild with a smaller limit: metadata shrinks, the diff
-                # stays; a still-too-large diff is re-chunked by the caller.
+                # One rebuild with a smaller limit: metadata shrinks, then rules
+                # drop whole; the diff stays; a still-too-large diff is
+                # re-chunked by the caller.
                 smaller = int(self._settings.max_input_tokens * _OVERFLOW_SHRINK)
                 try:
-                    prompt = self._prompts.build(payload, max_input_tokens=smaller)
+                    prompt = self._prompts.build(
+                        payload, max_input_tokens=smaller, rules=rules_text
+                    )
                 except PromptTooLargeError:
                     raise ContextOverflowError from None
                 call = await self._generate(payload, prompt, budget)
@@ -108,7 +124,9 @@ class ReviewService:
         limitations = [*prompt.limitations, *call.parsed.limitations]
         if call.provider != self._gateway.primary_provider:
             limitations.append(_FALLBACK_NOTE.format(call.provider, call.model))
-        outcome = self._validator.validate(call.parsed.findings, payload)
+        outcome = self._validator.validate(
+            call.parsed.findings, payload, rule_refs=rule_refs
+        )
         return self._result(
             payload,
             budget,

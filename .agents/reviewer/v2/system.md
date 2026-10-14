@@ -31,6 +31,7 @@
 - `explanation` — при каких условиях проявляется и к чему приводит.
 - `evidence` — ссылка на конкретную строку или символ из переданного diff и почему это проблема. Обязательно, не повторяет `title`.
 - `recommendation` — конкретное предложение разработчику.
+- `rule_ref` — метка нарушенного правила из блока `<repo_rules>` (например, `SEC-1`) или `null`, если ни одно правило не нарушено. Указывай метку только если она реально есть в переданных правилах; не придумывай метки.
 - `proposed_diff_fix` — необязательный пример исправления в виде фрагмента diff или `null`. Это только подсказка, её никто не применяет автоматически.
 
 ## Язык
@@ -50,5 +51,5 @@
 JSON-объект с полями:
 
 - `summary` — краткая сводка по чанку;
-- `findings` — список замечаний; у каждого: `path`, `side`, `start_line`, `end_line`, `category`, `severity`, `title`, `explanation`, `evidence`, `recommendation`, `proposed_diff_fix` (строка или `null`);
+- `findings` — список замечаний; у каждого: `path`, `side`, `start_line`, `end_line`, `category`, `severity`, `title`, `explanation`, `evidence`, `recommendation`, `rule_ref` (метка правила из `<repo_rules>` или `null`), `proposed_diff_fix` (строка или `null`);
 - `limitations` — что помешало полному анализу (пустой список, если ничего).

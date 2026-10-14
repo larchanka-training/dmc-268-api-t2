@@ -7,6 +7,7 @@ explicit delimiters. The raw prompt is never logged (SD §13).
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +107,32 @@ class PromptBuilder:
         rules: str | None = None,
     ) -> BuiltPrompt:
         """Assemble the prompt; metadata shrinks, rules drop whole, diff never does."""
+        fitted = self._fit(payload, max_input_tokens, rules=rules)
+        if fitted is not None:
+            return fitted
+        if rules:
+            # Rules are never trimmed: a partial rule changes its meaning (ADR 0002
+            # trust boundary). Drop them whole and say so.
+            fitted = self._fit(
+                payload,
+                max_input_tokens,
+                rules=None,
+                extra_limitations=(_RULES_DROPPED_NOTE,),
+            )
+            if fitted is not None:
+                return fitted
+        msg = "chunk diff does not fit the input token limit"
+        raise PromptTooLargeError(msg)
+
+    def _fit(
+        self,
+        payload: ContextPayload,
+        max_input_tokens: int,
+        *,
+        rules: str | None,
+        extra_limitations: Sequence[str] = (),
+    ) -> BuiltPrompt | None:
+        """Best prompt across metadata levels that fits the budget, else None."""
         files = [f.diff for f in payload.files]
         shots = self._select_few_shots({f.language for f in files if f.language})
         prefix = self._prefix(shots)
@@ -120,29 +147,11 @@ class PromptBuilder:
                     messages=messages,
                     prompt_version=self.prompt_version,
                     estimated_tokens=estimated,
-                    limitations=[_TRIMMED_NOTE] if level else [],
+                    limitations=([_TRIMMED_NOTE] if level else [])
+                    + list(extra_limitations),
                     few_shot_ids=[shot.id for shot in shots],
                 )
-        if rules:
-            # Rules are never trimmed: a partial rule changes its meaning (ADR 0002
-            # trust boundary). Drop them whole and say so.
-            for level, metadata in enumerate(_metadata_levels(payload.metadata)):
-                messages = [
-                    *prefix,
-                    ChatMessage(role="user", content=_user_message(metadata, files)),
-                ]
-                estimated = self._estimate(messages)
-                if estimated <= max_input_tokens:
-                    return BuiltPrompt(
-                        messages=messages,
-                        prompt_version=self.prompt_version,
-                        estimated_tokens=estimated,
-                        limitations=([_TRIMMED_NOTE] if level else [])
-                        + [_RULES_DROPPED_NOTE],
-                        few_shot_ids=[shot.id for shot in shots],
-                    )
-        msg = "chunk diff does not fit the input token limit"
-        raise PromptTooLargeError(msg)
+        return None
 
     def _select_few_shots(self, languages: set[str]) -> list[FewShot]:
         """One example with findings (chunk languages first, then file order)

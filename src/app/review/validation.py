@@ -11,6 +11,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from app.domain.enums import FindingSide
+from app.domain.settings import rule_instructions
 from app.review.schemas.context import ContextPayload, Hunk, LineKind
 from app.review.schemas.finding import LLMFinding, ValidatedFinding
 from app.review.schemas.result import ReviewChunkOutcome
@@ -104,10 +105,9 @@ class FindingValidator:
 
 def extract_rule_refs(rules: Mapping[str, Sequence[str]] | None) -> frozenset[str]:
     """Rule labels ([SEC-1] style) from the canonical rules document."""
-    instructions = (rules or {}).get("instructions", [])
     return frozenset(
         label
-        for instruction in instructions
+        for instruction in rule_instructions(rules)
         for label in _RULE_LABEL.findall(instruction)
     )
 

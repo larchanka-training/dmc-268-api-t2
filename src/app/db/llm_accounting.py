@@ -421,7 +421,10 @@ class PostgresReviewRunBudget:
                     state=outcome,
                     error_code=error_code,
                     latency_ms=latency_ms,
-                    settled_at=func.clock_timestamp(),
+                    # DB wall time can step behind the committed reservation.
+                    settled_at=func.greatest(
+                        ReviewLlmAttempt.reserved_at, func.clock_timestamp()
+                    ),
                 )
                 .returning(ReviewLlmAttempt.id)
             )

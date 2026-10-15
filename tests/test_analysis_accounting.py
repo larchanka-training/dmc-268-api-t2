@@ -369,8 +369,10 @@ async def wait_for_lock(factory: async_sessionmaker[AsyncSession], table: str) -
             await asyncio.sleep(0.01)
 
 
-async def expire_soon(execution: Execution, expiry: str) -> datetime:
-    boundary = func.clock_timestamp() + timedelta(milliseconds=300)
+async def expire_soon(
+    execution: Execution, expiry: str, *, seconds: float = 0.3
+) -> datetime:
+    boundary = func.clock_timestamp() + timedelta(seconds=seconds)
     if expiry == "deadline":
         statement = (
             update(ReviewJob)
@@ -1542,7 +1544,6 @@ async def test_unique_index_wait_cannot_issue_expired_permit(
     pending = None
     try:
         await other.store().begin(task=other.task, lease=other.lease)
-        expiration = await expire_soon(other, expiry)
         identity = uuid.uuid4()
         async with execution.factory() as blocker:
             await blocker.begin()
@@ -1564,6 +1565,8 @@ async def test_unique_index_wait_cannot_issue_expired_permit(
                 )
             )
             await blocker.flush()
+            # Start the cutoff after setup, with time to reach the competing INSERT.
+            expiration = await expire_soon(other, expiry, seconds=1)
             pending = asyncio.create_task(
                 reserve(other, other.budget(), reservation_id=identity)
             )
@@ -1574,7 +1577,11 @@ async def test_unique_index_wait_cannot_issue_expired_permit(
             )  # UUID becomes free only after B's authority expires.
         with pytest.raises((LeaseLostError, BudgetExceededError)):
             await pending
-        assert (await other.budget().snapshot()).requests_used == 0
+        snapshot = await other.budget().snapshot()
+        assert snapshot.requests_used == 0
+        assert snapshot.input_tokens_used == snapshot.output_tokens_used == 0
+        async with execution.factory() as session:
+            assert await session.get(ReviewLlmAttempt, identity) is None
     finally:
         if pending is not None:
             pending.cancel()

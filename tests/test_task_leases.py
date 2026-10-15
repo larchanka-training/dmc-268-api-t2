@@ -85,6 +85,8 @@ async def _wait_for_blocked_operation(
 ) -> None:
     async with postgres.engine.connect() as observer:
         for _ in range(200):
+            # A new backend can arrive after the transaction's activity snapshot.
+            await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
             waiting = await observer.scalar(
                 text(
                     "SELECT count(*) FROM pg_stat_activity WHERE "
@@ -371,21 +373,31 @@ async def test_heartbeat_cannot_resurrect_lease_expired_while_update_waits(
     lease = await store.acquire(review_id, owner="worker-a", task_kind="analyze")
     assert lease is not None
     async with postgres.engine.begin() as connection:
-        await connection.execute(
-            update(TaskLease)
-            .where(TaskLease.review_job_id == review_id)
-            .values(expires_at=func.clock_timestamp() + timedelta(seconds=0.3))
-        )
+        # Allow connection setup to reach UPDATE before the lease expires.
+        cutoff = (
+            await connection.execute(
+                update(TaskLease)
+                .where(TaskLease.review_job_id == review_id)
+                .values(expires_at=func.clock_timestamp() + timedelta(seconds=1))
+                .returning(TaskLease.expires_at)
+            )
+        ).scalar_one()
     async with postgres.engine.begin() as blocker:
         await blocker.execute(text("LOCK TABLE task_lease IN SHARE MODE"))
         blocker_pid = await blocker.scalar(select(func.pg_backend_pid()))
         task = asyncio.create_task(store.renew(lease))
-        await _wait_for_blocked_operation(postgres, blocker_pid)
-        await blocker.execute(text("SELECT pg_sleep(0.4)"))
+        try:
+            await _wait_for_blocked_operation(postgres, blocker_pid)
+            await _wait_for_database_clock(blocker, cutoff)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
     assert await task is None
     next_lease = await store.acquire(review_id, owner="worker-b", task_kind="analyze")
     assert next_lease is not None
     assert next_lease.fencing_token == 2  # noqa: PLR2004 — literal AC expectation
+    assert await store.renew(lease) is None
 
 
 async def test_release_refuses_lease_expired_while_update_waits(

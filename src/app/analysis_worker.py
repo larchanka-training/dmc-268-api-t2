@@ -1,4 +1,4 @@
-"""Process new analyze deliveries using the frozen PostgreSQL composition."""
+"""Process and recover analyze deliveries using the frozen PostgreSQL composition."""
 
 import argparse
 import asyncio
@@ -7,6 +7,7 @@ import math
 import signal
 import uuid
 from pathlib import Path
+from time import monotonic
 
 import httpx
 import structlog
@@ -15,6 +16,7 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 
 from app.adapters.redis_queue import RedisQueue
+from app.application.ports import LeaseLostError
 from app.core.config import Logging, get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
@@ -32,7 +34,7 @@ def _poll_interval(value: str) -> float:
     return interval
 
 
-async def run(*, once: bool, poll_interval: float) -> None:
+async def run(*, once: bool, poll_interval: float) -> None:  # noqa: PLR0912 -- process lifecycle and bounded scheduling
     """Own process resources and complete trusted preparation before any receive."""
     runtime = load_runtime_configuration()
     settings = get_settings()
@@ -41,6 +43,7 @@ async def run(*, once: bool, poll_interval: float) -> None:
     for name in ("httpcore", "httpx"):
         logging.getLogger(name).setLevel(logging.WARNING)
     from app.db.session import async_session_factory, engine  # noqa: PLC0415
+    from app.db.worker_tasks import QueueIdentityError  # noqa: PLC0415
 
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -72,8 +75,28 @@ async def run(*, once: bool, poll_interval: float) -> None:
                 schemas_dir=Path("schemas"),
                 owner=owner,
             )
+            cursor = "0-0"
+            next_recovery = monotonic() + 30
             while not stopping.is_set():
-                acknowledged = await worker.run_once()
+                if not once and monotonic() >= next_recovery:
+                    cursor, recovered = await worker.recover_once(cursor=cursor)
+                    next_recovery = monotonic() + 30
+                    structlog.get_logger().info(
+                        "analysis_worker_recovery", owner=owner, acknowledged=recovered
+                    )
+                    if stopping.is_set():
+                        break
+                try:
+                    acknowledged = await worker.run_once()
+                except (QueueIdentityError, LeaseLostError) as error:
+                    if once:
+                        raise
+                    acknowledged = False
+                    structlog.get_logger().warning(
+                        "analysis_worker_delivery_deferred",
+                        owner=owner,
+                        error_type=type(error).__name__,
+                    )
                 structlog.get_logger().info(
                     "analysis_worker_pass", owner=owner, acknowledged=acknowledged
                 )
@@ -82,7 +105,8 @@ async def run(*, once: bool, poll_interval: float) -> None:
                 # False includes deferred/pending work; it never proves an empty PEL.
                 if not acknowledged:
                     try:
-                        async with asyncio.timeout(poll_interval):
+                        delay = min(poll_interval, max(0, next_recovery - monotonic()))
+                        async with asyncio.timeout(delay):
                             await stopping.wait()
                     except TimeoutError:
                         pass

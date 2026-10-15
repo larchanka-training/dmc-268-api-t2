@@ -4,6 +4,7 @@ import asyncio
 import time
 import uuid
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
@@ -82,8 +83,13 @@ class PostgresReviewWorker:
                     if claimed.delivery is not None
                     else False
                 )
-            except QueueIdentityError:
+            except (QueueIdentityError, LeaseLostError) as error:
                 acknowledged = False
+                structlog.get_logger().warning(
+                    "analysis_worker_recovery_deferred",
+                    owner=self._owner,
+                    error_type=type(error).__name__,
+                )
             return claimed.cursor, acknowledged
 
     async def _process_delivery(self, delivery: QueueDelivery) -> bool:

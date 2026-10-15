@@ -124,11 +124,12 @@ The normal queue envelope is validated against
 attempt, and trace identity. Source, diff, prompt, and model result are never sent
 in the envelope.
 
-`RedisQueue` implements enqueue, receive, acknowledgement and safe dead-letter
-quarantine. `PostgresReviewWorker` automatically renews its PostgreSQL lease
-while the handler executes. Pending-delivery claiming and periodic review
-recovery are not implemented. The v1 Redis-backed queue adapter and workers must
-provide these observable guarantees:
+`RedisQueue` implements enqueue, receive, pending-delivery claiming,
+acknowledgement and safe dead-letter quarantine. `PostgresReviewWorker`
+automatically renews its PostgreSQL lease while the handler executes. The analysis
+CLI schedules bounded Redis pending recovery in continuous mode; periodic
+PostgreSQL recovery remains Stage 8C-04-03. The v1 Redis-backed queue adapter and
+workers must provide these observable guarantees:
 
 - separate analyze, publish, and dead-letter task kinds/channels;
 - acknowledged enqueue before marking the PostgreSQL outbox event published;
@@ -278,8 +279,9 @@ claimed. FAILED/SKIPPED need no successor handoff and are excluded from this sca
 
 The standalone `python -m app.outbox_dispatcher --once` performs one recovery
 sweep followed by one initial analyze batch. Existing continuous polling performs
-initial batches only; periodic30s recovery and analysis process lifecycle belong
-to Stage8C-04. No background process is activated by this change.
+initial batches only; periodic PostgreSQL recovery belongs to Stage 8C-04-03.
+The analysis CLI's Redis pending recovery is separate and described in §4.2.
+No background process is activated by this change.
 It composes the existing `PostgresOutboxDispatcher`, `RedisQueue`, and database
 session factory using `POSTGRES__*`, `REDIS__URL`, and `LOGGING__*` settings.
 `--batch-size` defaults to 100 and must be a positive integer;
@@ -302,16 +304,16 @@ With PostgreSQL and Redis configured, an operator can invoke
 `docker compose run --rm worker python -m app.outbox_dispatcher --once`
 or omit `--once` for manual continuous execution. This command is documented
 for future operation; deployment does not start the dispatcher automatically.
-Both Compose worker services retain `sleep infinity`. The runtime performs no
-analysis, LLM calls, or Redis task ACKs. Production analysis still depends on
-the LLM Gateway integration and a separate production worker bootstrap.
+Both Compose worker services retain `sleep infinity`. The dispatcher performs no
+analysis, LLM calls, or Redis task ACKs. The separately invoked analysis CLI
+composes the existing production handler and frozen LLM Gateway as described below.
 
 ### 4.2 Bounded worker execution
 
 `PostgresReviewWorker.run_once()` receives at most one new Redis delivery for
 its configured task kind and consumer group. Construction requires a typed
-`TaskHandlerPort`; there is no default handler, CLI, service, or production
-worker loop. The generic callback supplies no provider call-start authority;
+`TaskHandlerPort`; the analysis CLI explicitly composes the existing production
+handler. The generic callback supplies no provider call-start authority;
 `PostgresAnalysisHandler` adds the checks described in §4.3. Publisher
 call-start checks and serialization remain separate.
 
@@ -329,12 +331,42 @@ internal claim retry.
 attempts one analyze recovery and returns `(next_cursor, acknowledged)`. It and
 `run_once()` share one delivery processing path and one execution slot; no claim
 or receive happens while that slot is occupied. A PostgreSQL identity mismatch
-remains pending and returns the next recovery cursor, without DLQ. Invalid
+or lease loss remains pending and returns the next recovery cursor, without DLQ.
+These expected delivery failures log only the owner and error type. Invalid
 transport envelopes retain that cursor through the existing safe quarantine
 protocol, DLQ XADD before source XACK. All existing PostgreSQL guards, durable
 attempts, retry clocks, ledger and completion proofs apply unchanged. The caller
-must retain/advance the cursor even when no delivery was acknowledged. Scheduling
-and periodic invocation are deferred to Stage 8C-04; this API starts no service.
+must retain/advance the cursor even when no delivery was acknowledged. This
+bounded API starts no service; the analysis CLI owns its periodic invocation.
+
+`python -m app.analysis_worker` runs the existing frozen PostgreSQL composition
+in continuous analyze-only mode. Trusted runtime/artifact/credential preparation
+finishes before any receive or claim, and each process boot uses a fresh consumer
+owner. The standard Docker image includes this CLI. `--once` retains one bounded
+pass of new deliveries only: at most one `run_once()` call, without pending
+recovery. `--poll-interval` defaults to 1 second and must be finite in [0.01, 60].
+
+Continuous mode schedules the first recovery tick 30 seconds after preparation,
+using monotonic time. Before receiving another new delivery, an eligible tick
+awaits exactly one `recover_once()` with `min_idle_time=90000`. It retains one
+process-local cursor, initially `0-0`, including after an empty scan, no ACK,
+identity mismatch or lease loss. A returned `0-0` completes the pass; the next
+eligible tick starts a new pass. The next tick becomes eligible 30 seconds after
+the bounded recovery finishes, so delayed ticks never accumulate or trigger a
+catch-up loop. An idle wait is capped by the remaining time to the next tick.
+Checking eligibility before each new receive gives recovery an opportunity under
+continuous new backlog. New and reclaimed deliveries run sequentially through
+the existing execution slot and heartbeat; no claimed batch accumulates in memory.
+
+In continuous mode, `QueueIdentityError` and `LeaseLostError` from new deliveries
+leave work pending, produce a sanitized owner/error-type warning and allow the
+next pass. Recovery handles those same expected failures while preserving its
+cursor. Invalid Redis envelopes use safe DLQ-before-ACK quarantine. Redis,
+PostgreSQL and other unexpected failures propagate to a sanitized nonzero CLI
+exit; infrastructure failures are never reported as successful empty passes.
+Logs omit raw envelopes, diffs, prompts, provider payloads and exception repr.
+`--once` keeps its existing exception/exit behavior. Compose/CD does not start
+the analysis worker automatically; activation remains outside this stage.
 
 The worker validates every canonical envelope field against the PostgreSQL
 OutboxEvent and its ReviewJob. Unparseable UUID identity, a missing command, or
@@ -380,9 +412,8 @@ There is currently no durable per-event receipt or retry-successor verification
 contract. A retry ACK must prove an atomic replacement outbox command and
 accepted scheduling/budget state; a `retry_at` write or callback assertion alone
 is insufficient. Deadline expiry and UNKNOWN need the separate recovery and
-reconciliation decisions described below. Bounded pending delivery recovery is
-explicitly callable as above; periodic PostgreSQL review recovery and scheduling
-are not implemented.
+reconciliation decisions described below. Redis pending recovery is scheduled
+as above; periodic PostgreSQL review recovery remains Stage 8C-04-03.
 After acquisition and the locked readiness check, the worker runs a heartbeat
 alongside the typed handler: every 15 seconds it renews the same live owner,
 task kind, and fencing token to PostgreSQL time plus 90 seconds. Renewal changes
@@ -405,8 +436,9 @@ and remain requirements for publisher integration.
 ### 4.3 Analysis handler and publication handoff
 
 `PostgresAnalysisHandler` implements the existing `TaskHandlerPort`. Composition
-must explicitly supply `GithubPort`, `LlmGatewayPort` and the checked-in schemas
-directory; there is no default LLM provider or production worker entrypoint.
+must explicitly supply `GithubPort`, the checked-in schemas directory and either
+`LlmGatewayPort` or the frozen execution factory; there is no default LLM provider.
+The production analysis CLI uses the frozen execution composition described below.
 It checks canonical command identity, live lease and accepted deadlines before
 GitHub/LLM invocations, closes all PostgreSQL transactions before external I/O,
 and uses existing transaction-local fenced repositories for writes.
@@ -500,13 +532,12 @@ Migration tests preserve legacy rows/digests/settings through 0001…0010 and th
 head/check/downgrade0009/upgrade/check cycle. Accepted migrations, prompt renderers,
 v1/v2 digest vectors and canonical schemas remain unchanged.
 
-This is internal composition readiness, not deployment readiness. The builder
-returns a bounded worker and starts no process. Production analysis CLI, automatic
-worker startup, XAUTOCLAIM, periodic recovery/retry scheduling, complete chunk
-planning/checkpoint recovery, real publisher/reconciliation and OAuth/session
-integration remain outside 8B-05. Controlled Redis redelivery tests demonstrate
-safety when work is delivered; they do not establish automatic recovery liveness.
-Issue #13 is not declared complete by this stage.
+The builder returns a bounded worker and starts no process. Stage 8C adds the
+production analysis CLI, bounded XAUTOCLAIM and automatic continuous Redis pending
+recovery described in §4.2. Automatic worker startup, periodic PostgreSQL recovery,
+full in-flight shutdown/cancellation, complete chunk planning/checkpoint recovery,
+real publisher/reconciliation and OAuth/session integration remain outside this
+stage. This is not deployment readiness, and Issue #13 is not declared complete.
 
 ## 5. Leases and fencing
 

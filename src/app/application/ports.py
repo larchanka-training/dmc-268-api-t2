@@ -67,6 +67,18 @@ class QueueDelivery:
     envelope: QueueTaskEnvelope
 
 
+@dataclass(frozen=True, slots=True)
+class QueueClaim:
+    """PEL scan position and at most one delivery; deleted IDs are diagnostic only.
+
+    Cursor 0-0 ends a pass. An empty delivery can still advance the cursor.
+    """
+
+    cursor: str
+    delivery: QueueDelivery | None
+    deleted_ids: tuple[str, ...] = ()
+
+
 class QueuePort(Protocol):
     async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
         """Confirm enqueue or reject before I/O via QueueEnvelopeValidationError."""
@@ -75,6 +87,12 @@ class QueuePort(Protocol):
     async def receive(
         self, *, task_kind: TaskKind, consumer_name: str
     ) -> QueueDelivery | None: ...
+
+    async def reclaim(
+        self, *, consumer_name: str, cursor: str, min_idle_time: int = 90_000
+    ) -> QueueClaim:
+        """Claim at most one pending analyze delivery; caller owns scan cursor."""
+        ...
 
     async def ack(self, delivery: QueueDelivery) -> bool: ...
 

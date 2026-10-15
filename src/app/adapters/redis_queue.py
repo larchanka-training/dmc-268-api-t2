@@ -13,6 +13,7 @@ from redis.exceptions import ResponseError
 
 from app.application.ports import (
     MAX_QUEUE_ENVELOPE_BYTES,
+    QueueClaim,
     QueueDelivery,
     QueueEnvelopeReason,
     QueueEnvelopeValidationError,
@@ -71,7 +72,7 @@ def _source_identity(serialized: str | bytes | None) -> _SourceIdentity:
 class InvalidQueueMessageError(ValueError):
     """Safe rejection metadata; the original message remains pending."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- safe rejection identity and optional scan cursor
         self,
         message: str,
         *,
@@ -79,12 +80,14 @@ class InvalidQueueMessageError(ValueError):
         source_routing_key: TaskKind,
         reason_code: DeadReason = "INVALID_ENVELOPE",
         source_identity: _SourceIdentity | None = None,
+        next_cursor: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message_id = message_id
         self.source_routing_key = source_routing_key
         self.reason_code = reason_code
         self.source_identity = source_identity or _SourceIdentity()
+        self.next_cursor = next_cursor
 
 
 def _decode_envelope(serialized: str | bytes) -> QueueTaskEnvelope:
@@ -167,13 +170,7 @@ class RedisQueue:
         if task_kind not in ("analyze", "publish"):
             raise ValueError("Unsupported source task channel")
         stream = f"{self._stream_prefix}:{task_kind}"
-        try:
-            await self._client.xgroup_create(
-                stream, self._group_name, id="0", mkstream=True
-            )
-        except ResponseError as error:
-            if not str(error).startswith("BUSYGROUP "):
-                raise
+        await self._ensure_group(stream)
         # Decode only Redis IDs, never untrusted fields in the transport parser.
         messages = await self._client.execute_command(  # type: ignore[no-untyped-call]
             "XREADGROUP",
@@ -191,6 +188,70 @@ class RedisQueue:
             return None
         # Default Redis responses for new messages, without CLAIM or tombstones.
         message_id, fields = cast(_ReadResponse, messages)[0][1][0]
+        return self._delivery(message_id, fields, task_kind)
+
+    async def reclaim(
+        self, *, consumer_name: str, cursor: str, min_idle_time: int = 90_000
+    ) -> QueueClaim:
+        """One XAUTOCLAIM, one analyze delivery; no polling or completion inference."""
+        await self._ensure_group(f"{self._stream_prefix}:analyze")
+        # execute_command may retry an ambiguous claim after a lost response.
+        # Borrow one exclusive connection and send once, retaining Redis parsing.
+        pool = self._client.connection_pool
+        connection = await pool.get_connection()  # type: ignore[no-untyped-call]
+        try:
+            await connection.send_command(
+                "XAUTOCLAIM",
+                f"{self._stream_prefix}:analyze",
+                self._group_name,
+                consumer_name,
+                min_idle_time,
+                cursor,
+                "COUNT",
+                1,
+            )
+            response = await self._client.parse_response(
+                connection, "XAUTOCLAIM", **{NEVER_DECODE: True}
+            )
+        except BaseException:
+            # Never return an unread/ambiguous response to another pool borrower.
+            await connection.disconnect()
+            raise
+        finally:
+            await pool.release(connection)
+        next_cursor = response[0]
+        next_cursor = (
+            next_cursor.decode() if isinstance(next_cursor, bytes) else next_cursor
+        )
+        messages = cast(list[_StreamMessage], response[1])
+        return QueueClaim(
+            cursor=next_cursor,
+            delivery=self._delivery(*messages[0], "analyze", next_cursor=next_cursor)
+            if messages
+            else None,
+            deleted_ids=tuple(
+                item.decode() if isinstance(item, bytes) else item
+                for item in response[2]
+            ),
+        )
+
+    async def _ensure_group(self, stream: str) -> None:
+        try:
+            await self._client.xgroup_create(
+                stream, self._group_name, id="0", mkstream=True
+            )
+        except ResponseError as error:
+            if not str(error).startswith("BUSYGROUP "):
+                raise
+
+    def _delivery(
+        self,
+        message_id: str | bytes,
+        fields: dict[str | bytes, str | bytes],
+        task_kind: TaskKind,
+        *,
+        next_cursor: str | None = None,
+    ) -> QueueDelivery:
         serialized = fields.get("envelope", fields.get(b"envelope"))
         try:
             if serialized is None:
@@ -209,6 +270,7 @@ class RedisQueue:
                 if isinstance(error, QueueEnvelopeValidationError)
                 else "INVALID_ENVELOPE",
                 source_identity=_source_identity(serialized),
+                next_cursor=next_cursor,
             ) from None
         return QueueDelivery(
             message_id=message_id.decode()

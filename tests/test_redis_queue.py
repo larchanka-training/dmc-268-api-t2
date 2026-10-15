@@ -12,7 +12,10 @@ import pytest
 import pytest_asyncio
 from jsonschema import Draft202012Validator, FormatChecker
 from redis.asyncio import Redis
-from redis.exceptions import NoPermissionError
+from redis.asyncio.connection import Connection, ConnectionPool
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.exceptions import NoPermissionError, TimeoutError
 from redis.typing import EncodableT, FieldT
 
 from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
@@ -60,6 +63,87 @@ def envelope(task_kind: TaskKind = "analyze") -> QueueTaskEnvelope:
         attempt=1,
         trace_id="trace_123",
     )
+
+
+async def test_crashed_consumer_pending_delivery_is_reclaimed_with_original_id(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    first = await queue.receive(task_kind="analyze", consumer_name="consumer-a")
+    assert first is not None and first.message_id == message_id
+    assert await queue.receive(task_kind="analyze", consumer_name="consumer-b") is None
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [(row["message_id"], row["consumer"]) for row in pending] == [
+        (message_id, "consumer-a")
+    ]
+
+    claimed = await queue.reclaim(
+        consumer_name="consumer-b", cursor="0-0", min_idle_time=0
+    )
+    assert claimed.delivery == first
+    assert claimed.cursor == "0-0"
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "consumer-b", 2)]
+
+
+async def test_reclaim_preserves_cursor_across_empty_idle_scan(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    ids = [await queue.enqueue(envelope()) for _ in range(12)]
+    for _ in ids:
+        assert await queue.receive(task_kind="analyze", consumer_name="a")
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0", min_idle_time=90_000)
+    assert claimed.delivery is None
+    # Redis scans at most COUNT * 10 PEL entries, even when none is idle enough.
+    assert claimed.cursor == ids[10]
+    end = await queue.reclaim(
+        consumer_name="b", cursor=claimed.cursor, min_idle_time=90_000
+    )
+    assert end.cursor == "0-0" and end.delivery is None
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == len(ids)
+
+
+async def test_reclaim_reports_deleted_pel_ids_without_delivery_or_ack(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    await redis_client.xdel(f"{stream_prefix}:analyze", message_id)
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 1
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0", min_idle_time=0)
+    assert claimed.delivery is None and claimed.cursor == "0-0"
+    assert claimed.deleted_ids == (message_id,)
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 0
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+
+async def test_reclaim_recreates_missing_group_without_resetting_existing_group(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0")
+    assert claimed.delivery is None and claimed.cursor == "0-0"
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    await redis_client.xgroup_destroy(f"{stream_prefix}:analyze", "review-workers")
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0")
+    assert claimed.delivery is None
+    fresh = await queue.receive(task_kind="analyze", consumer_name="b")
+    assert fresh is not None and fresh.message_id == message_id
 
 
 @pytest.mark.parametrize("task_kind", ["analyze", "publish"])
@@ -632,3 +716,109 @@ async def test_producer_validation_exposes_only_typed_safe_rejection(
     assert "x" * 100 not in str(rejected.value)
     assert await redis_client.xlen(f"{stream_prefix}:analyze") == 0
     assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+
+async def test_reclaim_supports_real_byte_client_and_preserves_message_identity(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    assert _REDIS_URL is not None
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    async with Redis.from_url(_REDIS_URL, decode_responses=False) as raw:
+        claimed = await RedisQueue(raw, stream_prefix=stream_prefix).reclaim(
+            consumer_name="b", cursor="0-0", min_idle_time=0
+        )
+    assert claimed.delivery is not None
+    assert claimed.delivery.message_id == message_id
+    assert claimed.delivery.envelope == envelope()
+    assert claimed.cursor == "0-0" and claimed.deleted_ids == ()
+
+
+async def test_reclaim_real_redis_error_never_acknowledges_pending_delivery(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    username, password = uuid.uuid4().hex, uuid.uuid4().hex
+    await redis_client.acl_setuser(
+        username,
+        enabled=True,
+        passwords=[f"+{password}"],
+        commands=["+@all", "-xautoclaim"],
+        keys=[f"{stream_prefix}:*"],
+    )
+    assert _REDIS_URL is not None
+    try:
+        async with Redis.from_url(
+            _REDIS_URL, username=username, password=password
+        ) as denied:
+            with pytest.raises(NoPermissionError):
+                await RedisQueue(denied, stream_prefix=stream_prefix).reclaim(
+                    consumer_name="b", cursor="0-0", min_idle_time=0
+                )
+    finally:
+        await redis_client.acl_deluser(username)
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "a", 1)]
+
+
+async def test_reclaim_response_timeout_is_never_retried_by_redis_sdk(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    sent = []
+    dropped = False
+
+    class DropClaimResponse(Connection):
+        claim_response = False
+
+        async def send_command(self, *args: Any, **kwargs: Any) -> None:
+            await super().send_command(*args, **kwargs)
+            self.claim_response = args[0] == "XAUTOCLAIM"
+            if self.claim_response:
+                sent.append(args)
+
+        async def read_response(self, *args: Any, **kwargs: Any) -> Any:
+            nonlocal dropped
+            response = await super().read_response(*args, **kwargs)
+            if self.claim_response:
+                self.claim_response = False
+                if not dropped:
+                    dropped = True
+                    # Server has executed the command; client loses the response.
+                    raise TimeoutError("lost XAUTOCLAIM response")
+            return response
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    assert _REDIS_URL is not None
+    pool = ConnectionPool.from_url(
+        _REDIS_URL,
+        connection_class=DropClaimResponse,
+        retry=Retry(NoBackoff(), 1),
+        max_connections=1,
+    )
+    async with Redis.from_pool(pool) as client:
+        try:
+            await RedisQueue(client, stream_prefix=stream_prefix).reclaim(
+                consumer_name="b", cursor="0-0", min_idle_time=0
+            )
+        except TimeoutError:
+            pass
+        else:
+            pytest.fail(f"response timeout hidden; XAUTOCLAIM sent {len(sent)} times")
+        assert len(sent) == 1
+        # The borrowed connection must be safe for the next independent command.
+        assert await client.ping()
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "b", 2)]

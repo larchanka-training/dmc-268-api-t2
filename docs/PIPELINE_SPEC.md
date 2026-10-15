@@ -258,6 +258,27 @@ worker loop. The generic callback supplies no provider call-start authority;
 `PostgresAnalysisHandler` adds the checks described in §4.3. Publisher
 call-start checks and serialization remain separate.
 
+`RedisQueue.reclaim(consumer_name=..., cursor=..., min_idle_time=90000)` performs
+at most one `XAUTOCLAIM COUNT 1`, without JUSTID, on the analyze stream and the
+existing `review-workers` group. The caller owns the consumer and cursor, starting
+at `0-0`. The returned `QueueClaim` carries the next cursor, at most one delivery,
+and diagnostic deleted IDs from Redis 7+/8. An empty batch still advances the
+cursor; `0-0` ends a pass. Deleted PEL entries do not prove completion and cause
+no synthetic envelope, handler, DLQ, or ACK. Missing groups are created with the
+existing `id=0 MKSTREAM` policy. Redis errors propagate without a delivery or an
+internal claim retry.
+
+`PostgresReviewWorker.recover_once(cursor=..., min_idle_time=90000)` explicitly
+attempts one analyze recovery and returns `(next_cursor, acknowledged)`. It and
+`run_once()` share one delivery processing path and one execution slot; no claim
+or receive happens while that slot is occupied. A PostgreSQL identity mismatch
+remains pending and returns the next recovery cursor, without DLQ. Invalid
+transport envelopes retain that cursor through the existing safe quarantine
+protocol, DLQ XADD before source XACK. All existing PostgreSQL guards, durable
+attempts, retry clocks, ledger and completion proofs apply unchanged. The caller
+must retain/advance the cursor even when no delivery was acknowledged. Scheduling
+and periodic invocation are deferred to Stage 8C-04; this API starts no service.
+
 The worker validates every canonical envelope field against the PostgreSQL
 OutboxEvent and its ReviewJob. Unparseable UUID identity, a missing command, or
 a mismatch raises `QueueIdentityError` and leaves the delivery pending; these
@@ -302,8 +323,9 @@ There is currently no durable per-event receipt or retry-successor verification
 contract. A retry ACK must prove an atomic replacement outbox command and
 accepted scheduling/budget state; a `retry_at` write or callback assertion alone
 is insufficient. Deadline expiry and UNKNOWN need the separate recovery and
-reconciliation decisions described below. Pending-delivery recovery
-(XAUTOCLAIM) and periodic review recovery are not implemented.
+reconciliation decisions described below. Bounded pending delivery recovery is
+explicitly callable as above; periodic PostgreSQL review recovery and scheduling
+are not implemented.
 After acquisition and the locked readiness check, the worker runs a heartbeat
 alongside the typed handler: every 15 seconds it renews the same live owner,
 task kind, and fencing token to PostgreSQL time plus 90 seconds. Renewal changes

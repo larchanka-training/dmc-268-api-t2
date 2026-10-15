@@ -20,7 +20,7 @@ from app.application.ports import (
     TaskLeaseSnapshot,
 )
 from app.db.task_leases import HEARTBEAT_INTERVAL, PostgresTaskLeaseStore
-from app.db.worker_tasks import PostgresWorkerTasks
+from app.db.worker_tasks import PostgresWorkerTasks, QueueIdentityError
 
 
 class PostgresReviewWorker:
@@ -36,6 +36,7 @@ class PostgresReviewWorker:
         task_kind: TaskKind,
         heartbeat_interval: float = HEARTBEAT_INTERVAL.total_seconds(),
     ) -> None:
+        self._slot = asyncio.Lock()
         self._queue = queue
         self._handler = handler
         self._owner = owner
@@ -46,15 +47,46 @@ class PostgresReviewWorker:
 
     async def run_once(self) -> bool:
         """Return True only for an acknowledged delivery; False retains work."""
-        try:
-            delivery = await self._queue.receive(
-                task_kind=self._task_kind, consumer_name=self._owner
-            )
-        except InvalidQueueMessageError as rejected:
-            await self._queue.quarantine(rejected)
-            return True
-        if delivery is None:
-            return False
+        async with self._slot:
+            try:
+                delivery = await self._queue.receive(
+                    task_kind=self._task_kind, consumer_name=self._owner
+                )
+            except InvalidQueueMessageError as rejected:
+                await self._queue.quarantine(rejected)
+                return True
+            if delivery is None:
+                return False
+            return await self._process_delivery(delivery)
+
+    async def recover_once(
+        self, *, cursor: str, min_idle_time: int = 90_000
+    ) -> tuple[str, bool]:
+        """One explicit analyze recovery attempt; caller owns cursor and scheduling."""
+        async with self._slot:
+            if self._task_kind != "analyze":
+                raise ValueError("Pending recovery supports analyze only")
+            try:
+                claimed = await self._queue.reclaim(
+                    consumer_name=self._owner,
+                    cursor=cursor,
+                    min_idle_time=min_idle_time,
+                )
+            except InvalidQueueMessageError as rejected:
+                await self._queue.quarantine(rejected)
+                assert rejected.next_cursor is not None
+                return rejected.next_cursor, True
+            try:
+                acknowledged = (
+                    await self._process_delivery(claimed.delivery)
+                    if claimed.delivery is not None
+                    else False
+                )
+            except QueueIdentityError:
+                acknowledged = False
+            return claimed.cursor, acknowledged
+
+    async def _process_delivery(self, delivery: QueueDelivery) -> bool:
         if not await self._tasks.validate_identity(delivery.envelope):
             return False
         if await self._tasks.completed(delivery.envelope):

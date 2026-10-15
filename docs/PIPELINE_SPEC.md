@@ -350,17 +350,35 @@ result-commit failure; accepted analysis deadlines and budgets are not reset.
 Context v1 has only `metadata.rules_version`, populated with the immutable
 RepositorySettings UUID, plus the frozen output language. It has no instructions
 field. The supplied real gateway must resolve frozen rules/model/prompt by
-authoritative review/settings identity. The gateway exists in `app.llm` /
-`app.review`. Stage 8A integration tests exercise the actual adapter, service
-and Gateway through HTTP MockTransport into PostgreSQL. Test composition loads
-the stored model/prompt version for an explicitly attested fixture configuration;
-production frozen configuration resolution and prompt-digest policy remain
-unimplemented. There is no implicit fallback to current environment configuration.
-Each adapter is restricted to one review identity and needs its own RunBudget;
-production composition must supply a fresh adapter/budget per job. BudgetState
-is still in memory and is not recovered after crashes or redelivery.
-ReviewService owns the single raw format repair; the handler never performs a
-second `review` call to repair an invalid backend result.
+authoritative review/settings identity. Stage 8B-05 supplies production-capable internal composition through
+`build_postgres_analysis_worker` and `FrozenAnalysisExecutionFactory`. It builds
+the existing worker/handler, never another queue or lifecycle. After authoritative
+`begin`, the factory locks the ReviewJob and TaskLease, binds the accepted attempt
+and current execution-local authority, and resolves only saved model/settings,
+rules and prompt identities using verified deployment artifacts. Missing profiles,
+unsupported history, unattestable model pins and digest mismatches fail closed
+before GitHub/LLM HTTP. Runtime supplies transport, credentials and an allowlisted
+profile inventory; it supplies no replacement routing/generation/retry policy.
+
+Each execution receives a fresh service/Gateway/adapter with a concrete
+`PostgresReviewRunBudget`. There is no memory-budget parameter or default in this
+composition. Every retry/fallback/rebuild/repair HTTP needs a separately committed
+fenced reservation in `review_llm_attempt`; settlement commits independently of
+the result UoW, even for invalid paid output. All recreated objects share the
+same per-review ledger. Unknown usage stays reserved; known overruns are retained
+and block later calls. Conservative estimates are not a guaranteed billing cap.
+The durable repair claim is irreversible across crashes, with a single owner in
+ReviewService. The handler never performs another raw-output repair.
+
+`PostgresAnalysisAttemptStore` owns the initial persisted analysis clock and
+execution counter. Worker retries retain the original deadline and durable spend;
+a future `retry_at` prevents begin/reservation and leaves the delivery pending.
+Queue envelope attempt does not replace this persisted execution count. Gateway
+whole-call timeout is bounded by saved request policy and remaining authoritative
+analysis time. Rolling heartbeat/watchdog cancellation is independent of the
+initial lease interval. Admission is database-linearized plus local authority
+cancellation; it does not promise absolute remote-wire fencing or exactly-once
+provider billing.
 
 The gateway must validate raw model output against `schemas/llm-output/v1.json`
 before backend enrichment. The completed `ReviewChunkResult` passes
@@ -368,20 +386,48 @@ before backend enrichment. The completed `ReviewChunkResult` passes
 checks against the captured hunks. Raw-only constraints are not reapplied to
 the enriched backend result. Findings carry backend
 SHA-256 fingerprints over canonical path/side/range/category/title fields.
-Invalid raw output after Gateway repair, or an invalid backend result, fails with LLM_OUTPUT_INVALID
-without ChunkResult/Findings. Useful output with limitations, or returning after
-the analysis deadline, is PARTIAL; otherwise it is COMPLETED. Useful terminal
-status, summary, ChunkResult/Findings, Publication preparation and canonical
-publish outbox commit atomically. Publication remains PENDING, never fake success.
-Permanent GitHub/diff errors record safe terminal decisions; retryable GitHub
-failures record an active failure event and retain pending work. Expected
-ChunkReviewFailedError outcomes terminate under the live fence: invalid output
-maps to LLM_OUTPUT_INVALID, other Gateway failures to LLM_UNAVAILABLE, retaining
-the safe original error_code in the transition event. Stage 8A deliberately has
-no queue-level retry for these failures, avoiding restarted provider budgets;
-retryable LLM job recovery requires durable budget/repair accounting first.
-Unknown programming and DB errors still propagate and retain pending work.
-This limited error mapping does not implement retry scheduling or recovery.
+Invalid raw output after Gateway repair, or an invalid backend result, creates
+no ChunkResult/Findings. Without usable validated saved results the review is
+FAILED; with usable canonical saved results terminal failure preserves them as
+PARTIAL, records a safe limitation and prepares the existing publication handoff.
+Retained canonical results may outlive their contexts; a retained context must
+pass canonical validation before its locations can support a useful result.
+Optional result usage is independent of the authoritative cost ledger.
+Useful fresh output with substantive limitations or arriving late is PARTIAL;
+otherwise it is COMPLETED. A technical fallback provenance note alone is not a
+result limitation. Terminal status and finished_at change in one SQL statement;
+summary, findings/result, Publication(PENDING) and publish outbox share one UoW.
+Publication is never recorded as successful by analysis.
+
+Precise safe budget codes (`budget_requests_exhausted`,
+`budget_input_exhausted`, `budget_output_exhausted`) retain public
+reason LLM_UNAVAILABLE. Queue/analysis deadlines use the existing corresponding
+reason codes; invalid output uses LLM_OUTPUT_INVALID. Auth/config failures and
+exhausted attempts remain terminal and retain safe root details without adding
+public enum values. Typed transient errors may persist bounded retry_at and
+remain pending. Unknown programming/DB errors propagate without ACK. NULL frozen
+markers never acquire current defaults or a new zero-cost budget: unknown
+historical spend fails closed as `historical_budget_unknown`, terminalizing only
+under a valid fence and retaining a useful historical result as PARTIAL.
+
+Real PostgreSQL 18/Redis 8 integration tests use this production composition and
+HTTP MockTransport for GitHub/LLM. They cover dispatch → lease/heartbeat → captured
+context → frozen service → paid ledger → atomic result/handoff → authoritative
+completion proof → ACK, plus terminal/retryable errors, original-ID duplicate
+redelivery, lease loss, result rollback, post-settlement crash and failed ACK.
+A result rollback never refunds HTTP; a new worker needs a new reservation. A
+terminal duplicate skips LLM and ACKs only after existing completion proof.
+Migration tests preserve legacy rows/digests/settings through 0001…0010 and the
+head/check/downgrade0009/upgrade/check cycle. Accepted migrations, prompt renderers,
+v1/v2 digest vectors and canonical schemas remain unchanged.
+
+This is internal composition readiness, not deployment readiness. The builder
+returns a bounded worker and starts no process. Production analysis CLI, automatic
+worker startup, XAUTOCLAIM, periodic recovery/retry scheduling, complete chunk
+planning/checkpoint recovery, real publisher/reconciliation and OAuth/session
+integration remain outside 8B-05. Controlled Redis redelivery tests demonstrate
+safety when work is delivered; they do not establish automatic recovery liveness.
+Issue #13 is not declared complete by this stage.
 
 ## 5. Leases and fencing
 

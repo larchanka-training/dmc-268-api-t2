@@ -154,7 +154,8 @@ class LLMGateway:
                     ).total_seconds() - elapsed
                     if remaining <= 0:
                         raise BudgetExceededError(
-                            "analysis deadline exceeded before dispatch"
+                            "analysis deadline exceeded before dispatch",
+                            error_code="analysis_deadline_exceeded",
                         )
                     if (
                         permit.lease_expires_at - permit.sampled_at
@@ -263,7 +264,7 @@ class LLMGateway:
     ) -> None:
         if delay >= await _remaining_s(budget):
             msg = "backoff does not fit the run deadline"
-            raise BudgetExceededError(msg)
+            raise BudgetExceededError(msg, error_code="analysis_deadline_exceeded")
         await self._sleep(delay)
 
     def _backoff(self, attempt: int) -> float:

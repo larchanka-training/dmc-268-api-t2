@@ -566,7 +566,11 @@ async def test_reservation_requires_current_durable_execution(
         )
     with pytest.raises((LeaseLostError, FrozenConfigurationError, BudgetExceededError)):
         await reserve(execution, execution.budget())
-    assert (await execution.budget().snapshot()).requests_used == 0
+    if defect == "legacy":
+        with pytest.raises(FrozenConfigurationError, match="historical_budget_unknown"):
+            await execution.budget().snapshot()
+    else:
+        assert (await execution.budget().snapshot()).requests_used == 0
 
 
 async def test_reservation_uuid_reuse_never_returns_another_permit(
@@ -1103,7 +1107,7 @@ async def test_actual_overrun_blocks_restarted_service_without_clamping(
         )
         with pytest.raises(ChunkReviewFailedError) as failure:
             await adapter().review(payload)
-    assert failure.value.outcome.error_code == "budget_exceeded"
+    assert failure.value.outcome.error_code == "budget_input_exhausted"
     assert len(requests) == 1
 
 
@@ -1742,7 +1746,7 @@ async def test_reservation_round_trip_consumes_local_deadline_before_dispatch(
             ],
             clock=lambda: clock[0],
         )
-        with pytest.raises(BudgetExceededError):
+        with pytest.raises(BudgetExceededError) as failure:
             await gateway.generate_structured(
                 LLMRequest(
                     messages=[ChatMessage(role="user", content="review")],
@@ -1755,6 +1759,7 @@ async def test_reservation_round_trip_consumes_local_deadline_before_dispatch(
                 chunk_id=execution.chunk_id,
                 operation_id=uuid.uuid4(),
             )
+    assert failure.value.error_code == "analysis_deadline_exceeded"
     assert requests == []
     assert (await execution.budget().snapshot()).requests_used == 1
 

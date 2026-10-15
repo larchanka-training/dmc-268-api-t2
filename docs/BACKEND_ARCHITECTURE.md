@@ -132,8 +132,9 @@ ReviewJob** и не собирает полный LLM `ContextPayload`. Пуст
 отфильтрованный diff допустим как Level 1 artifact. Retry, lease и локальная
 проверка описаны в [`github-webhook-intake.md`](./github-webhook-intake.md).
 Redis review worker не использует WebhookReceipt как неявный источник входных
-данных. LLM Gateway реализован в `app.llm` / `app.review`, но ещё не подключён
-к production review worker.
+данных. LLM Gateway реализован в `app.llm` / `app.review` и подключён к bounded
+review worker через internal production-capable composition; production CLI для
+analysis worker отсутствует.
 
 ### 3.3 Запуск ReviewJob
 
@@ -291,16 +292,51 @@ authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` �
 canonical Level 1 ContextPayload → injected `LlmGatewayPort.review` → fenced
 PostgreSQL result и atomic publication handoff. ACK/lease orchestration не
 дублируется. Call-start guards проверяют authority/deadlines; внешние вызовы
-проходят вне DB transactions. Этап 8A проверяет handler с настоящими
-LlmGatewayAdapter/ReviewService/LLMGateway, HTTP MockTransport и PostgreSQL.
-Repair принадлежит ReviewService; ожидаемые FAILED исходы Gateway завершаются
-терминально с безопасным error_code, без повторного запуска бюджета из очереди.
-Adapter ограничен одним ReviewJob. Production factory, разрешение frozen rules
-и prompt digest, durable budget recovery ещё не реализованы; composition
-интеграционного теста использует явно аттестованную frozen configuration.
-HTTP mock и fake существуют только в tests. Детали и ограничения —
-PIPELINE_SPEC.md §4.3; обработчик использует существующие canonical schemas и
-fenced persistence contracts.
+проходят вне DB transactions.
+
+Stage 8B-05 предоставляет internal builder `build_postgres_analysis_worker`:
+`PostgresReviewWorker → PostgresAnalysisHandler → FrozenAnalysisExecutionFactory
+→ LlmGatewayAdapter / ReviewService → LLMGateway → PostgresReviewRunBudget`.
+Factory получает authoritative ReviewJob под existing locks, TaskLease,
+persisted analysis attempt и execution-local authority. Frozen reader проверяет
+saved config/rules/settings/prompt digests и deployment artifacts; context limits
+берутся из сохранённой policy. Runtime предоставляет HTTP transport, credentials
+и разрешённые provider profiles, без замены frozen модели/routing/settings.
+Unsupported history/profile/model pin или непроверенный digest дают безопасный
+terminal отказ до HTTP. Созданный per-execution budget всегда PostgreSQL-backed;
+RunBudget не является параметром или default этой composition.
+
+Reservation каждого HTTP и actual usage settlement имеют собственные committed
+транзакции `review_llm_attempt`. Result rollback/crash не возвращает списанные
+затраты, новая factory/service/Gateway не обнуляют общий ledger. Retry/repair,
+accepted deadline и analysis attempts durable; heartbeat/watchdog отменяют
+execution при потере rolling lease. Проверки дают DB-linearized admission и
+local cancellation, без обещания exactly-once billing или absolute wire fencing.
+Unknown usage остаётся charged; estimates не являются доказанным billing cap.
+
+Точный safe error_code budget/auth/config сохраняется с canonical public reason.
+Нет пригодного проверенного результата — FAILED; сохранённый canonical результат
+при terminal failure — PARTIAL с limitation и existing atomic publication handoff.
+Raw/invalid LLM output не сохраняется как результат. Technical fallback provenance
+не делает полноценный результат PARTIAL. Terminal status и finished_at меняются
+одним UPDATE; результат, findings, Publication(PENDING) и OutboxEvent(publish)
+фиксируются в одной транзакции. ACK требует authoritative completion proof.
+
+Real PostgreSQL 18/Redis 8 integration tests проверяют production composition
+in-process с GitHub/LLM HTTP MockTransport, terminal/retryable failure, duplicate
+delivery, lease loss, settlement → result rollback/crash и terminal commit →
+failed ACK. Migration tests проходят 0001…0010 и head/check/downgrade0009/upgrade/check
+с сохранением legacy identities/settings и CHECK constraints. NULL frozen marker
+не получает новую policy или нулевой budget: historical_budget_unknown, zero LLM
+HTTP, fenced FAILED либо PARTIAL при пригодном сохранённом результате. Historical
+terminal rows остаются читаемыми через REST без переписывания digests.
+
+Builder лишь возвращает bounded worker; фонового сервиса он не запускает.
+Production analysis CLI/activation, XAUTOCLAIM, periodic recovery/retry scheduler,
+полный chunk planner, real publisher/reconciliation и OAuth/session integration
+остаются до production activation. Safety controlled redelivery не означает
+готовность automatic recovery. Issue #13 и deployment readiness не объявлены
+завершёнными. Детали — PIPELINE_SPEC.md §4.3.
 
 ### 3.6 Dispatcher и recovery
 
@@ -504,7 +540,11 @@ ORM-модели не используются как публичные HTTP DT
 - `PostgresAnalysisHandler`: GitHub snapshot, Level 1 context, canonical schema
   и semantic validation, вызов внедряемого LLM-порта, сохранение результата и
   атомарная подготовка publication/outbox;
-- интеграционные тесты Redis queue, dispatcher, worker и analysis handler;
+- verified v1/v2 prompt bundles, frozen configuration reader/admission и
+  production-capable internal analysis composition;
+- migrations 0008…0010: nullable frozen marker, durable LLM ledger/attempts и repair claim;
+- интеграционные тесты Redis queue, dispatcher, worker, analysis composition,
+  durable crash accounting, legacy compatibility и atomic terminal handoff;
 - HTTP start ReviewJob со scoped idempotency и атомарными quota/outbox writes;
 - HTTP detail/findings с RepositoryAccess и keyset pagination; до подключения
   backend session integration endpoints закрыты для реальных пользователей.
@@ -519,8 +559,6 @@ ORM-модели не используются как публичные HTTP DT
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
-- production composition LLM Gateway для analysis worker, разрешение frozen
-  settings/prompt digest и durable retry/request/repair budget с handler;
 - production CLI для analysis worker, pending-delivery claiming (XAUTOCLAIM),
   периодический review recovery и retry scheduler;
 - publication executor (publisher worker) с call-start guards и сериализацией

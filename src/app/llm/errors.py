@@ -86,6 +86,12 @@ class SchemaValidationError(LLMGatewayError):
 class BudgetExceededError(LLMGatewayError):
     error_code = "budget_exceeded"
 
+    def __init__(
+        self, message: str = "", *, error_code: str = "budget_exceeded"
+    ) -> None:
+        self.error_code = error_code
+        super().__init__(message)
+
 
 class LLMUnavailableError(LLMGatewayError):
     """All endpoints failed after the allowed attempts."""

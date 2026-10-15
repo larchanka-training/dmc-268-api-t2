@@ -399,7 +399,7 @@ async def test_fallback_provider_is_recorded_in_the_result(
     assert result.status == ChunkStatus.COMPLETED
     assert (result.provider, result.model) == ("ollama", "qwen")
     assert providers.hosts == ["euro.example", "euro.example", "ollama"]
-    assert "Чанк обработан резервным провайдером (ollama/qwen)." in result.limitations
+    assert result.limitations == []
     assert (result.usage.input_tokens, result.usage.output_tokens) == (None, 7)
 
 

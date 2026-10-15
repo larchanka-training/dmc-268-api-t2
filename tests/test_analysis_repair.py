@@ -291,8 +291,16 @@ async def test_distinct_contexts_and_fresh_services_share_job_allowances(
         assert (await adapter(execution, config, http).review(first)).summary == "ok"
         with pytest.raises(ChunkReviewFailedError) as error:
             await adapter(execution, config, http).review(second)
-        assert error.value.outcome.error_code == (
-            "invalid_llm_output" if cap == "repair" else "budget_exceeded"
+        assert (
+            error.value.outcome.error_code
+            == (
+                {
+                    "repair": "invalid_llm_output",
+                    "requests": "budget_requests_exhausted",
+                    "input": "budget_input_exhausted",
+                    "output": "budget_output_exhausted",
+                }[cap]
+            )
         )
     snapshot = await execution.budget().snapshot()
     assert len(calls) == (3 if cap == "repair" else 1)
@@ -357,7 +365,7 @@ async def test_one_logical_repair_retries_and_falls_back_within_shared_cap(
         if request_cap == 3:
             with pytest.raises(ChunkReviewFailedError) as error:
                 await adapter(execution, config, http).review(context)
-            assert error.value.outcome.error_code == "budget_exceeded"
+            assert error.value.outcome.error_code == "budget_requests_exhausted"
         else:
             assert (
                 await adapter(execution, config, http).review(context)

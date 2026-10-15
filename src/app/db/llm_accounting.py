@@ -44,6 +44,9 @@ class PostgresReviewRunBudget:
 
     async def snapshot(self) -> DurableBudgetSnapshot:
         async with self._factory() as session:
+            job = await session.get(ReviewJob, self._lease.review_job_id)
+            if job is None or job.frozen_configuration_version != 1:
+                raise FrozenConfigurationError("historical_budget_unknown")
             return await self._snapshot(session)
 
     async def _snapshot(self, session: AsyncSession) -> DurableBudgetSnapshot:
@@ -113,7 +116,10 @@ class PostgresReviewRunBudget:
             ):
                 raise LeaseLostError("Analysis execution is no longer current")
             if job.analysis_deadline_at is None or job.analysis_deadline_at <= now:
-                raise BudgetExceededError("analysis deadline exceeded")
+                raise BudgetExceededError(
+                    "analysis deadline exceeded",
+                    error_code="analysis_deadline_exceeded",
+                )
             if job.retry_at is not None and job.retry_at > now:
                 raise BudgetExceededError("analysis retry deferred")
             if await session.get(ReviewLlmAttempt, reservation_id) is not None:
@@ -186,17 +192,29 @@ class PostgresReviewRunBudget:
                 raise BudgetExceededError("invalid per-call token reservation")
             used = await self._snapshot(session)
             if used.input_tokens_used + input_tokens > limits.run_max_input_tokens:
-                raise BudgetExceededError("run input token limit exhausted")
+                raise BudgetExceededError(
+                    "run input token limit exhausted",
+                    error_code="budget_input_exhausted",
+                )
             if used.output_tokens_used + output_tokens > limits.run_max_output_tokens:
-                raise BudgetExceededError("run output token limit exhausted")
+                raise BudgetExceededError(
+                    "run output token limit exhausted",
+                    error_code="budget_output_exhausted",
+                )
             if used.requests_used >= policy.limits.run_max_requests:
-                raise BudgetExceededError("run request limit exhausted")
+                raise BudgetExceededError(
+                    "run request limit exhausted",
+                    error_code="budget_requests_exhausted",
+                )
             final_now = await session.scalar(select(func.clock_timestamp()))
             assert final_now is not None
             if lease.expires_at <= final_now:
                 raise LeaseLostError("Reservation lease expired during lock wait")
             if job.analysis_deadline_at <= final_now:
-                raise BudgetExceededError("analysis deadline exceeded")
+                raise BudgetExceededError(
+                    "analysis deadline exceeded",
+                    error_code="analysis_deadline_exceeded",
+                )
             row_id = await session.scalar(
                 insert(ReviewLlmAttempt)
                 .from_select(
@@ -293,7 +311,10 @@ class PostgresReviewRunBudget:
             ):
                 raise LeaseLostError("Analysis execution is no longer current")
             if job.analysis_deadline_at is None or job.analysis_deadline_at <= now:
-                raise BudgetExceededError("analysis deadline exceeded")
+                raise BudgetExceededError(
+                    "analysis deadline exceeded",
+                    error_code="analysis_deadline_exceeded",
+                )
             if job.retry_at is not None and job.retry_at > now:
                 raise BudgetExceededError("analysis retry deferred")
             if not await session.scalar(

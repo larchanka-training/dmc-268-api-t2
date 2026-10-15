@@ -361,7 +361,8 @@ async def test_invalid_llm_location_never_persists_findings(
         and review.finished_at is not None
     )
     assert chunks == [] and review.final_summary is None
-    assert len(events) == 1 and events[0].safe_details is None
+    assert len(events) == 1
+    assert events[0].safe_details == {"error_code": "backend_result_invalid"}
     assert len(llm.payloads) == 1  # Repair belongs to ReviewService/Gateway.
 
 
@@ -588,6 +589,15 @@ async def test_analysis_deadline_after_capture_blocks_llm(
         assert await worker.run_once() is True
     async with factory() as session:
         review = await session.get(ReviewJob, review_id)
+        event = (
+            await session.scalars(
+                select(ReviewEvent).where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.status == "FAILED",
+                )
+            )
+        ).one()
+        assert event.safe_details == {"error_code": "analysis_deadline_exceeded"}
         reasons = (
             await session.scalars(
                 select(ReviewEvent.reason_code).where(
@@ -1007,6 +1017,15 @@ async def test_invalid_backend_result_is_terminal_without_handler_repair_on_rede
             )
         ).all()
         review = await session.get(ReviewJob, review_id)
+        failure = (
+            await session.scalars(
+                select(ReviewEvent).where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.status == "FAILED",
+                )
+            )
+        ).one()
+        assert failure.safe_details == {"error_code": "backend_result_invalid"}
     assert events == []
     assert review is not None and review.status == "FAILED"
 

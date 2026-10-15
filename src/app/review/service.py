@@ -36,8 +36,6 @@ from app.review.validation import FindingValidator, ValidationOutcome
 
 logger = structlog.get_logger(__name__)
 
-_FALLBACK_NOTE = "Чанк обработан резервным провайдером ({}/{})."
-
 
 @dataclass
 class _Attempt:
@@ -122,8 +120,6 @@ class ReviewService:
             )
         attempt.calls.append(call)
         limitations = [*prompt.limitations, *call.parsed.limitations]
-        if call.provider != self._gateway.primary_provider:
-            limitations.append(_FALLBACK_NOTE.format(call.provider, call.model))
         outcome = self._validator.validate(call.parsed.findings, payload)
         return await self._result(
             payload,

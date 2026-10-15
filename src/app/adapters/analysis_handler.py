@@ -24,7 +24,9 @@ from app.application.ports import (
     LlmGatewayPort,
     QueueTaskEnvelope,
     ReviewChunkResult,
+    ReviewFinding,
     TaskLeaseSnapshot,
+    TokenUsage,
 )
 from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
@@ -46,8 +48,10 @@ from app.db.task_leases import lock_owned_lease
 from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.contract_validation import validate_hunks, validate_ranges
 from app.domain.enums import ReviewReasonCode, ReviewStatus
+from app.domain.frozen_configuration import FrozenConfigurationError
 from app.domain.settings import project_historical_empty_settings
 from app.llm.tokens import ConservativeTokenCounter
+from app.review.execution import FrozenAnalysisExecutionFactory
 from app.review.port_adapter import ChunkReviewFailedError
 from app.vcs.diff import InvalidDiff, parse_diff
 
@@ -71,15 +75,17 @@ class PostgresAnalysisHandler:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         github: GithubPort,
-        llm: LlmGatewayPort,
+        llm: LlmGatewayPort | None,
         *,
         schemas_dir: Path,
         limit_input_tokens: int = 100_000,
         reserved_output_tokens: int = 4_000,
+        execution_factory: FrozenAnalysisExecutionFactory | None = None,
     ) -> None:
         self._factory = session_factory
         self._github = github
         self._llm = llm
+        self._execution_factory = execution_factory
         self._limit = limit_input_tokens
         self._reserved = reserved_output_tokens
         documents = [
@@ -104,7 +110,23 @@ class PostgresAnalysisHandler:
         *,
         error_code: str | None = None,
     ) -> None:
+        saved: list[ChunkResult] = []
+        if status == ReviewStatus.FAILED:
+            locked = await lock_owned_lease(session, lease)
+            if locked is None:
+                raise LeaseLostError("Analysis lease is no longer current")
+            saved = await self._usable_saved_results(session, lease.review_job_id)
+            if saved:
+                status = ReviewStatus.PARTIAL
+                locked[0].final_summary = "\n\n".join(row.summary for row in saved)
+                limitation = error_code or (
+                    reason.value.lower() if reason else "analysis_incomplete"
+                )
+                for row in saved:
+                    row.limitations = [*row.limitations, limitation]
         await SqlAlchemyReviewJobRepository(session).update_status(lease, status=status)
+        if status == ReviewStatus.PARTIAL and saved:
+            await self._prepare_publication(session, task, lease)
         job = await session.get(ReviewJob, lease.review_job_id)
         assert job is not None
         details: dict[str, object] = {"error_code": error_code} if error_code else {}
@@ -129,20 +151,32 @@ class PostgresAnalysisHandler:
             )
         )
 
-    async def handle(
+    async def handle(  # noqa: PLR0911 -- explicit expected terminal/retry outcomes
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
     ) -> DurableTaskOutcome | None:
         try:
             return await self._execute(task, lease)
+        except FrozenConfigurationError as failure:
+            async with self._factory.begin() as session:
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    ReviewStatus.FAILED,
+                    ReviewReasonCode.LLM_UNAVAILABLE,
+                    error_code=failure.reason,
+                )
+            return DurableTaskOutcome.COMPLETED
         except ChunkReviewFailedError as failure:
             error_code = failure.outcome.error_code or "llm_error"
-            reason = (
-                ReviewReasonCode.LLM_OUTPUT_INVALID
-                if error_code == "invalid_llm_output"
-                else ReviewReasonCode.LLM_UNAVAILABLE
-            )
+            reason = {
+                "invalid_llm_output": ReviewReasonCode.LLM_OUTPUT_INVALID,
+                "analysis_deadline_exceeded": (
+                    ReviewReasonCode.ANALYSIS_DEADLINE_EXCEEDED
+                ),
+            }.get(error_code, ReviewReasonCode.LLM_UNAVAILABLE)
             if failure.outcome.retryable and await PostgresAnalysisAttemptStore(
                 self._factory
             ).defer_retry(
@@ -188,7 +222,16 @@ class PostgresAnalysisHandler:
                     if failure.reason == ReviewReasonCode.PR_STALE_OR_CLOSED
                     else ReviewStatus.FAILED
                 )
-                await self._transition(session, task, lease, status, failure.reason)
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    status,
+                    failure.reason,
+                    error_code="analysis_deadline_exceeded"
+                    if failure.reason == ReviewReasonCode.ANALYSIS_DEADLINE_EXCEEDED
+                    else None,
+                )
             return DurableTaskOutcome.COMPLETED
 
     async def _execute(  # noqa: PLR0912, PLR0915 — one bounded Level 1 capture
@@ -218,6 +261,22 @@ class PostgresAnalysisHandler:
                     error_code=decision.error_code,
                 )
             return DurableTaskOutcome.COMPLETED
+        llm = self._llm
+        limit, reserved = self._limit, self._reserved
+        if self._execution_factory is not None:
+            authority = current_analysis_authority.get()
+            if authority is None:
+                raise FrozenConfigurationError("execution_authority_required")
+            execution = await self._execution_factory.create(
+                task=task,
+                lease=lease,
+                analysis_attempt=decision.analysis_attempt,
+                authority=authority,
+            )
+            llm = execution.llm
+            limit = execution.configuration.policy.limits.max_input_tokens
+            reserved = execution.configuration.policy.limits.max_output_tokens
+        assert llm is not None
         await self._ensure_call_authority(task, lease)
         async with self._factory.begin() as session:
             stored = await session.scalar(
@@ -284,7 +343,7 @@ class PostgresAnalysisHandler:
             validate_ranges(saved.to_wire())
             for file in cast(list[dict[str, Any]], saved.payload_body["files"]):
                 validate_hunks(file["diff"]["hunks"])
-            return await self._infer(task, lease, saved)
+            return await self._infer(task, lease, saved, llm)
         await self._ensure_call_authority(task, lease)
         try:
             captured = await self._github.fetch(request)
@@ -319,8 +378,8 @@ class PostgresAnalysisHandler:
             "coverage": parsed.coverage,
             "budget": {
                 "estimated_input_tokens": 0,
-                "reserved_output_tokens": self._reserved,
-                "limit_input_tokens": self._limit,
+                "reserved_output_tokens": reserved,
+                "limit_input_tokens": limit,
             },
         }
         context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
@@ -333,7 +392,7 @@ class PostgresAnalysisHandler:
             )
         ) > body["budget"]["estimated_input_tokens"]:
             body["budget"]["estimated_input_tokens"] = estimated
-        if estimated > self._limit:
+        if estimated > limit:
             coverage = {
                 "included": [],
                 "skipped": [
@@ -366,7 +425,7 @@ class PostgresAnalysisHandler:
             )
             await self._transition(session, task, lease, ReviewStatus.LLM_PROCESSING)
 
-        return await self._infer(task, lease, context)
+        return await self._infer(task, lease, context, llm)
 
     def _check_snapshot(
         self,
@@ -392,10 +451,11 @@ class PostgresAnalysisHandler:
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
         context: BuiltContextPayload,
+        llm: LlmGatewayPort,
     ) -> DurableTaskOutcome:
         files = cast(list[dict[str, Any]], context.payload_body["files"])
         await self._ensure_call_authority(task, lease)
-        result = await self._llm.review(context)
+        result = await llm.review(context)
         authority = current_analysis_authority.get()
         if authority is not None:
             authority.check()
@@ -409,6 +469,7 @@ class PostgresAnalysisHandler:
                     lease,
                     ReviewStatus.FAILED,
                     ReviewReasonCode.LLM_OUTPUT_INVALID,
+                    error_code="backend_result_invalid",
                 )
             return DurableTaskOutcome.COMPLETED
         async with self._factory.begin() as session:
@@ -474,27 +535,85 @@ class PostgresAnalysisHandler:
                 session.add(
                     Finding(chunk_result_id=chunk_id, fingerprint=fingerprint, **values)
                 )
-            await SqlAlchemyPublicationRepository(session).prepare(lease)
-            successor = QueueTaskEnvelope(
-                1,
-                str(uuid.uuid4()),
-                str(context.review_id),
-                "publish",
-                1,
-                task.trace_id,
-            )
-            successor.to_json()
-            session.add(
-                OutboxEvent(
-                    id=uuid.UUID(successor.event_id),
-                    review_job_id=context.review_id,
-                    schema_version=1,
-                    task_kind="publish",
-                    attempt=1,
-                    trace_id=task.trace_id,
-                )
-            )
+            await self._prepare_publication(session, task, lease)
         return DurableTaskOutcome.COMPLETED
+
+    async def _usable_saved_results(
+        self, session: AsyncSession, review_id: uuid.UUID
+    ) -> list[ChunkResult]:
+        usable = []
+        rows = (
+            await session.scalars(
+                select(ChunkResult)
+                .where(ChunkResult.review_job_id == review_id)
+                .order_by(ChunkResult.created_at, ChunkResult.id)
+            )
+        ).all()
+        for row in rows:
+            try:
+                usage = TokenUsage(**row.usage) if row.usage is not None else None
+            except TypeError:
+                continue
+            findings = (
+                await session.scalars(
+                    select(Finding).where(Finding.chunk_result_id == row.id)
+                )
+            ).all()
+            fields = ReviewFinding.__dataclass_fields__
+            result = ReviewChunkResult(
+                schema_version=row.schema_version,
+                summary=row.summary,
+                limitations=row.limitations,
+                usage=usage,
+                latency_ms=row.latency_ms,
+                findings=[
+                    ReviewFinding(**{name: getattr(f, name) for name in fields})
+                    for f in findings
+                ],
+            )
+            # Retained canonical results can outlive their ContextPayload by contract.
+            context = (
+                await session.get(ContextPayload, row.context_payload_id)
+                if row.context_payload_id
+                else None
+            )
+            if context is not None:
+                try:
+                    wire = BuiltContextPayload(
+                        context.schema_version,
+                        context.review_job_id,
+                        context.id,
+                        context.payload_body,
+                    ).to_wire()
+                    self._context_validator.validate(wire)
+                    validate_ranges(wire)
+                    for file in context.payload_body["files"]:
+                        validate_hunks(file["diff"]["hunks"])
+                except ValidationError, ValueError, TypeError:
+                    continue
+            files = context.payload_body.get("files", []) if context else None
+            if self._valid_result(result, files):
+                usable.append(row)
+        return usable
+
+    async def _prepare_publication(
+        self, session: AsyncSession, task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
+    ) -> None:
+        await SqlAlchemyPublicationRepository(session).prepare(lease)
+        successor = QueueTaskEnvelope(
+            1, str(uuid.uuid4()), str(lease.review_job_id), "publish", 1, task.trace_id
+        )
+        successor.to_json()
+        session.add(
+            OutboxEvent(
+                id=uuid.UUID(successor.event_id),
+                review_job_id=lease.review_job_id,
+                schema_version=1,
+                task_kind="publish",
+                attempt=1,
+                trace_id=task.trace_id,
+            )
+        )
 
     async def _ensure_call_authority(
         self,
@@ -541,12 +660,14 @@ class PostgresAnalysisHandler:
     def _valid_result(
         self,
         result: ReviewChunkResult,
-        files: list[dict[str, Any]],
+        files: list[dict[str, Any]] | None,
     ) -> bool:
         try:
             wire = asdict(result)
             self._result_validator.validate(wire)
             validate_ranges(wire)
+            if files is None:
+                return True
             allowed: dict[tuple[str, str], set[int]] = {}
             for file in files:
                 diff = file["diff"]

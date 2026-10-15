@@ -117,6 +117,8 @@ class ReviewService:
                 attempt,
                 prompt.prompt_version,
                 error_code=exc.error_code,
+                retryable=exc.retryable,
+                root_error_code=getattr(exc, "last_error_code", exc.error_code),
             )
         attempt.calls.append(call)
         limitations = [*prompt.limitations, *call.parsed.limitations]
@@ -150,16 +152,25 @@ class ReviewService:
                 call_kind=call_kind,
             )
         except SchemaValidationError as exc:
-            # Durable repair permission is fail-closed until Stage 8B-04.
-            if not isinstance(budget, RunBudget) or not budget.try_use_format_repair():
+            repair_id = uuid4()
+            allowed = (
+                budget.try_use_format_repair()
+                if isinstance(budget, RunBudget)
+                else await budget.claim_format_repair(
+                    repair_id=repair_id, chunk_id=UUID(payload.chunk_id)
+                )
+            )
+            if not allowed:
                 raise
-            return await self._repair(payload, exc, budget)
+            return await self._repair(payload, exc, budget, repair_id=repair_id)
 
     async def _repair(
         self,
         payload: ContextPayload,
         error: SchemaValidationError,
         budget: RunBudget | ReviewRunBudgetPort,
+        *,
+        repair_id: UUID,
     ) -> LLMCallResult[LLMReviewOutput]:
         """One repair request: original messages, the truncated invalid answer
         and the validation errors (locations and messages, no source code)."""
@@ -178,9 +189,10 @@ class ReviewService:
             budget,
             payload,
             call_kind="repair",
+            operation_id=repair_id,
         )
 
-    async def _send(
+    async def _send(  # noqa: PLR0913 -- paid operation identity
         self,
         messages: list[ChatMessage],
         input_tokens: int,
@@ -188,6 +200,7 @@ class ReviewService:
         payload: ContextPayload,
         *,
         call_kind: str,
+        operation_id: UUID | None = None,
     ) -> LLMCallResult[LLMReviewOutput]:
         request = LLMRequest(
             messages=messages,
@@ -207,7 +220,7 @@ class ReviewService:
             chunk_id=UUID(payload.chunk_id)
             if not isinstance(budget, RunBudget)
             else None,
-            operation_id=uuid4(),
+            operation_id=operation_id or uuid4(),
             call_kind=call_kind,
         )
 
@@ -222,6 +235,8 @@ class ReviewService:
         outcome: ValidationOutcome | None = None,
         limitations: list[str] | None = None,
         error_code: str | None = None,
+        retryable: bool = False,
+        root_error_code: str | None = None,
     ) -> ReviewChunkOutcome:
         last = attempt.calls[-1] if attempt.calls else None
         result = ReviewChunkOutcome(
@@ -243,6 +258,8 @@ class ReviewService:
             provider=last.provider if last else self._gateway.primary_provider,
             prompt_version=prompt_version,
             error_code=error_code,
+            retryable=retryable,
+            root_error_code=root_error_code,
         )
         logger.info(
             "review_chunk_finished",

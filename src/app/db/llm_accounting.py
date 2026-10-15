@@ -16,7 +16,7 @@ from app.db.analysis_authority import (
     lock_analysis,
     validate_config_identity,
 )
-from app.db.models import ContextPayload, ReviewJob, ReviewLlmAttempt
+from app.db.models import ChunkResult, ContextPayload, ReviewJob, ReviewLlmAttempt
 from app.domain.frozen_configuration import FrozenConfigurationError, ModelSettings
 from app.llm.client import known_token_usage
 from app.llm.errors import BudgetExceededError
@@ -114,6 +114,8 @@ class PostgresReviewRunBudget:
                 raise LeaseLostError("Analysis execution is no longer current")
             if job.analysis_deadline_at is None or job.analysis_deadline_at <= now:
                 raise BudgetExceededError("analysis deadline exceeded")
+            if job.retry_at is not None and job.retry_at > now:
+                raise BudgetExceededError("analysis retry deferred")
             if await session.get(ReviewLlmAttempt, reservation_id) is not None:
                 raise AccountingIdentityError("reservation_already_exists")
             policy = ModelSettings.from_stored(job.model_settings)
@@ -150,6 +152,13 @@ class PostgresReviewRunBudget:
                 )
             ):
                 raise AccountingIdentityError("context_identity_mismatch")
+            if await session.scalar(
+                select(ChunkResult.id).where(
+                    ChunkResult.context_payload_id == chunk_id,
+                    ChunkResult.review_job_id == job.id,
+                )
+            ):
+                raise AccountingIdentityError("context_already_completed")
             routes = {
                 (policy.routing.primary_profile_ref, job.model_ref, job.model_digest),
                 *(
@@ -159,8 +168,13 @@ class PostgresReviewRunBudget:
             }
             if (provider_profile_ref, model_ref, model_digest) not in routes:
                 raise AccountingIdentityError("model_route_mismatch")
-            # Durable repair entitlement is deliberately introduced in 8B-04.
-            if call_kind not in {"initial", "overflow_rebuild"}:
+            if call_kind == "repair" and (
+                job.format_repair_id,
+                job.format_repair_fence,
+                job.format_repair_chunk_id,
+            ) != (operation_id, self._lease.fencing_token, chunk_id):
+                raise AccountingIdentityError("repair_claim_mismatch")
+            if call_kind not in {"initial", "overflow_rebuild", "repair"}:
                 raise AccountingIdentityError("unsupported_call_kind")
             if (
                 type(input_tokens) is not int
@@ -223,6 +237,10 @@ class PostgresReviewRunBudget:
                         ReviewJob.analysis_attempts == self._attempt,
                         ReviewJob.analysis_attempt_fence == self._lease.fencing_token,
                         ReviewJob.analysis_deadline_at > func.clock_timestamp(),
+                        (
+                            ReviewJob.retry_at.is_(None)
+                            | (ReviewJob.retry_at <= func.clock_timestamp())
+                        ),
                         live_fence(self._lease),
                     ),
                 )
@@ -243,6 +261,10 @@ class PostgresReviewRunBudget:
                         ReviewJob.analysis_attempts == self._attempt,
                         ReviewJob.analysis_attempt_fence == self._lease.fencing_token,
                         ReviewJob.analysis_deadline_at > func.clock_timestamp(),
+                        (
+                            ReviewJob.retry_at.is_(None)
+                            | (ReviewJob.retry_at <= func.clock_timestamp())
+                        ),
                     ),
                 )
                 .values(reserved_at=func.clock_timestamp())
@@ -256,6 +278,59 @@ class PostgresReviewRunBudget:
             )
         # Returning only after __aexit__ confirms the commit: no ambiguous permit.
         return permit  # noqa: RET504 -- return only after confirmed transaction exit
+
+    async def claim_format_repair(self, *, repair_id: UUID, chunk_id: UUID) -> bool:
+        async with self._factory.begin() as session:
+            job, _, now = await lock_analysis(session, self._task, self._lease)
+            if job.frozen_configuration_version != 1:
+                raise FrozenConfigurationError("historical_budget_unknown")
+            ModelSettings.from_stored(job.model_settings)
+            validate_config_identity(job)
+            if (
+                job.finished_at is not None
+                or job.analysis_attempts != self._attempt
+                or job.analysis_attempt_fence != self._lease.fencing_token
+            ):
+                raise LeaseLostError("Analysis execution is no longer current")
+            if job.analysis_deadline_at is None or job.analysis_deadline_at <= now:
+                raise BudgetExceededError("analysis deadline exceeded")
+            if job.retry_at is not None and job.retry_at > now:
+                raise BudgetExceededError("analysis retry deferred")
+            if not await session.scalar(
+                select(ContextPayload.id).where(
+                    ContextPayload.id == chunk_id,
+                    ContextPayload.review_job_id == job.id,
+                )
+            ):
+                raise AccountingIdentityError("context_identity_mismatch")
+            if job.format_repair_id is not None:
+                return False
+            changed = await session.scalar(
+                update(ReviewJob)
+                .where(
+                    ReviewJob.id == job.id,
+                    ReviewJob.finished_at.is_(None),
+                    ReviewJob.analysis_attempts == self._attempt,
+                    ReviewJob.analysis_attempt_fence == self._lease.fencing_token,
+                    ReviewJob.analysis_deadline_at > func.clock_timestamp(),
+                    (
+                        ReviewJob.retry_at.is_(None)
+                        | (ReviewJob.retry_at <= func.clock_timestamp())
+                    ),
+                    ReviewJob.format_repair_id.is_(None),
+                    live_fence(self._lease),
+                )
+                .values(
+                    format_repair_id=repair_id,
+                    format_repair_claimed_at=func.clock_timestamp(),
+                    format_repair_fence=self._lease.fencing_token,
+                    format_repair_chunk_id=chunk_id,
+                )
+                .returning(ReviewJob.id)
+            )
+            if changed is None:
+                raise LeaseLostError("Repair claim authority expired")
+        return True
 
     async def settle_call(  # noqa: PLR0913 -- identified immutable settlement
         self,

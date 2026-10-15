@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
@@ -27,6 +28,10 @@ from app.adapters.analysis_handler import PostgresAnalysisHandler
 from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
 from app.adapters.redis_queue import RedisQueue
 from app.adapters.review_worker import PostgresReviewWorker
+from app.application.analysis_authority import (
+    LiveAnalysisAuthority,
+    current_analysis_authority,
+)
 from app.application.ports import (
     BuiltContextPayload,
     LeaseLostError,
@@ -1183,7 +1188,8 @@ async def test_rate_limited_github_preserves_active_job_and_pending_delivery(
         and review.status == "FETCHING_DIFF"
         and review.finished_at is None
     )
-    assert len(events) == 1 and events[0].retryable and events[0].safe_details is None
+    assert len(events) == 1 and events[0].retryable
+    assert events[0].safe_details == {"error_code": "vcs_rate_limited"}
     assert llm.payloads == []
     assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
         "pending"
@@ -1568,6 +1574,12 @@ async def test_failure_audit_uses_durable_execution_attempt(
         )
         assert await handler.handle(task, first) is None
         assert await leases.release(first)
+        async with factory.begin() as session:
+            await session.execute(
+                update(ReviewJob)
+                .where(ReviewJob.id == review_id)
+                .values(retry_at=func.clock_timestamp() - timedelta(seconds=1))
+            )
         second = await leases.acquire(review_id, owner="second", task_kind="analyze")
         assert second is not None
         assert await handler.handle(task, second) is None
@@ -1583,3 +1595,51 @@ async def test_failure_audit_uses_durable_execution_attempt(
             )
         ).all()
         assert [event.attempt for event in events] == [1, 2]
+
+
+async def test_local_authority_loss_before_result_persistence_keeps_delivery_pending(
+    postgres: PostgresHarness,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", 1, event.trace_id
+        )
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancelled-result", task_kind="analyze"
+    )
+    assert lease is not None
+    signal = LiveAnalysisAuthority(lease, started=time.monotonic())
+
+    class LostAuthorityLlm(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            signal.cancel()
+            return result
+
+    async with httpx.AsyncClient(transport=github_http()) as http:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(http), LostAuthorityLlm(), schemas_dir=SCHEMAS
+        )
+        token = current_analysis_authority.set(signal)
+        try:
+            with pytest.raises(LeaseLostError):
+                await handler.handle(task, lease)
+        finally:
+            current_analysis_authority.reset(token)
+    async with factory() as session:
+        assert (
+            await session.scalar(
+                select(ChunkResult.id).where(ChunkResult.review_job_id == review_id)
+            )
+            is None
+        )
+        job = await session.get(ReviewJob, review_id)
+        assert job is not None and job.finished_at is None

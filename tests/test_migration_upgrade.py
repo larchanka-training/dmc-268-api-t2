@@ -445,7 +445,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0009"
+        == "0010"
     )
     assert (
         await database.connection.fetch(
@@ -617,6 +617,7 @@ async def test_durable_accounting_upgrade_preserves_legacy_clocks_and_identity(
             )
         ).values()
     ) == (0, None)
+    database.migrate("upgrade", "head")
     database.migrate("check")
     database.migrate("downgrade", "0008")
     assert (
@@ -626,4 +627,54 @@ async def test_durable_accounting_upgrade_preserves_legacy_clocks_and_identity(
         == before
     )
     database.migrate("upgrade", "0009")
+    database.migrate("upgrade", "head")
     database.migrate("check")
+
+
+async def test_durable_repair_0010_round_trip_and_atomic_check(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+    before = await database.connection.fetchrow(
+        "SELECT config_digest, model_settings, analysis_attempts "
+        "FROM review_job WHERE id=$1",
+        job_id,
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE review_job SET format_repair_id=$2 WHERE id=$1",
+            job_id,
+            uuid.uuid4(),
+        )
+    await database.connection.execute(
+        "UPDATE review_job SET format_repair_id=$2, "
+        "format_repair_claimed_at=clock_timestamp(), format_repair_fence=1, "
+        "format_repair_chunk_id=$3 WHERE id=$1",
+        job_id,
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    database.migrate("downgrade", "0009")
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0009"
+    )
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+    assert (
+        await database.connection.fetchrow(
+            "SELECT config_digest, model_settings, analysis_attempts "
+            "FROM review_job WHERE id=$1",
+            job_id,
+        )
+        == before
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT format_repair_id FROM review_job WHERE id=$1", job_id
+        )
+        is None
+    )

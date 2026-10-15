@@ -262,6 +262,16 @@ class ReviewJob(Base):
     analysis_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    format_repair_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    format_repair_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    format_repair_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    format_repair_chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     analysis_attempt_fence: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
@@ -319,6 +329,14 @@ class ReviewJob(Base):
     outbox_events: Mapped[list[OutboxEvent]] = relationship(back_populates="review_job")
 
     __table_args__ = (
+        CheckConstraint(
+            "(format_repair_id IS NULL AND format_repair_claimed_at IS NULL "
+            "AND format_repair_fence IS NULL AND format_repair_chunk_id IS NULL) OR "
+            "(format_repair_id IS NOT NULL AND format_repair_claimed_at IS NOT NULL "
+            "AND format_repair_fence IS NOT NULL AND format_repair_fence >= 1 "
+            "AND format_repair_chunk_id IS NOT NULL)",
+            name=conv("ck_review_job_repair_state"),
+        ),
         CheckConstraint(
             "(analysis_attempts = 0 AND analysis_attempt_fence IS NULL) OR "
             "(analysis_attempts > 0 AND analysis_attempt_fence IS NOT NULL "

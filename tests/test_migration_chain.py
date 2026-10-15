@@ -9,7 +9,7 @@ def test_github_intake_extends_accepted_contract_and_ownership_migrations() -> N
     config = Config(str(root / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["0009"]
+    assert scripts.get_heads() == ["0010"]
     assert scripts.get_revision("0009").down_revision == "0008"
     assert scripts.get_revision("0008").down_revision == "0007"
     assert scripts.get_revision("0007").down_revision == "0006"

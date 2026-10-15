@@ -60,3 +60,6 @@ class ReviewChunkOutcome(BaseModel):
     provider: str
     prompt_version: str
     error_code: str | None  # safe code when FAILED, never model output text
+
+    retryable: bool = False
+    root_error_code: str | None = None

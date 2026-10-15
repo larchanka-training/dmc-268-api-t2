@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import UUID
 
 from app.application.ports import QueueTaskEnvelope, TaskLeaseSnapshot
+from app.domain.enums import ReviewReasonCode
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,16 @@ class AnalysisAttemptStore(Protocol):
     async def begin(
         self, *, task: QueueTaskEnvelope, lease: TaskLeaseSnapshot
     ) -> BeginAnalysisDecision: ...
+
+    async def defer_retry(
+        self,
+        *,
+        task: QueueTaskEnvelope,
+        lease: TaskLeaseSnapshot,
+        reason: ReviewReasonCode,
+        error_code: str,
+        delay_s: float,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,8 @@ class AccountingIdentityError(ValueError):
 
 
 class ReviewRunBudgetPort(Protocol):
+    async def claim_format_repair(self, *, repair_id: UUID, chunk_id: UUID) -> bool: ...
+
     async def snapshot(self) -> DurableBudgetSnapshot: ...
     async def remaining_s(self) -> float: ...
     async def reserve_call(  # noqa: PLR0913 -- immutable HTTP identity

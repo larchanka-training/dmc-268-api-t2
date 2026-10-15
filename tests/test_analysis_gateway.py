@@ -288,6 +288,25 @@ async def test_gateway_failure_finishes_without_restarting_provider_budget(
             adapter,
             schemas_dir=SCHEMAS,
         )
+        if http_status == 503 and not limits:  # noqa: PLR2004 -- transient case
+            assert await handler.handle(task, lease) is None
+            assert not await PostgresWorkerTasks(factory).completed(task, lease)
+            async with factory() as session:
+                job = await session.get(ReviewJob, review_id)
+                assert job is not None and job.retry_at is not None
+                event = (
+                    await session.scalars(
+                        select(ReviewEvent).where(
+                            ReviewEvent.review_job_id == review_id,
+                            ReviewEvent.event_type == "FAILURE",
+                        )
+                    )
+                ).one()
+                assert event.retryable
+                assert event.safe_details == {"error_code": "provider_unavailable"}
+            assert len(requests) == expected_requests
+            await leases.release(lease)
+            return
         assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
         # Terminal durable decision prevents a worker from invoking LLM again
         # on redelivery; its existing completed() gate is part of that contract.
@@ -321,7 +340,9 @@ async def test_gateway_failure_finishes_without_restarting_provider_budget(
         )
     assert job is not None and job.status == "FAILED" and job.finished_at is not None
     assert failed.reason_code == "LLM_UNAVAILABLE" and failed.retryable is False
-    assert failed.safe_details == {"error_code": error_code}
+    assert failed.safe_details == {
+        "error_code": "provider_auth_failed" if http_status == 401 else error_code  # noqa: PLR2004 -- auth case
+    }
     assert len(requests) == expected_requests
     await leases.release(lease)
 

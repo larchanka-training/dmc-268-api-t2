@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
+from app.application.analysis_authority import (
+    LiveAnalysisAuthority,
+    current_analysis_authority,
+)
 from app.application.ports import (
     DurableTaskOutcome,
     LeaseLostError,
@@ -54,6 +59,7 @@ class PostgresReviewWorker:
             return False
         if await self._tasks.completed(delivery.envelope):
             return await self._queue.ack(delivery)
+        claim_started = time.monotonic()
         lease = await self._leases.acquire(
             uuid.UUID(delivery.envelope.review_id),
             owner=self._owner,
@@ -61,7 +67,13 @@ class PostgresReviewWorker:
         )
         if lease is None:
             return False
-        return await self._run_claimed(delivery, lease)
+        authority = LiveAnalysisAuthority(lease, started=claim_started)
+        token = current_analysis_authority.set(authority)
+        try:
+            return await self._run_claimed(delivery, lease)
+        finally:
+            authority.cancel()
+            current_analysis_authority.reset(token)
 
     async def _run_claimed(
         self, delivery: QueueDelivery, lease: TaskLeaseSnapshot
@@ -69,21 +81,30 @@ class PostgresReviewWorker:
         try:
             if not await self._tasks.ready(delivery.envelope, lease):
                 return False
+            authority = current_analysis_authority.get()
+            assert authority is not None
+            watchdog = asyncio.create_task(authority.watch())
             heartbeat = asyncio.create_task(self._heartbeat(delivery, lease))
             handling = asyncio.create_task(
                 self._handler.handle(delivery.envelope, lease)
             )
             try:
                 done, _ = await asyncio.wait(
-                    (handling, heartbeat), return_when=asyncio.FIRST_COMPLETED
+                    (handling, heartbeat, watchdog), return_when=asyncio.FIRST_COMPLETED
                 )
                 if heartbeat in done:
                     await heartbeat
+                if watchdog in done:
+                    await watchdog
                 outcome = await handling
             finally:
+                authority.cancel()
+                watchdog.cancel()
                 heartbeat.cancel()
                 handling.cancel()
-                await asyncio.gather(heartbeat, handling, return_exceptions=True)
+                await asyncio.gather(
+                    heartbeat, handling, watchdog, return_exceptions=True
+                )
             # A failure racing handler completion must still prevent ACK.
             if not heartbeat.cancelled():
                 heartbeat.result()
@@ -102,9 +123,20 @@ class PostgresReviewWorker:
     ) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            if await self._leases.renew(lease) is None:
+            authority = current_analysis_authority.get()
+            assert authority is not None
+            authority.check()
+            started = time.monotonic()
+            try:
+                renewed = await self._leases.renew(lease)
+            except BaseException:
+                authority.cancel()
+                raise
+            if renewed is None:
                 # Terminal commit can make renewal ineligible before handle returns.
                 # Only a durable decision under this same live claim explains it.
                 if await self._tasks.completed(delivery.envelope, lease):
                     return
+                authority.cancel()
                 raise LeaseLostError("Task lease could not be renewed")
+            authority.confirm(renewed, started=started)

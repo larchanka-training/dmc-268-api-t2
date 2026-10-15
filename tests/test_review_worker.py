@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 
+import httpx
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
@@ -1075,7 +1076,9 @@ async def test_handler_keeps_lease_live_through_automatic_heartbeat(
             .where(ReviewJob.id == uuid.UUID(task.review_id))
             .values(
                 analysis_deadline_at=func.clock_timestamp() + timedelta(minutes=10),
-                retry_at=func.clock_timestamp() + timedelta(minutes=1),
+                retry_at=(func.clock_timestamp() + timedelta(minutes=1))
+                if kind == "publish"
+                else None,
             )
         )
     entered, finish = asyncio.Event(), asyncio.Event()
@@ -1414,3 +1417,60 @@ async def test_worker_cancellation_joins_blocked_heartbeat_before_release(
     finally:
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
+
+
+async def test_hung_heartbeat_cancels_http_at_last_confirmed_expiry(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    monkeypatch.setattr(
+        "app.db.task_leases.LEASE_DURATION", timedelta(milliseconds=500)
+    )
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    factory = async_sessionmaker(postgres.engine)
+
+    async def response(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+
+        async def call(task: QueueTaskEnvelope, lease: TaskLeaseSnapshot) -> None:
+            await http.get("https://llm.invalid/hung")
+
+        queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+        await queue.enqueue(task)
+        worker = PostgresReviewWorker(
+            factory,
+            queue,
+            CallbackHandler(call),
+            owner="hung",
+            task_kind="analyze",
+            heartbeat_interval=0.05,
+        )
+        running = asyncio.create_task(worker.run_once())
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            async with factory.begin() as blocker:
+                await blocker.execute(text("LOCK TABLE task_lease IN SHARE MODE"))
+                pid = await blocker.scalar(select(func.pg_backend_pid()))
+                await wait_for_blocked_worker(postgres, pid)
+                await asyncio.wait_for(cancelled.wait(), 1)
+            with pytest.raises(LeaseLostError):
+                await running
+            assert (
+                await redis_client.xpending(
+                    f"{stream_prefix}:analyze", "review-workers"
+                )
+            )["pending"] == 1
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)

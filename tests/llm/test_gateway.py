@@ -1,5 +1,6 @@
 """LLMGateway routing, key rotation, backoff and failover (spec §4.3-4.4)."""
 
+import asyncio
 import json
 import random
 from collections import defaultdict, deque
@@ -326,3 +327,38 @@ async def test_request_errors_are_not_retried_or_failed_over(
         await _call(gateway, _budget(clock))
 
     assert provider.calls == ["key-one"]
+
+
+async def test_whole_http_timeout_includes_blocked_transport_pool() -> None:
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def blocked(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return httpx.Response(200)
+
+    async def no_backoff(delay: float) -> None:
+        pass
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(blocked)) as http:
+        gateway = build_gateway(_settings(fallback=False), http, sleep=no_backoff)
+        budget = RunBudget(BudgetLimits(8, 80000, 16000, 600))
+        async with asyncio.timeout(1):
+            with pytest.raises(LLMUnavailableError) as error:
+                await gateway.generate_structured(
+                    LLMRequest(
+                        messages=[ChatMessage(role="user", content="review")],
+                        max_output_tokens=2000,
+                        timeout_s=0.01,
+                    ),
+                    Answer,
+                    budget=budget,
+                    input_tokens=100,
+                )
+        assert error.value.retryable
+        assert error.value.last_error_code == "provider_timeout"
+        assert entered.is_set() and cancelled.is_set()

@@ -205,6 +205,7 @@ class TaskLeaseSnapshot:
     expires_at: datetime
     fencing_token: int
     task_kind: TaskKind
+    sampled_at: datetime | None = None
 
 
 class LeaseLostError(Exception):

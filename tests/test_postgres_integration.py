@@ -746,6 +746,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
         "fk_review_job_change_request_same_repository": "f",
         "fk_review_job_settings_same_repository": "f",
         "ck_review_job_status_finished_at": "c",
+        "ck_review_job_repair_state": "c",
         "uq_context_payload_review_job_id_id": "u",
         "fk_chunk_result_context_payload_same_review": "f",
         "uq_chunk_result_context_payload": "u",
@@ -756,7 +757,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0009"
+        ).scalar_one() == "0010"
 
         result = await connection.execute(
             text(

@@ -103,13 +103,14 @@ def publish_eligibility_sql(review_job_id: uuid.UUID) -> ColumnElement[bool]:
     ).correlate(None)
 
 
-def _snapshot(lease: TaskLease) -> TaskLeaseSnapshot:
+def _snapshot(lease: TaskLease, sampled_at: datetime) -> TaskLeaseSnapshot:
     return TaskLeaseSnapshot(
         review_job_id=lease.review_job_id,
         owner=lease.owner,
         expires_at=lease.expires_at,
         fencing_token=lease.fencing_token,
         task_kind=cast(TaskKind, lease.task_kind),
+        sampled_at=sampled_at,
     )
 
 
@@ -158,7 +159,7 @@ class PostgresTaskLeaseStore:
                 lease.expires_at = now + LEASE_DURATION
                 lease.fencing_token += 1
             await session.flush()
-            return _snapshot(lease)
+            return _snapshot(lease, now)
 
     async def renew(self, lease: TaskLeaseSnapshot) -> TaskLeaseSnapshot | None:
         async with self._session_factory.begin() as session:
@@ -173,26 +174,28 @@ class PostgresTaskLeaseStore:
             now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
             if not task_is_eligible(locked[0], lease.task_kind, publication, now):
                 return None
-            current = await session.scalar(
-                update(TaskLease)
-                .where(
-                    TaskLease.review_job_id == lease.review_job_id,
-                    TaskLease.owner == lease.owner,
-                    TaskLease.task_kind == lease.task_kind,
-                    TaskLease.fencing_token == lease.fencing_token,
-                    TaskLease.expires_at > func.clock_timestamp(),
-                    publish_eligibility_sql(lease.review_job_id)
-                    if lease.task_kind == "publish"
-                    else exists().where(
-                        ReviewJob.id == lease.review_job_id,
-                        ReviewJob.finished_at.is_(None),
-                    ),
+            current = (
+                await session.execute(
+                    update(TaskLease)
+                    .where(
+                        TaskLease.review_job_id == lease.review_job_id,
+                        TaskLease.owner == lease.owner,
+                        TaskLease.task_kind == lease.task_kind,
+                        TaskLease.fencing_token == lease.fencing_token,
+                        TaskLease.expires_at > func.clock_timestamp(),
+                        publish_eligibility_sql(lease.review_job_id)
+                        if lease.task_kind == "publish"
+                        else exists().where(
+                            ReviewJob.id == lease.review_job_id,
+                            ReviewJob.finished_at.is_(None),
+                        ),
+                    )
+                    .values(expires_at=func.clock_timestamp() + LEASE_DURATION)
+                    .returning(TaskLease, func.clock_timestamp())
+                    .execution_options(populate_existing=True)
                 )
-                .values(expires_at=func.clock_timestamp() + LEASE_DURATION)
-                .returning(TaskLease)
-                .execution_options(populate_existing=True)
-            )
-            return None if current is None else _snapshot(current)
+            ).one_or_none()
+            return None if current is None else _snapshot(current[0], current[1])
 
     async def release(self, lease: TaskLeaseSnapshot) -> bool:
         async with self._session_factory.begin() as session:

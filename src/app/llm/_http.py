@@ -10,6 +10,7 @@ from app.llm.errors import (
     AuthError,
     ContextOverflowError,
     ProviderRequestError,
+    ProviderTimeoutError,
     RateLimitedError,
     SchemaValidationError,
     TransientProviderError,
@@ -39,8 +40,9 @@ async def post_json(
     """POST ``body`` once and return the decoded JSON of a 2xx response."""
     try:
         response = await http.post(url, json=body, headers=headers, timeout=timeout_s)
+    except httpx.TimeoutException:
+        raise ProviderTimeoutError from None
     except (
-        httpx.TimeoutException,
         httpx.NetworkError,
         httpx.RemoteProtocolError,
     ) as exc:

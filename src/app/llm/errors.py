@@ -7,6 +7,7 @@ and keys never go into error messages.
 
 class LLMGatewayError(Exception):
     error_code = "llm_error"
+    retryable = False
     input_tokens: int | None = None
     output_tokens: int | None = None
     latency_ms: int | None = None
@@ -19,6 +20,7 @@ class RateLimitedError(LLMGatewayError):
     """HTTP 429: the key/endpoint goes into cooldown."""
 
     error_code = "rate_limited"
+    retryable = True
 
     def __init__(self, retry_after: float | None = None) -> None:
         super().__init__()
@@ -29,10 +31,15 @@ class TransientProviderError(LLMGatewayError):
     """HTTP 500/502/503/504, connect/read timeouts, protocol errors."""
 
     error_code = "provider_unavailable"
+    retryable = True
 
     def __init__(self, message: str = "", *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class ProviderTimeoutError(TransientProviderError):
+    error_code = "provider_timeout"
 
 
 class AuthError(LLMGatewayError):
@@ -85,9 +92,10 @@ class LLMUnavailableError(LLMGatewayError):
 
     error_code = "llm_unavailable"
 
-    def __init__(self, last_error_code: str) -> None:
+    def __init__(self, last_error_code: str, *, retryable: bool = False) -> None:
         super().__init__(f"all providers failed, last error: {last_error_code}")
         self.last_error_code = last_error_code
+        self.retryable = retryable
 
 
 class ModelIdentityError(LLMGatewayError):

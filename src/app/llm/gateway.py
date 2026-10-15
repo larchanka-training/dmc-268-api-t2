@@ -14,7 +14,9 @@ from uuid import UUID, uuid4
 import structlog
 from pydantic import BaseModel
 
+from app.application.analysis_authority import current_analysis_authority
 from app.application.analysis_ports import AccountingIdentityError, ReviewRunBudgetPort
+from app.application.ports import LeaseLostError
 from app.llm.budget import RunBudget
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
 from app.llm.errors import (
@@ -23,6 +25,7 @@ from app.llm.errors import (
     LLMGatewayError,
     LLMUnavailableError,
     ModelIdentityError,
+    ProviderTimeoutError,
     RateLimitedError,
     TransientProviderError,
 )
@@ -99,6 +102,7 @@ class LLMGateway:
     ) -> LLMCallResult[T]:
         attempts = 0
         last_error: LLMGatewayError | None = None
+        saw_retryable = False
         for pool in self._pools:
             transient_failures = 0
             while (
@@ -108,6 +112,9 @@ class LLMGateway:
                 endpoint = pool.next_available(self._clock())
                 if endpoint is None:
                     break
+                authority = current_analysis_authority.get()
+                if authority is not None:
+                    authority.check()
                 reservation = None
                 permit = None
                 if isinstance(budget, RunBudget):
@@ -123,6 +130,7 @@ class LLMGateway:
                         or endpoint.expected_model is None
                     ):
                         raise AccountingIdentityError("durable_call_identity_required")
+                    reserve_started = self._clock()
                     permit = await budget.reserve_call(
                         reservation_id=uuid4(),
                         chunk_id=chunk_id,
@@ -137,16 +145,39 @@ class LLMGateway:
                 attempts += 1
                 # A failed attempt has no usage: its whole reservation stays
                 # charged (SD §14).
-                timeout_s = min(
-                    request.timeout_s, pool.timeout_s, await _remaining_s(budget)
-                )
+                if permit is None:
+                    remaining = await _remaining_s(budget)
+                else:
+                    elapsed = self._clock() - reserve_started
+                    remaining = (
+                        permit.analysis_deadline_at - permit.sampled_at
+                    ).total_seconds() - elapsed
+                    if remaining <= 0:
+                        raise BudgetExceededError(
+                            "analysis deadline exceeded before dispatch"
+                        )
+                    if (
+                        permit.lease_expires_at - permit.sampled_at
+                    ).total_seconds() <= elapsed:
+                        raise LeaseLostError("Lease expired before dispatch")
+                timeout_s = min(request.timeout_s, pool.timeout_s, remaining)
                 try:
                     try:
-                        result = await endpoint.client.generate_structured(
-                            request.model_copy(update={"timeout_s": timeout_s}),
-                            response_model,
-                        )
+                        try:
+                            async with asyncio.timeout(timeout_s):
+                                if authority is not None:
+                                    authority.check()
+                                result = await endpoint.client.generate_structured(
+                                    request.model_copy(update={"timeout_s": timeout_s}),
+                                    response_model,
+                                )
+                        except TimeoutError:
+                            raise ProviderTimeoutError from None
+                        if authority is not None:
+                            authority.check()
                     except LLMGatewayError as exc:
+                        if authority is not None:
+                            authority.check()
                         if isinstance(budget, RunBudget):
                             assert reservation is not None
                             budget.settle(
@@ -171,15 +202,18 @@ class LLMGateway:
                         exc.retry_after or 0.0, self._backoff(attempts)
                     )
                     last_error = exc
+                    saw_retryable |= exc.retryable
                     continue
                 except AuthError as exc:
                     _log_failure(pool.name, attempts, exc)
                     endpoint.disabled = True
                     last_error = exc
+                    saw_retryable |= exc.retryable
                     continue
                 except TransientProviderError as exc:
                     _log_failure(pool.name, attempts, exc)
                     last_error = exc
+                    saw_retryable = True
                     transient_failures += 1
                     if transient_failures < MAX_TRANSIENT_PER_PROVIDER:
                         await self._wait(self._backoff(attempts), budget)
@@ -220,7 +254,8 @@ class LLMGateway:
                 )
                 return result
         raise LLMUnavailableError(
-            last_error.error_code if last_error else "no_available_endpoint"
+            last_error.error_code if last_error else "no_available_endpoint",
+            retryable=saw_retryable or last_error is None,
         )
 
     async def _wait(

@@ -15,6 +15,7 @@ from referencing import Registry, Resource
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.analysis_authority import current_analysis_authority
 from app.application.github_ports import GithubFailure, GithubPort, GithubRequest
 from app.application.ports import (
     BuiltContextPayload,
@@ -136,14 +137,22 @@ class PostgresAnalysisHandler:
         try:
             return await self._execute(task, lease)
         except ChunkReviewFailedError as failure:
-            # Gateway already owns bounded provider retries/repair. Until durable
-            # budget recovery exists, do not restart them through queue redelivery.
             error_code = failure.outcome.error_code or "llm_error"
             reason = (
                 ReviewReasonCode.LLM_OUTPUT_INVALID
                 if error_code == "invalid_llm_output"
                 else ReviewReasonCode.LLM_UNAVAILABLE
             )
+            if failure.outcome.retryable and await PostgresAnalysisAttemptStore(
+                self._factory
+            ).defer_retry(
+                task=task,
+                lease=lease,
+                reason=reason,
+                error_code=failure.outcome.root_error_code or error_code,
+                delay_s=2,
+            ):
+                return None
             async with self._factory.begin() as session:
                 await self._transition(
                     session,
@@ -151,33 +160,27 @@ class PostgresAnalysisHandler:
                     lease,
                     ReviewStatus.FAILED,
                     reason,
-                    error_code=error_code,
+                    error_code=failure.outcome.root_error_code or error_code,
                 )
             return DurableTaskOutcome.COMPLETED
         except GithubFailure as failure:
+            if await PostgresAnalysisAttemptStore(self._factory).defer_retry(
+                task=task,
+                lease=lease,
+                reason=ReviewReasonCode(failure.reason_code),
+                error_code=failure.reason_code.lower(),
+                delay_s=2,
+            ):
+                return None
             async with self._factory.begin() as session:
-                locked = await lock_owned_lease(session, lease)
-                if locked is None:
-                    raise LeaseLostError(
-                        "Analysis lease is no longer current"
-                    ) from None
-                review = locked[0]
-                await SqlAlchemyReviewJobRepository(session).update_status(
+                await self._transition(
+                    session,
+                    task,
                     lease,
-                    status=ReviewStatus(review.status),
+                    ReviewStatus.FAILED,
+                    ReviewReasonCode(failure.reason_code),
                 )
-                session.add(
-                    ReviewEvent(
-                        review_job_id=lease.review_job_id,
-                        event_type="FAILURE",
-                        status=review.status,
-                        phase=review.status,
-                        reason_code=ReviewReasonCode(failure.reason_code),
-                        retryable=True,
-                        attempt=max(1, review.analysis_attempts),
-                    )
-                )
-            return None
+            return DurableTaskOutcome.COMPLETED
         except _AnalysisFailureError as failure:
             async with self._factory.begin() as session:
                 status = (
@@ -188,14 +191,16 @@ class PostgresAnalysisHandler:
                 await self._transition(session, task, lease, status, failure.reason)
             return DurableTaskOutcome.COMPLETED
 
-    async def _execute(  # noqa: PLR0915 — one bounded Level 1 capture
+    async def _execute(  # noqa: PLR0912, PLR0915 — one bounded Level 1 capture
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
-    ) -> DurableTaskOutcome:
+    ) -> DurableTaskOutcome | None:
         decision = await PostgresAnalysisAttemptStore(self._factory).begin(
             task=task, lease=lease
         )
+        if decision.error_code == "retry_deferred":
+            return None
         if not decision.accepted:
             reason = {
                 "queue_deadline_exceeded": ReviewReasonCode.QUEUE_DEADLINE_EXCEEDED,
@@ -391,6 +396,9 @@ class PostgresAnalysisHandler:
         files = cast(list[dict[str, Any]], context.payload_body["files"])
         await self._ensure_call_authority(task, lease)
         result = await self._llm.review(context)
+        authority = current_analysis_authority.get()
+        if authority is not None:
+            authority.check()
         if not self._valid_result(result, files):
             # Raw format repair belongs exclusively to ReviewService. Invalid
             # backend results fail defensively without another provider call.
@@ -407,6 +415,8 @@ class PostgresAnalysisHandler:
             locked = await lock_owned_lease(session, lease)
             if locked is None:
                 raise LeaseLostError("Analysis lease is no longer current")
+            if authority is not None:
+                authority.check()
             deadline = locked[0].analysis_deadline_at
             late = deadline is not None and deadline <= locked[2]
             await self._transition(

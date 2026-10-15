@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -29,6 +30,10 @@ from test_postgres_integration import (
 )
 
 from app.adapters.analysis_handler import PostgresAnalysisHandler
+from app.application.analysis_authority import (
+    LiveAnalysisAuthority,
+    current_analysis_authority,
+)
 from app.application.analysis_ports import (
     AccountingIdentityError,
     CallPermit,
@@ -60,6 +65,7 @@ from app.db.models import (
 from app.db.task_leases import PostgresTaskLeaseStore
 from app.db.uow import SqlAlchemyUnitOfWork
 from app.db.worker_tasks import QueueIdentityError
+from app.domain.enums import ReviewReasonCode
 from app.domain.frozen_configuration import (
     FrozenConfigurationError,
     ModelSettings,
@@ -69,6 +75,8 @@ from app.domain.frozen_configuration import (
 from app.domain.settings import compute_repository_settings_digest, compute_rules_digest
 from app.llm.client import ChatMessage, LLMRequest
 from app.llm.errors import BudgetExceededError, SchemaValidationError
+from app.llm.gateway import Endpoint, LLMGateway, ProviderPool
+from app.llm.openai_compatible import OpenAICompatibleClient
 from app.llm.tokens import ConservativeTokenCounter
 from app.review.configuration import FrozenConfigurationReader, build_frozen_gateway
 from app.review.port_adapter import ChunkReviewFailedError, LlmGatewayAdapter
@@ -1573,3 +1581,324 @@ async def test_unique_index_wait_cannot_issue_expired_permit(
                     delete(table).where(table.review_job_id == other_id)
                 )
             await session.execute(delete(ReviewJob).where(ReviewJob.id == other_id))
+
+
+async def test_deadline_rejection_precedes_future_retry_gate(
+    execution: Execution,
+) -> None:
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    async with execution.factory.begin() as session:
+        await session.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == execution.lease.review_job_id)
+            .values(
+                retry_at=func.clock_timestamp() + timedelta(minutes=1),
+                analysis_deadline_at=func.clock_timestamp() - timedelta(seconds=1),
+            )
+        )
+    decision = await execution.store().begin(task=execution.task, lease=execution.lease)
+    assert not decision.accepted and decision.error_code == "analysis_deadline_exceeded"
+    assert decision.analysis_attempt == 1
+
+
+@pytest.mark.parametrize("loss", ["fence", "signal", "deadline"])
+async def test_gateway_stops_after_503_when_authority_changes(
+    execution: Execution,
+    loss: str,
+) -> None:
+
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    signal = LiveAnalysisAuthority(execution.lease, started=time.monotonic())
+    calls = []
+
+    async def response(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503)
+
+    async def backoff(delay: float) -> None:
+        if loss == "signal":
+            signal.cancel()
+        elif loss == "deadline":
+            async with execution.factory.begin() as session:
+                await session.execute(
+                    update(ReviewJob)
+                    .where(ReviewJob.id == execution.lease.review_job_id)
+                    .values(
+                        analysis_deadline_at=func.clock_timestamp()
+                        - timedelta(seconds=1)
+                    )
+                )
+        else:
+            async with execution.factory.begin() as session:
+                await session.execute(
+                    update(TaskLease)
+                    .where(TaskLease.review_job_id == execution.lease.review_job_id)
+                    .values(fencing_token=2)
+                )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        client = OpenAICompatibleClient(
+            name="eurorouter",
+            http=http,
+            base_url="https://llm.invalid/v1",
+            model="test-model",
+            api_key="test",
+        )
+        gateway = LLMGateway(
+            [
+                ProviderPool(
+                    "eurorouter",
+                    [Endpoint(client, expected_model="test-model")],
+                    120,
+                    profile_ref="eurorouter/review-v1",
+                )
+            ],
+            sleep=backoff,
+        )
+        token = current_analysis_authority.set(signal)
+        try:
+            with pytest.raises(
+                BudgetExceededError if loss == "deadline" else LeaseLostError
+            ):
+                await gateway.generate_structured(
+                    LLMRequest(
+                        messages=[ChatMessage(role="user", content="review")],
+                        max_output_tokens=2000,
+                        timeout_s=120,
+                    ),
+                    LLMReviewOutput,
+                    budget=execution.budget(),
+                    input_tokens=100,
+                    chunk_id=execution.chunk_id,
+                    operation_id=uuid.uuid4(),
+                )
+        finally:
+            current_analysis_authority.reset(token)
+    assert len(calls) == 1
+    assert (await execution.budget().snapshot()).requests_used == 1
+
+
+async def test_reservation_round_trip_consumes_local_deadline_before_dispatch(
+    execution: Execution,
+) -> None:
+
+    clock = [0.0]
+
+    class DelayedReceipt(AsyncSessionTransaction):
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            await super().__aexit__(exc_type, exc, traceback)
+            clock[0] = 601.0
+
+    class DelayedSession(AsyncSession):
+        def begin(self) -> AsyncSessionTransaction:
+            return DelayedReceipt(self)
+
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    factory = async_sessionmaker[AsyncSession](
+        execution.factory.kw["bind"], class_=DelayedSession, expire_on_commit=False
+    )
+    budget = PostgresReviewRunBudget(
+        factory, task=execution.task, lease=execution.lease, analysis_attempt=1
+    )
+    requests = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "test-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"summary":"ok","findings":[],"limitations":[]}'
+                        }
+                    }
+                ],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        client = OpenAICompatibleClient(
+            name="eurorouter",
+            http=http,
+            base_url="https://llm.invalid/v1",
+            model="test-model",
+            api_key="test",
+        )
+        gateway = LLMGateway(
+            [
+                ProviderPool(
+                    "eurorouter",
+                    [Endpoint(client, expected_model="test-model")],
+                    120,
+                    profile_ref="eurorouter/review-v1",
+                )
+            ],
+            clock=lambda: clock[0],
+        )
+        with pytest.raises(BudgetExceededError):
+            await gateway.generate_structured(
+                LLMRequest(
+                    messages=[ChatMessage(role="user", content="review")],
+                    max_output_tokens=2000,
+                    timeout_s=120,
+                ),
+                LLMReviewOutput,
+                budget=budget,
+                input_tokens=100,
+                chunk_id=execution.chunk_id,
+                operation_id=uuid.uuid4(),
+            )
+    assert requests == []
+    assert (await execution.budget().snapshot()).requests_used == 1
+
+
+@pytest.mark.parametrize("answer", ["valid", "invalid"])
+async def test_locally_cancelled_paid_response_cannot_settle_or_retry(
+    execution: Execution, answer: str
+) -> None:
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    config = await FrozenConfigurationReader(
+        execution.factory, PROMPTS, runtime_profiles()
+    ).resolve(execution.lease.review_job_id)
+    signal = LiveAnalysisAuthority(execution.lease, started=time.monotonic())
+    calls = []
+
+    async def response(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        signal.cancel()  # renewal failure races a provider returning usable output
+        return httpx.Response(
+            200,
+            json={
+                "model": "test-model",
+                "usage": {"prompt_tokens": 40, "completion_tokens": 20},
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "{}"
+                                if answer == "invalid"
+                                else '{"summary":"ok","findings":[],"limitations":[]}'
+                            )
+                        }
+                    }
+                ],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        token = current_analysis_authority.set(signal)
+        try:
+            with pytest.raises(LeaseLostError):
+                await build_frozen_gateway(
+                    config, runtime_profiles(), http
+                ).generate_structured(
+                    LLMRequest(
+                        messages=[ChatMessage(role="user", content="review")],
+                        max_output_tokens=2000,
+                        timeout_s=120,
+                    ),
+                    LLMReviewOutput,
+                    budget=execution.budget(),
+                    input_tokens=100,
+                    chunk_id=execution.chunk_id,
+                    operation_id=uuid.uuid4(),
+                )
+        finally:
+            current_analysis_authority.reset(token)
+    snapshot = await execution.budget().snapshot()
+    assert len(calls) == 1
+    assert (
+        snapshot.requests_used,
+        snapshot.input_tokens_used,
+        snapshot.output_tokens_used,
+    ) == (1, 100, 2000)
+
+
+@pytest.mark.parametrize("operation", ["reserve", "repair"])
+async def test_future_retry_at_denies_direct_durable_reservation(
+    execution: Execution, operation: str
+) -> None:
+
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    async with execution.factory.begin() as session:
+        await session.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == execution.lease.review_job_id)
+            .values(status="LLM_PROCESSING")
+        )
+    assert await execution.store().defer_retry(
+        task=execution.task,
+        lease=execution.lease,
+        reason=ReviewReasonCode.LLM_UNAVAILABLE,
+        error_code="provider_unavailable",
+        delay_s=20,
+    )
+    with pytest.raises(BudgetExceededError, match="retry deferred"):
+        if operation == "reserve":
+            await reserve(execution, execution.budget())
+        else:
+            await execution.budget().claim_format_repair(
+                repair_id=uuid.uuid4(), chunk_id=execution.chunk_id
+            )
+    assert (await execution.budget().snapshot()).requests_used == 0
+
+
+@pytest.mark.parametrize("operation", ["repair", "defer"])
+@pytest.mark.parametrize("expiry", ["lease", "deadline"])
+async def test_repair_and_defer_lock_wait_resample_authority(
+    execution: Execution,
+    operation: str,
+    expiry: str,
+) -> None:
+
+    await execution.store().begin(task=execution.task, lease=execution.lease)
+    async with execution.factory.begin() as session:
+        await session.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == execution.lease.review_job_id)
+            .values(status="LLM_PROCESSING")
+        )
+    expiration = await expire_soon(execution, expiry)
+    async with execution.factory.begin() as blocker:
+        await blocker.execute(text("LOCK TABLE review_job IN SHARE MODE"))
+        if operation == "repair":
+            pending = asyncio.create_task(
+                execution.budget().claim_format_repair(
+                    repair_id=uuid.uuid4(), chunk_id=execution.chunk_id
+                )
+            )
+        else:
+            pending = asyncio.create_task(
+                execution.store().defer_retry(
+                    task=execution.task,
+                    lease=execution.lease,
+                    reason=ReviewReasonCode.LLM_UNAVAILABLE,
+                    error_code="provider_unavailable",
+                    delay_s=2,
+                )
+            )
+        await wait_for_lock(execution.factory, "review_job")
+        await wait_until_expired(execution.factory, expiration)
+    if operation == "defer" and expiry == "deadline":
+        assert await pending is False
+    else:
+        with pytest.raises((LeaseLostError, BudgetExceededError)):
+            await pending
+    async with execution.factory() as session:
+        job = await session.get(ReviewJob, execution.lease.review_job_id)
+        assert job is not None and job.retry_at is None and job.format_repair_id is None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ReviewEvent)
+                .where(ReviewEvent.review_job_id == job.id)
+            )
+            == 0
+        )

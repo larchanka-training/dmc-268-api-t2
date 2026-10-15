@@ -44,6 +44,17 @@ class PostgresWorkerTasks:
                 else None
             )
             now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            review = locked[0]
+            if (
+                lease.task_kind == "analyze"
+                and review.retry_at is not None
+                and review.retry_at > now
+                and (
+                    review.analysis_deadline_at is None
+                    or review.analysis_deadline_at > now
+                )
+            ):
+                return False
             return locked[1].expires_at > now and task_is_eligible(
                 locked[0], lease.task_kind, publication, now
             )

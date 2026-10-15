@@ -22,6 +22,11 @@ API будет доступен на http://localhost:8000, healthcheck — http
 Компоненты очереди реализованы, но compose не запускает dispatcher и analysis
 worker автоматически.
 
+Stage 8C-04-01 добавляет `uv run python -m app.analysis_worker --once` и
+последовательный continuous mode. Требования к trusted runtime, параметры CLI и
+границы реализации описаны в [`analysis-runtime.md`](docs/examples/analysis-runtime.md).
+Deployment и activation этим изменением не включаются.
+
 Миграции (после старта compose):
 
 ```bash

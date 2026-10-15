@@ -48,9 +48,33 @@ or empty entries are refused. This proves local configuration, not provider-side
 key validity. Reports contain only nonsecret manifest identity, scan counts,
 profile references, job IDs and error codes.
 
-Future analysis CLI composition must await
-`prepare_postgres_analysis_worker(...)` before calling receive/claim/run_once.
+The analysis CLI (Stage 8C-04-01) awaits
+`prepare_postgres_analysis_worker(...)` before receiving any delivery.
 It validates offline compatibility and credentials, then returns the existing
-bounded worker. This stage adds no CLI or continuous loop. A direct
+bounded worker. A direct
 `build_frozen_gateway(...)` independently enforces execution credentials before
 any inference, including fallback routes. Ollama remains auth-free.
+
+With an approved manifest, required credentials, migrated PostgreSQL and Redis
+configured in the process environment:
+
+```bash
+uv run python -m app.analysis_worker --help
+uv run python -m app.analysis_worker --once
+uv run python -m app.analysis_worker --poll-interval 1
+```
+
+`--help` requires no settings, manifest, credentials or service connections.
+`--once` processes at most one new analyze delivery; an empty or deferred pass
+exits successfully. Without `--once`, execution is sequential and idle passes wait
+for `--poll-interval` seconds (default 1; finite range 0.01–60). A false result
+does not imply an empty pending list. Each process boot uses a fresh owner UUID.
+The CLI owns and closes its Redis/HTTP connections and database engine. SIGTERM
+and SIGINT interrupt idle waiting and prevent another receive; full in-flight
+shutdown is deferred. Startup/runtime failures exit nonzero and log only the error
+type and an allowlisted reason, without exception text.
+
+This stage does not schedule pending claiming, periodic PostgreSQL recovery or
+transport maintenance, and does not execute publication. Compose/CD do not start
+this CLI automatically. Deployment and activation remain gated on independent
+acceptance and the remaining lifecycle work.

@@ -133,8 +133,8 @@ ReviewJob** и не собирает полный LLM `ContextPayload`. Пуст
 проверка описаны в [`github-webhook-intake.md`](./github-webhook-intake.md).
 Redis review worker не использует WebhookReceipt как неявный источник входных
 данных. LLM Gateway реализован в `app.llm` / `app.review` и подключён к bounded
-review worker через internal production-capable composition; production CLI для
-analysis worker отсутствует.
+review worker через production-capable composition; CLI `app.analysis_worker`
+запускает её с обязательным trusted preflight (Stage 8C-04-01).
 
 ### 3.3 Запуск ReviewJob
 
@@ -277,7 +277,8 @@ provider-вызовов для одного PR нужна отдельно от 
 Реализован bounded `PostgresReviewWorker.run_once()` с
 обязательным `TaskHandlerPort`: одна Redis delivery, authoritative identity,
 task-specific acquire, повторная проверка перед callback, fenced release и ACK
-после проверенного durable outcome. Production CLI для analysis worker отсутствует.
+после проверенного durable outcome. CLI `app.analysis_worker` выполняет один
+new-delivery pass (`--once`) либо последовательный continuous loop.
 Обычный return, промежуточный commit и захват lease не разрешают
 ACK. Консервативные completion proofs и pending-классификация определены в
 PIPELINE_SPEC.md §4.2; PostgreSQL outbox marker может оставаться NULL при delivery.
@@ -332,7 +333,8 @@ HTTP, fenced FAILED либо PARTIAL при пригодном сохранён�
 terminal rows остаются читаемыми через REST без переписывания digests.
 
 Builder лишь возвращает bounded worker; фонового сервиса он не запускает.
-Production analysis CLI/activation, XAUTOCLAIM, periodic recovery/retry scheduler,
+CLI Stage 8C-04-01 описан в [analysis-runtime.md](examples/analysis-runtime.md).
+Activation, automatic pending claiming, periodic recovery/retry scheduler,
 полный chunk planner, real publisher/reconciliation и OAuth/session integration
 остаются до production activation. Safety controlled redelivery не означает
 готовность automatic recovery. Issue #13 и deployment readiness не объявлены
@@ -353,7 +355,8 @@ Stream ID/Redis TIME задают transport expiry20min; job clocks/budgets не
 
 CLI `python -m app.outbox_dispatcher --once` выполняет один recovery sweep и один
 initial batch. Continuous mode пока выполняет только initial batches; periodic
-recovery, analysis CLI и lifecycle относятся к8C-04. Deployment не запускает новые
+recovery и оставшийся lifecycle относятся к последующим частям8C-04.
+Analysis CLI Stage 8C-04-01 уже реализован. Deployment не запускает новые
 процессы. Publish outbox и Publication(PENDING) остаются в PostgreSQL, без publish
 XADD; analysis full completion proof не требует исполняемого publisher.
 Подробнее — PIPELINE_SPEC.md §4.1.
@@ -547,6 +550,8 @@ ORM-модели не используются как публичные HTTP DT
   атомарная подготовка publication/outbox;
 - verified v1/v2 prompt bundles, frozen configuration reader/admission и
   production-capable internal analysis composition;
+- analysis CLI Stage 8C-04-01: trusted preflight, bounded `--once`, последовательный
+  continuous loop новых analyze deliveries, idle polling и остановка idle loop;
 - migrations 0008…0010: nullable frozen marker, durable LLM ledger/attempts и repair claim;
 - интеграционные тесты Redis queue, dispatcher, worker, analysis composition,
   durable crash accounting, legacy compatibility и atomic terminal handoff;
@@ -564,8 +569,8 @@ ORM-модели не используются как публичные HTTP DT
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
-- production CLI для analysis worker, pending-delivery claiming (XAUTOCLAIM),
-  периодический review recovery и retry scheduler;
+- automatic pending-delivery claiming (XAUTOCLAIM), периодический review recovery,
+  retry scheduler и полный in-flight shutdown analysis CLI;
 - publication executor (publisher worker) с call-start guards и сериализацией
   по ChangeRequest;
 - Publisher reconciliation;

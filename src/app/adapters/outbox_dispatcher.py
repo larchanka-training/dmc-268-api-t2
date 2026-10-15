@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import and_, func, not_, select, text, tuple_, update
+from sqlalchemy import and_, func, not_, or_, select, text, tuple_, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from app.application.ports import (
     QueueEnvelopeValidationError,
@@ -17,7 +18,7 @@ from app.application.ports import (
     QueueTaskEnvelope,
     TaskKind,
 )
-from app.db.models import OutboxEvent
+from app.db.models import OutboxEvent, Publication, ReviewJob
 
 _MAX_CANDIDATES = 100
 _MAX_RECOVERY_SENDS = 10
@@ -55,6 +56,7 @@ class PostgresOutboxDispatcher:
         self._session_factory = session_factory
         self._queue = queue
         self._recovery_cursor: tuple[datetime, uuid.UUID] | None = None
+        self._terminal_cursor: tuple[datetime, uuid.UUID] | None = None
 
     async def dispatch_batch(self, *, batch_size: int = 100) -> int:
         """Dispatch genuine initial analyze commands; publish remains parked."""
@@ -101,24 +103,69 @@ class PostgresOutboxDispatcher:
         return confirmed
 
     async def recover_batch(self) -> int:
-        """Probe at most 100 previously reserved or legacy analyze commands."""
+        """Probe at most 100 active commands; separately bound terminal alerts."""
         async with asyncio.timeout(5), self._session_factory.begin() as session:
             await session.execute(text("SET LOCAL lock_timeout = '500ms'"))
             await session.execute(text("SET LOCAL statement_timeout = '2s'"))
             await session.execute(
                 text("SET LOCAL idle_in_transaction_session_timeout = '5s'")
             )
-            query = select(OutboxEvent).where(
-                OutboxEvent.task_kind == "analyze",
-                OutboxEvent.quarantined_at.is_(None),
-                not_(
-                    and_(
-                        OutboxEvent.dispatch_generation == 0,
-                        OutboxEvent.broker_published_at.is_(None),
-                        OutboxEvent.broker_message_id.is_(None),
-                    )
-                ),
+            query = (
+                select(OutboxEvent)
+                .join(ReviewJob)
+                .where(
+                    OutboxEvent.task_kind == "analyze",
+                    OutboxEvent.quarantined_at.is_(None),
+                    not_(
+                        and_(
+                            OutboxEvent.dispatch_generation == 0,
+                            OutboxEvent.broker_published_at.is_(None),
+                            OutboxEvent.broker_message_id.is_(None),
+                        )
+                    ),
+                )
             )
+            # Structural gaps only; the worker still owns full completion proof.
+            prepared_publication = (
+                select(Publication.id)
+                .where(
+                    Publication.review_job_id == ReviewJob.id,
+                    Publication.status != "NOT_READY",
+                    Publication.started_at.is_not(None),
+                    Publication.deadline_at.is_not(None),
+                )
+                .exists()
+            )
+            successor = aliased(OutboxEvent)
+            publish_work = (
+                select(successor.id)
+                .where(
+                    successor.review_job_id == ReviewJob.id,
+                    successor.task_kind == "publish",
+                    successor.quarantined_at.is_(None),
+                )
+                .exists()
+            )
+            terminal_query = query.with_only_columns(
+                ReviewJob.finished_at, OutboxEvent.id
+            ).where(
+                ReviewJob.finished_at.is_not(None),
+                ReviewJob.status.in_(("COMPLETED", "PARTIAL")),
+                or_(~prepared_publication, ~publish_work),
+            )
+            if self._terminal_cursor is not None:
+                terminal_query = terminal_query.where(
+                    tuple_(ReviewJob.finished_at, OutboxEvent.id)
+                    > self._terminal_cursor
+                )
+            terminal_events = (
+                await session.execute(
+                    terminal_query.order_by(
+                        ReviewJob.finished_at, OutboxEvent.id
+                    ).limit(_MAX_CANDIDATES)
+                )
+            ).all()
+            query = query.where(ReviewJob.finished_at.is_(None))
             if self._recovery_cursor is not None:
                 query = query.where(
                     tuple_(OutboxEvent.created_at, OutboxEvent.id)
@@ -178,6 +225,11 @@ class PostgresOutboxDispatcher:
             == (candidates[-1].created_at, uuid.UUID(candidates[-1].envelope.event_id))
         ):
             self._recovery_cursor = None
+        for finished_at, event_id in terminal_events:
+            structlog.get_logger().warning(
+                "outbox_terminal_deferred", event_id=str(event_id)
+            )
+            self._terminal_cursor = (finished_at, event_id)
         return confirmed
 
     async def _reserve(  # noqa: PLR0911, PLR0912 -- explicit authority rejection/rollback gates

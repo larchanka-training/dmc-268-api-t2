@@ -221,8 +221,10 @@ cooldown before Redis I/O. Pure canonical validation precedes reservation. An
 invalid unpublished command is quarantined; an invalid historically published
 command is retained with a safe diagnostic. No source command is reconstructed.
 
-`recover_batch()` scans at most 100 previously reserved/legacy analyze candidates
-per tick in `(created_at, id)` keyset order, backed by a partial analyze index.
+`recover_batch()` scans at most 100 previously reserved/legacy active analyze
+candidates per tick in `(created_at, id)` keyset order, backed by a partial analyze
+index. The candidate query joins ReviewJob and filters `finished_at IS NULL`
+before LIMIT, so terminal history does not consume active probe slots.
 The cursor advances past present, untrusted and deferred events and wraps at the
 end of a pass. Fairness is process-local across calls on one dispatcher; fresh
 `--once` processes restart the scan. No restart-persistent cursor is claimed.
@@ -259,6 +261,20 @@ selected busy authority rows; recovery cursor fairness is process-local. Distrib
 after XADD and before finalize may require a later bounded duplicate. Existing
 worker fencing/accounting, deadlines and full completion proof remain authoritative.
 Terminal/incomplete handoff is deferred with a safe alert and never reopened.
+Within the same invocation, a separate lock-free snapshot diagnoses at most 100
+terminal COMPLETED/PARTIAL analyze events with a structural handoff gap: no
+prepared Publication (non-NOT_READY with start/deadline), or no nonquarantined
+publish outbox event. Healthy prepared handoffs do not emit
+`outbox_terminal_deferred`. This scan uses the same recovery/quarantine predicates,
+performs no Redis I/O or reservation, and changes no authoritative state.
+Its independent process-local `(finished_at, event_id)` cursor never wraps, so
+each selected event warns once per dispatcher instance, including across empty
+ticks. New terminalizations can advance the cursor even for older analyze events.
+This is bounded best-effort structural diagnostics, not the worker's full
+canonical/envelope completion proof: present but invalid successors may go
+undiagnosed. Restarts can repeat alerts, and late corruption or a late commit
+behind the diagnostic cursor can be missed. No persistent audit mechanism is
+claimed. FAILED/SKIPPED need no successor handoff and are excluded from this scan.
 
 The standalone `python -m app.outbox_dispatcher --once` performs one recovery
 sweep followed by one initial analyze batch. Existing continuous polling performs

@@ -1,6 +1,7 @@
 """Stage8C03 public dispatcher transport contract on real PostgreSQL and Redis."""
 
 import asyncio
+import json
 import os
 
 # ruff: noqa: PLR2004 -- contract limits and literal generations
@@ -33,6 +34,7 @@ from app.application.ports import (
 )
 from app.db.models import OutboxEvent, Publication, ReviewJob, TaskLease
 from app.db.task_leases import PostgresTaskLeaseStore
+from app.db.worker_tasks import PostgresWorkerTasks
 
 pytest_plugins = ("test_postgres_integration",)
 
@@ -41,6 +43,20 @@ pytest_plugins = ("test_postgres_integration",)
 def diagnostics() -> Iterator[list[MutableMapping[str, Any]]]:
     with capture_logs() as records:
         yield records
+
+
+@pytest.fixture
+def transport_commands(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+    commands: list[tuple[object, ...]] = []
+    original = Connection.send_command
+
+    async def record(self: Connection, *args: object, **kwargs: Any) -> None:
+        if args and args[0] in {"XADD", "XACK", "XRANGE"}:
+            commands.append(args)
+        await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "send_command", record)
+    return commands
 
 
 async def state(postgres: PostgresHarness, event_id: uuid.UUID) -> dict[str, Any]:
@@ -54,6 +70,21 @@ async def state(postgres: PostgresHarness, event_id: uuid.UUID) -> dict[str, Any
             .mappings()
             .one()
         )
+
+
+async def handoff_state(
+    postgres: PostgresHarness, review_ids: list[uuid.UUID]
+) -> dict[str, list[dict[str, Any]]]:
+    snapshot = {}
+    async with postgres.engine.connect() as connection:
+        for model in (ReviewJob, Publication, OutboxEvent, TaskLease):
+            table = model.__table__
+            key = table.c.id if model is ReviewJob else table.c.review_job_id
+            rows = await connection.execute(
+                select(table).where(key.in_(review_ids)).order_by(table.c.id)
+            )
+            snapshot[model.__tablename__] = [dict(row) for row in rows.mappings()]
+    return snapshot
 
 
 def dispatcher(
@@ -123,10 +154,10 @@ async def test_live_lease_blocks_lost_payload_reservation(
     postgres: PostgresHarness,
     dispatcher_redis: tuple[Redis, str],
 ) -> None:
-
-    event_id, review_id = await _create_outbox_event(postgres)
     client, prefix = dispatcher_redis
     service = dispatcher(postgres, client, prefix)
+    await finished_history(postgres, service)
+    event_id, review_id = await _create_outbox_event(postgres)
     await service.dispatch_batch()
     await client.delete(f"{prefix}:analyze")
     async with postgres.engine.begin() as connection:
@@ -155,10 +186,10 @@ async def test_future_retry_defers_lost_delivery_without_mutating_analysis(
     postgres: PostgresHarness,
     dispatcher_redis: tuple[Redis, str],
 ) -> None:
-
-    event_id, review_id = await _create_outbox_event(postgres)
     client, prefix = dispatcher_redis
     service = dispatcher(postgres, client, prefix)
+    await finished_history(postgres, service)
+    event_id, review_id = await _create_outbox_event(postgres)
     await service.dispatch_batch()
     await client.delete(f"{prefix}:analyze")
     async with postgres.engine.begin() as connection:
@@ -346,7 +377,9 @@ async def test_cursor_passes_hundred_existing_and_poison_deliveries_then_wraps(
     postgres: PostgresHarness,
     dispatcher_redis: tuple[Redis, str],
 ) -> None:
-
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    await finished_history(postgres, service)
     first_id, review_id = await _create_outbox_event(postgres)
     ids = [first_id]
     async with postgres.engine.begin() as connection:
@@ -363,8 +396,6 @@ async def test_cursor_passes_hundred_existing_and_poison_deliveries_then_wraps(
                     trace_id="backlog",
                 )
             )
-    client, prefix = dispatcher_redis
-    service = dispatcher(postgres, client, prefix)
     assert await service.dispatch_batch() == 100
     assert await service.dispatch_batch() == 1
     async with postgres.engine.begin() as connection:
@@ -460,6 +491,311 @@ async def make_due(postgres: PostgresHarness, event_id: uuid.UUID) -> None:
             .where(OutboxEvent.id == event_id)
             .values(dispatch_not_before=func.clock_timestamp() - timedelta(seconds=1))
         )
+
+
+async def finished_history(
+    postgres: PostgresHarness,
+    service: PostgresOutboxDispatcher,
+    *,
+    status: str = "SKIPPED",
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    history = [await _create_outbox_event(postgres) for _ in range(101)]
+    assert await service.dispatch_batch() == 100
+    assert await service.dispatch_batch() == 1
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id.in_([review_id for _, review_id in history]))
+            .values(status=status, finished_at=func.clock_timestamp())
+        )
+    return history
+
+
+async def prepare_handoff(postgres: PostgresHarness, review_id: uuid.UUID) -> None:
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            insert(Publication).values(
+                id=postgres.track("publication", uuid.uuid4()),
+                review_job_id=review_id,
+                status="PENDING",
+                started_at=func.clock_timestamp(),
+                deadline_at=func.clock_timestamp() + timedelta(minutes=5),
+            )
+        )
+        await connection.execute(
+            insert(OutboxEvent).values(
+                id=postgres.track("outbox_event", uuid.uuid4()),
+                review_job_id=review_id,
+                schema_version=1,
+                task_kind="publish",
+                attempt=1,
+                trace_id="prepared-handoff",
+            )
+        )
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "PARTIAL"])
+async def test_healthy_terminal_handoff_does_not_warn_on_repeated_recovery(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    diagnostics: list[MutableMapping[str, Any]],
+    transport_commands: list[tuple[object, ...]],
+    status: str,
+) -> None:
+    event_id, review_id = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    assert await service.dispatch_batch() == 1
+    await prepare_handoff(postgres, review_id)
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_id)
+            .values(status=status, finished_at=func.clock_timestamp())
+        )
+    task = QueueTaskEnvelope(
+        1, str(event_id), str(review_id), "analyze", 2, "trace-outbox-test"
+    )
+    assert await PostgresWorkerTasks(async_sessionmaker(postgres.engine)).completed(
+        task
+    )
+    before = await handoff_state(postgres, [review_id])
+    transport_commands.clear()
+    for _ in range(3):
+        assert await service.recover_batch() == 0
+    assert await handoff_state(postgres, [review_id]) == before
+    assert transport_commands == []
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert await client.xlen(f"{prefix}:publish") == 0
+    assert "outbox_terminal_deferred" not in {row["event"] for row in diagnostics}
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "PARTIAL"])
+@pytest.mark.parametrize("gap", ["missing", "quarantined"])
+async def test_terminal_handoff_without_publish_command_still_warns(  # noqa: PLR0913, PLR0917 -- terminal gap matrix and real transport observation
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    diagnostics: list[MutableMapping[str, Any]],
+    transport_commands: list[tuple[object, ...]],
+    status: str,
+    gap: str,
+) -> None:
+    event_id, review_id = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    assert await service.dispatch_batch() == 1
+    await prepare_handoff(postgres, review_id)
+    async with postgres.engine.begin() as connection:
+        predicate = (OutboxEvent.review_job_id == review_id) & (
+            OutboxEvent.task_kind == "publish"
+        )
+        if gap == "missing":
+            await connection.execute(delete(OutboxEvent).where(predicate))
+        else:
+            await connection.execute(
+                update(OutboxEvent)
+                .where(predicate)
+                .values(
+                    quarantined_at=func.clock_timestamp(),
+                    quarantine_reason_code="INVALID_ENVELOPE",
+                )
+            )
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_id)
+            .values(status=status, finished_at=func.clock_timestamp())
+        )
+    before = await handoff_state(postgres, [review_id])
+    transport_commands.clear()
+    for _ in range(3):
+        assert await service.recover_batch() == 0
+    assert await handoff_state(postgres, [review_id]) == before
+    assert transport_commands == []
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert await client.xlen(f"{prefix}:publish") == 0
+    alerts = [row for row in diagnostics if row["event"] == "outbox_terminal_deferred"]
+    assert [row["event_id"] for row in alerts] == [str(event_id)]
+
+
+async def test_healthy_terminal_history_does_not_hide_active_loss_or_warn(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    diagnostics: list[MutableMapping[str, Any]],
+) -> None:
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    history = await finished_history(postgres, service, status="COMPLETED")
+    for _, review_id in history:
+        await prepare_handoff(postgres, review_id)
+    before = await handoff_state(postgres, [review_id for _, review_id in history])
+    event_id, _ = await _create_outbox_event(postgres)
+    assert await service.dispatch_batch() == 1
+    lost = await state(postgres, event_id)
+    assert await client.xdel(f"{prefix}:analyze", lost["broker_message_id"]) == 1
+    await make_due(postgres, event_id)
+    assert await service.recover_batch() == 1
+    for _ in range(3):
+        assert await service.recover_batch() == 0
+    assert "outbox_terminal_deferred" not in {row["event"] for row in diagnostics}
+    assert (
+        await handoff_state(postgres, [review_id for _, review_id in history]) == before
+    )
+    assert await client.xlen(f"{prefix}:analyze") == 102
+    assert await client.xlen(f"{prefix}:publish") == 0
+
+
+async def test_later_terminalization_of_older_job_is_diagnosed_once(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    diagnostics: list[MutableMapping[str, Any]],
+) -> None:
+    old_event, old_review = await _create_outbox_event(postgres)
+    new_event, new_review = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    assert await service.dispatch_batch() == 2
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == new_review)
+            .values(status="PARTIAL", finished_at=func.clock_timestamp())
+        )
+    assert await service.recover_batch() == 0
+    assert [row["event_id"] for row in diagnostics] == [str(new_event)]
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == old_review)
+            .values(status="COMPLETED", finished_at=func.clock_timestamp())
+        )
+    diagnostics.clear()
+    assert await service.recover_batch() == 0
+    assert [row["event_id"] for row in diagnostics] == [str(old_event)]
+    diagnostics.clear()
+    assert await service.recover_batch() == 0
+    assert diagnostics == []
+
+
+async def test_finished_history_cannot_hide_active_lost_delivery(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+) -> None:
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    history = await finished_history(postgres, service)
+    event_id, _ = await _create_outbox_event(postgres)
+    assert await service.dispatch_batch() == 1
+    before = await state(postgres, event_id)
+    queue = RedisQueue(client, stream_prefix=prefix)
+    entries = await client.xrange(f"{prefix}:analyze")
+    assert entries
+    assert len(entries) == 102
+    await client.delete(f"{prefix}:analyze")
+    fields = entries[-1][1]
+    assert fields is not None
+    task = QueueTaskEnvelope(**json.loads(fields["envelope"]))
+    assert task.event_id == str(event_id)
+    assert await queue.probe(task, before["broker_message_id"]) == "ABSENT"
+    await make_due(postgres, event_id)
+
+    assert await service.recover_batch() == 1
+
+    recovered = await client.xrange(f"{prefix}:analyze")
+    assert recovered
+    assert len(recovered) == 1
+    assert recovered[0][1] == entries[-1][1]
+    assert (await state(postgres, event_id))["dispatch_generation"] == 2
+    for historic_id, _ in history:
+        historic = await state(postgres, historic_id)
+        assert historic["dispatch_generation"] == 1
+        assert historic["recovery_send_count"] == 0
+
+
+async def test_quarantined_prefix_cannot_hide_active_lost_delivery(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+) -> None:
+    first_id, review_id = await _create_outbox_event(postgres)
+    quarantined_ids = [first_id]
+    async with postgres.engine.begin() as connection:
+        for _ in range(100):
+            event_id = postgres.track("outbox_event", uuid.uuid4())
+            quarantined_ids.append(event_id)
+            await connection.execute(
+                insert(OutboxEvent).values(
+                    id=event_id,
+                    review_job_id=review_id,
+                    schema_version=1,
+                    task_kind="analyze",
+                    attempt=2,
+                    trace_id="quarantined-history",
+                )
+            )
+        await connection.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id.in_(quarantined_ids))
+            .values(
+                dispatch_generation=1,
+                broker_message_id="1-0",
+                quarantined_at=func.clock_timestamp(),
+                quarantine_reason_code="INVALID_ENVELOPE",
+            )
+        )
+    event_id, _ = await _create_outbox_event(postgres)
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    assert await service.dispatch_batch() == 1
+    await client.delete(f"{prefix}:analyze")
+    await make_due(postgres, event_id)
+    before = [await state(postgres, row_id) for row_id in quarantined_ids]
+    assert await service.recover_batch() == 1
+    assert await service.recover_batch() == 0
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert [await state(postgres, row_id) for row_id in quarantined_ids] == before
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "PARTIAL"])
+async def test_terminal_alerts_are_bounded_fair_and_do_not_consume_active_slots(
+    postgres: PostgresHarness,
+    dispatcher_redis: tuple[Redis, str],
+    diagnostics: list[MutableMapping[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    client, prefix = dispatcher_redis
+    service = dispatcher(postgres, client, prefix)
+    history = await finished_history(postgres, service, status=status)
+    event_id, _ = await _create_outbox_event(postgres)
+    assert await service.dispatch_batch() == 1
+    await client.delete(f"{prefix}:analyze")
+    await make_due(postgres, event_id)
+    probes = []
+    original = Connection.send_command
+
+    async def record_probe(self: Connection, *args: object, **kwargs: Any) -> None:
+        if args and args[0] == "XRANGE":
+            probes.append(args)
+        await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "send_command", record_probe)
+    assert await service.recover_batch() == 1
+    assert len(probes) == 1  # Only the active receipt, never terminal history.
+    alerts = [row for row in diagnostics if row["event"] == "outbox_terminal_deferred"]
+    assert len(alerts) == 100
+    diagnostics.clear()
+    assert await service.recover_batch() == 0
+    alerts += [row for row in diagnostics if row["event"] == "outbox_terminal_deferred"]
+    assert {row["event_id"] for row in alerts} == {str(row_id) for row_id, _ in history}
+    assert len(alerts) == 101
+    diagnostics.clear()
+    for _ in range(3):
+        assert await service.recover_batch() == 0
+    assert "outbox_terminal_deferred" not in {row["event"] for row in diagnostics}
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    for historic_id, _ in history:
+        historic = await state(postgres, historic_id)
+        assert historic["dispatch_generation"] == 1
+        assert historic["recovery_send_count"] == 0
 
 
 async def test_committed_reservation_survives_crash_before_send_and_restart(
@@ -910,10 +1246,15 @@ async def test_changed_command_after_probe_is_diagnosed_without_synthesizing(
         await asyncio.gather(running, return_exceptions=True)
 
 
-async def test_incomplete_terminal_handoff_alerts_without_reopening_or_send(
+@pytest.mark.parametrize("status", ["COMPLETED", "PARTIAL"])
+@pytest.mark.parametrize("gap", ["missing", "not-ready", "no-start", "no-deadline"])
+async def test_incomplete_terminal_handoff_alerts_without_reopening_or_send(  # noqa: PLR0913, PLR0917 -- terminal gap matrix and real transport observation
     postgres: PostgresHarness,
     dispatcher_redis: tuple[Redis, str],
     diagnostics: list[MutableMapping[str, Any]],
+    transport_commands: list[tuple[object, ...]],
+    status: str,
+    gap: str,
 ) -> None:
 
     event_id, review_id = await _create_outbox_event(postgres)
@@ -922,17 +1263,37 @@ async def test_incomplete_terminal_handoff_alerts_without_reopening_or_send(
     await service.dispatch_batch()
     await client.delete(f"{prefix}:analyze")
     await make_due(postgres, event_id)
+    if gap != "missing":
+        await prepare_handoff(postgres, review_id)
     async with postgres.engine.begin() as connection:
+        if gap != "missing":
+            changes: dict[str, Any] = {
+                "not-ready": {
+                    "status": "NOT_READY",
+                    "started_at": None,
+                    "deadline_at": None,
+                },
+                "no-start": {"started_at": None},
+                "no-deadline": {"deadline_at": None},
+            }
+            await connection.execute(
+                update(Publication)
+                .where(Publication.review_job_id == review_id)
+                .values(**changes[gap])
+            )
         await connection.execute(
             update(ReviewJob)
             .where(ReviewJob.id == review_id)
-            .values(status="PARTIAL", finished_at=func.clock_timestamp())
+            .values(status=status, finished_at=func.clock_timestamp())
         )
-    before = await state(postgres, event_id)
-    assert await service.recover_batch() == 0
-    assert await state(postgres, event_id) == before
+    before = await handoff_state(postgres, [review_id])
+    transport_commands.clear()
+    for _ in range(3):
+        assert await service.recover_batch() == 0
+    assert await handoff_state(postgres, [review_id]) == before
+    assert transport_commands == []
     assert await client.xlen(f"{prefix}:analyze") == 0
-    assert "outbox_terminal_deferred" in {entry["event"] for entry in diagnostics}
+    assert [entry["event_id"] for entry in diagnostics] == [str(event_id)]
 
 
 async def test_legacy_unknown_receipt_uses_recovery_allowance_and_safe_diagnostic(

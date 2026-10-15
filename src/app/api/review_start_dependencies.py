@@ -1,5 +1,6 @@
-"""Fail-closed admission wiring until the trusted provider integration exists."""
+"""Trusted configuration selection; user/provider authorization stays fail closed."""
 
+from pathlib import Path
 from uuid import UUID
 
 from app.api.errors import ApiError
@@ -8,6 +9,11 @@ from app.application.review_start_ports import (
     RepositoryIdentity,
     ReviewConfigurationResolver,
     ReviewStartAuthorizer,
+)
+from app.db.session import async_session_factory
+from app.review.configuration import (
+    FrozenConfigurationError,
+    load_runtime_configuration,
 )
 
 
@@ -37,4 +43,10 @@ class _UnavailableConfigurationResolver:
 
 
 def get_review_configuration_resolver() -> ReviewConfigurationResolver:
-    return _UnavailableConfigurationResolver()
+    try:
+        runtime = load_runtime_configuration()
+    except FrozenConfigurationError:
+        return _UnavailableConfigurationResolver()
+    return runtime.admission_resolver(
+        async_session_factory, Path(__file__).resolve().parents[3] / ".agents/reviewer"
+    )

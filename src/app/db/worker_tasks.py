@@ -49,6 +49,7 @@ class PostgresWorkerTasks:
                 lease.task_kind == "analyze"
                 and review.retry_at is not None
                 and review.retry_at > now
+                and not (review.started_at is None and review.queue_deadline_at <= now)
                 and (
                     review.analysis_deadline_at is None
                     or review.analysis_deadline_at > now

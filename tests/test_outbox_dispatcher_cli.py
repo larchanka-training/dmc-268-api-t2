@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
-from sqlalchemy import text, update
+from sqlalchemy import func, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
 from test_postgres_integration import PostgresHarness, _create_outbox_event
@@ -128,10 +128,11 @@ async def test_once_bounds_delivery_and_durably_excludes_confirmed_events(
     assert third.returncode == 0, third.stderr
     assert '"confirmed": 0' in third.stdout
     assert await runtime_redis.xlen(f"{STREAM}:analyze") == 1
-    assert await runtime_redis.xlen(f"{STREAM}:publish") == 1
+    assert await runtime_redis.xlen(f"{STREAM}:publish") == 0
     async with factory() as session:
         publish = await session.get(OutboxEvent, publish_id)
-        assert publish is not None and publish.broker_published_at is not None
+        assert publish is not None and publish.broker_published_at is None
+        assert publish.dispatch_generation == 0
 
 
 @pytest.mark.skipif(
@@ -201,6 +202,7 @@ async def test_continuous_runs_multiple_bounded_batches_with_idle_polling(
     postgres: PostgresHarness, runtime_redis: Redis
 ) -> None:
     await _create_outbox_event(postgres)
+    await _create_outbox_event(postgres)
     await _create_outbox_event(postgres, task_kind="publish")
     process = await start_runtime("--batch-size", "1", "--poll-interval", "0.2")
     try:
@@ -213,8 +215,8 @@ async def test_continuous_runs_multiple_bounded_batches_with_idle_polling(
         assert (await batch_record(process))["confirmed"] == 0
         assert time.monotonic() - idle_at >= MIN_POLL_DELAY
         assert process.returncode is None
-        assert await runtime_redis.xlen(f"{STREAM}:analyze") == 1
-        assert await runtime_redis.xlen(f"{STREAM}:publish") == 1
+        assert await runtime_redis.xlen(f"{STREAM}:analyze") == 2  # noqa: PLR2004
+        assert await runtime_redis.xlen(f"{STREAM}:publish") == 0
     finally:
         await stop_process(process)
 
@@ -230,7 +232,8 @@ async def publication_lock(
             text(f"""
             CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
-                IF NEW.id = '{event_id}'::uuid THEN
+                IF NEW.id = '{event_id}'::uuid
+                   AND NEW.broker_message_id IS NOT NULL THEN
                     PERFORM pg_advisory_xact_lock({key});
                 END IF;
                 RETURN NEW;
@@ -422,16 +425,33 @@ async def test_enqueue_failure_preserves_retry_eligibility_without_logging_sourc
     finally:
         await runtime_redis.acl_deluser(username)
 
+    restarted = invoke("--once")
+    assert restarted.returncode == 0, restarted.stderr
+    assert await runtime_redis.xlen(f"{STREAM}:analyze") == 0
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id == event_id)
+            .values(
+                dispatch_not_before=func.clock_timestamp() - text("INTERVAL '1 second'")
+            )
+        )
     retried = invoke("--once")
     assert retried.returncode == 0, retried.stderr
     assert await runtime_redis.xlen(f"{STREAM}:analyze") == 1
+    async with async_sessionmaker(postgres.engine)() as session:
+        event = await session.get(OutboxEvent, event_id)
+        assert event is not None
+        assert event.dispatch_generation == 2  # noqa: PLR2004 -- first recovery
+        assert event.recovery_send_count == 1
+        assert event.broker_message_id is not None
 
 
 async def test_cli_preserves_quarantine_and_does_not_log_private_source_at_debug(
     postgres: PostgresHarness, runtime_redis: Redis
 ) -> None:
     invalid_id, _ = await _create_outbox_event(postgres)
-    valid_id, _ = await _create_outbox_event(postgres, task_kind="publish")
+    valid_id, _ = await _create_outbox_event(postgres)
     async with postgres.engine.begin() as connection:
         await connection.execute(
             update(OutboxEvent)
@@ -444,8 +464,8 @@ async def test_cli_preserves_quarantine_and_does_not_log_private_source_at_debug
     assert result.returncode == 0, result.stderr
     assert "private-source" not in result.stdout + result.stderr
     assert '"confirmed": 1' in result.stdout
-    assert await runtime_redis.xlen(f"{STREAM}:analyze") == 0
-    assert await runtime_redis.xlen(f"{STREAM}:publish") == 1
+    assert await runtime_redis.xlen(f"{STREAM}:analyze") == 1
+    assert await runtime_redis.xlen(f"{STREAM}:publish") == 0
     async with async_sessionmaker(postgres.engine)() as session:
         rejected = await session.get(OutboxEvent, invalid_id)
         accepted = await session.get(OutboxEvent, valid_id)
@@ -459,4 +479,4 @@ async def test_cli_preserves_quarantine_and_does_not_log_private_source_at_debug
     again = invoke("--once")
     assert again.returncode == 0, again.stderr
     assert '"confirmed": 0' in again.stdout
-    assert await runtime_redis.xlen(f"{STREAM}:publish") == 1
+    assert await runtime_redis.xlen(f"{STREAM}:publish") == 0

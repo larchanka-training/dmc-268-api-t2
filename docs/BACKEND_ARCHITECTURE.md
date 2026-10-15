@@ -340,18 +340,23 @@ Production analysis CLI/activation, XAUTOCLAIM, periodic recovery/retry schedule
 
 ### 3.6 Dispatcher и recovery
 
-Dispatcher выбирает `OutboxEvent` с `broker_published_at IS NULL`, передаёт
-небольшую команду в очередь Redis и устанавливает `broker_published_at` только
-после подтверждения постановки queue adapter. PostgreSQL остаётся источником
-истины; recovery должен восстанавливать потерянную доставку по состоянию job/outbox,
-lease и deadlines. Реализованы `PostgresOutboxDispatcher.dispatch_batch()` и
-`RedisQueue` с enqueue, receive, ACK и safe dead-letter quarantine. Dispatcher CLI
-`python -m app.outbox_dispatcher` поддерживает continuous polling и `--once`,
-но deployment не запускает его автоматически. Production CLI для analysis worker,
-периодический review recovery и retry scheduler отсутствуют; отдельный webhook
-worker реализует recovery только для intake.
+Dispatcher отправляет только analyze `OutboxEvent`. `dispatch_batch()` выбирает
+до100 genuine initial commands, `recover_batch()` — до100 recovery candidates
+по process-local keyset cursor `(created_at,id)` и создаёт до10 recovery reservations.
+Оба пути резервируют generation/cooldown под locks
+`ReviewJob → TaskLease → OutboxEvent`, используя DB clock после locks.
+Redis exact-ID probe и единственный XADD attempt выполняются вне PG transaction;
+conditional finalize сохраняет receipt и marker только для той же generation.
+Metadata и bounds3/event/300s, cooldown60s переживают restart на существующем outbox.
+PRESENT запрещает backlog amplification; UNKNOWN/UNTRUSTED не дают права на send.
+Stream ID/Redis TIME задают transport expiry20min; job clocks/budgets не меняются.
 
-Recovery должен обрабатывать expired/no lease с учётом `retry_at` и deadline-полей.
+CLI `python -m app.outbox_dispatcher --once` выполняет один recovery sweep и один
+initial batch. Continuous mode пока выполняет только initial batches; periodic
+recovery, analysis CLI и lifecycle относятся к8C-04. Deployment не запускает новые
+процессы. Publish outbox и Publication(PENDING) остаются в PostgreSQL, без publish
+XADD; analysis full completion proof не требует исполняемого publisher.
+Подробнее — PIPELINE_SPEC.md §4.1.
 
 Переход ReviewJob в terminal status записывает terminal `status` и non-null
 `finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого

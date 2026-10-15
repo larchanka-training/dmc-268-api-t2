@@ -971,7 +971,7 @@ class CompleteAnalysis(SkipAnalysis):
 
 
 @pytest.mark.parametrize("status", [ReviewStatus.COMPLETED, ReviewStatus.PARTIAL])
-async def test_atomic_analysis_handoff_is_dispatchable_and_publishable(
+async def test_atomic_analysis_handoff_acks_while_publication_stays_parked(
     postgres: PostgresHarness,
     redis_client: Redis,
     stream_prefix: str,
@@ -985,25 +985,27 @@ async def test_atomic_analysis_handoff_is_dispatchable_and_publishable(
         analyzer.factory, queue, analyzer, owner="analyzer", task_kind="analyze"
     )
     assert await worker.run_once() is True
-    # Original event marker is still NULL, so dispatcher sends its duplicate
-    # alongside the atomically committed publication command.
-    dispatched = await PostgresOutboxDispatcher(
-        analyzer.factory, queue
-    ).dispatch_batch()
-    assert dispatched == 2  # noqa: PLR2004 — original and publish commands
+    # Full analysis proof permits ACK after durable handoff while publish is parked.
+    dispatcher = PostgresOutboxDispatcher(analyzer.factory, queue)
+    assert await dispatcher.dispatch_batch() == 0
+    assert await dispatcher.recover_batch() == 0
+    assert await redis_client.xlen(f"{stream_prefix}:publish") == 0
+    # An actual duplicate still verifies committed proof without another handler.
+    await queue.enqueue(task)
     assert await worker.run_once() is True
     assert len(analyzer.claims) == 1
-    publisher = FinishPublication(postgres)
-    publish_worker = PostgresReviewWorker(
-        publisher.factory, queue, publisher, owner="publisher", task_kind="publish"
-    )
-    assert await publish_worker.run_once() is True
-    assert publisher.claims[0].fencing_token == 2  # noqa: PLR2004 — second grant
-    async with SqlAlchemyUnitOfWork(publisher.factory) as uow:
+    async with SqlAlchemyUnitOfWork(analyzer.factory) as uow:
         publication = await uow.publications.get(uuid.UUID(task.review_id))
         review = await uow.review_jobs.get(uuid.UUID(task.review_id))
-    assert publication is not None and publication.status == "PUBLISHED"
+    assert publication is not None and publication.status == "PENDING"
+    assert publication.started_at is not None and publication.deadline_at is not None
+    assert publication.finished_at is None
     assert review is not None and review.status == status.value
+    async with analyzer.factory() as session:
+        event = await session.get(OutboxEvent, analyzer.publish_event_id)
+        assert event is not None and event.task_kind == "publish"
+        assert event.broker_published_at is None and event.broker_message_id is None
+        assert event.dispatch_generation == 0 and event.quarantined_at is None
 
 
 async def test_successful_callback_without_explicit_outcome_keeps_delivery_pending(

@@ -55,14 +55,6 @@ class PostgresAnalysisAttemptStore:
                     job.analysis_deadline_at,
                     "analysis_deadline_exceeded",
                 )
-            if job.retry_at is not None and job.retry_at > now:
-                return BeginAnalysisDecision(
-                    False,
-                    job.analysis_attempts,
-                    job.started_at,
-                    job.analysis_deadline_at,
-                    "retry_deferred",
-                )
             if job.started_at is None and job.queue_deadline_at <= now:
                 return BeginAnalysisDecision(
                     False,
@@ -70,6 +62,14 @@ class PostgresAnalysisAttemptStore:
                     job.started_at,
                     job.analysis_deadline_at,
                     "queue_deadline_exceeded",
+                )
+            if job.retry_at is not None and job.retry_at > now:
+                return BeginAnalysisDecision(
+                    False,
+                    job.analysis_attempts,
+                    job.started_at,
+                    job.analysis_deadline_at,
+                    "retry_deferred",
                 )
             if (
                 job.analysis_attempt_fence != lease.fencing_token

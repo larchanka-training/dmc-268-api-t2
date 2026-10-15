@@ -166,6 +166,11 @@ erDiagram
         TEXT trace_id
         TIMESTAMPTZ created_at
         TIMESTAMPTZ broker_published_at
+        TEXT broker_message_id
+        INTEGER dispatch_generation
+        TIMESTAMPTZ dispatch_not_before
+        TIMESTAMPTZ recovery_window_started_at
+        INTEGER recovery_send_count
     }
 
     TaskLease {
@@ -405,7 +410,8 @@ negation. `rules_digest` создаёт backend из canonical serialization п�
 - partial `UNIQUE(change_request_id, requested_head_sha, config_digest) WHERE finished_at IS NULL`
   — не более одного незавершённого эквивалентного запуска; завершённые запуски не
   блокируют rerun;
-- `outbox_event(broker_published_at, created_at)` — выбор событий dispatcher;
+- `outbox_event(broker_published_at, created_at)` — legacy unpublished index;
+- `outbox_event(created_at, id) WHERE task_kind='analyze' AND quarantined_at IS NULL` — bounded dispatcher keyset scan;
 - `task_lease(expires_at)` — выбор истёкших lease;
 - `idempotency_record(expires_at)` — удаление истёкших записей;
 - частичный уникальный индекс для `QuotaUsage(type='starts')` по `repository_id, user_id, type, window_start`;

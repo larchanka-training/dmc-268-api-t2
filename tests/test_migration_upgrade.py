@@ -445,7 +445,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0010"
+        == "0011"
     )
     assert (
         await database.connection.fetch(

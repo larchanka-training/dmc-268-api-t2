@@ -5,11 +5,13 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime, timedelta
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, func, insert, select, text, update
-from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
+from sqlalchemy import ScalarResult, delete, func, insert, select, text, update
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+from sqlalchemy.sql import Select
 from test_postgres_integration import PostgresHarness, _create_review_fixture
 
 from app.application.ports import LeaseLostError
@@ -995,7 +997,7 @@ async def _wait_for_database_clock(
         PublicationStatus.SKIPPED,
     ],
 )
-async def test_publication_write_rechecks_clock_after_lock_wait(
+async def test_publication_write_rechecks_clock_after_lock_wait(  # noqa: PLR0915 -- deterministic authority/SQL contention fixture
     postgres: PostgresHarness,
     review_id: uuid.UUID,
     boundary: str,
@@ -1003,19 +1005,42 @@ async def test_publication_write_rechecks_clock_after_lock_wait(
     status: PublicationStatus,
 ) -> None:
     await _create_publication(postgres, review_id)
-    factory = async_sessionmaker(postgres.engine)
-    lease = await PostgresTaskLeaseStore(factory).acquire(
+    lease_clock_armed = False
+
+    class ExpireValidatedLease(AsyncSession):
+        async def scalars(
+            self, statement: Any, *args: Any, **kwargs: Any
+        ) -> ScalarResult[Any]:
+            nonlocal lease_clock_armed
+            rows = await super().scalars(statement, *args, **kwargs)
+            if (
+                boundary == "lease"
+                and not lease_clock_armed
+                and isinstance(statement, Select)
+                and statement.column_descriptions[0].get("entity") is Publication
+            ):
+                # This DB boundary follows the production live-lease check.
+                # A row blocker has already delayed this SELECT; a table blocker
+                # will delay the subsequent UPDATE. Arm expiry without a timer
+                # that can run out during unrelated fixture/setup awaits.
+                await self.execute(
+                    update(TaskLease)
+                    .where(TaskLease.review_job_id == review_id)
+                    .values(expires_at=func.clock_timestamp())
+                    .execution_options(synchronize_session=False)
+                )
+                lease_clock_armed = True
+            return rows
+
+    factory = async_sessionmaker[AsyncSession](
+        postgres.engine, class_=ExpireValidatedLease
+    )
+    lease = await PostgresTaskLeaseStore(async_sessionmaker(postgres.engine)).acquire(
         review_id, owner="publisher", task_kind="publish"
     )
     assert lease is not None
     async with postgres.engine.begin() as connection:
-        if boundary == "lease":
-            await connection.execute(
-                update(TaskLease)
-                .where(TaskLease.review_job_id == review_id)
-                .values(expires_at=func.clock_timestamp() + timedelta(seconds=0.3))
-            )
-        else:
+        if boundary == "deadline":
             await connection.execute(
                 update(Publication)
                 .where(Publication.review_job_id == review_id)
@@ -1033,32 +1058,45 @@ async def test_publication_write_rechecks_clock_after_lock_wait(
     async with SqlAlchemyUnitOfWork(factory) as uow:
         before = await uow.publications.get(review_id)
         review_before = await uow.review_jobs.get(review_id)
-        async with postgres.engine.begin() as blocker:
-            if lock_kind == "table":
-                await blocker.execute(text("LOCK TABLE publication IN SHARE MODE"))
-            else:
-                await blocker.execute(
-                    select(Publication)
-                    .where(Publication.review_job_id == review_id)
-                    .with_for_update()
+        task = None
+        try:
+            async with postgres.engine.begin() as blocker:
+                if lock_kind == "table":
+                    await blocker.execute(text("LOCK TABLE publication IN SHARE MODE"))
+                else:
+                    await blocker.execute(
+                        select(Publication)
+                        .where(Publication.review_job_id == review_id)
+                        .with_for_update()
+                    )
+                blocker_pid = await blocker.scalar(select(func.pg_backend_pid()))
+                task = asyncio.create_task(
+                    uow.publications.update(
+                        lease,
+                        status=status,
+                        provider_metadata={"review_id": "operation-outcome"},
+                    )
                 )
-            blocker_pid = await blocker.scalar(select(func.pg_backend_pid()))
-            task = asyncio.create_task(
-                uow.publications.update(
-                    lease,
-                    status=status,
-                    provider_metadata={"review_id": "operation-outcome"},
-                )
-            )
-            await _wait_for_blocked_operation(postgres, blocker_pid)
-            await _wait_for_database_clock(blocker, cutoff)
-        allowed = boundary == "deadline" and status != PublicationStatus.PENDING
-        if allowed:
-            await task
-        else:
-            with pytest.raises(LeaseLostError):
+                try:
+                    await _wait_for_blocked_operation(postgres, blocker_pid)
+                except AssertionError:
+                    if task.done():
+                        task.result()  # Surface an unexpected early operation failure.
+                    raise
+                if boundary == "deadline":
+                    await _wait_for_database_clock(blocker, cutoff)
+            allowed = boundary == "deadline" and status != PublicationStatus.PENDING
+            if allowed:
                 await task
-        await uow.commit()
+            else:
+                with pytest.raises(LeaseLostError):
+                    await task
+            assert boundary != "lease" or lease_clock_armed
+            await uow.commit()
+        finally:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
     async with SqlAlchemyUnitOfWork(factory) as uow:
         saved = await uow.publications.get(review_id)
         if allowed:

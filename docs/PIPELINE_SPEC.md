@@ -153,8 +153,8 @@ The v1 serializer emits only the canonical envelope fields. V1 consumers ignore
 unknown optional fields. Breaking envelope changes require a new major version
 and corresponding consumer.
 
-The dispatcher selects unpublished outbox records that are not quarantined. It
-marks `broker_published_at` only after the queue adapter confirms Redis enqueue.
+The dispatcher selects only analyze outbox records that are not quarantined. Publish
+commands remain parked in PostgreSQL with NULL transport markers. It marks `broker_published_at` only after the queue adapter confirms Redis enqueue.
 Consumers reject unsupported schema versions, unknown task kinds, and otherwise
 invalid envelopes before domain work begins.
 
@@ -178,8 +178,9 @@ all other source data. It stores only the accepted reason code, never payloads,
 exception text, stack traces, or secrets. A quarantined event keeps
 `broker_published_at IS NULL`; a published event has no quarantine metadata.
 PostgreSQL CHECK constraints enforce paired quarantine metadata, accepted reason
-codes, and mutual exclusion of publication and quarantine. Both terminal writes
-conditionally update only an event that is still unpublished and unquarantined,
+codes, and mutual exclusion of publication and quarantine. Quarantine writes
+conditionally update only an event that is still unpublished and unquarantined;
+receipt finalization also checks the reserved generation,
 so repeated quarantine is idempotent and concurrent dispatchers cannot commit
 both terminal states for the same event.
 
@@ -196,33 +197,73 @@ downgrading to `0006`: downgrade removes quarantine metadata and makes previousl
 quarantined unpublished records eligible for normal selection again. Downgrade
 does not provide a validated operator replay operation.
 
-The minimal PostgreSQL dispatcher is `PostgresOutboxDispatcher.dispatch_batch()`
-in `src/app/adapters/outbox_dispatcher.py`. It accepts the existing session factory
-and `QueuePort`, selects oldest unpublished, unquarantined events with
-`FOR UPDATE SKIP LOCKED`, and defaults to a batch of 100 (the supplied batch size must be positive). It
-copies authoritative event columns into `QueueTaskEnvelope` and closes the
-selection transaction before Redis enqueue. Each confirmed enqueue is marked in
-its own short transaction, updating only a still-unpublished, unquarantined event.
+`PostgresOutboxDispatcher.dispatch_batch()` sends at most 100 genuine initial
+analyze commands (positive `batch_size`, capped at 100). Genuine initial means
+`dispatch_generation = 0`, NULL `broker_published_at` and NULL `broker_message_id`.
+Every selection applies analyze-only filtering before ORDER BY/LIMIT. Publish
+outbox and Publication(PENDING) remain durable without a runnable publish path.
 
-Selection locks are not claims across Redis I/O: overlapping dispatcher runs may
-enqueue duplicates after those locks are released. A crash after enqueue but
-before the marker commits also permits a duplicate. Both paths retain the same
-event ID and envelope; delivery is at-least-once, not exactly-once. The method
-returns the number of confirmed Redis enqueues, including concurrent duplicates;
-quarantined events do not increase that count. It continues after a known
-canonical validation failure has been durably quarantined and propagates the
-first other enqueue or database error. Earlier publication/quarantine markers
-stay committed; failed and remaining ordinary unpublished events stay eligible
-for the next invocation. There is no transaction spanning PostgreSQL and Redis,
-retry loop inside `dispatch_batch()`. A dispatcher that
-already copied an envelope is not cancelled by another run's terminal write.
-If source columns are concurrently corrected, an in-flight valid snapshot can
-still enter Redis after quarantine; its ACK is counted but cannot overwrite the
-quarantine marker. These guarantees concern authoritative PostgreSQL states,
-not exactly-once broker I/O.
+Migration `0011` adds transport metadata to the existing OutboxEvent:
+`broker_message_id`, `dispatch_generation` (default 0), `dispatch_not_before`,
+`recovery_window_started_at`, and `recovery_send_count` (default 0), with
+nonnegative generation/count and paired window/count CHECKs. Historical published
+rows without message ID and new reserved generations without receipt remain valid.
+`broker_published_at` is the DB time of the last confirmed enqueue, not completion.
 
-The standalone runtime is `python -m app.outbox_dispatcher --once` for one
-bounded batch, or `python -m app.outbox_dispatcher` for continuous polling.
+Initial and recovery sends share one persisted gate. Recovery snapshots take no
+row locks. Initial selection briefly uses OutboxEvent-only `SKIP LOCKED`, closing
+that transaction before reservation. A separate short transaction locks
+ReviewJob → TaskLease → OutboxEvent, rechecks
+canonical identity, observed generation/receipt/marker, active state, live lease,
+retry/deadline and persisted throttle using DB time sampled after locks. It commits
+an incremented generation, clears only the current receipt, and sets a 60-second
+cooldown before Redis I/O. Pure canonical validation precedes reservation. An
+invalid unpublished command is quarantined; an invalid historically published
+command is retained with a safe diagnostic. No source command is reconstructed.
+
+`recover_batch()` scans at most 100 previously reserved/legacy analyze candidates
+per tick in `(created_at, id)` keyset order, backed by a partial analyze index.
+The cursor advances past present, untrusted and deferred events and wraps at the
+end of a pass. Fairness is process-local across calls on one dispatcher; fresh
+`--once` processes restart the scan. No restart-persistent cursor is claimed.
+
+Known receipts use exact `XRANGE stream id id` outside PG transactions. Canonical
+unexpired PRESENT suppresses XADD for both unread and PEL backlog regardless of
+lease/retry age. Missing group is recreated with id0 through the existing policy.
+Empty XRANGE proves ABSENT. Redis failures or indeterminate responses are UNKNOWN
+and cause no reservation/receipt change; mismatched identity/payload is UNTRUSTED
+and causes safe diagnostics without ACK/DLQ. Unknown historical/ambiguous receipt
+allows only bounded recovery with an uncertainty diagnostic. Expiry is 20 minutes
+from the server-generated XADD ID relative to Redis TIME sampled before probe;
+a future ID does not expire. Existing expired transport with an expired accepted
+job deadline stays on receive/PEL for the existing zero-HTTP terminal handler.
+Missing transport can be replaced even after deadline so that handler can run.
+Future retry blocks a send unless the accepted queue/analysis deadline expired.
+
+At most 10 recovery reservations commit per tick, and at most 3/event in a persisted
+300-second window. Every send after generation0, including a failed first send
+with NULL marker, is recovery. Initial sends have separate limit100 and count0.
+Rollover begins at current DB time without clearing cooldown; exhausted windows
+defer with safe alert. No lifetime cap or catch-up loop is added. Failed/ambiguous
+sends and crashes never refund allowance. One reservation permits one XADD command
+attempt through an exclusive connection from the existing pool, bypassing hidden
+redis-py command retries. Conditional finalize writes returned message ID and
+DB-time marker only for the same generation and nonquarantined analyze event;
+a late older generation cannot overwrite a newer receipt.
+
+PG transactions have local lock timeout500ms, statement timeout2s, idle transaction
+timeout5s and application transaction timeout5s. Neither Redis probe nor XADD
+holds a PG transaction. Authority lock contention (SQLSTATE55P03) rolls back and
+defers only that candidate; other DB failures propagate. Initial batches may defer
+selected busy authority rows; recovery cursor fairness is process-local. Distributed exactly-once delivery is not promised: crash
+after XADD and before finalize may require a later bounded duplicate. Existing
+worker fencing/accounting, deadlines and full completion proof remain authoritative.
+Terminal/incomplete handoff is deferred with a safe alert and never reopened.
+
+The standalone `python -m app.outbox_dispatcher --once` performs one recovery
+sweep followed by one initial analyze batch. Existing continuous polling performs
+initial batches only; periodic30s recovery and analysis process lifecycle belong
+to Stage8C-04. No background process is activated by this change.
 It composes the existing `PostgresOutboxDispatcher`, `RedisQueue`, and database
 session factory using `POSTGRES__*`, `REDIS__URL`, and `LOGGING__*` settings.
 `--batch-size` defaults to 100 and must be a positive integer;

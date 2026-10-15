@@ -61,6 +61,11 @@ async def _run(*, once: bool, batch_size: int, poll_interval: float) -> None:
                     await client.ping()
                     if stopping.is_set():
                         break
+                    if once:
+                        recovered = await dispatcher.recover_batch()
+                        structlog.get_logger().info(
+                            "outbox_recovery", confirmed=recovered
+                        )
                     confirmed = await dispatcher.dispatch_batch(batch_size=batch_size)
                     structlog.get_logger().info("outbox_batch", confirmed=confirmed)
                     if once:

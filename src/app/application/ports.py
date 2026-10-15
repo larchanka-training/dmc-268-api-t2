@@ -79,7 +79,18 @@ class QueueClaim:
     deleted_ids: tuple[str, ...] = ()
 
 
+type TransportProbe = Literal["PRESENT", "ABSENT", "UNTRUSTED", "UNKNOWN", "EXPIRED"]
+
+
 class QueuePort(Protocol):
+    def validate(self, envelope: QueueTaskEnvelope) -> None:
+        """Pure canonical serialization validation, before any reservation/I/O."""
+        ...
+
+    async def probe(
+        self, envelope: QueueTaskEnvelope, message_id: str
+    ) -> TransportProbe: ...
+
     async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
         """Confirm enqueue or reject before I/O via QueueEnvelopeValidationError."""
         ...

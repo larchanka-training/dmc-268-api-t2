@@ -9,7 +9,7 @@ from typing import cast
 
 from redis.asyncio import Redis
 from redis.client import NEVER_DECODE
-from redis.exceptions import ResponseError
+from redis.exceptions import RedisError, ResponseError
 
 from app.application.ports import (
     MAX_QUEUE_ENVELOPE_BYTES,
@@ -19,8 +19,10 @@ from app.application.ports import (
     QueueEnvelopeValidationError,
     QueueTaskEnvelope,
     TaskKind,
+    TransportProbe,
 )
 
+_TRANSPORT_EXPIRY_MS = 20 * 60 * 1000
 _DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 type _StreamMessage = tuple[str | bytes, dict[str | bytes, str | bytes]]
 type _ReadResponse = list[tuple[str | bytes, list[_StreamMessage]]]
@@ -154,14 +156,80 @@ class RedisQueue:
         self._stream_prefix = stream_prefix
         self._group_name = group_name
 
+    def validate(self, envelope: QueueTaskEnvelope) -> None:
+        _decode_envelope(envelope.to_json())
+
     async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
         payload = envelope.to_json()
         canonical = _decode_envelope(payload)
         payload = canonical.to_json()
-        message_id = await self._client.xadd(
-            f"{self._stream_prefix}:{canonical.task_kind}", {"envelope": payload}
-        )
+        # One application command attempt per durable reservation, even when
+        # the shared pool's redis-py Retry policy retries ambiguous commands.
+        pool = self._client.connection_pool
+        connection = await pool.get_connection()  # type: ignore[no-untyped-call]
+        try:
+            await connection.send_command(
+                "XADD",
+                f"{self._stream_prefix}:{canonical.task_kind}",
+                "*",
+                "envelope",
+                payload,
+            )
+            message_id = await self._client.parse_response(
+                connection, "XADD", **{NEVER_DECODE: True}
+            )
+        except BaseException:
+            await connection.disconnect()
+            raise
+        finally:
+            await pool.release(connection)
         return message_id.decode() if isinstance(message_id, bytes) else message_id
+
+    async def probe(  # noqa: PLR0911 -- transport evidence is never inferred on error
+        self, envelope: QueueTaskEnvelope, message_id: str
+    ) -> TransportProbe:
+        """Read only the confirmed transport receipt, never scan the backlog."""
+        try:
+            # Sample before the read: delays in probe/group creation cannot age
+            # an entry into expiry. Auto XADD IDs originate at the Redis server;
+            # its monotonic ID floor can be ahead of TIME, which never expires it.
+            seconds, micros = await self._client.time()
+            rows = await self._client.execute_command(  # type: ignore[no-untyped-call]
+                "XRANGE",
+                f"{self._stream_prefix}:analyze",
+                message_id,
+                message_id,
+                **{NEVER_DECODE: True},
+            )
+        except RedisError, TimeoutError:
+            return "UNKNOWN"
+        if not isinstance(rows, list):
+            return "UNKNOWN"
+        if not rows:
+            return "ABSENT"
+        if len(rows) != 1:
+            return "UNKNOWN"
+        try:
+            delivery = self._delivery(*cast(list[_StreamMessage], rows)[0], "analyze")
+        except InvalidQueueMessageError:
+            return "UNTRUSTED"
+        fields = cast(list[_StreamMessage], rows)[0][1]
+        serialized = fields.get("envelope", fields.get(b"envelope"))
+        if (
+            delivery.message_id != message_id
+            or delivery.envelope != envelope
+            or set(fields) not in ({"envelope"}, {b"envelope"})
+            or serialized is None
+            or json.loads(serialized) != asdict(envelope)
+        ):
+            return "UNTRUSTED"
+        try:
+            await self._ensure_group(f"{self._stream_prefix}:analyze")
+        except RedisError, TimeoutError:
+            return "UNKNOWN"
+        timestamp = int(delivery.message_id.split("-", 1)[0])
+        now_ms = seconds * 1000 + micros // 1000
+        return "EXPIRED" if now_ms - timestamp >= _TRANSPORT_EXPIRY_MS else "PRESENT"
 
     async def receive(
         self, *, task_kind: TaskKind, consumer_name: str

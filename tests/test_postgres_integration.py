@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
+from redis.asyncio.connection import Connection
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -287,13 +288,11 @@ async def _stream_envelopes(client: Redis, stream: str) -> list[dict[str, object
     return payloads
 
 
-@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
-async def test_dispatcher_preserves_outbox_identity_in_correct_redis_stream(
+async def test_dispatcher_preserves_outbox_identity_in_analyze_stream(
     postgres: PostgresHarness,
     dispatcher_redis: tuple[Redis, str],
-    task_kind: TaskKind,
 ) -> None:
-    event_id, review_id = await _create_outbox_event(postgres, task_kind=task_kind)
+    event_id, review_id = await _create_outbox_event(postgres, task_kind="analyze")
     client, prefix = dispatcher_redis
     dispatcher = PostgresOutboxDispatcher(
         async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
@@ -301,18 +300,17 @@ async def test_dispatcher_preserves_outbox_identity_in_correct_redis_stream(
 
     assert await dispatcher.dispatch_batch() == 1
 
-    payloads = await _stream_envelopes(client, f"{prefix}:{task_kind}")
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
     assert len(payloads) == 1
     assert payloads[0] == {
         "schema_version": 1,
         "event_id": str(event_id),
         "review_id": str(review_id),
-        "task_kind": task_kind,
+        "task_kind": "analyze",
         "attempt": 2,
         "trace_id": "trace-outbox-test",
     }
-    other_kind = "publish" if task_kind == "analyze" else "analyze"
-    assert await client.xlen(f"{prefix}:{other_kind}") == 0
+    assert await client.xlen(f"{prefix}:publish") == 0
 
 
 async def test_dispatcher_releases_postgres_transaction_before_redis_enqueue(
@@ -368,10 +366,23 @@ async def test_dispatcher_keeps_redis_failure_unpublished_until_successful_retry
         assert event.broker_published_at is None
         assert event.quarantined_at is None
         assert event.quarantine_reason_code is None
+        assert event.dispatch_generation == 1
+        assert event.recovery_send_count == 0
+        assert event.dispatch_not_before is not None
     assert await client.xlen(f"{prefix}:analyze") == 0
 
     retry = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
-    assert await retry.dispatch_batch() == 1
+    assert await retry.dispatch_batch() == 0
+    assert await retry.recover_batch() == 0
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.OutboxEvent)
+            .where(models.OutboxEvent.id == event_id)
+            .values(
+                dispatch_not_before=func.clock_timestamp() - text("INTERVAL '1 second'")
+            )
+        )
+    assert await retry.recover_batch() == 1
 
     async with factory() as session:
         event = await session.get(models.OutboxEvent, event_id)
@@ -527,7 +538,7 @@ async def test_dispatcher_crash_retries_same_event_without_losing_progress(
     postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
 ) -> None:
     first_id, _ = await _create_outbox_event(postgres)
-    crashed_id, review_id = await _create_outbox_event(postgres, task_kind="publish")
+    crashed_id, review_id = await _create_outbox_event(postgres)
     factory = async_sessionmaker(postgres.engine)
     client, prefix = dispatcher_redis
     dispatcher = PostgresOutboxDispatcher(
@@ -544,7 +555,9 @@ async def test_dispatcher_crash_retries_same_event_without_losing_progress(
         await connection.execute(
             text(f"""
             CREATE TRIGGER {trigger_name} BEFORE UPDATE ON outbox_event
-            FOR EACH ROW WHEN (NEW.id = '{crashed_id}'::uuid)
+            FOR EACH ROW WHEN (
+                NEW.id = '{crashed_id}'::uuid AND NEW.broker_message_id IS NOT NULL
+            )
             EXECUTE FUNCTION {trigger_name}()
         """)
         )
@@ -564,32 +577,42 @@ async def test_dispatcher_crash_retries_same_event_without_losing_progress(
         assert first is not None and crashed is not None
         assert first.broker_published_at is not None
         assert crashed.broker_published_at is None
-    assert await client.xlen(f"{prefix}:analyze") == 1
-    assert await client.xlen(f"{prefix}:publish") == 1
+    assert await client.xlen(f"{prefix}:analyze") == 2  # noqa: PLR2004 -- two sends
+    assert await client.xlen(f"{prefix}:publish") == 0
 
     restarted = PostgresOutboxDispatcher(
         factory, RedisQueue(client, stream_prefix=prefix)
     )
-    assert await restarted.dispatch_batch() == 1
+    assert await restarted.dispatch_batch() == 0
+    assert await restarted.recover_batch() == 0
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.OutboxEvent)
+            .where(models.OutboxEvent.id == crashed_id)
+            .values(
+                dispatch_not_before=func.clock_timestamp() - text("INTERVAL '1 second'")
+            )
+        )
+    assert await restarted.recover_batch() == 1
 
-    payloads = await _stream_envelopes(client, f"{prefix}:publish")
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
     expected_payload = {
         "schema_version": 1,
         "event_id": str(crashed_id),
         "review_id": str(review_id),
-        "task_kind": "publish",
+        "task_kind": "analyze",
         "attempt": 2,
         "trace_id": "trace-outbox-test",
     }
-    assert payloads == [expected_payload, expected_payload]
-    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert payloads[1:] == [expected_payload, expected_payload]
+    assert await client.xlen(f"{prefix}:analyze") == 3  # noqa: PLR2004 -- bounded retry
     async with factory() as session:
         event = await session.get(models.OutboxEvent, crashed_id)
         assert event is not None
         assert event.broker_published_at is not None
 
 
-async def test_parallel_dispatchers_allow_duplicates_but_preserve_first_publication(
+async def test_parallel_dispatchers_reserve_once_before_redis_send(
     postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
 ) -> None:
     event_id, _ = await _create_outbox_event(postgres)
@@ -609,12 +632,13 @@ async def test_parallel_dispatchers_allow_duplicates_but_preserve_first_publicat
     slow_run = asyncio.create_task(slow.dispatch_batch())
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        assert await asyncio.wait_for(fast.dispatch_batch(), 2) == 1
+        assert await asyncio.wait_for(fast.dispatch_batch(), 2) == 0
         async with factory() as session:
             event = await session.get(models.OutboxEvent, event_id)
             assert event is not None
-            first_published_at = event.broker_published_at
-            assert first_published_at is not None
+            assert event.broker_published_at is None
+            assert event.dispatch_generation == 1
+            assert event.recovery_send_count == 0
         release.set()
         assert await asyncio.wait_for(slow_run, 2) == 1
     finally:
@@ -625,16 +649,14 @@ async def test_parallel_dispatchers_allow_duplicates_but_preserve_first_publicat
             await slow_run
 
     payloads = await _stream_envelopes(client, f"{prefix}:analyze")
-    assert [payload["event_id"] for payload in payloads] == [
-        str(event_id),
-        str(event_id),
-    ]
-    assert payloads[0] == payloads[1]
+    assert [payload["event_id"] for payload in payloads] == [str(event_id)]
     assert payloads[0]["event_id"] == str(event_id)
     async with factory() as session:
         event = await session.get(models.OutboxEvent, event_id)
         assert event is not None
-        assert event.broker_published_at == first_published_at
+        assert event.broker_published_at is not None
+        assert event.broker_message_id is not None
+        assert event.dispatch_generation == 1
     assert await fast.dispatch_batch() == 0
 
 
@@ -757,7 +779,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0010"
+        ).scalar_one() == "0011"
 
         result = await connection.execute(
             text(
@@ -1370,7 +1392,7 @@ async def test_dispatcher_delivers_valid_event_after_quarantine_in_same_batch(
             .where(models.OutboxEvent.id == invalid_id)
             .values(schema_version=2)
         )
-    later_id, _ = await _create_outbox_event(postgres, task_kind="publish")
+    later_id, _ = await _create_outbox_event(postgres)
     client, prefix = dispatcher_redis
     dispatcher = PostgresOutboxDispatcher(
         async_sessionmaker(postgres.engine), RedisQueue(client, stream_prefix=prefix)
@@ -1378,7 +1400,7 @@ async def test_dispatcher_delivers_valid_event_after_quarantine_in_same_batch(
 
     assert await dispatcher.dispatch_batch() == 1
 
-    payloads = await _stream_envelopes(client, f"{prefix}:publish")
+    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
     assert [payload["event_id"] for payload in payloads] == [str(later_id)]
     async with postgres.engine.connect() as connection:
         marker = await connection.scalar(
@@ -1453,7 +1475,7 @@ async def test_quarantine_wins_over_concurrent_inflight_publication_marker(
                 .where(models.OutboxEvent.id == event_id)
                 .values(schema_version=2)
             )
-        assert await fast.dispatch_batch() == 0
+        assert await fast.recover_batch() == 0
         async with factory() as session:
             event = await session.get(models.OutboxEvent, event_id)
             assert event is not None
@@ -1480,70 +1502,45 @@ async def test_quarantine_wins_over_concurrent_inflight_publication_marker(
     assert await fast.dispatch_batch() == 0
 
 
-@pytest.mark.parametrize("publish_first", [False, True])
-async def test_concurrent_quarantine_preserves_first_terminal_decision(
-    postgres: PostgresHarness,
-    dispatcher_redis: tuple[Redis, str],
-    publish_first: bool,
+async def test_published_receipt_with_corrected_source_is_untrusted_and_not_quarantined(
+    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
 ) -> None:
     event_id, _ = await _create_outbox_event(postgres)
+    factory = async_sessionmaker(postgres.engine)
+    client, prefix = dispatcher_redis
+    dispatcher = PostgresOutboxDispatcher(
+        factory, RedisQueue(client, stream_prefix=prefix)
+    )
+    assert await dispatcher.dispatch_batch() == 1
+    async with factory() as session:
+        event = await session.get(models.OutboxEvent, event_id)
+        assert event is not None
+        receipt = (
+            event.broker_message_id,
+            event.broker_published_at,
+            event.dispatch_generation,
+        )
     async with postgres.engine.begin() as connection:
         await connection.execute(
             update(models.OutboxEvent)
             .where(models.OutboxEvent.id == event_id)
             .values(schema_version=2)
         )
-    factory = async_sessionmaker(postgres.engine)
-    client, prefix = dispatcher_redis
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class PausedQueue(RedisQueue):
-        async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
-            entered.set()
-            await release.wait()
-            return await super().enqueue(envelope)
-
-    slow = PostgresOutboxDispatcher(factory, PausedQueue(client, stream_prefix=prefix))
-    fast = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
-    run = asyncio.create_task(slow.dispatch_batch())
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        if publish_first:
-            async with postgres.engine.begin() as connection:
-                await connection.execute(
-                    update(models.OutboxEvent)
-                    .where(models.OutboxEvent.id == event_id)
-                    .values(schema_version=1)
-                )
-        assert await fast.dispatch_batch() == int(publish_first)
-        async with factory() as session:
-            event = await session.get(models.OutboxEvent, event_id)
-            assert event is not None
-            first_state = (
-                event.quarantined_at,
-                event.quarantine_reason_code,
-                event.broker_published_at,
-            )
-        release.set()
-        assert await asyncio.wait_for(run, 2) == 0
-    finally:
-        release.set()
-        if not run.done():
-            run.cancel()
-        with suppress(asyncio.CancelledError):
-            await run
-
+    assert await dispatcher.recover_batch() == 0
+    assert await dispatcher.dispatch_batch() == 0
     async with factory() as session:
         event = await session.get(models.OutboxEvent, event_id)
         assert event is not None
         assert (
-            event.quarantined_at,
-            event.quarantine_reason_code,
+            event.broker_message_id,
             event.broker_published_at,
-        ) == first_state
-    assert await client.xlen(f"{prefix}:analyze") == int(publish_first)
-    assert await fast.dispatch_batch() == 0
+            event.dispatch_generation,
+        ) == receipt
+        assert event.quarantined_at is None
+        assert event.quarantine_reason_code is None
+        assert event.recovery_send_count == 0
+    assert await client.xlen(f"{prefix}:analyze") == 1
+    assert await client.xlen(f"{prefix}:dead") == 0
 
 
 async def test_quarantine_commit_failure_rolls_back_and_preserves_batch_progress(
@@ -1551,7 +1548,7 @@ async def test_quarantine_commit_failure_rolls_back_and_preserves_batch_progress
 ) -> None:
     first_id, _ = await _create_outbox_event(postgres)
     invalid_id, _ = await _create_outbox_event(postgres)
-    later_id, _ = await _create_outbox_event(postgres, task_kind="publish")
+    later_id, _ = await _create_outbox_event(postgres)
     unsupported_version = 2
     trigger_name = f"quarantine_failure_{uuid.uuid4().hex}"
     async with postgres.engine.begin() as connection:
@@ -1621,11 +1618,15 @@ async def test_dispatcher_propagates_unknown_sdk_value_error_without_quarantine(
     event_id, _ = await _create_outbox_event(postgres)
     client, prefix = dispatcher_redis
 
-    async def fail_xadd(*args: object, **kwargs: object) -> str:
-        raise ValueError("unknown Redis SDK failure")
+    original_send = Connection.send_command
+
+    async def fail_xadd(self: Connection, *args: object, **kwargs: object) -> None:
+        if args and args[0] == "XADD":
+            raise ValueError("unknown Redis SDK failure")
+        await original_send(self, *args, **kwargs)
 
     # Inject an error at the external SDK boundary, after canonical validation.
-    monkeypatch.setattr(client, "xadd", fail_xadd)
+    monkeypatch.setattr(Connection, "send_command", fail_xadd)
     factory = async_sessionmaker(postgres.engine)
     dispatcher = PostgresOutboxDispatcher(
         factory, RedisQueue(client, stream_prefix=prefix)

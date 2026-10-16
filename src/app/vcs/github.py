@@ -26,6 +26,7 @@ _MAX_ERROR_BYTES = 16 * 1024
 _MAX_RETRY_AFTER_DIGITS = 9
 _MAX_RESET_EPOCH_DIGITS = 10
 _TOTAL_TIMEOUT_SECONDS = 15
+_MAX_PAGE = 2_147_483_647
 _SECONDARY_RETRY_AFTER_SECONDS = 60
 
 
@@ -136,9 +137,151 @@ def _pull_metadata(response: httpx.Response, request: GithubRequest) -> dict[str
     return pull
 
 
+def _listed_text(value: object, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+    return value
+
+
+def _listed_ref(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    repository = value.get("repo")
+    if (
+        not isinstance(repository, dict)
+        or type(repository.get("id")) is not int
+        or repository["id"] < 1
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    sha = _listed_text(value.get("sha"))
+    if not _SHA.fullmatch(sha):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    return {
+        "repository_external_id": str(repository["id"]),
+        "ref": _listed_text(value.get("ref")),
+        "sha": sha,
+    }
+
+
+def _listed_pull(value: object, external_id: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    if value.get("state") == "closed":
+        return None
+    author = value.get("user")
+    if (
+        value.get("state") != "open"
+        or type(value.get("number")) is not int
+        or value["number"] < 1
+        or not isinstance(author, dict)
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    base = _listed_ref(value.get("base"))
+    if base["repository_external_id"] != external_id:
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    return {
+        "number": value["number"],
+        "title": _listed_text(value.get("title"), allow_empty=True),
+        "author": {"login": _listed_text(author.get("login"))},
+        "state": "OPEN",
+        "source": _listed_ref(value.get("head")),
+        "base": base,
+    }
+
+
+def _next_pull_page(  # noqa: PLR0913 - one provider page context
+    response: httpx.Response,
+    external_id: str,
+    owner: str,
+    name: str,
+    *,
+    limit: int,
+    page: int,
+) -> int | None:
+    try:
+        if not response.headers.get("Link", "").isascii():
+            raise ValueError("Invalid continuation header")
+        link = response.links.get("next")
+        if link is None:
+            return None
+        url = httpx.URL(link["url"])
+        params = url.params
+        raw_page = params.get("page", "")
+        if (
+            url.scheme != "https"
+            or url.host != "api.github.com"
+            or url.port not in {None, 443}
+            or url.userinfo
+            or url.fragment
+            or url.path
+            not in {
+                f"/repos/{owner}/{name}/pulls",
+                f"/repositories/{external_id}/pulls",
+            }
+            or set(params) != {"state", "per_page", "page"}
+            or len(params.multi_items()) != len({"state", "per_page", "page"})
+            or params["state"] != "open"
+            or params["per_page"] != str(limit)
+            or not raw_page.isascii()
+            or not raw_page.isdecimal()
+            or len(raw_page) > len(str(_MAX_PAGE))
+            or not page < int(raw_page) <= _MAX_PAGE
+        ):
+            raise ValueError("Invalid continuation")
+        return int(raw_page)
+    except ValueError, KeyError, httpx.InvalidURL:
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+
+
 class GithubClient:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
+
+    async def list_pull_requests(
+        self, external_id: str, owner: str, name: str, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        try:
+            async with asyncio.timeout(_TOTAL_TIMEOUT_SECONDS):
+                return await self._list_pull_requests(
+                    external_id, owner, name, limit=limit, page=page
+                )
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+
+    async def _list_pull_requests(
+        self, external_id: str, owner: str, name: str, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        if (
+            not _OWNER.fullmatch(owner)
+            or not _REPOSITORY.fullmatch(name)
+            or name in {".", ".."}
+            or not _EXTERNAL_ID.fullmatch(external_id)
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        response = await self._get(
+            f"https://api.github.com/repos/{owner}/{name}/pulls"
+            f"?state=open&per_page={limit}&page={page}",
+            "application/vnd.github+json",
+        )
+        try:
+            payload = response.json()
+        except ValueError, UnicodeError, RecursionError:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+        if not isinstance(payload, list) or len(payload) > limit:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        items = []
+        for pull in payload:
+            item = _listed_pull(pull, external_id)
+            if item is not None:
+                items.append(item)
+        next_page = _next_pull_page(
+            response, external_id, owner, name, limit=limit, page=page
+        )
+        return items, next_page
 
     async def has_read_access(self, external_id: str) -> bool:
         """The caller must supply an HTTP client with this user's credentials."""
@@ -198,7 +341,15 @@ class GithubClient:
                     _check_status(response, bytes(content))
         except httpx.RequestError:
             raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
-        return httpx.Response(200, content=bytes(content))
+        return httpx.Response(
+            200,
+            content=bytes(content),
+            headers=[
+                (key, value)
+                for key, value in response.headers.raw
+                if key.lower() == b"link"
+            ],
+        )
 
     async def _fetch(self, request: GithubRequest) -> GithubSnapshot:
         if (

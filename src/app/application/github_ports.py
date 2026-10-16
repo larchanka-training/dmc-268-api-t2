@@ -40,3 +40,7 @@ class GithubRepositoryReader(Protocol):
     """Current read access, using only the authenticated user's credentials."""
 
     async def has_read_access(self, external_id: str) -> bool: ...
+
+    async def list_pull_requests(
+        self, external_id: str, owner: str, name: str, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]: ...

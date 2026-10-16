@@ -140,6 +140,28 @@ class GithubClient:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
+    async def has_read_access(self, external_id: str) -> bool:
+        """The caller must supply an HTTP client with this user's credentials."""
+        if not _EXTERNAL_ID.fullmatch(external_id):
+            raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        try:
+            response = await self._get(
+                f"https://api.github.com/repositories/{external_id}",
+                "application/vnd.github+json",
+            )
+        except GithubFailure as error:
+            if error.reason_code == "VCS_ACCESS_DENIED":
+                return False
+            raise
+        payload = _json_object(response)
+        permissions = payload.get("permissions")
+        return (
+            type(payload.get("id")) is int
+            and str(payload["id"]) == external_id
+            and isinstance(permissions, dict)
+            and permissions.get("pull") is True
+        )
+
     async def fetch(self, request: GithubRequest) -> GithubSnapshot:
         try:
             async with asyncio.timeout(_TOTAL_TIMEOUT_SECONDS):

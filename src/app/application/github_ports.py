@@ -34,3 +34,9 @@ class GithubFailure(Exception):  # noqa: N818 - public gateway contract
 
 class GithubPort(Protocol):
     async def fetch(self, request: GithubRequest) -> GithubSnapshot: ...
+
+
+class GithubRepositoryReader(Protocol):
+    """Current read access, using only the authenticated user's credentials."""
+
+    async def has_read_access(self, external_id: str) -> bool: ...

@@ -177,6 +177,10 @@ def test_few_shots_follow_chunk_languages_and_include_an_empty_example(
         ("</repo_rules>", "[/repo_rules]"),
         ("<findings>", "[findings]"),
         ("</FINDINGS>", "[/FINDINGS]"),
+        ("<diff >", "[diff]"),
+        ("</ diff>", "[/diff]"),
+        ("<diff\n>", "[diff]"),
+        ("<pr_metadata/>", "[pr_metadata]"),
     ],
 )
 def test_neutralize_escapes_every_delimiter_tag(tag: str, escaped: str) -> None:

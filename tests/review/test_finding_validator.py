@@ -81,6 +81,19 @@ def test_rule_refs_from_text_extracts_labels() -> None:
     assert rule_refs_from_text(rendered) == frozenset({"SEC-1", "perf-2"})
 
 
+def test_rule_refs_from_text_anchors_labels_to_instruction_start() -> None:
+    # CONTEXT.md (rule_ref): the label opens the instruction text; a bracketed
+    # word mid-sentence is prose, not a citable rule (no [IGNORE-ALL] whitelist).
+    rendered = (
+        "- [SEC-1] No eval\n"
+        "- используй [eval] только для проверок\n"
+        "- plain text with [IGNORE-ALL] inside\n"
+        "- [perf-2] Cache it"
+    )
+
+    assert rule_refs_from_text(rendered) == frozenset({"SEC-1", "perf-2"})
+
+
 def test_rule_refs_from_text_tolerates_missing_rules() -> None:
     assert rule_refs_from_text(None) == frozenset()
     assert rule_refs_from_text("") == frozenset()

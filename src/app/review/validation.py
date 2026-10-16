@@ -35,8 +35,11 @@ _SECRET_PATTERNS = (
 _TEXT_FIELDS = ("title", "explanation", "evidence", "recommendation")
 _OPTIONAL_TEXT_FIELDS = ("proposed_diff_fix",)
 
-# Rule labels like [SEC-1] at any position of an instruction (CONTEXT.md: rule_ref).
-_RULE_LABEL = re.compile(r"\[([A-Za-z][A-Za-z0-9_-]{0,31})\]")
+# Rule labels like [SEC-1] opening the instruction text (CONTEXT.md: rule_ref
+# — «в начале текста инструкции»); a bracketed word mid-sentence is prose.
+_RULE_LABEL = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?\[([A-Za-z][A-Za-z0-9_-]{0,31})\]", re.MULTILINE
+)
 
 _CHANGED_KIND = {
     FindingSide.NEW: LineKind.ADDED,

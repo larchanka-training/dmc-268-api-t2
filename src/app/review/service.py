@@ -210,11 +210,13 @@ class ReviewService:
         rules_text: str | None,
     ) -> tuple[LLMCallResult[LLMReviewOutput], BuiltPrompt]:
         """One repair request: original messages, the truncated invalid answer
-        and the validation errors (locations and messages, no source code)."""
+        (neutralized: it is untrusted text) and the validation errors
+        (locations and messages, no source code)."""
         errors = "\n".join(f"- {d}" for d in error.details[:_REPAIR_MAX_ERRORS])
         extra = [
             ChatMessage(
-                role="assistant", content=error.raw_text[:_REPAIR_ANSWER_CHARS]
+                role="assistant",
+                content=neutralize(error.raw_text[:_REPAIR_ANSWER_CHARS]),
             ),
             ChatMessage(role="user", content=_REPAIR_INSTRUCTION.format(errors=errors)),
         ]
@@ -240,7 +242,7 @@ class ReviewService:
         messages: list[ChatMessage],
         input_tokens: int,
         budget: RunBudget,
-        response_model: type[T] = LLMReviewOutput,  # type: ignore[assignment]
+        response_model: type[T],
     ) -> LLMCallResult[T]:
         request = LLMRequest(
             messages=messages,
@@ -288,8 +290,12 @@ class ReviewService:
             return outcome
         try:
             call = await self._send(messages, estimated, budget, ReflectionOutput)
-        except LLMGatewayError:
-            logger.info("reflection_pass_failed", fallback="deterministic_result")
+        except LLMGatewayError as exc:
+            logger.info(
+                "reflection_pass_failed",
+                fallback="deterministic_result",
+                error_code=exc.error_code,
+            )
             return outcome
         attempt.reflection_calls.append(call)
         rejected = {
@@ -338,6 +344,8 @@ class ReviewService:
             rejected_findings_count=outcome.rejected_count if outcome else 0,
             limitations=limitations or [],
             usage=Usage(
+                # Known-value sums: a billed call without usage makes the total
+                # understate (never overstate); requests stays exact.
                 input_tokens=_sum_known(c.input_tokens for c in billed),
                 output_tokens=_sum_known(c.output_tokens for c in billed),
                 requests=budget.state().requests_used - attempt.requests_before,

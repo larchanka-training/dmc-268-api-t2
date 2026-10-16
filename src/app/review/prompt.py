@@ -21,12 +21,19 @@ from app.review.schemas.result import LLMReviewOutput
 
 # Data may not open or close our delimiter tags (prompt injection, SD §12).
 # findings covers the Reflection Pass verifier block (issue #25).
-_DELIMITER_TAGS = ("pr_metadata", "diff", "repo_rules", "findings")
+DELIMITER_TAGS = ("pr_metadata", "diff", "repo_rules", "findings")
 # Tolerates padding and self-closing forms (<diff >, </ diff>, <pr_metadata/>):
 # the canonical renderer never emits them, but untrusted text may.
 _DELIMITER_TAG = re.compile(
-    rf"<(/?)\s*({'|'.join(_DELIMITER_TAGS)})\s*/?>", re.IGNORECASE
+    rf"<(/?)\s*({'|'.join(DELIMITER_TAGS)})\s*/?>", re.IGNORECASE
 )
+
+
+def delimiter_block_list() -> str:
+    """«<a>, <b> и <c>» — the block list for trust-boundary policy texts."""
+    *head, last = DELIMITER_TAGS
+    return ", ".join(f"<{tag}>" for tag in head) + f" и <{last}>"
+
 
 # Per-message framing tokens added by chat templates.
 _MESSAGE_OVERHEAD_TOKENS = 4

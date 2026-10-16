@@ -26,6 +26,7 @@ from app.db.llm_accounting import PostgresReviewRunBudget
 from app.db.models import (
     ChunkResult,
     ContextPayload,
+    Finding,
     OutboxEvent,
     Publication,
     RepositoryAccess,
@@ -233,12 +234,14 @@ async def test_budget_terminal_preserves_precise_safe_code(
     ],
     ids=["null", "valid", "zero"],
 )
-async def test_queue_deadline_preserves_validated_saved_result_as_partial(
+@pytest.mark.parametrize("schema_version", [1, 2], ids=["v1", "v2"])
+async def test_queue_deadline_preserves_validated_saved_result_as_partial(  # noqa: PLR0913, PLR0917 -- version/retention/usage matrix
     postgres: PostgresHarness,
     review_id: uuid.UUID,
     payload_data: dict[str, Any],
     usage: dict[str, int] | None,
     retained_context: bool,
+    schema_version: int,
 ) -> None:
 
     factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
@@ -261,11 +264,36 @@ async def test_queue_deadline_preserves_validated_saved_result_as_partial(
                 id=uuid.uuid4(),
                 review_job_id=review_id,
                 context_payload_id=context.id,
-                schema_version=1,
+                schema_version=schema_version,
                 summary="Verified saved review",
                 limitations=[],
                 usage=usage,
                 latency_ms=3,
+            )
+        )
+        await session.flush()
+        chunk = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).one()
+        session.add(
+            Finding(
+                id=uuid.uuid4(),
+                chunk_result_id=chunk.id,
+                fingerprint="historical-fingerprint-kept-verbatim",
+                path=payload_data["files"][0]["diff"]["new_path"],
+                side="NEW",
+                start_line=39,
+                end_line=39,
+                category="correctness",
+                severity="high",
+                title="Saved issue",
+                explanation="Saved explanation",
+                evidence="Saved evidence",
+                recommendation="Saved recommendation",
+                proposed_diff_fix=None,
+                rule_ref="SEC-1" if schema_version == 2 else None,
             )
         )
         await session.flush()
@@ -315,6 +343,14 @@ async def test_queue_deadline_preserves_validated_saved_result_as_partial(
         ).one()
         assert "queue_deadline_exceeded" in chunk.limitations
         assert chunk.usage == usage
+        assert chunk.schema_version == schema_version
+        finding = (
+            await session.scalars(
+                select(Finding).where(Finding.chunk_result_id == chunk.id)
+            )
+        ).one()
+        assert finding.fingerprint == "historical-fingerprint-kept-verbatim"
+        assert finding.rule_ref == ("SEC-1" if schema_version == 2 else None)
         assert chunk.context_payload_id == (context.id if retained_context else None)
         publication = (
             await session.scalars(
@@ -554,7 +590,7 @@ async def test_terminal_failure_matrix_preserves_only_canonical_saved_results(
                 ChunkResult(
                     id=uuid.uuid4(),
                     review_job_id=review_id,
-                    schema_version=1 if saved == "valid" else 2,
+                    schema_version=1 if saved == "valid" else 99,
                     summary="Verified saved review"
                     if saved == "valid"
                     else "raw invalid answer",

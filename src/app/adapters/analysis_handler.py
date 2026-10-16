@@ -88,17 +88,30 @@ class PostgresAnalysisHandler:
         self._execution_factory = execution_factory
         self._limit = limit_input_tokens
         self._reserved = reserved_output_tokens
-        documents = [
-            json.loads((schemas_dir / name / "v1.json").read_text(encoding="utf-8"))
-            for name in ("context", "review-result")
-        ]
+        context_schema = json.loads(
+            (schemas_dir / "context/v1.json").read_text(encoding="utf-8")
+        )
+        result_schemas = {
+            version: json.loads(
+                (schemas_dir / f"review-result/v{version}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for version in (1, 2)
+        }
         registry: Registry[Any] = Registry().with_resources(
-            (doc["$id"], Resource.from_contents(doc)) for doc in documents
+            (doc["$id"], Resource.from_contents(doc))
+            for doc in (context_schema, *result_schemas.values())
         )
-        self._context_validator, self._result_validator = (
-            Draft202012Validator(doc, registry=registry, format_checker=FormatChecker())
-            for doc in documents
+        self._context_validator = Draft202012Validator(
+            context_schema, registry=registry, format_checker=FormatChecker()
         )
+        self._result_validators = {
+            version: Draft202012Validator(
+                doc, registry=registry, format_checker=FormatChecker()
+            )
+            for version, doc in result_schemas.items()
+        }
 
     async def _transition(  # noqa: PLR0913 — fenced transition with safe diagnostics
         self,
@@ -663,8 +676,8 @@ class PostgresAnalysisHandler:
         files: list[dict[str, Any]] | None,
     ) -> bool:
         try:
-            wire = asdict(result)
-            self._result_validator.validate(wire)
+            wire = result.to_wire()
+            self._result_validators[result.schema_version].validate(wire)
             validate_ranges(wire)
             if files is None:
                 return True

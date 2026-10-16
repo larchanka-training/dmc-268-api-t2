@@ -131,3 +131,16 @@ def test_execution_rejects_control_characters_before_csv_normalization(
             ("eurorouter/review-v1",),
             environ={"LLM__EUROROUTER__API_KEYS": "synthetic-test-key\n"},
         )
+
+
+def test_manifest_admits_verified_v3_without_changing_historical_defaults(
+    tmp_path: Path,
+) -> None:
+    values = manifest_values()
+    values["admission"]["prompt_version"] = "v3"
+    values["admission"]["prompt_digest"] = PromptBuilder.load(
+        PROMPTS, "v3"
+    ).prompt_digest
+    runtime = configuration.load_runtime_configuration(write_manifest(tmp_path, values))
+    assert runtime.admission.prompt_version == "v3"
+    assert manifest_values()["admission"]["prompt_version"] == "v2"

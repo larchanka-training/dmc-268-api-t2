@@ -15,7 +15,7 @@ from app.domain.frozen_configuration import RepositoryInstructions
 from app.review.prompt import PromptBuilder, PromptConfigError
 from app.review.renderers import v1
 from app.review.schemas.context import ContextPayload
-from app.review.schemas.result import LLMReviewOutput
+from app.review.schemas.result import provider_output_model
 
 REPO = Path(__file__).resolve().parents[2]
 PROMPTS = REPO / ".agents/reviewer"
@@ -307,11 +307,12 @@ def test_remote_schema_reference_fails_closed(
 
 def test_frozen_schema_and_backend_parser_parity() -> None:
     schema = json.loads(PromptBuilder.load(PROMPTS, "v1").output_schema_json)
+    model = provider_output_model("schemas/llm-output/v1.json")
     Draft202012Validator.check_schema(schema)
     shots = json.loads((PROMPTS / "v1/few_shots.json").read_text("utf-8"))
     for shot in shots:
         Draft202012Validator(schema).validate(shot["output"])
-        LLMReviewOutput.model_validate(shot["output"])
+        model.model_validate(shot["output"])
     invalid: list[dict[str, Any]] = [
         {"summary": "ok", "findings": [], "limitations": [], "extra": True},
         {"summary": "ok", "findings": [], "limitations": [], "usage": None},
@@ -320,14 +321,14 @@ def test_frozen_schema_and_backend_parser_parity() -> None:
     for bad in invalid:
         assert not Draft202012Validator(schema).is_valid(bad)
         with pytest.raises(ValidationError):
-            LLMReviewOutput.model_validate(bad)
+            model.model_validate(bad)
     # Existing backend policy is deliberately stricter than the public contract:
     # finding length and coordinate ordering stay backend validators.
     backend_rejected = shots[0]["output"]
     backend_rejected["findings"][0]["title"] = "x" * 201
     Draft202012Validator(schema).validate(backend_rejected)
     with pytest.raises(ValidationError):
-        LLMReviewOutput.model_validate(backend_rejected)
+        model.model_validate(backend_rejected)
 
 
 def test_complete_repair_is_rendered_by_verified_bundle(
@@ -437,15 +438,16 @@ def test_v2_independent_identity_and_message_vectors(
         "review_result_schema",
     ],
 )
-def test_v2_declared_bytes_cannot_change_under_saved_identity(
-    bundle_root: Path, deployment_root: Path, role: str
+@pytest.mark.parametrize("version", ["v2", "v3"])
+def test_v2_v3_declared_bytes_cannot_change_under_saved_identity(
+    bundle_root: Path, deployment_root: Path, role: str, version: str
 ) -> None:
     digest = PromptBuilder.load(
-        bundle_root, "v2", source_root=deployment_root
+        bundle_root, version, source_root=deployment_root
     ).prompt_digest
     manifest = read_manifest(bundle_root)
     artifact = next(
-        a for a in manifest["versions"]["v2"]["artifacts"] if a["role"] == role
+        a for a in manifest["versions"][version]["artifacts"] if a["role"] == role
     )
     root = (
         deployment_root
@@ -456,7 +458,7 @@ def test_v2_declared_bytes_cannot_change_under_saved_identity(
     path.write_bytes(path.read_bytes() + b"\n")
     with pytest.raises(PromptConfigError, match="SHA-256"):
         PromptBuilder.load(
-            bundle_root, "v2", source_root=deployment_root, expected_digest=digest
+            bundle_root, version, source_root=deployment_root, expected_digest=digest
         )
 
 

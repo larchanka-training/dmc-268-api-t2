@@ -1,8 +1,11 @@
 """Shared per-run budget (SD §14, spec §4.5)."""
 
+from dataclasses import replace
+
 import pytest
 
 from app.core.config import LLM, Ollama
+from app.domain.frozen_configuration import ExecutionModel, ExecutionSettings
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.errors import BudgetExceededError
 
@@ -70,6 +73,19 @@ def test_format_repair_is_allowed_once_per_run() -> None:
     assert budget.try_use_format_repair() is False
 
 
+def test_reflection_slot_is_off_by_default() -> None:
+    budget = RunBudget(_LIMITS, clock=_Clock())
+
+    assert budget.try_use_reflection() is False
+
+
+def test_reflection_is_spent_within_its_limit() -> None:
+    budget = RunBudget(replace(_LIMITS, max_reflections=1), clock=_Clock())
+
+    assert budget.try_use_reflection() is True
+    assert budget.try_use_reflection() is False
+
+
 def test_state_can_be_saved_and_restored() -> None:
     clock = _Clock()
     budget = RunBudget(_LIMITS, clock=clock)
@@ -101,3 +117,22 @@ def test_limits_come_from_llm_settings() -> None:
         deadline_s=120,
         max_format_repairs=1,
     )
+
+
+def test_frozen_execution_limits_disable_reflection_without_policy_changes() -> None:
+    settings = ExecutionSettings(
+        eurorouter=ExecutionModel(model="frozen"),
+        ollama=ExecutionModel(model="unused"),
+        context_window=16384,
+        max_input_tokens=10000,
+        max_output_tokens=2000,
+        request_timeout_s=120.0,
+        run_max_requests=8,
+        run_max_input_tokens=80000,
+        run_max_output_tokens=16000,
+        run_deadline_s=600.0,
+        max_chunks=5,
+        temperature=0.0,
+    )
+    limits = BudgetLimits.from_settings(settings)
+    assert limits == BudgetLimits(8, 80000, 16000, 600.0, max_reflections=0)

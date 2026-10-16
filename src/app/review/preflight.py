@@ -53,7 +53,7 @@ async def offline_preflight(
         *(route.profile_ref for route in runtime.admission.policy.routing.fallback),
     }
     try:
-        for version in ("v1", "v2"):
+        for version in ("v1", "v2", "v3"):
             PromptBuilder.load(prompt_root, version).ensure_verified()
         PromptBuilder.load(
             prompt_root,

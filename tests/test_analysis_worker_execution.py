@@ -33,9 +33,10 @@ from app.adapters.redis_queue import RedisQueue
 from app.analysis_worker import run
 from app.application.ports import QueueTaskEnvelope
 from app.core.config import get_settings
-from app.db.models import OutboxEvent, ReviewJob, ReviewLlmAttempt
+from app.db.models import OutboxEvent, RepositorySettings, ReviewJob, ReviewLlmAttempt
 from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.frozen_configuration import FrozenConfigurationError
+from app.domain.settings import compute_rules_digest
 
 pytest_plugins = ("test_analysis_handler",)
 STREAM = "dmc268:review-tasks"
@@ -71,13 +72,26 @@ async def runtime_environment(
 
 
 @pytest.mark.usefixtures("runtime_environment")
+@pytest.mark.parametrize("prompt_version", ["v1", "v2", "v3"])
 async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # noqa: PLR0915 -- inspect debit and handoff at external edges
     postgres: PostgresHarness,
     redis_client: Redis,
     review_id: uuid.UUID,
     monkeypatch: pytest.MonkeyPatch,
+    prompt_version: str,
 ) -> None:
     factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
+    monkeypatch.setenv("LLM__RUN_MAX_REFLECTIONS", "8")
+    async with factory.begin() as session:
+        job = await session.get(ReviewJob, review_id)
+        assert job is not None
+        job.prompt_version = prompt_version
+        if prompt_version == "v3":
+            settings = await session.get(RepositorySettings, job.repository_settings_id)
+            assert settings is not None
+            settings.rules = {"instructions": ["[SEC-1] Avoid division by zero"]}
+            settings.rules_digest = compute_rules_digest(settings.rules)
+            job.rules_digest = settings.rules_digest
     await freeze(factory, review_id)
     queue = RedisQueue(redis_client)
     assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
@@ -111,11 +125,20 @@ async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # 
             assert attempt.model_ref == "test-model"
             assert attempt.reserved_input_tokens > 0
             assert attempt.reserved_output_tokens == 2000
+        output: dict[str, Any] = dict(OUTPUT)
+        if prompt_version == "v3":
+            output = output | {
+                "findings": [output["findings"][0] | {"rule_ref": "SEC-1"}]
+            }
+            context = calls[-1]["messages"][-1]["content"]
+            assert (
+                "<repo_rules>\n[SEC-1] Avoid division by zero\n</repo_rules>" in context
+            )
         return httpx.Response(
             200,
             json={
                 "model": "test-model",
-                "choices": [{"message": {"content": json.dumps(OUTPUT)}}],
+                "choices": [{"message": {"content": json.dumps(output)}}],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 40},
             },
         )

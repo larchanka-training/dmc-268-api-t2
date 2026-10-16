@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -192,17 +192,25 @@ async def review_id(postgres: PostgresHarness) -> AsyncIterator[uuid.UUID]:
                 )
 
 
-async def test_pipeline_persists_valid_analysis_and_publication_handoff(
+@pytest.mark.parametrize(("schema_version", "rule_ref"), [(1, None), (2, "SEC-1")])
+async def test_pipeline_persists_valid_analysis_and_publication_handoff(  # noqa: PLR0913, PLR0917 -- canonical result version and reference
     postgres: PostgresHarness,
     redis_client: Redis,
     stream_prefix: str,
     review_id: uuid.UUID,
+    schema_version: int,
+    rule_ref: str | None,
 ) -> None:
 
     factory = async_sessionmaker(postgres.engine)
     queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
     assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
     llm = DeterministicLlm()
+    llm.result = replace(
+        llm.result,
+        schema_version=schema_version,
+        findings=[replace(llm.result.findings[0], rule_ref=rule_ref)],
+    )
     async with httpx.AsyncClient(transport=github_http()) as client:
         handler = PostgresAnalysisHandler(
             factory, GithubClient(client), llm, schemas_dir=Path(SCHEMAS)
@@ -269,7 +277,11 @@ async def test_pipeline_persists_valid_analysis_and_publication_handoff(
     )
     assert llm.payloads[0].review_id == review_id
     _validator(SCHEMAS / "context/v1.json").validate(llm.payloads[0].to_wire())
-    _validator(SCHEMAS / "review-result/v1.json").validate(asdict(llm.result))
+    _validator(SCHEMAS / f"review-result/v{schema_version}.json").validate(
+        llm.result.to_wire()
+    )
+    assert chunk.schema_version == schema_version
+    assert findings[0].rule_ref == rule_ref
     assert context.payload_body == llm.payloads[0].payload_body
     assert review.coverage == {
         "included": [
@@ -314,7 +326,7 @@ async def test_invalid_llm_location_never_persists_findings(
     await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
     llm = DeterministicLlm()
     if mutation == "schema":
-        llm.result = replace(llm.result, schema_version=2)
+        llm.result = replace(llm.result, schema_version=99)
     elif mutation == "usage":
         llm.result = replace(llm.result, usage=TokenUsage(-1, 0))
     elif mutation == "summary":
@@ -1445,7 +1457,7 @@ async def test_backend_limitation_preserves_valid_result_without_repair(
     model_limitations = [f"Model limitation {number}" for number in range(10)]
     raw = {
         "summary": llm.result.summary,
-        "findings": [asdict(finding) for finding in llm.result.findings],
+        "findings": llm.result.to_wire()["findings"],
         "limitations": model_limitations,
     }
     _validator(SCHEMAS / "llm-output/v1.json").validate(raw)
@@ -1453,7 +1465,7 @@ async def test_backend_limitation_preserves_valid_result_without_repair(
         llm.result,
         limitations=[*model_limitations, "Backend note: PR metadata was shortened."],
     )
-    _validator(SCHEMAS / "review-result/v1.json").validate(asdict(llm.result))
+    _validator(SCHEMAS / "review-result/v1.json").validate(llm.result.to_wire())
     async with httpx.AsyncClient(transport=github_http()) as client:
         worker = PostgresReviewWorker(
             factory,

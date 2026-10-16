@@ -58,7 +58,7 @@ async def test_legacy_job_terminalizes_without_inference_or_identity_rewrite(
                 ChunkResult(
                     id=uuid.uuid4(),
                     review_job_id=review_id,
-                    schema_version=1 if saved == "canonical" else 2,
+                    schema_version=1 if saved == "canonical" else 99,
                     summary="Verified historical result",
                     limitations=[],
                     latency_ms=1,

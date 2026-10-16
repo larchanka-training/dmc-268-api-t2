@@ -445,7 +445,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0013"
+        == "0014"
     )
     assert (
         await database.connection.fetch(
@@ -692,7 +692,7 @@ async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata
         await migration_database.connection.fetchval(
             "SELECT version_num FROM alembic_version"
         )
-        == "0013"
+        == "0014"
     )
     assert (
         await migration_database.connection.fetchval(
@@ -710,3 +710,58 @@ async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata
     )
     migration_database.migrate("upgrade", "head")
     migration_database.migrate("check")
+
+
+async def test_rule_ref_migration_preserves_retained_v1_findings_and_round_trips(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0013")
+    chunk_id, finding_id = uuid.uuid4(), uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO chunk_result
+        (id,review_job_id,context_payload_id,schema_version,summary,limitations,
+         usage,latency_ms,created_at)
+        VALUES ($1,$2,NULL,1,'Retained v1','[]',
+                '{"input_tokens":17,"output_tokens":9}',3,now())""",
+        chunk_id,
+        job_id,
+    )
+    await database.connection.execute(
+        """INSERT INTO finding
+        (id,chunk_result_id,fingerprint,path,side,start_line,end_line,category,
+         severity,title,explanation,evidence,recommendation,proposed_diff_fix,created_at)
+        VALUES ($1,$2,'legacy-fingerprint','src/a.py','NEW',1,1,'correctness',
+                'high','Issue','Explanation','Evidence','Recommendation',NULL,now())""",
+        finding_id,
+        chunk_id,
+    )
+    before = await database.connection.fetchrow(
+        "SELECT * FROM chunk_result WHERE id=$1", chunk_id
+    )
+    for _ in range(2):
+        database.migrate("upgrade", "0014")
+        finding = await database.connection.fetchrow(
+            "SELECT fingerprint,rule_ref FROM finding WHERE id=$1", finding_id
+        )
+        assert finding is not None
+        assert tuple(finding) == ("legacy-fingerprint", None)
+        assert (
+            await database.connection.fetchrow(
+                "SELECT * FROM chunk_result WHERE id=$1", chunk_id
+            )
+            == before
+        )
+        await database.connection.execute(
+            "UPDATE finding SET rule_ref='SEC-1' WHERE id=$1", finding_id
+        )
+        assert (
+            await database.connection.fetchval(
+                "SELECT rule_ref FROM finding WHERE id=$1", finding_id
+            )
+            == "SEC-1"
+        )
+        database.migrate("check")
+        if _ == 0:
+            database.migrate("downgrade", "0013")

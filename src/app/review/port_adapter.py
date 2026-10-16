@@ -21,8 +21,6 @@ from app.review.schemas.finding import ValidatedFinding
 from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome
 from app.review.service import ReviewService
 
-_SCHEMA_VERSION = 1
-
 
 class ChunkReviewFailedError(Exception):
     """The chunk FAILED: the port result has no status, so failure is raised.
@@ -66,7 +64,7 @@ def to_port_result(outcome: ReviewChunkOutcome) -> ReviewChunkResult:
         else None
     )
     return ReviewChunkResult(
-        schema_version=_SCHEMA_VERSION,
+        schema_version=outcome.schema_version,
         summary=outcome.summary or "",  # always set for COMPLETED
         limitations=list(outcome.limitations),
         usage=tokens,
@@ -87,5 +85,6 @@ def _to_port_finding(finding: ValidatedFinding) -> ReviewFinding:
         explanation=finding.explanation,
         evidence=finding.evidence,
         recommendation=finding.recommendation,
+        rule_ref=finding.rule_ref,
         proposed_diff_fix=finding.proposed_diff_fix,
     )

@@ -1,9 +1,12 @@
 """HTTP plumbing shared by provider clients: one request, typed errors."""
 
+import json
 import re
 from typing import Any
 
 import httpx
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, ValidationError
 
 from app.llm.errors import (
@@ -105,15 +108,54 @@ def _is_context_overflow(response: httpx.Response) -> bool:
     return any(marker in text for marker in _OVERFLOW_MARKERS)
 
 
-def parse_structured[T: BaseModel](
+def parse_structured[T: BaseModel](  # noqa: PLR0913 -- schema and usage metadata
     content: str,
     response_model: type[T],
     *,
+    output_schema_json: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     latency_ms: int | None = None,
 ) -> T:
     """Validate model output; errors list locations and messages, not input."""
+    if output_schema_json is not None:
+        try:
+            payload = json.loads(content)
+            Draft202012Validator(json.loads(output_schema_json)).validate(payload)
+        except json.JSONDecodeError:
+            details = ["<root>: invalid JSON"]
+        except JSONSchemaValidationError as exc:
+            # Instance paths and jsonschema messages may include model text or
+            # arbitrary extra property names. Only the trusted schema path and
+            # validator keyword are safe to include in format-repair details.
+            location = ".".join(str(part) for part in exc.absolute_schema_path)
+            required = exc.validator_value
+            instance = exc.instance
+            if (
+                exc.validator == "required"
+                and not exc.absolute_path
+                and isinstance(required, list)
+                and isinstance(instance, dict)
+            ):
+                # Preserve historical repair vectors for missing output fields.
+                # Names and order come from the trusted schema, never payload.
+                details = [
+                    f"{name}: Field required"
+                    for name in required
+                    if name not in instance
+                ]
+            else:
+                details = [f"schema.{location}: {exc.validator} validation failed"]
+        else:
+            details = []
+        if details:
+            raise SchemaValidationError(
+                details,
+                content,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+            ) from None
     try:
         return response_model.model_validate_json(content)
     except ValidationError as exc:

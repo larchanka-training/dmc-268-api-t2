@@ -64,6 +64,7 @@ class OllamaClient(BaseLLMClient):
             parsed=parse_structured(
                 content,
                 response_model,
+                output_schema_json=request.output_schema_json,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,

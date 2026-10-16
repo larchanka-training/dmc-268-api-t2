@@ -7,11 +7,12 @@ counted, never moved to a neighbouring line.
 
 import hashlib
 import re
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 from app.domain.enums import FindingSide
 from app.review.schemas.context import ContextPayload, Hunk, LineKind
-from app.review.schemas.finding import LLMFinding, ValidatedFinding
+from app.review.schemas.finding import LLMFindingV1, ValidatedFinding
 from app.review.schemas.result import ReviewChunkOutcome
 
 # Baseline secret patterns (SD §12): AWS keys, GitHub tokens, password=..., PEM.
@@ -34,6 +35,12 @@ _SECRET_PATTERNS = (
 _TEXT_FIELDS = ("title", "explanation", "evidence", "recommendation")
 _OPTIONAL_TEXT_FIELDS = ("proposed_diff_fix",)
 
+# Rule labels like [SEC-1] opening the instruction text (CONTEXT.md: rule_ref
+# — «в начале текста инструкции»); a bracketed word mid-sentence is prose.
+_RULE_LABEL = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?\[([A-Za-z][A-Za-z0-9_-]{0,31})\]", re.MULTILINE
+)
+
 _CHANGED_KIND = {
     FindingSide.NEW: LineKind.ADDED,
     FindingSide.OLD: LineKind.DELETED,
@@ -46,7 +53,7 @@ class ValidationOutcome:
     rejected_count: int = 0
 
 
-def fingerprint(finding: LLMFinding) -> str:
+def fingerprint(finding: LLMFindingV1) -> str:
     """Hash of normalized path/side/range/category/title (SD §7)."""
     title = _normalize(finding.title)
     key = "|".join(
@@ -64,12 +71,24 @@ def fingerprint(finding: LLMFinding) -> str:
 
 class FindingValidator:
     def validate(
-        self, findings: list[LLMFinding], payload: ContextPayload
+        self,
+        findings: Sequence[LLMFindingV1],
+        payload: ContextPayload,
+        *,
+        rule_refs: Collection[str] = (),
     ) -> ValidationOutcome:
         accepted: list[ValidatedFinding] = []
         rejected = 0
         for finding in findings:
-            if not _hits_changed_lines(finding, payload) or not _has_evidence(finding):
+            # A rule_ref the model was not given is a hallucination (SD §12):
+            # reject it the same deterministic way as a missed line.
+            rule_ref = getattr(finding, "rule_ref", None)
+            known_ref = rule_ref is None or rule_ref in rule_refs
+            if (
+                not known_ref
+                or not _hits_changed_lines(finding, payload)
+                or not _has_evidence(finding)
+            ):
                 rejected += 1
                 continue
             update: dict[str, str | None] = {
@@ -80,11 +99,21 @@ class FindingValidator:
                 update[name] = mask_secrets(value) if value is not None else None
             masked = finding.model_copy(update=update)
             accepted.append(
-                ValidatedFinding(**masked.model_dump(), fingerprint=fingerprint(masked))
+                ValidatedFinding(
+                    **(masked.model_dump() | {"rule_ref": rule_ref}),
+                    fingerprint=fingerprint(masked),
+                )
             )
         return ValidationOutcome(
             accepted=merge_findings([accepted]), rejected_count=rejected
         )
+
+
+def rule_refs_from_text(rules_text: str | None) -> frozenset[str]:
+    """Rule labels ([SEC-1] style) from a rendered rules document."""
+    if not rules_text:
+        return frozenset()
+    return frozenset(_RULE_LABEL.findall(rules_text))
 
 
 def merge_findings(groups: list[list[ValidatedFinding]]) -> list[ValidatedFinding]:
@@ -114,12 +143,12 @@ def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-def _has_evidence(finding: LLMFinding) -> bool:
+def _has_evidence(finding: LLMFindingV1) -> bool:
     evidence = _normalize(finding.evidence)
     return bool(evidence) and evidence != _normalize(finding.title)
 
 
-def _hits_changed_lines(finding: LLMFinding, payload: ContextPayload) -> bool:
+def _hits_changed_lines(finding: LLMFindingV1, payload: ContextPayload) -> bool:
     """``start_line`` is a changed line of its side; the whole
     ``start_line..end_line`` range lies inside the same hunk (context lines
     allowed after the start)."""

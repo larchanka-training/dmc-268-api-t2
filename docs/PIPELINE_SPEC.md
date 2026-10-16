@@ -47,6 +47,21 @@ FAILED/SKIPPED без полезного результата не требую�
 При ошибке пригодный сохранённый результат остаётся PARTIAL с safe limitation.
 Полезный валидированный late output сохраняется как PARTIAL, не разрешая новую попытку после deadline.
 
+LLM возвращает только summary, findings и limitations. Verified prompt identities
+v1/v2 используют provider/result schema v1; rules-aware v3 использует schema v2.
+Gateway разрешает локальные `$ref` из проверенного closure и валидирует исходный
+JSON до parsing. Backend добавляет schema version, измеренную latency и usage
+только при наличии обоих token counts; identity, status, provenance, request
+counts и safe errors принадлежат backend. V1 wire не содержит `rule_ref`; v2
+требует nullable `rule_ref`. Stored versions, fingerprints и usage не переписываются.
+Подробный mapping и activation gates: `PROMPT_VERSION_CONTRACT.md`.
+
+Reflection Pass разрешён только для verified prompt identity v3 при in-memory
+исполнении и выключен для historical v1/v2 и durable worker.
+Frozen repository instructions — единственный источник правил worker; environment
+и runtime arguments не заменяют их. Все его платные запросы проходят PostgreSQL
+ledger, включая retry, overflow и format repair.
+
 ## 3. Retry, deadlines и платные запросы
 
 Допустимые публичные reason codes остаются:

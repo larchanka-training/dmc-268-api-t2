@@ -6,14 +6,16 @@ explicit delimiters. The raw prompt is never logged (SD §13).
 
 import ast
 import builtins
+import copy
 import hashlib
 import importlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -24,7 +26,7 @@ from app.domain.frozen_configuration import RepositoryInstructions
 from app.llm.client import ChatMessage
 from app.llm.tokens import ConservativeTokenCounter, TokenCounter
 from app.review.schemas.context import ContextPayload, FileDiff
-from app.review.schemas.result import LLMReviewOutput
+from app.review.schemas.result import LLMReviewOutput, LLMReviewOutputV1
 
 
 class PromptConfigError(Exception):
@@ -36,6 +38,16 @@ class PromptTooLargeError(Exception):
 
 
 class FewShot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    languages: list[str]
+    title: str
+    files: list[FileDiff]
+    output: LLMReviewOutputV1
+
+
+class FewShotV2(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str
@@ -61,6 +73,7 @@ class BuiltPrompt:
     estimated_tokens: int
     limitations: list[str]
     few_shot_ids: list[str]
+    included_rules: str | None = None
 
 
 class PromptBuilder:
@@ -69,13 +82,14 @@ class PromptBuilder:
         *,
         prompt_version: str,
         system: str,
-        few_shots: list[FewShot],
+        few_shots: list[FewShot | FewShotV2],
         counter: TokenCounter | None = None,
     ) -> None:
         self._prompt_version = prompt_version
         self._system = system
         self._few_shots = few_shots
         self._counter = counter or ConservativeTokenCounter()
+        self._repair: RepairInputs | None = None
         self._verified = False
         self._repository_instructions: tuple[str, ...] = ()
         self._prompt_digest: str | None = None
@@ -89,6 +103,16 @@ class PromptBuilder:
     @property
     def prompt_version(self) -> str:
         return self._prompt_version
+
+    @property
+    def provider_schema_path(self) -> str:
+        self.ensure_verified()
+        return _PROMPT_IDENTITIES[self._prompt_version][1]
+
+    @property
+    def result_schema_version(self) -> Literal[1, 2]:
+        self.ensure_verified()
+        return _PROMPT_IDENTITIES[self._prompt_version][2]
 
     @property
     def repository_instructions(self) -> tuple[str, ...]:
@@ -107,6 +131,25 @@ class PromptBuilder:
     def ensure_verified(self) -> None:
         if not self._verified:
             raise PromptConfigError("execution requires a verified prompt bundle")
+
+    def with_repository_instructions(
+        self, instructions: RepositoryInstructions
+    ) -> PromptBuilder:
+        """Bind in-memory rules to the same verified v3 closure without mutation."""
+        self.ensure_verified()
+        if self._prompt_version != "v3":
+            raise PromptConfigError("only v3 supports rules rebinding")
+        builder = copy.copy(self)
+        builder._repository_instructions = instructions.instructions
+        builder._renderer = self._renderer_module.Renderer(
+            self._prompt_version,
+            self._system,
+            self._few_shots,
+            self._counter,
+            self._repair,
+            instructions.instructions,
+        )
+        return builder
 
     def overflow_input_limit(self, limit: int) -> int:
         self.ensure_verified()
@@ -175,7 +218,12 @@ class PromptBuilder:
             Draft202012Validator.check_schema(schema)
             for shot in raw_shots:
                 Draft202012Validator(schema).validate(shot["output"])
-            few_shots = [FewShot.model_validate(shot) for shot in raw_shots]
+            shot_model = (
+                FewShotV2
+                if _PROMPT_IDENTITIES[prompt_version][1] == "schemas/llm-output/v2.json"
+                else FewShot
+            )
+            few_shots = [shot_model.model_validate(shot) for shot in raw_shots]
         except (
             OSError,
             KeyError,
@@ -190,6 +238,9 @@ class PromptBuilder:
         # Do not run the convenience constructor: it uses the current imported
         # renderer for test-only assembly. Execution uses only the checked bytes.
         builder = cls.__new__(cls)
+        builder._system = system
+        builder._few_shots = few_shots
+        builder._repair = repair
         builder._prompt_version = prompt_version
         builder._counter = counter or ConservativeTokenCounter()
         builder._verified = True
@@ -254,6 +305,7 @@ def _to_prompt(rendered: Any) -> BuiltPrompt:
         estimated_tokens=rendered.estimated_tokens,
         limitations=rendered.limitations,
         few_shot_ids=rendered.few_shot_ids,
+        included_rules=getattr(rendered, "included_rules", None),
     )
 
 
@@ -272,15 +324,20 @@ def _verify_artifacts(
     # Paths are server-owned; manifest entries cannot select imports or files.
     if not re.fullmatch(r"v[1-9][0-9]*", version):
         raise PromptConfigError("unsupported prompt version")
-    if entry["renderer_version"] not in _RENDERERS:
-        raise PromptConfigError("unsupported renderer version")
+    if (
+        version not in _PROMPT_IDENTITIES
+        or entry["renderer_version"] != _PROMPT_IDENTITIES[version][0]
+    ):
+        raise PromptConfigError("unsupported prompt/renderer identity")
     required = {
         "system": f"{version}/system.md",
         "few_shots": f"{version}/few_shots.json",
         "repair": f"{version}/repair.json",
         "renderer": _RENDERERS[entry["renderer_version"]][1],
-        "llm_output_schema": "schemas/llm-output/v1.json",
-        "review_result_schema": "schemas/review-result/v1.json",
+        "llm_output_schema": _PROMPT_IDENTITIES[version][1],
+        "review_result_schema": (
+            f"schemas/review-result/v{_PROMPT_IDENTITIES[version][2]}.json"
+        ),
     }
     artifacts = entry["artifacts"]
     if not isinstance(artifacts, list):
@@ -323,6 +380,14 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[3]
 _RENDERERS = {
     "review-renderer-v1": ("app.review.renderers.v1", "src/app/review/renderers/v1.py"),
     "review-renderer-v2": ("app.review.renderers.v2", "src/app/review/renderers/v2.py"),
+    "review-renderer-v3": ("app.review.renderers.v3", "src/app/review/renderers/v3.py"),
+}
+
+
+_PROMPT_IDENTITIES: dict[str, tuple[str, str, Literal[1, 2]]] = {
+    "v1": ("review-renderer-v1", "schemas/llm-output/v1.json", 1),
+    "v2": ("review-renderer-v2", "schemas/llm-output/v1.json", 1),
+    "v3": ("review-renderer-v3", "schemas/llm-output/v2.json", 2),
 }
 
 
@@ -366,3 +431,32 @@ def _renderer_import(name: str, *args: Any, **kwargs: Any) -> ModuleType:
     if name not in {"json", "re", "posixpath", "typing"}:
         raise PromptConfigError("unverified renderer dependency")
     return importlib.import_module(name)
+
+
+DELIMITER_TAGS = (
+    "repository_instructions",
+    "pr_metadata",
+    "diff",
+    "invalid_answer",
+    "repo_rules",
+    "findings",
+)
+_DELIMITER_TAG = re.compile(
+    rf"<\s*(/?)\s*({'|'.join(DELIMITER_TAGS)})\b[^>]*>", re.IGNORECASE
+)
+
+
+def neutralize(data: str) -> str:
+    """Keep untrusted data from opening or closing review/verifier delimiters."""
+    return _DELIMITER_TAG.sub(r"[\1\2]", data)
+
+
+def delimiter_block_list() -> str:
+    """Describe every protected block in verifier trust-boundary instructions."""
+    *head, last = DELIMITER_TAGS
+    return ", ".join(f"<{tag}>" for tag in head) + f" и <{last}>"
+
+
+def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
+    """Content estimate including chat-template framing for every message."""
+    return sum(counter.count(message.content) + 4 for message in messages)

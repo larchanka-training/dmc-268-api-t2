@@ -155,7 +155,7 @@ class ProfileDescriptor(FrozenDTO):
 class AdmissionSelection(FrozenDTO):
     primary: ModelRoute
     policy: ModelSettings
-    prompt_version: Literal["v1", "v2"]
+    prompt_version: Literal["v1", "v2", "v3"]
     prompt_digest: Digest
 
 

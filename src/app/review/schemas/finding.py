@@ -27,7 +27,7 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class LLMFinding(_Strict):
+class LLMFindingV1(_Strict):
     """Flat finding of ``schemas/review-result/v1.json#/$defs/finding``."""
 
     path: RelPath
@@ -48,6 +48,13 @@ class LLMFinding(_Strict):
             msg = "end_line must not be less than start_line"
             raise ValueError(msg)
         return self
+
+
+class LLMFinding(LLMFindingV1):
+    """Provider v2 finding; the nullable rule reference is required on the wire."""
+
+    # The validator rejects labels absent from the rules actually sent.
+    rule_ref: str | None = Field(max_length=32)
 
 
 class ValidatedFinding(LLMFinding):

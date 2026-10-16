@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from types import TracebackType
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from app.domain.enums import (
     FindingCategory,
@@ -188,6 +188,7 @@ class ReviewFinding:
     evidence: str
     recommendation: str
     proposed_diff_fix: str | None
+    rule_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +199,17 @@ class ReviewChunkResult:
     usage: TokenUsage | None
     latency_ms: int
     findings: Sequence[ReviewFinding]
+
+    def to_wire(self) -> dict[str, Any]:
+        """Serialize by the declared result version, never by field presence."""
+        if self.schema_version not in (1, 2):
+            raise ValueError("unsupported result schema version")
+        wire = asdict(self)
+        if self.schema_version == 1:
+            for finding in wire["findings"]:
+                if finding.pop("rule_ref") is not None:
+                    raise ValueError("v1 result cannot contain a rule reference")
+        return wire
 
 
 @dataclass(frozen=True, slots=True)

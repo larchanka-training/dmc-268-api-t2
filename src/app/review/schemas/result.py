@@ -10,11 +10,21 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.review.schemas.finding import LLMFinding, ValidatedFinding
+from app.review.schemas.finding import LLMFinding, LLMFindingV1, ValidatedFinding
+
+
+class LLMReviewOutputV1(BaseModel):
+    """Historical provider v1 wire output, without rule references or defaults."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    summary: str = Field(max_length=2000)
+    findings: list[LLMFindingV1] = Field(max_length=50)
+    limitations: list[str] = Field(max_length=10)
 
 
 class LLMReviewOutput(BaseModel):
-    """The only schema passed to the model as structured-output format (spec §3.2).
+    """Provider v2 output with required nullable rule references.
 
     Every field is required (nullable where optional) to stay compatible with
     OpenAI-style ``strict`` JSON Schema.
@@ -25,6 +35,17 @@ class LLMReviewOutput(BaseModel):
     summary: str = Field(max_length=2000)
     findings: list[LLMFinding] = Field(max_length=50)
     limitations: list[str] = Field(max_length=10)
+
+
+def provider_output_model(
+    schema_path: str,
+) -> type[LLMReviewOutputV1] | type[LLMReviewOutput]:
+    """Select by the explicit provider schema identity; never infer from fields."""
+    if schema_path == "schemas/llm-output/v1.json":
+        return LLMReviewOutputV1
+    if schema_path == "schemas/llm-output/v2.json":
+        return LLMReviewOutput
+    raise ValueError(f"unsupported provider schema: {schema_path}")
 
 
 class ChunkStatus(StrEnum):
@@ -46,7 +67,7 @@ class ReviewChunkOutcome(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     review_id: str
     chunk_id: str
     status: ChunkStatus

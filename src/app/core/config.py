@@ -53,6 +53,25 @@ class Auth(BaseModel):
     github_redirect_uri: str = ""
     jwt_secret: SecretStr = SecretStr("")
     credential_key: SecretStr = SecretStr("")
+    frontend_origins: list[str] = Field(default_factory=list)
+
+    def check_frontend_origins(self) -> None:
+        """Mutation trust comes only from explicit, exact origin configuration."""
+        if not self.frontend_origins:
+            raise ValueError("Frontend origins are not configured")
+        for origin in self.frontend_origins:
+            uri = urlsplit(origin)
+            if (
+                uri.scheme not in {"https", "http"}
+                or not uri.hostname
+                or uri.username is not None
+                or uri.password is not None
+                or origin != f"{uri.scheme}://{uri.netloc}"
+                or "*" in origin
+                or any(char.isspace() or ord(char) < 32 for char in origin)  # noqa: PLR2004
+                or (uri.port is not None and not 0 < uri.port < 65536)  # noqa: PLR2004
+            ):
+                raise ValueError("Invalid frontend origin")
 
     def check_ready(self) -> None:
         """Validate on use; absent auth secrets must not break other components."""

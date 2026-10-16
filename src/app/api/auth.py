@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from secrets import compare_digest
 from typing import Annotated
 from uuid import UUID
 
@@ -42,8 +43,12 @@ async def get_verified_session(
     unauthorized = ApiError(
         401, "AUTHENTICATION_REQUIRED", "Authentication is required."
     )
-    if not token or len(token) > 4096 or len(secret.encode()) < 32:  # noqa: PLR2004
+    if not token or len(token) > 4096:  # noqa: PLR2004
         raise unauthorized
+    if len(secret.encode()) < 32:  # noqa: PLR2004
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        )
     try:
         claims = jwt.decode(
             token,
@@ -76,7 +81,7 @@ async def get_verified_session(
                 )
             )
         ).one_or_none()
-    except SQLAlchemyError:
+    except SQLAlchemyError, OSError:
         raise ApiError(
             503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
         ) from None
@@ -91,6 +96,50 @@ async def get_authenticated_principal(
     return AuthenticatedPrincipal(verified.user_id)
 
 
+async def get_optional_verified_session(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> VerifiedSession | None:
+    """Logout tolerates authentication failure, never dependency failure."""
+    try:
+        return await get_verified_session(request, settings, session)
+    except ApiError as error:
+        if error.status != 401:  # noqa: PLR2004
+            raise
+        return None
+
+
+def verify_mutation_origin_csrf(
+    request: Request, settings: Settings, verified: VerifiedSession
+) -> None:
+    """Check exact configured Origin and the authoritative session's CSRF token."""
+    try:
+        settings.auth.check_frontend_origins()
+    except ValueError, UnicodeError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
+    origins = request.headers.getlist("origin")
+    tokens = request.headers.getlist("x-csrf-token")
+    if (
+        len(origins) != 1
+        or origins[0] not in settings.auth.frontend_origins
+        or len(tokens) != 1
+        or not compare_digest(tokens[0].encode(), verified.csrf_token.encode())
+    ):
+        raise ApiError(403, "ACCESS_DENIED", "Access is denied.")
+
+
+async def get_verified_mutation_session(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    verified: Annotated[VerifiedSession, Depends(get_verified_session)],
+) -> VerifiedSession:
+    verify_mutation_origin_csrf(request, settings, verified)
+    return verified
+
+
 @dataclass(frozen=True)
 class VerifiedMutationIdentity:
     """Evidence supplied only by the trusted session/Origin/CSRF verifier."""
@@ -102,7 +151,7 @@ class VerifiedMutationIdentity:
 
 
 async def get_verified_mutation_identity(
-    principal: Annotated[AuthenticatedPrincipal, Depends(get_authenticated_principal)],
+    verified: Annotated[VerifiedSession, Depends(get_verified_mutation_session)],
 ) -> VerifiedMutationIdentity:
-    """Headers alone cannot prove session-bound mutation authorization."""
-    raise ApiError(403, "ACCESS_DENIED", "Access is denied.")
+    """Browser identity evidence; resource permissions remain separate gates."""
+    return VerifiedMutationIdentity(verified.user_id, True, True, True)

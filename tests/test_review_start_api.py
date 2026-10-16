@@ -112,8 +112,8 @@ async def test_principal_alone_does_not_verify_browser_mutation(
         json={"requested_head_sha": "head-sha"},
         headers={"Origin": "https://trusted.example", "X-CSRF-Token": "forged"},
     )
-    assert response.status_code == HTTPStatus.FORBIDDEN
-    assert response.json()["code"] == "ACCESS_DENIED"
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert response.json()["code"] == "AUTHENTICATION_REQUIRED"
     assert_schema(response, "Error")
 
 

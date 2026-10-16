@@ -4,6 +4,7 @@ import hashlib
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import timedelta
 from typing import Annotated
 from urllib.parse import unquote, urlencode
@@ -12,11 +13,18 @@ import httpx
 import jwt
 from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import RedirectResponse
 
-from app.api.auth import VerifiedSession, get_verified_session
+from app.api.auth import (
+    VerifiedSession,
+    get_optional_verified_session,
+    get_verified_mutation_session,
+    get_verified_session,
+    verify_mutation_origin_csrf,
+)
 from app.api.errors import ApiError
 from app.application.github_ports import GithubFailure
 from app.core.config import Settings, get_settings
@@ -232,3 +240,88 @@ async def get_current_user(
         "session": {"expires_at": verified.expires_at.isoformat()},
         "csrf_token": verified.csrf_token,
     }
+
+
+@router.post("/auth/refresh", operation_id="refreshSession")
+async def refresh_session(
+    verified: Annotated[VerifiedSession, Depends(get_verified_mutation_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    response: Response,
+) -> dict[str, object]:
+    try:
+        # Check DB time only after acquiring the row: a lock wait can cross expiry
+        # even when no competing transaction changes the tuple (no EPQ recheck).
+        await session.execute(
+            select(AuthSession.id)
+            .where(AuthSession.id == verified.session_id)
+            .with_for_update()
+        )
+        expires = await session.scalar(
+            update(AuthSession)
+            .where(
+                AuthSession.id == verified.session_id,
+                AuthSession.user_id == verified.user_id,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > func.clock_timestamp(),
+            )
+            .values(
+                expires_at=func.date_trunc("second", func.clock_timestamp())
+                + timedelta(minutes=30)
+            )
+            .returning(AuthSession.expires_at)
+        )
+        await session.commit()
+    except SQLAlchemyError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
+    if expires is None:
+        raise ApiError(401, "AUTHENTICATION_REQUIRED", "Authentication is required.")
+    encoded = jwt.encode(
+        {
+            "sub": str(verified.user_id),
+            "sid": str(verified.session_id),
+            "iat": expires - timedelta(minutes=30),
+            "exp": expires,
+            "iss": "dmc268",
+            "aud": "dmc268-browser",
+        },
+        settings.auth.jwt_secret.get_secret_value(),
+        algorithm="HS256",
+    )
+    response.set_cookie(
+        "dmc_session",
+        encoded,
+        max_age=1800,
+        expires=expires,
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    return await get_current_user(replace(verified, expires_at=expires), response)
+
+
+@router.post("/auth/logout", operation_id="logout", status_code=204)
+async def logout(
+    request: Request,
+    verified: Annotated[VerifiedSession | None, Depends(get_optional_verified_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    if verified is not None:
+        verify_mutation_origin_csrf(request, settings, verified)
+        try:
+            await session.execute(
+                update(AuthSession)
+                .where(AuthSession.id == verified.session_id)
+                .values(revoked_at=func.clock_timestamp())
+            )
+            await session.commit()
+        except SQLAlchemyError:
+            raise ApiError(
+                503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+            ) from None
+    response = Response(status_code=204, headers={"Cache-Control": "no-store"})
+    response.delete_cookie("dmc_session", secure=True, httponly=True, samesite="lax")
+    return response

@@ -241,6 +241,22 @@ class GithubClient:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
+    async def get_identity(self, token: str) -> tuple[str, str]:
+        """Resolve the authenticated user using only the exchanged user token."""
+        response = await self._get(
+            "https://api.github.com/user", "application/vnd.github+json", token=token
+        )
+        payload = _json_object(response)
+        login = payload.get("login")
+        if (
+            type(payload.get("id")) is not int
+            or payload["id"] <= 0
+            or not isinstance(login, str)
+            or not _OWNER.fullmatch(login)
+        ):
+            raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        return str(payload["id"]), login
+
     async def list_pull_requests(
         self, external_id: str, owner: str, name: str, *, limit: int, page: int
     ) -> tuple[list[dict[str, Any]], int | None]:
@@ -312,10 +328,15 @@ class GithubClient:
         except TimeoutError:
             raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
 
-    async def _get(self, url: str, accept: str) -> httpx.Response:
+    async def _get(
+        self, url: str, accept: str, *, token: str | None = None
+    ) -> httpx.Response:
+        headers = {"Accept": accept}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         try:
             async with self._client.stream(
-                "GET", url, headers={"Accept": accept}, follow_redirects=False
+                "GET", url, headers=headers, follow_redirects=False
             ) as response:
                 ambiguous_forbidden = (
                     response.status_code == HTTPStatus.FORBIDDEN

@@ -445,7 +445,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0012"
+        == "0013"
     )
     assert (
         await database.connection.fetch(
@@ -678,3 +678,35 @@ async def test_durable_repair_0010_round_trip_and_atomic_check(
         )
         is None
     )
+
+
+async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata(
+    migration_database: MigrationDatabase,
+) -> None:
+    legacy_user = uuid.uuid4()
+    await migration_database.connection.execute(
+        'INSERT INTO "user" (id) VALUES ($1)', legacy_user
+    )
+    migration_database.migrate("upgrade", "head")
+    assert (
+        await migration_database.connection.fetchval(
+            "SELECT version_num FROM alembic_version"
+        )
+        == "0013"
+    )
+    assert (
+        await migration_database.connection.fetchval(
+            'SELECT id FROM "user" WHERE id=$1', legacy_user
+        )
+        == legacy_user
+    )
+    migration_database.migrate("check")
+    migration_database.migrate("downgrade", "0012")
+    assert (
+        await migration_database.connection.fetchval(
+            'SELECT id FROM "user" WHERE id=$1', legacy_user
+        )
+        == legacy_user
+    )
+    migration_database.migrate("upgrade", "head")
+    migration_database.migrate("check")

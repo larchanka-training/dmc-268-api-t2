@@ -24,6 +24,9 @@ def test_webhook_recovery_has_partial_pending_index() -> None:
 def test_expected_core_tables_are_registered() -> None:
     expected = {
         "user",
+        "github_oauth_flow",
+        "github_identity",
+        "auth_session",
         "repository",
         "repository_access",
         "repository_settings",

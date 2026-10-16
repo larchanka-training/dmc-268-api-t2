@@ -3,8 +3,9 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal, Self
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -42,6 +43,35 @@ class Webhook(BaseModel):
 
 class Github(BaseModel):
     token: SecretStr = SecretStr("")
+
+
+class Auth(BaseModel):
+    """GitHub browser OAuth only; validated lazily by auth endpoints."""
+
+    github_client_id: str = ""
+    github_client_secret: SecretStr = SecretStr("")
+    github_redirect_uri: str = ""
+    jwt_secret: SecretStr = SecretStr("")
+    credential_key: SecretStr = SecretStr("")
+
+    def check_ready(self) -> None:
+        """Validate on use; absent auth secrets must not break other components."""
+        uri = urlsplit(self.github_redirect_uri)
+        if (
+            not self.github_client_id.strip()
+            or not self.github_client_secret.get_secret_value().strip()
+            or len(self.jwt_secret.get_secret_value().encode()) < 32  # noqa: PLR2004
+            or uri.scheme != "https"
+            or not uri.hostname
+            or uri.username is not None
+            or uri.password is not None
+            or uri.path != "/api/v1/auth/github/callback"
+            or uri.query
+            or uri.fragment
+            or (uri.port is not None and not 0 < uri.port < 65536)  # noqa: PLR2004
+        ):
+            raise ValueError("GitHub browser auth is not configured")
+        Fernet(self.credential_key.get_secret_value())
 
 
 class Logging(BaseModel):
@@ -177,6 +207,7 @@ class Settings(BaseSettings):
     redis: Redis = Field(default_factory=Redis)
     webhook: Webhook = Field(default_factory=Webhook)
     github: Github = Field(default_factory=Github)
+    auth: Auth = Field(default_factory=Auth)
     logging: Logging = Field(default_factory=Logging)
     llm: LLM = Field(default_factory=LLM)
 

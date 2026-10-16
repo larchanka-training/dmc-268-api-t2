@@ -37,6 +37,42 @@ class User(Base):
     )
 
 
+class GithubOAuthFlow(Base):
+    __tablename__ = "github_oauth_flow"
+
+    state_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    browser_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    return_to: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class GithubIdentity(Base):
+    __tablename__ = "github_identity"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id"), primary_key=True
+    )
+    external_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    login: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_token: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_session"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id"), nullable=False
+    )
+    csrf_token: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Repository(Base):
     __tablename__ = "repository"
 

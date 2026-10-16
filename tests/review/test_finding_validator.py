@@ -8,8 +8,8 @@ from app.review.schemas.context import ContextPayload
 from app.review.schemas.finding import LLMFinding
 from app.review.validation import (
     FindingValidator,
-    extract_rule_refs,
     merge_findings,
+    rule_refs_from_text,
 )
 
 
@@ -75,15 +75,15 @@ def test_null_rule_ref_needs_no_rules(payload: ContextPayload) -> None:
     assert outcome.rejected_count == 0
 
 
-def test_extract_rule_refs_from_canonical_instructions() -> None:
-    rules = {"instructions": ["[SEC-1] No eval", "plain text", "[perf-2] Cache it"]}
+def test_rule_refs_from_text_extracts_labels() -> None:
+    rendered = "- [SEC-1] No eval\n- plain text\n- [perf-2] Cache it"
 
-    assert extract_rule_refs(rules) == frozenset({"SEC-1", "perf-2"})
+    assert rule_refs_from_text(rendered) == frozenset({"SEC-1", "perf-2"})
 
 
-def test_extract_rule_refs_tolerates_rules_without_instructions() -> None:
-    assert extract_rule_refs(None) == frozenset()
-    assert extract_rule_refs({}) == frozenset()
+def test_rule_refs_from_text_tolerates_missing_rules() -> None:
+    assert rule_refs_from_text(None) == frozenset()
+    assert rule_refs_from_text("") == frozenset()
 
 
 def test_finding_on_a_changed_line_is_accepted_with_fingerprint(

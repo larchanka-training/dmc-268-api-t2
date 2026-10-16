@@ -7,11 +7,10 @@ counted, never moved to a neighbouring line.
 
 import hashlib
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from app.domain.enums import FindingSide
-from app.domain.settings import rule_instructions
 from app.review.schemas.context import ContextPayload, Hunk, LineKind
 from app.review.schemas.finding import LLMFinding, ValidatedFinding
 from app.review.schemas.result import ReviewChunkOutcome
@@ -103,13 +102,11 @@ class FindingValidator:
         )
 
 
-def extract_rule_refs(rules: Mapping[str, Sequence[str]] | None) -> frozenset[str]:
-    """Rule labels ([SEC-1] style) from the canonical rules document."""
-    return frozenset(
-        label
-        for instruction in rule_instructions(rules)
-        for label in _RULE_LABEL.findall(instruction)
-    )
+def rule_refs_from_text(rules_text: str | None) -> frozenset[str]:
+    """Rule labels ([SEC-1] style) from a rendered rules document."""
+    if not rules_text:
+        return frozenset()
+    return frozenset(_RULE_LABEL.findall(rules_text))
 
 
 def merge_findings(groups: list[list[ValidatedFinding]]) -> list[ValidatedFinding]:

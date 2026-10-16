@@ -20,7 +20,9 @@ from app.review.schemas.context import ContextPayload, FileDiff, Metadata
 from app.review.schemas.result import LLMReviewOutput
 
 # Data may not open or close our delimiter tags (prompt injection, SD §12).
-_DELIMITER_TAG = re.compile(r"<(/?)(pr_metadata|diff|repo_rules)>", re.IGNORECASE)
+# findings covers the Reflection Pass verifier block (issue #25).
+_DELIMITER_TAGS = ("pr_metadata", "diff", "repo_rules", "findings")
+_DELIMITER_TAG = re.compile(rf"<(/?)({'|'.join(_DELIMITER_TAGS)})>", re.IGNORECASE)
 
 # Per-message framing tokens added by chat templates.
 _MESSAGE_OVERHEAD_TOKENS = 4
@@ -57,6 +59,10 @@ class BuiltPrompt:
     estimated_tokens: int
     limitations: list[str]
     few_shot_ids: list[str]
+    # The rules text actually embedded in the messages (None when the block
+    # was dropped by the token limit); rule_ref whitelist is checked against
+    # it, never against the source document (ADR 0002 trust boundary).
+    included_rules: str | None = None
 
 
 class PromptBuilder:
@@ -150,6 +156,7 @@ class PromptBuilder:
                     limitations=([_TRIMMED_NOTE] if level else [])
                     + list(extra_limitations),
                     few_shot_ids=[shot.id for shot in shots],
+                    included_rules=rules,
                 )
         return None
 
@@ -177,9 +184,7 @@ class PromptBuilder:
         return messages
 
     def _estimate(self, messages: list[ChatMessage]) -> int:
-        return sum(
-            self._counter.count(m.content) + _MESSAGE_OVERHEAD_TOKENS for m in messages
-        )
+        return estimate_messages(messages, self._counter)
 
 
 def _metadata_block(title: str, output_language: str = "ru") -> str:
@@ -219,6 +224,11 @@ def _render_metadata(
             + "\n".join(f"- {d.author}: {d.body}" for d in metadata.discussions)
         )
     return "\n".join(lines)
+
+
+def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
+    """Token estimate for a message list: content plus per-message framing."""
+    return sum(counter.count(m.content) + _MESSAGE_OVERHEAD_TOKENS for m in messages)
 
 
 def neutralize(data: str) -> str:

@@ -366,8 +366,6 @@ async def test_dispatcher_keeps_redis_failure_unpublished_until_successful_retry
         assert event.broker_published_at is None
         assert event.quarantined_at is None
         assert event.quarantine_reason_code is None
-        assert event.dispatch_generation == 1
-        assert event.recovery_send_count == 0
         assert event.dispatch_not_before is not None
     assert await client.xlen(f"{prefix}:analyze") == 0
 
@@ -612,54 +610,6 @@ async def test_dispatcher_crash_retries_same_event_without_losing_progress(
         assert event.broker_published_at is not None
 
 
-async def test_parallel_dispatchers_reserve_once_before_redis_send(
-    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
-) -> None:
-    event_id, _ = await _create_outbox_event(postgres)
-    factory = async_sessionmaker(postgres.engine)
-    client, prefix = dispatcher_redis
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class PausedQueue(RedisQueue):
-        async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
-            entered.set()
-            await release.wait()
-            return await super().enqueue(envelope)
-
-    slow = PostgresOutboxDispatcher(factory, PausedQueue(client, stream_prefix=prefix))
-    fast = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
-    slow_run = asyncio.create_task(slow.dispatch_batch())
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        assert await asyncio.wait_for(fast.dispatch_batch(), 2) == 0
-        async with factory() as session:
-            event = await session.get(models.OutboxEvent, event_id)
-            assert event is not None
-            assert event.broker_published_at is None
-            assert event.dispatch_generation == 1
-            assert event.recovery_send_count == 0
-        release.set()
-        assert await asyncio.wait_for(slow_run, 2) == 1
-    finally:
-        release.set()
-        if not slow_run.done():
-            slow_run.cancel()
-        with suppress(asyncio.CancelledError):
-            await slow_run
-
-    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
-    assert [payload["event_id"] for payload in payloads] == [str(event_id)]
-    assert payloads[0]["event_id"] == str(event_id)
-    async with factory() as session:
-        event = await session.get(models.OutboxEvent, event_id)
-        assert event is not None
-        assert event.broker_published_at is not None
-        assert event.broker_message_id is not None
-        assert event.dispatch_generation == 1
-    assert await fast.dispatch_batch() == 0
-
-
 @pytest.mark.parametrize("batch_size", [0, -1])
 async def test_dispatcher_rejects_nonpositive_batch_without_enqueue(
     postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str], batch_size: int
@@ -779,7 +729,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0011"
+        ).scalar_one() == "0012"
 
         result = await connection.execute(
             text(
@@ -1448,60 +1398,6 @@ async def test_restarted_dispatcher_excludes_quarantine_from_batch_limit(
         assert event.broker_published_at is None
 
 
-async def test_quarantine_wins_over_concurrent_inflight_publication_marker(
-    postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
-) -> None:
-    event_id, _ = await _create_outbox_event(postgres)
-    factory = async_sessionmaker(postgres.engine)
-    client, prefix = dispatcher_redis
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class PausedQueue(RedisQueue):
-        async def enqueue(self, envelope: QueueTaskEnvelope) -> str:
-            entered.set()
-            await release.wait()
-            return await super().enqueue(envelope)
-
-    slow = PostgresOutboxDispatcher(factory, PausedQueue(client, stream_prefix=prefix))
-    fast = PostgresOutboxDispatcher(factory, RedisQueue(client, stream_prefix=prefix))
-    run = asyncio.create_task(slow.dispatch_batch())
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        # Represent two different snapshots during a concurrent legacy correction.
-        async with postgres.engine.begin() as connection:
-            await connection.execute(
-                update(models.OutboxEvent)
-                .where(models.OutboxEvent.id == event_id)
-                .values(schema_version=2)
-            )
-        assert await fast.recover_batch() == 0
-        async with factory() as session:
-            event = await session.get(models.OutboxEvent, event_id)
-            assert event is not None
-            first_quarantine_at = event.quarantined_at
-            assert first_quarantine_at is not None
-        release.set()
-        # ACK is counted even if its stale snapshot cannot change terminal state.
-        assert await asyncio.wait_for(run, 2) == 1
-    finally:
-        release.set()
-        if not run.done():
-            run.cancel()
-        with suppress(asyncio.CancelledError):
-            await run
-
-    async with factory() as session:
-        event = await session.get(models.OutboxEvent, event_id)
-        assert event is not None
-        assert event.broker_published_at is None
-        assert event.quarantined_at == first_quarantine_at
-        assert event.quarantine_reason_code == "UNSUPPORTED_SCHEMA_VERSION"
-    payloads = await _stream_envelopes(client, f"{prefix}:analyze")
-    assert [payload["event_id"] for payload in payloads] == [str(event_id)]
-    assert await fast.dispatch_batch() == 0
-
-
 async def test_published_receipt_with_corrected_source_is_untrusted_and_not_quarantined(
     postgres: PostgresHarness, dispatcher_redis: tuple[Redis, str]
 ) -> None:
@@ -1518,7 +1414,6 @@ async def test_published_receipt_with_corrected_source_is_untrusted_and_not_quar
         receipt = (
             event.broker_message_id,
             event.broker_published_at,
-            event.dispatch_generation,
         )
     async with postgres.engine.begin() as connection:
         await connection.execute(
@@ -1534,11 +1429,9 @@ async def test_published_receipt_with_corrected_source_is_untrusted_and_not_quar
         assert (
             event.broker_message_id,
             event.broker_published_at,
-            event.dispatch_generation,
         ) == receipt
         assert event.quarantined_at is None
         assert event.quarantine_reason_code is None
-        assert event.recovery_send_count == 0
     assert await client.xlen(f"{prefix}:analyze") == 1
     assert await client.xlen(f"{prefix}:dead") == 0
 

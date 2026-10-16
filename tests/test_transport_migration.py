@@ -1,12 +1,10 @@
-"""Additive transport receipts preserve historical authority through migration."""
+"""Forward transport simplification preserves receipts and business authority."""
 
 import asyncio
 import json
 import uuid
 from dataclasses import replace
 
-import asyncpg  # type: ignore[import-untyped]
-import pytest
 from sqlalchemy.engine import make_url
 from test_migration_upgrade import MigrationDatabase, _seed_legacy
 
@@ -15,13 +13,19 @@ from app.domain.frozen_configuration import admission_policy
 
 pytest_plugins = ("test_migration_upgrade",)
 
+_REMOVED = (
+    "dispatch_generation",
+    "recovery_window_started_at",
+    "recovery_send_count",
+)
 
-async def test_transport_receipts_upgrade_legacy_and_roundtrip(
+
+async def test_lean_transport_upgrade_preserves_historical_data_and_roundtrip(
     migration_database: MigrationDatabase,
 ) -> None:
     db = migration_database
     command, job_id = await _seed_legacy(db)
-    db.migrate("upgrade", "0010")
+    db.migrate("upgrade", "0011")
     policy = admission_policy("0" * 64).model_dump(mode="json")
     frozen = replace(command, model_settings=policy, frozen_configuration_version=1)
     await db.connection.execute(
@@ -37,16 +41,19 @@ async def test_transport_receipts_upgrade_legacy_and_roundtrip(
         uuid.uuid4(),
         uuid.uuid4(),
     )
-    ids = [uuid.uuid4() for _ in range(3)]
-    for index, event_id in enumerate(ids):
+    for index in range(3):
         await db.connection.execute(
             "INSERT INTO outbox_event "
             "(id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at,"
-            "broker_published_at,quarantined_at,quarantine_reason_code) "
+            "broker_published_at,broker_message_id,dispatch_not_before,"
+            "dispatch_generation,recovery_window_started_at,recovery_send_count,"
+            "quarantined_at,quarantine_reason_code) "
             "VALUES ($1,$2,1,'analyze',1,'legacy',now(),"
-            "CASE WHEN $3=1 THEN now() END,CASE WHEN $3=2 THEN now() END,"
+            "CASE WHEN $3=1 THEN now() END,CASE WHEN $3>0 THEN '123456789-0' END,"
+            "now()+interval '90 seconds',7,now(),4,"
+            "CASE WHEN $3=2 THEN now() END,"
             "CASE WHEN $3=2 THEN 'INVALID_ENVELOPE' END)",
-            event_id,
+            uuid.uuid4(),
             job_id,
             index,
         )
@@ -56,160 +63,93 @@ async def test_transport_receipts_upgrade_legacy_and_roundtrip(
         uuid.uuid4(),
         job_id,
     )
-    before = await db.connection.fetch("SELECT * FROM outbox_event ORDER BY id")
-    job = await db.connection.fetchrow("SELECT * FROM review_job WHERE id=$1", job_id)
-    lease = await db.connection.fetchrow("SELECT * FROM task_lease")
-    db.migrate("upgrade", "head")
-    metadata = await db.connection.fetch(
-        "SELECT broker_message_id,dispatch_generation,dispatch_not_before,"
-        "recovery_window_started_at,recovery_send_count FROM outbox_event"
-    )
-    assert [tuple(row) for row in metadata] == [(None, 0, None, None, 0)] * 3
-    for assignment in (
-        "dispatch_generation=-1",
-        "recovery_send_count=-1",
-        "recovery_send_count=1",
-        "recovery_window_started_at=now()",
-    ):
-        with pytest.raises(asyncpg.CheckViolationError):
-            await db.connection.execute(
-                f"UPDATE outbox_event SET {assignment} WHERE id=$1", ids[0]
-            )
-    # A reserved generation without receipt/marker is a valid crash state.
     await db.connection.execute(
-        "UPDATE outbox_event SET dispatch_generation=1,"
-        "dispatch_not_before=now()+interval '60 seconds' WHERE id=$1",
-        ids[0],
-    )
-    db.migrate("check")
-    db.migrate("downgrade", "0010")
-    assert await db.connection.fetch("SELECT * FROM outbox_event ORDER BY id") == before
-    assert (
-        await db.connection.fetchrow("SELECT * FROM review_job WHERE id=$1", job_id)
-        == job
-    )
-    assert await db.connection.fetchrow("SELECT * FROM task_lease") == lease
-    db.migrate("upgrade", "head")
-    db.migrate("check")
-
-
-async def _seed_transport_event(db: MigrationDatabase) -> tuple[uuid.UUID, uuid.UUID]:
-    _, job_id = await _seed_legacy(db)
-    db.migrate("upgrade", "head")
-    event_id = uuid.uuid4()
-    await db.connection.execute(
-        "INSERT INTO outbox_event "
-        "(id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at) "
-        "VALUES ($1,$2,1,'analyze',1,'transport-migration',clock_timestamp())",
-        event_id,
+        "INSERT INTO chunk_result "
+        "(id,review_job_id,schema_version,summary,limitations,usage,"
+        "latency_ms,created_at) "
+        "VALUES ($1,$2,1,'retained result','[]','{\"input_tokens\":12}',3,now())",
+        uuid.uuid4(),
         job_id,
     )
-    return job_id, event_id
-
-
-async def test_transport_check_failure_rolls_back_entire_reservation(
-    migration_database: MigrationDatabase,
-) -> None:
-    db = migration_database
-    job_id, event_id = await _seed_transport_event(db)
-    before = await db.connection.fetchrow(
-        "SELECT * FROM outbox_event WHERE id=$1", event_id
+    await db.connection.execute(
+        "INSERT INTO review_llm_attempt "
+        "(id,review_job_id,chunk_id,operation_id,call_kind,analysis_attempt,"
+        "lease_owner,fencing_token,provider_profile_ref,model_ref,"
+        "reserved_input_tokens,reserved_output_tokens,state,actual_input_tokens,"
+        "actual_output_tokens,reserved_at,settled_at,latency_ms) "
+        "VALUES ($1,$2,$3,$4,'initial',2,'old',17,'profile','model',20,10,"
+        "'SUCCEEDED',12,4,now()-interval '1 minute',now(),3)",
+        uuid.uuid4(),
+        job_id,
+        uuid.uuid4(),
+        uuid.uuid4(),
     )
-    job_before = await db.connection.fetchrow(
-        "SELECT * FROM review_job WHERE id=$1", job_id
-    )
-    with pytest.raises(asyncpg.CheckViolationError):
-        async with db.connection.transaction():
-            await db.connection.execute(
-                "UPDATE outbox_event SET dispatch_generation=1,"
-                "dispatch_not_before=clock_timestamp()+interval '60 seconds',"
-                "recovery_window_started_at=clock_timestamp(),"
-                "recovery_send_count=1 WHERE id=$1",
-                event_id,
-            )
-            await db.connection.execute(
-                "UPDATE outbox_event SET recovery_send_count=-1 WHERE id=$1",
-                event_id,
-            )
+    tables = ("review_job", "task_lease", "chunk_result", "review_llm_attempt")
+    before = {
+        table: await db.connection.fetch(f"SELECT * FROM {table} ORDER BY id")
+        for table in tables
+    }
+    events = [
+        {key: value for key, value in row.items() if key not in _REMOVED}
+        for row in await db.connection.fetch("SELECT * FROM outbox_event ORDER BY id")
+    ]
+
+    db.migrate("upgrade", "head")
     assert (
-        await db.connection.fetchrow("SELECT * FROM outbox_event WHERE id=$1", event_id)
-        == before
+        await db.connection.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name='outbox_event' AND column_name=ANY($1::text[])",
+            list(_REMOVED),
+        )
+        == 0
     )
     assert (
-        await db.connection.fetchrow("SELECT * FROM review_job WHERE id=$1", job_id)
-        == job_before
+        await db.connection.fetchval(
+            "SELECT count(*) FROM pg_constraint WHERE conname IN "
+            "('ck_outbox_dispatch_generation','ck_outbox_recovery_count',"
+            "'ck_outbox_recovery_window')"
+        )
+        == 0
     )
+    assert [
+        dict(row)
+        for row in await db.connection.fetch("SELECT * FROM outbox_event ORDER BY id")
+    ] == events
+    for table in tables:
+        assert (
+            await db.connection.fetch(f"SELECT * FROM {table} ORDER BY id")
+            == before[table]
+        )
+    db.migrate("downgrade", "0011")
+    assert [
+        tuple(row)
+        for row in await db.connection.fetch(
+            "SELECT dispatch_generation,recovery_window_started_at,recovery_send_count "
+            "FROM outbox_event"
+        )
+    ] == [(0, None, 0)] * 3
+    db.migrate("upgrade", "head")
+    assert [
+        dict(row)
+        for row in await db.connection.fetch("SELECT * FROM outbox_event ORDER BY id")
+    ] == events
+    for table in tables:
+        assert (
+            await db.connection.fetch(f"SELECT * FROM {table} ORDER BY id")
+            == before[table]
+        )
 
 
-async def test_transport_metadata_cas_rechecks_after_concurrent_commit(
-    migration_database: MigrationDatabase,
-) -> None:
-    db = migration_database
-    _, event_id = await _seed_transport_event(db)
-    contender = await asyncpg.connect(
-        make_url(db.url)
-        .set(drivername="postgresql")
-        .render_as_string(hide_password=False)
-    )
-    entered = asyncio.Event()
-
-    async def stale_finalize() -> uuid.UUID | None:
-        async with contender.transaction():
-            entered.set()
-            result = await contender.fetchval(
-                "UPDATE outbox_event SET broker_message_id='old-0',"
-                "broker_published_at=clock_timestamp() "
-                "WHERE id=$1 AND dispatch_generation=0 RETURNING id",
-                event_id,
-            )
-            assert result is None or isinstance(result, uuid.UUID)
-            return result
-
-    pending = None
-    try:
-        async with db.connection.transaction():
-            await db.connection.execute(
-                "UPDATE outbox_event SET dispatch_generation=1,"
-                "broker_message_id='new-0',broker_published_at=clock_timestamp() "
-                "WHERE id=$1",
-                event_id,
-            )
-            pending = asyncio.create_task(stale_finalize())
-            await entered.wait()
-            # PostgreSQL confirms actual contention before the winning commit.
-            async with asyncio.timeout(5):
-                while not await db.connection.fetchval(
-                    "SELECT cardinality(pg_blocking_pids($1)) > 0",
-                    contender.get_server_pid(),
-                ):
-                    pass
-            assert not pending.done()
-        assert await pending is None
-        assert tuple(
-            await db.connection.fetchrow(
-                "SELECT dispatch_generation,broker_message_id,"
-                "broker_published_at IS NOT NULL FROM outbox_event WHERE id=$1",
-                event_id,
-            )
-        ) == (1, "new-0", True)
-    finally:
-        if pending is not None:
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
-        await contender.close()
-
-
-async def test_transport_migration_lock_timeout_preserves_previous_revision(
+async def test_lean_transport_lock_timeout_preserves_previous_revision(
     migration_database: MigrationDatabase,
 ) -> None:
     db = migration_database
     _, job_id = await _seed_legacy(db)
-    db.migrate("upgrade", "0010")
-    job_before = await db.connection.fetchrow(
+    db.migrate("upgrade", "0011")
+    before = await db.connection.fetchrow(
         "SELECT * FROM review_job WHERE id=$1", job_id
     )
     name = make_url(db.url).database
-    # Only this fixture's uniquely named disposable database is configured.
     await db.connection.execute(f'ALTER DATABASE "{name}" SET lock_timeout="100ms"')
     try:
         async with db.connection.transaction():
@@ -222,32 +162,20 @@ async def test_transport_migration_lock_timeout_preserves_previous_revision(
         await db.connection.execute(f'ALTER DATABASE "{name}" RESET lock_timeout')
     assert (
         await db.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0010"
+        == "0011"
     )
-    assert (
-        await db.connection.fetchval(
-            "SELECT count(*) FROM information_schema.columns "
-            "WHERE table_name='outbox_event' AND column_name IN "
-            "('broker_message_id','dispatch_generation','dispatch_not_before',"
-            "'recovery_window_started_at','recovery_send_count')"
-        )
-        == 0
-    )
-    assert (
-        await db.connection.fetchval(
-            "SELECT count(*) FROM pg_constraint WHERE conname IN "
-            "('ck_outbox_dispatch_generation','ck_outbox_recovery_count',"
-            "'ck_outbox_recovery_window')"
-        )
-        == 0
-    )
-    assert (
-        await db.connection.fetchval("SELECT to_regclass('ix_outbox_analyze_cursor')")
-        is None
-    )
+    assert await db.connection.fetchval(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name='outbox_event' AND column_name=ANY($1::text[])",
+        list(_REMOVED),
+    ) == len(_REMOVED)
+    assert await db.connection.fetchval(
+        "SELECT count(*) FROM pg_constraint WHERE conname IN "
+        "('ck_outbox_dispatch_generation','ck_outbox_recovery_count',"
+        "'ck_outbox_recovery_window')"
+    ) == len(_REMOVED)
     assert (
         await db.connection.fetchrow("SELECT * FROM review_job WHERE id=$1", job_id)
-        == job_before
+        == before
     )
     db.migrate("upgrade", "head")
-    db.migrate("check")

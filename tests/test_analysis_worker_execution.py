@@ -176,7 +176,7 @@ async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # 
         ).one()
         assert publish.broker_published_at is None
         assert publish.broker_message_id is None
-        assert publish.dispatch_generation == 0
+        assert publish.dispatch_not_before is None
     assert len(transports) == 2
     assert set(closed) == set(transports)
 

@@ -132,7 +132,7 @@ async def test_once_bounds_delivery_and_durably_excludes_confirmed_events(
     async with factory() as session:
         publish = await session.get(OutboxEvent, publish_id)
         assert publish is not None and publish.broker_published_at is None
-        assert publish.dispatch_generation == 0
+        assert publish.dispatch_not_before is None
 
 
 @pytest.mark.skipif(
@@ -186,6 +186,8 @@ async def batch_record(process: asyncio.subprocess.Process) -> dict[str, object]
     assert process.stdout is not None
     async with asyncio.timeout(10):
         line = await process.stdout.readline()
+        if line and json.loads(line)["event"] == "outbox_recovery":
+            line = await process.stdout.readline()
     assert line, "dispatcher exited before reporting a batch"
     record = json.loads(line)
     assert isinstance(record, dict) and record["event"] == "outbox_batch"
@@ -442,8 +444,7 @@ async def test_enqueue_failure_preserves_retry_eligibility_without_logging_sourc
     async with async_sessionmaker(postgres.engine)() as session:
         event = await session.get(OutboxEvent, event_id)
         assert event is not None
-        assert event.dispatch_generation == 2  # noqa: PLR2004 -- first recovery
-        assert event.recovery_send_count == 1
+        assert event.dispatch_not_before is not None
         assert event.broker_message_id is not None
 
 
@@ -480,3 +481,11 @@ async def test_cli_preserves_quarantine_and_does_not_log_private_source_at_debug
     assert again.returncode == 0, again.stderr
     assert '"confirmed": 0' in again.stdout
     assert await runtime_redis.xlen(f"{STREAM}:publish") == 0
+
+
+@pytest.mark.parametrize("interval", ["1e-300", "0.009"])
+def test_poll_interval_rejects_practically_zero_values(interval: str) -> None:
+    result = invoke("--once", "--poll-interval", interval)
+    assert result.returncode == ARGPARSE_ERROR
+    assert result.stdout == ""
+    assert "at least 0.01" in result.stderr

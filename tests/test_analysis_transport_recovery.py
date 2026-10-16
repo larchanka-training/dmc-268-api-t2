@@ -288,7 +288,6 @@ async def test_lost_transport_after_paid_result_crash_preserves_charge_and_hando
             row for row in after["outbox_event"] if row["task_kind"] == "analyze"
         )
         assert analyze["broker_message_id"] != receipt
-        assert analyze["recovery_send_count"] == 1
         assert await PostgresWorkerTasks(factory).completed(task)
         await queue.enqueue(task)
         duplicate_calls: list[httpx.Request] = []

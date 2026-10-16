@@ -167,10 +167,7 @@ erDiagram
         TIMESTAMPTZ created_at
         TIMESTAMPTZ broker_published_at
         TEXT broker_message_id
-        INTEGER dispatch_generation
         TIMESTAMPTZ dispatch_not_before
-        TIMESTAMPTZ recovery_window_started_at
-        INTEGER recovery_send_count
     }
 
     TaskLease {

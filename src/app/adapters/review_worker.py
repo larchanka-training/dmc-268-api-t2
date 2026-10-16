@@ -97,6 +97,8 @@ class PostgresReviewWorker:
             return False
         if await self._tasks.completed(delivery.envelope):
             return await self._queue.ack(delivery)
+        if await self._queue.is_expired(delivery):
+            return False
         claim_started = time.monotonic()
         lease = await self._leases.acquire(
             uuid.UUID(delivery.envelope.review_id),

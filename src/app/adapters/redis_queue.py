@@ -231,6 +231,12 @@ class RedisQueue:
         now_ms = seconds * 1000 + micros // 1000
         return "EXPIRED" if now_ms - timestamp >= _TRANSPORT_EXPIRY_MS else "PRESENT"
 
+    async def is_expired(self, delivery: QueueDelivery) -> bool:
+        """Redis server time and Stream ID define the transport's twenty minutes."""
+        seconds, micros = await self._client.time()
+        timestamp = int(delivery.message_id.split("-", 1)[0])
+        return seconds * 1000 + micros // 1000 - timestamp >= _TRANSPORT_EXPIRY_MS
+
     async def receive(
         self, *, task_kind: TaskKind, consumer_name: str
     ) -> QueueDelivery | None:

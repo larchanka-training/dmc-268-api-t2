@@ -120,6 +120,51 @@ async def test_committed_analysis_decision_is_acked_even_before_outbox_marker(
     ] == 0
 
 
+@pytest.mark.parametrize("reclaim", [False, True])
+async def test_expired_delivery_requires_durable_completion_before_ack(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    task: QueueTaskEnvelope,
+    reclaim: bool,
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    seconds, micros = await redis_client.time()
+    expired_id = f"{seconds * 1000 + micros // 1000 - 1_201_000}-0"
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": task.to_json()}, id=expired_id
+    )
+    if reclaim:
+        assert await queue.receive(task_kind="analyze", consumer_name="crashed")
+    handler = SkipAnalysis(postgres)
+    worker = PostgresReviewWorker(
+        handler.factory, queue, handler, owner="worker", task_kind="analyze"
+    )
+
+    acknowledged = (
+        (await worker.recover_once(cursor="0-0", min_idle_time=0))[1]
+        if reclaim
+        else await worker.run_once()
+    )
+
+    assert acknowledged is False
+    assert handler.claims == []
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 1
+    async with handler.factory.begin() as session:
+        await session.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == uuid.UUID(task.review_id))
+            .values(status="SKIPPED", finished_at=func.clock_timestamp())
+        )
+    assert await worker.recover_once(cursor="0-0", min_idle_time=0) == ("0-0", True)
+    assert handler.claims == []
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 0
+
+
 class FinishPublication(SkipAnalysis):
     def __init__(
         self,
@@ -1005,7 +1050,7 @@ async def test_atomic_analysis_handoff_acks_while_publication_stays_parked(
         event = await session.get(OutboxEvent, analyzer.publish_event_id)
         assert event is not None and event.task_kind == "publish"
         assert event.broker_published_at is None and event.broker_message_id is None
-        assert event.dispatch_generation == 0 and event.quarantined_at is None
+        assert event.dispatch_not_before is None and event.quarantined_at is None
 
 
 async def test_successful_callback_without_explicit_outcome_keeps_delivery_pending(

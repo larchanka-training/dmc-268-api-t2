@@ -268,7 +268,7 @@ publisher, проверяют соответствующий fencing в той �
 Renew разрешён только пока задача своего типа остаётся допустимой; release после
 завершения остаётся доступен текущему владельцу живого lease. UNKNOWN требует
 отдельной reconciliation и исключает автоматическую повторную публикацию.
-Подробный контракт задан в PIPELINE_SPEC.md §5 и §8.
+Подробный контракт задан в PIPELINE_SPEC.md §6 и §8.
 
 Разные ReviewJob одного ChangeRequest имеют разные lease. Поэтому сериализация
 provider-вызовов для одного PR нужна отдельно от TaskLease; транзакционные locks
@@ -281,12 +281,14 @@ task-specific acquire, повторная проверка перед callback, 
 new-delivery pass (`--once`) либо последовательный continuous loop.
 Обычный return, промежуточный commit и захват lease не разрешают
 ACK. Консервативные completion proofs и pending-классификация определены в
-PIPELINE_SPEC.md §4.2; PostgreSQL outbox marker может оставаться NULL при delivery.
+PIPELINE_SPEC.md §6; PostgreSQL outbox marker может оставаться NULL при delivery.
 Тестовый harness фиксирует реальные fenced terminal решения и атомарный publish
 handoff без внешних provider calls. Во время callback worker автоматически
 продлевает TaskLease через `TaskLeasePort`: heartbeat каждые 15 секунд,
 lease на 90 секунд. Потеря lease или ошибка renewal отменяет handler и оставляет
-delivery pending. Pending-delivery recovery (XAUTOCLAIM) не реализован.
+delivery pending. Continuous analysis CLI выполняет bounded pending-delivery
+recovery через XAUTOCLAIM (Stage 8C-04-02); это отдельный путь от PostgreSQL
+transport recovery в dispatcher (§3.6).
 
 `PostgresAnalysisHandler` подключается через тот же `TaskHandlerPort`:
 authoritative ReviewJob/configuration → `GithubPort.fetch` → `parse_diff` →
@@ -334,32 +336,83 @@ terminal rows остаются читаемыми через REST без пер�
 
 Builder лишь возвращает bounded worker; фонового сервиса он не запускает.
 CLI Stage 8C-04-01 описан в [analysis-runtime.md](examples/analysis-runtime.md).
-Activation, automatic pending claiming, periodic recovery/retry scheduler,
+Activation, transport retention/cleanup, полный in-flight shutdown,
 полный chunk planner, real publisher/reconciliation и OAuth/session integration
-остаются до production activation. Safety controlled redelivery не означает
-готовность automatic recovery. Issue #13 и deployment readiness не объявлены
-завершёнными. Детали — PIPELINE_SPEC.md §4.3.
+остаются до production activation. Automatic Redis pending recovery и PostgreSQL transport recovery реализованы;
+их наличие не заменяет остальные activation gates. Issue #13 и deployment readiness не объявлены
+завершёнными. Детали — PIPELINE_SPEC.md §2–3, §6 и §8.
 
 ### 3.6 Dispatcher и recovery
 
-Dispatcher отправляет только analyze `OutboxEvent`. `dispatch_batch()` выбирает
-до100 genuine initial commands, `recover_batch()` — до100 recovery candidates
-по process-local keyset cursor `(created_at,id)` и создаёт до10 recovery reservations.
-Оба пути резервируют generation/cooldown под locks
-`ReviewJob → TaskLease → OutboxEvent`, используя DB clock после locks.
-Redis exact-ID probe и единственный XADD attempt выполняются вне PG transaction;
-conditional finalize сохраняет receipt и marker только для той же generation.
-Metadata и bounds3/event/300s, cooldown60s переживают restart на существующем outbox.
-PRESENT запрещает backlog amplification; UNKNOWN/UNTRUSTED не дают права на send.
-Stream ID/Redis TIME задают transport expiry20min; job clocks/budgets не меняются.
+Dispatcher отправляет только canonical analyze `OutboxEvent`; publish commands и
+Publication(PENDING) остаются durable в PostgreSQL без publish XADD. Initial batch
+выбирает максимум 100 ещё не резервированных команд. Recovery рассматривает до
+100 due active кандидатов и делает до 10 resend reservations за tick. Quarantine,
+live TaskLease и future retry исключаются до LIMIT; истёкший queue/analysis deadline
+позволяет доставку для terminalization существующим worker без нового HTTP.
 
-CLI `python -m app.outbox_dispatcher --once` выполняет один recovery sweep и один
-initial batch. Continuous mode пока выполняет только initial batches; periodic
-recovery и оставшийся lifecycle относятся к последующим частям8C-04.
-Analysis CLI Stage 8C-04-01 уже реализован. Deployment не запускает новые
-процессы. Publish outbox и Publication(PENDING) остаются в PostgreSQL, без publish
-XADD; analysis full completion proof не требует исполняемого publisher.
-Подробнее — PIPELINE_SPEC.md §4.1.
+Сохраняются `broker_message_id`, `broker_published_at` и `dispatch_not_before`.
+Перед одной XADD command attempt коммитится DB now + 90 секунд; hidden retries нет.
+Последний подтверждённый ID/marker сохраняется до подтверждения новой отправки.
+Crash до XADD и потерянный ответ/marker commit соблюдают persisted cooldown после
+restart; ambiguous send допускает bounded duplicates одной canonical PG команды.
+Generation/CAS, recovery counters/windows и отдельный terminal diagnostics scan удалены.
+Eligibility повторно проверяется под locks `ReviewJob → TaskLease → OutboxEvent`
+по DB clock после locks. Redis probe/XADD не удерживают PostgreSQL transaction.
+
+Exact Redis ID probe различает PRESENT, ABSENT, EXPIRED, UNKNOWN и UNTRUSTED.
+Canonical PRESENT откладывает следующую проверку без resend; ABSENT/EXPIRED допускают
+повторную eligibility check и committed throttle перед одной XADD. UNKNOWN —
+infrastructure failure с sanitized nonzero exit до recovery success log, включая
+transient Redis failure. UNTRUSTED даёт safe diagnostics и persisted deferral,
+без XADD, ACK и изменения canonical identity. Persisted order/deferral обеспечивают
+fairness due backlog без process-local dispatcher cursor и горячего повторного scan.
+Incomplete handoff остаётся pending без ACK. Автоматического structural-gap alert
+больше нет; проверка сохранённых Publication/outbox данных — ответственность оператора.
+
+Transport expiry 20 минут определяется Redis Stream ID и Redis TIME. Оба пути
+receive/reclaim проходят один worker processing seam: expired delivery без durable
+completion proof не запускает handler/LLM HTTP и не ACK-ается. Завершённый duplicate
+можно ACK-нуть по прежнему proof; PostgreSQL recovery создаёт свежую delivery для
+active job, в том числе для deadline terminalization. Job clocks, fencing и durable
+paid accounting от transport recovery не сбрасываются.
+
+Операционная предпосылка — **ровно один активный dispatcher**. Deploy/restart:
+остановить прежний процесс, дождаться выхода, затем запустить новый; после потери
+host подтвердить остановку прежнего процесса. Rolling overlap и active replicas
+не поддерживаются. Distributed leader election не добавляется. Нарушение singleton
+может увеличить duplicates; обязательные worker fencing/accounting сохраняются.
+
+CLI `python -m app.outbox_dispatcher --once` выполняет recovery sweep и initial batch
+без ожидания. Continuous mode делает recovery при старте, затем через 30 секунд
+после завершения предыдущего sweep по monotonic clock. Recovery и initial dispatch
+последовательны без catch-up, также при initial backlog и пустой очереди. Idle wait
+ограничен ближайшим tick; `--poll-interval` default 5s, finite и минимум 0.01s.
+`--batch-size` default 100, positive и capped at 100. SIGTERM/SIGINT запрещают новый
+tick; stop во время recovery запрещает следующий initial batch. Начатая bounded
+операция завершается, ожидание прерывается, Redis/engine освобождаются.
+Redis PING перед каждой итерацией, connect/command timeouts 5s, retries отключены;
+ошибки Redis/PostgreSQL дают nonzero exit с error type без raw payload/exception text.
+Оператор оставляет время завершить bounded batch; forced termination после XADD
+может дать duplicate. Pending recovery analysis worker claims существующие deliveries;
+PostgreSQL dispatcher восстанавливает потерянный transport через XADD. Автоматического
+старта в Compose/CD нет; retention/cleanup и полный analysis shutdown остаются отдельно.
+
+Forward migration `0012_lean_outbox_transport.py` следует за неизменённой `0011`:
+удаляет только три obsolete fields и связанные CHECK, сохраняя receipts, throttle,
+quarantine и business data. До upgrade необходимо drain/stop старых worker/API/dispatcher
+процессов, использующих ORM OutboxEvent: старый binary обращается к удаляемым columns.
+После migration запускается новый binary; rolling mixed versions не поддерживаются.
+Rollback тоже требует остановки процессов; downgrade восстанавливает counters нулями,
+но их историю восстановить нельзя.
+Конфликт PR #30 revision IDs 0008/0009 требует согласованной integration history
+до merge; migrations другого PR не перенумеровываются в LEAN-01.
+
+До merge техлид согласует изменение обещаний: singleton вместо competing generations,
+90s throttle вместо rolling window 3/event/300s и удаление terminal diagnostics scan.
+Exact probe, Transactional Outbox, at-least-once, safe DLQ/ACK, fencing, durable LLM
+accounting, canonical identity и atomic publication handoff сохраняются.
+Подробнее — PIPELINE_SPEC.md §4–6 и §10.
 
 Переход ReviewJob в terminal status записывает terminal `status` и non-null
 `finished_at` одним SQL `UPDATE` или ORM flush: CHECK проверяется после каждого
@@ -553,6 +606,8 @@ ORM-модели не используются как публичные HTTP DT
 - analysis CLI Stage 8C-04-01: trusted preflight, bounded `--once`, последовательный
   continuous loop новых analyze deliveries, idle polling и остановка idle loop;
 - migrations 0008…0010: nullable frozen marker, durable LLM ledger/attempts и repair claim;
+- forward transport migration 0012 после неизменённой 0011: confirmed Redis ID и
+  persisted 90s throttle без generation/window counters;
 - интеграционные тесты Redis queue, dispatcher, worker, analysis composition,
   durable crash accounting, legacy compatibility и atomic terminal handoff;
 - HTTP start ReviewJob со scoped idempotency и атомарными quota/outbox writes;
@@ -569,12 +624,10 @@ ORM-модели не используются как публичные HTTP DT
 - остальные HTTP-обработчики и DTO;
 - интеграция `VcsPort` с авторизованным ReviewJob worker;
 - Context Builder с source windows, whole files и related symbols сверх Level 1;
-- automatic pending-delivery claiming (XAUTOCLAIM), периодический review recovery,
-  retry scheduler и полный in-flight shutdown analysis CLI;
+- transport retention/cleanup и полный in-flight shutdown analysis CLI;
 - publication executor (publisher worker) с call-start guards и сериализацией
   по ChangeRequest;
 - Publisher reconciliation;
-- интеграционные тесты периодического review recovery;
 - readiness endpoint;
 - модель хранения OAuth/access и HTTP handlers для connection flow;
 - обязательная accepted auth-модель включает 30-минутную JWT cookie с `sid`,

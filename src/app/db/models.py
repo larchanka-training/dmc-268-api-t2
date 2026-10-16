@@ -612,17 +612,8 @@ class OutboxEvent(Base):
         DateTime(timezone=True), nullable=True
     )
     broker_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    dispatch_generation: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
-    )
     dispatch_not_before: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
-    )
-    recovery_window_started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    recovery_send_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
     )
     quarantined_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -649,17 +640,6 @@ class OutboxEvent(Base):
             "quarantine_reason_code IS NULL OR quarantine_reason_code IN "
             "('UNSUPPORTED_SCHEMA_VERSION','UNKNOWN_TASK_KIND','INVALID_ENVELOPE')",
             name=conv("ck_outbox_quarantine_reason_code"),
-        ),
-        CheckConstraint(
-            "dispatch_generation >= 0", name=conv("ck_outbox_dispatch_generation")
-        ),
-        CheckConstraint(
-            "recovery_send_count >= 0", name=conv("ck_outbox_recovery_count")
-        ),
-        CheckConstraint(
-            "(recovery_window_started_at IS NULL AND recovery_send_count = 0) OR "
-            "(recovery_window_started_at IS NOT NULL AND recovery_send_count > 0)",
-            name=conv("ck_outbox_recovery_window"),
         ),
         Index(
             "ix_outbox_analyze_cursor",

@@ -1035,10 +1035,11 @@ async def test_publication_write_rechecks_clock_after_lock_wait(  # noqa: PLR091
                 # A row blocker has already delayed this SELECT; a table blocker
                 # will delay the subsequent UPDATE. Arm expiry without a timer
                 # that can run out during unrelated fixture/setup awaits.
+                # Keep it expired across small backwards DB wall-clock steps.
                 await self.execute(
                     update(TaskLease)
                     .where(TaskLease.review_job_id == review_id)
-                    .values(expires_at=func.clock_timestamp())
+                    .values(expires_at=func.clock_timestamp() - timedelta(seconds=30))
                     .execution_options(synchronize_session=False)
                 )
                 lease_clock_armed = True

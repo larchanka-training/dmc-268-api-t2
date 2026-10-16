@@ -187,6 +187,26 @@ async def test_future_then_due_retry_uses_pg_attempt_not_redis_delivery_count(
                 .where(ReviewJob.id == review_id)
                 .values(retry_at=func.clock_timestamp() - timedelta(seconds=1))
             )
+        # Release uses DB wall time, which can move backwards before reacquire.
+        # Prove both eligibility cutoffs in that clock before the single attempt.
+        async with asyncio.timeout(15), factory() as session:
+            while True:
+                now, retry_at, lease_expires_at = (
+                    await session.execute(
+                        select(
+                            func.clock_timestamp(),
+                            ReviewJob.retry_at,
+                            TaskLease.expires_at,
+                        )
+                        .select_from(ReviewJob)
+                        .join(TaskLease, TaskLease.review_job_id == ReviewJob.id)
+                        .where(ReviewJob.id == review_id)
+                    )
+                ).one()
+                assert retry_at is not None
+                if retry_at <= now and lease_expires_at <= now:
+                    break
+                await asyncio.sleep(0.05)
         assert await worker.recover_once(cursor="0-0", min_idle_time=0) == ("0-0", True)
     after = await snapshot(factory, review_id)
     assert after["review_job"][0]["analysis_attempts"] == 1

@@ -95,6 +95,10 @@ class QueuePort(Protocol):
         """Confirm enqueue or reject before I/O via QueueEnvelopeValidationError."""
         ...
 
+    async def is_expired(self, delivery: QueueDelivery) -> bool:
+        """Check transport age using broker server time; propagate broker failures."""
+        ...
+
     async def receive(
         self, *, task_kind: TaskKind, consumer_name: str
     ) -> QueueDelivery | None: ...

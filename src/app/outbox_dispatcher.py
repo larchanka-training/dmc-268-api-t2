@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import math
 import signal
+from time import monotonic
 
 import structlog
 from redis.asyncio import Redis
@@ -30,9 +31,13 @@ def _poll_interval(value: str) -> float:
     try:
         interval = float(value)
     except ValueError:
-        raise argparse.ArgumentTypeError("must be finite and positive") from None
-    if not math.isfinite(interval) or interval <= 0:
-        raise argparse.ArgumentTypeError("must be finite and positive")
+        raise argparse.ArgumentTypeError(
+            "must be finite and positive (at least 0.01 seconds)"
+        ) from None
+    if not math.isfinite(interval) or interval < 0.01:  # noqa: PLR2004
+        raise argparse.ArgumentTypeError(
+            "must be finite and positive (at least 0.01 seconds)"
+        )
     return interval
 
 
@@ -57,21 +62,26 @@ async def _run(*, once: bool, batch_size: int, poll_interval: float) -> None:
                 dispatcher = PostgresOutboxDispatcher(
                     async_session_factory, RedisQueue(client)
                 )
+                next_recovery = monotonic()
                 while not stopping.is_set():
                     await client.ping()
                     if stopping.is_set():
                         break
-                    if once:
+                    if monotonic() >= next_recovery:
                         recovered = await dispatcher.recover_batch()
+                        next_recovery = monotonic() + 30
                         structlog.get_logger().info(
                             "outbox_recovery", confirmed=recovered
                         )
+                    if stopping.is_set():
+                        break
                     confirmed = await dispatcher.dispatch_batch(batch_size=batch_size)
                     structlog.get_logger().info("outbox_batch", confirmed=confirmed)
                     if once:
                         break
                     try:
-                        async with asyncio.timeout(poll_interval):
+                        delay = min(poll_interval, max(0, next_recovery - monotonic()))
+                        async with asyncio.timeout(delay):
                             await stopping.wait()
                     except TimeoutError:
                         pass
@@ -98,7 +108,7 @@ def main() -> None:
         "--poll-interval",
         type=_poll_interval,
         default=5.0,
-        help="Seconds between batches, including empty batches (5).",
+        help="Seconds between batches, including empty batches (5; minimum 0.01).",
     )
     args = parser.parse_args()
     configure_logging(Logging(format="json", file_enabled=False))

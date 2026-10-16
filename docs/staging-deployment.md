@@ -308,9 +308,16 @@ POSTGRES__DB=dmc
 | `STAGING_POSTGRES_PASSWORD` | `POSTGRES__PASSWORD` | Пароль PostgreSQL |
 | `WEBHOOK__SECRET` | `WEBHOOK__SECRET` | HMAC-секрет входящих VCS webhooks |
 | `GITHUB__TOKEN` | `GITHUB__TOKEN` | Read token GitHub API для PR/compare; не Actions `GITHUB_TOKEN` |
+| `GITHUB__WRITE_TOKEN` | `GITHUB__WRITE_TOKEN` | Отдельный токен публикации GitHub с Pull requests write; только для API / будущего publisher |
+| `GITHUB__BOT_USER_ID` | `GITHUB__BOT_USER_ID` | Числовой ID бота для проверки авторства опубликованного ревью |
 
 `webhook-worker` запускает recovery GitHub intake отдельно от ReviewJob worker.
 Нужны PostgreSQL и доступ к GitHub API; подробности: [GitHub intake](github-webhook-intake.md).
+
+Write-токен не передаётся `webhook-worker`. Publisher подключается явно через
+runtime factory; его очередь, session auth и production composition root
+интегрируются с PR #29. Контракт и ограничения:
+[GitHub review publication](github-review-publication.md).
 
 Настройки LLM gateway (ключ и параметры Eurorouter/Ollama) описаны отдельно — см. раздел «LLM gateway: ключ Eurorouter» ниже.
 

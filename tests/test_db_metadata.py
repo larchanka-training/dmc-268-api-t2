@@ -3,7 +3,10 @@ from typing import get_args, get_type_hints
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import configure_mappers
 
-from app.db import models
+from app.db import (
+    models,
+    publication_models,  # noqa: F401 - register publication metadata
+)
 from app.db.base import Base
 
 
@@ -34,6 +37,7 @@ def test_expected_core_tables_are_registered() -> None:
         "chunk_result",
         "finding",
         "publication",
+        "publication_operation",
         "outbox_event",
         "task_lease",
         "quota_usage",

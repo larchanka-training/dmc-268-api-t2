@@ -599,6 +599,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/reviews/{id}/findings", "get"),
         ("/api/v1/reviews/{id}/diff", "get"),
         ("/api/v1/reviews/{id}/events", "get"),
+        ("/api/v1/reviews/{id}/events/stream", "get"),
         ("/api/v1/reviews/{id}/publication-retries", "post"),
         ("/api/v1/webhooks/github", "post"),
         ("/healthcheck", "get"),

@@ -205,7 +205,7 @@ OutboxEvent(publish), если результат допускает публи�
 составной FK по `(review_job_id, context_payload_id)`: БД разрешает только context
 того же ReviewJob. При удалении context `ON DELETE SET NULL (context_payload_id)`
 сохраняет `review_job_id`, результат и Finding. Модель генерирует только
-summary, findings и limitations по `schemas/llm-output/v1.json`; gateway должен
+summary, findings и limitations по `schemas/llm-output/v2.json`; gateway должен
 развернуть локальный Finding `$ref` перед передачей structured-output schema
 провайдеру. Backend добавляет `schema_version`, timing и полные token counts
 (если доступны) в `ReviewChunkResult`. Review/chunk IDs остаются в authoritative

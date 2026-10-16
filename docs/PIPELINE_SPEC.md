@@ -86,7 +86,7 @@ side must start at one or later. New contexts use output language `ru`, while a
 frozen legacy settings version may retain another nonempty language value.
 
 The LLM generates only summary, findings, and limitations according to
-`schemas/llm-output/v1.json`. The gateway must bundle its local Finding `$ref`
+`schemas/llm-output/v2.json`. The gateway must bundle its local Finding `$ref`
 before passing a structured-output schema to a provider. The backend validates
 and maps model output to `ReviewChunkResult`, adding the schema version, measured
 gateway latency, and usage only when both token counts are available. Review/chunk

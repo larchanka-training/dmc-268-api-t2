@@ -46,7 +46,7 @@ class ReviewChunkOutcome(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     review_id: str
     chunk_id: str
     status: ChunkStatus

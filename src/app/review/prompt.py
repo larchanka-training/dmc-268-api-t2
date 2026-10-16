@@ -7,6 +7,7 @@ explicit delimiters. The raw prompt is never logged (SD §13).
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,13 +20,27 @@ from app.review.schemas.context import ContextPayload, FileDiff, Metadata
 from app.review.schemas.result import LLMReviewOutput
 
 # Data may not open or close our delimiter tags (prompt injection, SD §12).
-_DELIMITER_TAG = re.compile(r"<(/?)(pr_metadata|diff)>", re.IGNORECASE)
+# findings covers the Reflection Pass verifier block (issue #25).
+DELIMITER_TAGS = ("pr_metadata", "diff", "repo_rules", "findings")
+# Tolerates padding and self-closing forms (<diff >, </ diff>, <pr_metadata/>):
+# the canonical renderer never emits them, but untrusted text may.
+_DELIMITER_TAG = re.compile(
+    rf"<(/?)\s*({'|'.join(DELIMITER_TAGS)})\s*/?>", re.IGNORECASE
+)
+
+
+def delimiter_block_list() -> str:
+    """«<a>, <b> и <c>» — the block list for trust-boundary policy texts."""
+    *head, last = DELIMITER_TAGS
+    return ", ".join(f"<{tag}>" for tag in head) + f" и <{last}>"
+
 
 # Per-message framing tokens added by chat templates.
 _MESSAGE_OVERHEAD_TOKENS = 4
 
 
 _TRIMMED_NOTE = "Метаданные PR сокращены из-за лимита токенов."
+_RULES_DROPPED_NOTE = "Правила репозитория исключены из-за лимита токенов."
 _TRIMMED_BODY_CHARS = 1000
 _TRIMMED_COMMITS = 20
 
@@ -55,6 +70,10 @@ class BuiltPrompt:
     estimated_tokens: int
     limitations: list[str]
     few_shot_ids: list[str]
+    # The rules text actually embedded in the messages (None when the block
+    # was dropped by the token limit); rule_ref whitelist is checked against
+    # it, never against the source document (ADR 0002 trust boundary).
+    included_rules: str | None = None
 
 
 class PromptBuilder:
@@ -97,15 +116,47 @@ class PromptBuilder:
             counter=counter,
         )
 
-    def build(self, payload: ContextPayload, *, max_input_tokens: int) -> BuiltPrompt:
-        """Assemble the prompt; metadata shrinks first, the diff never does."""
+    def build(
+        self,
+        payload: ContextPayload,
+        *,
+        max_input_tokens: int,
+        rules: str | None = None,
+    ) -> BuiltPrompt:
+        """Assemble the prompt; metadata shrinks, rules drop whole, diff never does."""
+        fitted = self._fit(payload, max_input_tokens, rules=rules)
+        if fitted is not None:
+            return fitted
+        if rules:
+            # Rules are never trimmed: a partial rule changes its meaning (ADR 0002
+            # trust boundary). Drop them whole and say so.
+            fitted = self._fit(
+                payload,
+                max_input_tokens,
+                rules=None,
+                extra_limitations=(_RULES_DROPPED_NOTE,),
+            )
+            if fitted is not None:
+                return fitted
+        msg = "chunk diff does not fit the input token limit"
+        raise PromptTooLargeError(msg)
+
+    def _fit(
+        self,
+        payload: ContextPayload,
+        max_input_tokens: int,
+        *,
+        rules: str | None,
+        extra_limitations: Sequence[str] = (),
+    ) -> BuiltPrompt | None:
+        """Best prompt across metadata levels that fits the budget, else None."""
         files = [f.diff for f in payload.files]
         shots = self._select_few_shots({f.language for f in files if f.language})
         prefix = self._prefix(shots)
         for level, metadata in enumerate(_metadata_levels(payload.metadata)):
             messages = [
                 *prefix,
-                ChatMessage(role="user", content=_user_message(metadata, files)),
+                ChatMessage(role="user", content=_user_message(metadata, files, rules)),
             ]
             estimated = self._estimate(messages)
             if estimated <= max_input_tokens:
@@ -113,11 +164,12 @@ class PromptBuilder:
                     messages=messages,
                     prompt_version=self.prompt_version,
                     estimated_tokens=estimated,
-                    limitations=[_TRIMMED_NOTE] if level else [],
+                    limitations=([_TRIMMED_NOTE] if level else [])
+                    + list(extra_limitations),
                     few_shot_ids=[shot.id for shot in shots],
+                    included_rules=rules,
                 )
-        msg = "chunk diff does not fit the input token limit"
-        raise PromptTooLargeError(msg)
+        return None
 
     def _select_few_shots(self, languages: set[str]) -> list[FewShot]:
         """One example with findings (chunk languages first, then file order)
@@ -143,9 +195,7 @@ class PromptBuilder:
         return messages
 
     def _estimate(self, messages: list[ChatMessage]) -> int:
-        return sum(
-            self._counter.count(m.content) + _MESSAGE_OVERHEAD_TOKENS for m in messages
-        )
+        return estimate_messages(messages, self._counter)
 
 
 def _metadata_block(title: str, output_language: str = "ru") -> str:
@@ -187,13 +237,23 @@ def _render_metadata(
     return "\n".join(lines)
 
 
-def _neutralize(data: str) -> str:
+def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
+    """Token estimate for a message list: content plus per-message framing."""
+    return sum(counter.count(m.content) + _MESSAGE_OVERHEAD_TOKENS for m in messages)
+
+
+def neutralize(data: str) -> str:
     return _DELIMITER_TAG.sub(r"[\1\2]", data)
 
 
-def _user_message(metadata: str, files: list[FileDiff]) -> str:
-    diff = _neutralize("\n\n".join(render_file_diff(f) for f in files))
-    return (
-        f"<pr_metadata>\n{_neutralize(metadata)}\n</pr_metadata>\n\n"
+def _user_message(
+    metadata: str, files: list[FileDiff], rules: str | None = None
+) -> str:
+    diff = neutralize("\n\n".join(render_file_diff(f) for f in files))
+    message = (
+        f"<pr_metadata>\n{neutralize(metadata)}\n</pr_metadata>\n\n"
         f"<diff>\n{diff}\n</diff>"
     )
+    if rules:
+        message += f"\n\n<repo_rules>\n{neutralize(rules)}\n</repo_rules>"
+    return message

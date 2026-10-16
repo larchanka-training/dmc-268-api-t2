@@ -1,5 +1,7 @@
 """Shared per-run budget (SD §14, spec §4.5)."""
 
+from dataclasses import replace
+
 import pytest
 
 from app.core.config import LLM, Ollama
@@ -68,6 +70,19 @@ def test_format_repair_is_allowed_once_per_run() -> None:
 
     assert budget.try_use_format_repair() is True
     assert budget.try_use_format_repair() is False
+
+
+def test_reflection_slot_is_off_by_default() -> None:
+    budget = RunBudget(_LIMITS, clock=_Clock())
+
+    assert budget.try_use_reflection() is False
+
+
+def test_reflection_is_spent_within_its_limit() -> None:
+    budget = RunBudget(replace(_LIMITS, max_reflections=1), clock=_Clock())
+
+    assert budget.try_use_reflection() is True
+    assert budget.try_use_reflection() is False
 
 
 def test_state_can_be_saved_and_restored() -> None:

@@ -106,7 +106,7 @@ class LLM(BaseModel):
     eurorouter: Eurorouter = Field(default_factory=Eurorouter)
     ollama: Ollama = Field(default_factory=Ollama)
 
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
     # Per-call limits (SD §14), shared by both providers (spec §5.4).
     context_window: int = Field(default=16384, ge=16384)
     max_input_tokens: int = Field(default=10000, gt=0)
@@ -117,6 +117,8 @@ class LLM(BaseModel):
     run_max_input_tokens: int = Field(default=80000, gt=0)
     run_max_output_tokens: int = Field(default=16000, gt=0)
     run_deadline_s: float = Field(default=600, gt=0)
+    # Reflection Pass verifications per run; 0 keeps the pass off (issue #25).
+    run_max_reflections: int = Field(default=0, ge=0)
     max_chunks: int = Field(default=5, gt=0)
 
     @property

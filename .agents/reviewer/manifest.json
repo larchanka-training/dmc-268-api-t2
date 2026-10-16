@@ -5,7 +5,15 @@
       "few_shots": "v1/few_shots.json",
       "sha256": {
         "v1/system.md": "81ff225b4ad43eafe0a2c1ee8e7ef089d090bc6c560f4db111630baf393bbcd7",
-        "v1/few_shots.json": "10979e736d31cc99ba35b2ce9b926a153d030ee7e6462c98616beddc1f0fd15a"
+        "v1/few_shots.json": "07f413aa7fe51cde948cff2ac8d11c1adbbdaa44e32b495732cb8d7199736655"
+      }
+    },
+    "v2": {
+      "system": "v2/system.md",
+      "few_shots": "v2/few_shots.json",
+      "sha256": {
+        "v2/system.md": "d0326b342bbe5431333ae39cd4d7f634fd9b5bdebccea7bb252df26a376d206a",
+        "v2/few_shots.json": "07f413aa7fe51cde948cff2ac8d11c1adbbdaa44e32b495732cb8d7199736655"
       }
     }
   }

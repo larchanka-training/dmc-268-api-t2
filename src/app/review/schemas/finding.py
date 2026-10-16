@@ -40,6 +40,9 @@ class LLMFinding(_Strict):
     explanation: str = Field(min_length=1, max_length=2000)
     evidence: str = Field(min_length=1, max_length=1000)
     recommendation: str = Field(min_length=1, max_length=2000)
+    # Label of the violated repository rule (e.g. "SEC-1"); null when no rule
+    # applies. The validator rejects labels absent from the rules in the prompt.
+    rule_ref: str | None = Field(max_length=32)
     proposed_diff_fix: str | None = Field(max_length=4000)  # never auto-applied
 
     @model_validator(mode="after")

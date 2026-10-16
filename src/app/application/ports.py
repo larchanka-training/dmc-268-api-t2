@@ -85,6 +85,7 @@ class ReviewFinding:
     explanation: str
     evidence: str
     recommendation: str
+    rule_ref: str | None
     proposed_diff_fix: str | None
 
 

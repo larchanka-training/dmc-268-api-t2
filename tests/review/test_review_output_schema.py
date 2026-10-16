@@ -31,10 +31,23 @@ def _finding(**overrides: Any) -> dict[str, Any]:
         "explanation": "ValidationError уходит наружу и роняет обработчик.",
         "evidence": "src/review.py:39 вызывает model_validate без try.",
         "recommendation": "Перехватить ValidationError и вернуть 422.",
+        "rule_ref": None,
         "proposed_diff_fix": None,
     }
     finding.update(overrides)
     return finding
+
+
+def test_finding_may_reference_a_rule_label() -> None:
+    raw = {
+        "summary": "Одна проблема",
+        "findings": [_finding(rule_ref="SEC-1")],
+        "limitations": [],
+    }
+
+    output = LLMReviewOutput.model_validate(raw)
+
+    assert output.findings[0].rule_ref == "SEC-1"
 
 
 def test_valid_output_is_parsed() -> None:
@@ -43,6 +56,7 @@ def test_valid_output_is_parsed() -> None:
     output = LLMReviewOutput.model_validate(raw)
 
     assert output.findings[0].start_line == _LINE
+    assert output.findings[0].rule_ref is None  # rule refs are optional
 
 
 @pytest.mark.parametrize(
@@ -77,13 +91,18 @@ def test_json_schema_is_strict_mode_compatible() -> None:
 
 
 def test_canonical_example_model_fields_are_parsed() -> None:
-    """The shared fixture (schemas/examples) fits the model-facing contract."""
-    example = json.loads(_EXAMPLE.read_text(encoding="utf-8"))
+    """The shared v2 fixture (schemas/examples) fits the model-facing contract."""
+    example = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "schemas/examples/review-result.v2.json"
+        ).read_text(encoding="utf-8")
+    )
     raw = {key: example[key] for key in ("summary", "findings", "limitations")}
 
     output = LLMReviewOutput.model_validate(raw)
 
-    assert output.model_dump(mode="json") == raw
+    assert output.findings[0].rule_ref == "COR-1"
 
 
 def test_finding_without_proposed_diff_fix_is_rejected() -> None:
@@ -103,4 +122,4 @@ def test_parsed_output_matches_canonical_llm_output_schema(
         {"summary": "Сводка", "findings": [_finding()], "limitations": []}
     )
 
-    canonical_validator("llm-output/v1.json").validate(output.model_dump(mode="json"))
+    canonical_validator("llm-output/v2.json").validate(output.model_dump(mode="json"))

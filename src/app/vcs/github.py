@@ -237,9 +237,110 @@ def _next_pull_page(  # noqa: PLR0913 - one provider page context
         raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
 
 
+def _next_repository_page(
+    response: httpx.Response, *, limit: int, page: int
+) -> int | None:
+    try:
+        if not response.headers.get("Link", "").isascii():
+            raise ValueError("Invalid continuation header")
+        link = response.links.get("next")
+        if link is None:
+            return None
+        url = httpx.URL(link["url"])
+        params = url.params
+        raw_page = params.get("page", "")
+        if (
+            url.scheme != "https"
+            or url.host != "api.github.com"
+            or url.port not in {None, 443}
+            or url.userinfo
+            or url.fragment
+            or url.path != "/user/repos"
+            or set(params) != {"per_page", "page"}
+            or len(params.multi_items()) != 2  # noqa: PLR2004
+            or params["per_page"] != str(limit)
+            or not raw_page.isascii()
+            or not raw_page.isdecimal()
+            or len(raw_page) > len(str(_MAX_PAGE))
+            or not page < int(raw_page) <= _MAX_PAGE
+        ):
+            raise ValueError("Invalid continuation")
+        return int(raw_page)
+    except ValueError, KeyError, httpx.InvalidURL:
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+
+
+def _available_repository(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    owner = value.get("owner")
+    name = value.get("name")
+    permissions = value.get("permissions")
+    if (
+        type(value.get("id")) is not int
+        or value["id"] < 1
+        or not isinstance(owner, dict)
+        or not isinstance(owner.get("login"), str)
+        or not _OWNER.fullmatch(owner["login"])
+        or not isinstance(name, str)
+        or not _REPOSITORY.fullmatch(name)
+        or name in {".", ".."}
+        or not isinstance(permissions, dict)
+        or type(permissions.get("pull")) is not bool
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    if not permissions["pull"]:
+        return None
+    return {
+        "provider": "github",
+        "external_id": str(value["id"]),
+        "owner": owner["login"],
+        "name": name,
+    }
+
+
 class GithubClient:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
+
+    async def list_available_repositories(
+        self, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        response = await self._get(
+            f"https://api.github.com/user/repos?per_page={limit}&page={page}",
+            "application/vnd.github+json",
+        )
+        try:
+            payload = response.json()
+        except ValueError, UnicodeError, RecursionError:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+        if not isinstance(payload, list) or len(payload) > limit:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        items = []
+        for repository in payload:
+            item = _available_repository(repository)
+            if item is not None:
+                items.append(item)
+        return items, _next_repository_page(response, limit=limit, page=page)
+
+    async def get_repository(self, external_id: str) -> dict[str, Any]:
+        if not _EXTERNAL_ID.fullmatch(external_id):
+            raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        response = await self._get(
+            f"https://api.github.com/repositories/{external_id}",
+            "application/vnd.github+json",
+        )
+        try:
+            payload = _json_object(response)
+        except RecursionError:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+        item = _available_repository(payload)
+        if item is None or item["external_id"] != external_id:
+            raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        if type(payload["permissions"].get("admin")) is not bool:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        item["role"] = "admin" if payload["permissions"]["admin"] else "reviewer"
+        return item
 
     async def get_identity(self, token: str) -> tuple[str, str]:
         """Resolve the authenticated user using only the exchanged user token."""

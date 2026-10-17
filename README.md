@@ -41,6 +41,26 @@ cp .env.example .env   # укажите POSTGRES__HOST=localhost и REDIS__URL=r
 uv run uvicorn app.main:app --reload
 ```
 
+## Ключ шифрования GitHub credentials
+
+Для первоначальной настройки `AUTH__CREDENTIAL_KEY` сгенерируйте Fernet key
+через штатный API:
+
+```bash
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Сохраните результат полностью, включая завершающий `=`, и передайте его через
+окружение времени выполнения. `AUTH__CREDENTIAL_KEY` шифрует GitHub credentials,
+а отдельный `AUTH__JWT_SECRET` подписывает сессионные JWT; это разные секреты.
+Ключ с удалённым завершающим `=` отклоняется при OAuth start: endpoint возвращает
+`503 SERVICE_UNAVAILABLE`. Проверка конфигурации auth остаётся отложенной до
+использования auth endpoints и не препятствует запуску приложения.
+
+При обычном рестарте сохраняйте существующий ключ; не генерируйте его заново.
+Смена ключа без миграции сделает ранее зашифрованные GitHub credentials
+нечитаемыми. Реальные ключи нельзя записывать в Git, тестовые отчёты и логи.
+
 ## Логирование
 
 Логи пишутся одновременно в stdout и в файл `logs/app.log` (ротация: 10 МБ × 5 копий). Настройки — в `.env`:

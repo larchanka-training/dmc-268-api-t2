@@ -70,7 +70,11 @@ async def get_oauth_http() -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
-@router.get("/auth/github/start", status_code=302)
+@router.get(
+    "/auth/github/start",
+    status_code=302,
+    responses={503: {"description": "SERVICE_UNAVAILABLE"}},
+)
 async def start_github_oauth(
     settings: Annotated[Settings, Depends(get_settings)],
     session: Annotated[AsyncSession, Depends(get_session)],

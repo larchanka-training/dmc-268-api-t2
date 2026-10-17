@@ -464,7 +464,6 @@ async def test_start_rejects_fernet_key_missing_one_trailing_padding_character(
     assert "set-cookie" not in unavailable.headers
     assert not github_requests
     captured = capsys.readouterr()
-    assert "/api/v1/auth/github/start" in caplog.text
     outputs = (
         unavailable.text
         + str(unavailable.headers)

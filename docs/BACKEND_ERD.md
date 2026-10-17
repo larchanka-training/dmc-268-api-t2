@@ -166,12 +166,15 @@ erDiagram
         TEXT trace_id
         TIMESTAMPTZ created_at
         TIMESTAMPTZ broker_published_at
+        TEXT broker_message_id
+        TIMESTAMPTZ dispatch_not_before
     }
 
     TaskLease {
         UUID id PK
         UUID review_job_id FK
         TEXT owner
+        TEXT task_kind
         TIMESTAMPTZ expires_at
         BIGINT fencing_token
     }
@@ -254,7 +257,7 @@ erDiagram
 | ContextPayload → ChunkResult | `1:0..1`; nullable `UNIQUE(context_payload_id)`, composite FK `(review_job_id, context_payload_id) → ContextPayload(review_job_id, id)`, `ON DELETE SET NULL (context_payload_id)` |
 | ChunkResult → Finding        | `1:N`                                    |
 | ReviewJob → Publication      | `1:1`, `UNIQUE(review_job_id)`           |
-| ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`        |
+| ReviewJob → TaskLease        | `1:0..1`, `UNIQUE(review_job_id)`; обязательный `task_kind`, CHECK `analyze/publish` |
 | ReviewJob → OutboxEvent      | `1:N`                                    |
 | RepositoryAccess             | `UNIQUE(repository_id, user_id)`         |
 | WebhookReceipt               | `UNIQUE(provider_name, delivery_id)`     |
@@ -404,7 +407,8 @@ negation. `rules_digest` создаёт backend из canonical serialization п�
 - partial `UNIQUE(change_request_id, requested_head_sha, config_digest) WHERE finished_at IS NULL`
   — не более одного незавершённого эквивалентного запуска; завершённые запуски не
   блокируют rerun;
-- `outbox_event(broker_published_at, created_at)` — выбор событий dispatcher;
+- `outbox_event(broker_published_at, created_at)` — legacy unpublished index;
+- `outbox_event(created_at, id) WHERE task_kind='analyze' AND quarantined_at IS NULL` — bounded dispatcher keyset scan;
 - `task_lease(expires_at)` — выбор истёкших lease;
 - `idempotency_record(expires_at)` — удаление истёкших записей;
 - частичный уникальный индекс для `QuotaUsage(type='starts')` по `repository_id, user_id, type, window_start`;

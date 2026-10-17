@@ -175,8 +175,8 @@ def test_llm_limits_have_spec_defaults() -> None:
         llm.run_deadline_s,
         llm.max_chunks,
     ) == (8, 80000, 16000, 600, 5)
-    # v2 teaches the trust boundary for the isolated <repo_rules> section.
-    assert (llm.prompt_version, llm.request_timeout_s) == ("v2", 120)
+    # New identities require explicit selection; historical defaults stay stable.
+    assert (llm.prompt_version, llm.request_timeout_s) == ("v1", 120)
 
 
 @pytest.mark.parametrize(

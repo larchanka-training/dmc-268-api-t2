@@ -24,11 +24,15 @@ def test_webhook_recovery_has_partial_pending_index() -> None:
 def test_expected_core_tables_are_registered() -> None:
     expected = {
         "user",
+        "github_oauth_flow",
+        "github_identity",
+        "auth_session",
         "repository",
         "repository_access",
         "repository_settings",
         "change_request",
         "review_job",
+        "review_llm_attempt",
         "review_event",
         "context_payload",
         "chunk_result",
@@ -223,3 +227,11 @@ def test_review_event_and_finding_match_contract_foundation() -> None:
     assert "ck_review_event_ck_review_event_reason_code" not in check_names
     assert "ck_review_event_ck_review_event_attempt_positive" in check_names
     assert "ck_review_event_ck_review_event_safe_details_object" in check_names
+
+
+def test_finding_keeps_nullable_rule_reference_for_canonical_v2() -> None:
+    finding = models.Finding(
+        rule_ref="SEC-1", fingerprint="unchanged-legacy-fingerprint"
+    )
+    assert finding.rule_ref == "SEC-1"
+    assert Base.metadata.tables["finding"].c.rule_ref.nullable is True

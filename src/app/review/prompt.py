@@ -4,45 +4,29 @@ PR text, commit messages, discussions and code go to the model as data inside
 explicit delimiters. The raw prompt is never logged (SD §13).
 """
 
+import ast
+import builtins
+import copy
 import hashlib
+import importlib
 import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.frozen_configuration import RepositoryInstructions
 from app.llm.client import ChatMessage
 from app.llm.tokens import ConservativeTokenCounter, TokenCounter
-from app.review.diff_render import render_file_diff
-from app.review.schemas.context import ContextPayload, FileDiff, Metadata
-from app.review.schemas.result import LLMReviewOutput
-
-# Data may not open or close our delimiter tags (prompt injection, SD §12).
-# findings covers the Reflection Pass verifier block (issue #25).
-DELIMITER_TAGS = ("pr_metadata", "diff", "repo_rules", "findings")
-# Tolerates padding and self-closing forms (<diff >, </ diff>, <pr_metadata/>):
-# the canonical renderer never emits them, but untrusted text may.
-_DELIMITER_TAG = re.compile(
-    rf"<(/?)\s*({'|'.join(DELIMITER_TAGS)})\s*/?>", re.IGNORECASE
-)
-
-
-def delimiter_block_list() -> str:
-    """«<a>, <b> и <c>» — the block list for trust-boundary policy texts."""
-    *head, last = DELIMITER_TAGS
-    return ", ".join(f"<{tag}>" for tag in head) + f" и <{last}>"
-
-
-# Per-message framing tokens added by chat templates.
-_MESSAGE_OVERHEAD_TOKENS = 4
-
-
-_TRIMMED_NOTE = "Метаданные PR сокращены из-за лимита токенов."
-_RULES_DROPPED_NOTE = "Правила репозитория исключены из-за лимита токенов."
-_TRIMMED_BODY_CHARS = 1000
-_TRIMMED_COMMITS = 20
+from app.review.schemas.context import ContextPayload, FileDiff
+from app.review.schemas.result import LLMReviewOutput, LLMReviewOutputV1
 
 
 class PromptConfigError(Exception):
@@ -60,7 +44,26 @@ class FewShot(BaseModel):
     languages: list[str]
     title: str
     files: list[FileDiff]
+    output: LLMReviewOutputV1
+
+
+class FewShotV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    languages: list[str]
+    title: str
+    files: list[FileDiff]
     output: LLMReviewOutput
+
+
+class RepairInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    instruction: str
+    answer_chars: int = Field(gt=0)
+    max_errors: int = Field(gt=0)
+    overflow_shrink: float = Field(gt=0, lt=1)
 
 
 @dataclass(frozen=True)
@@ -70,9 +73,6 @@ class BuiltPrompt:
     estimated_tokens: int
     limitations: list[str]
     few_shot_ids: list[str]
-    # The rules text actually embedded in the messages (None when the block
-    # was dropped by the token limit); rule_ref whitelist is checked against
-    # it, never against the source document (ADR 0002 trust boundary).
     included_rules: str | None = None
 
 
@@ -82,178 +82,381 @@ class PromptBuilder:
         *,
         prompt_version: str,
         system: str,
-        few_shots: list[FewShot],
+        few_shots: list[FewShot | FewShotV2],
         counter: TokenCounter | None = None,
     ) -> None:
-        self.prompt_version = prompt_version
+        self._prompt_version = prompt_version
         self._system = system
         self._few_shots = few_shots
         self._counter = counter or ConservativeTokenCounter()
+        self._repair: RepairInputs | None = None
+        self._verified = False
+        self._repository_instructions: tuple[str, ...] = ()
+        self._prompt_digest: str | None = None
+        self._output_schema_json: str | None = None
+        v1 = importlib.import_module("app.review.renderers.v1")
+        self._renderer_module = v1
+        self._renderer = v1.Renderer(
+            prompt_version, system, few_shots, self._counter, None
+        )
+
+    @property
+    def prompt_version(self) -> str:
+        return self._prompt_version
+
+    @property
+    def provider_schema_path(self) -> str:
+        self.ensure_verified()
+        return _PROMPT_IDENTITIES[self._prompt_version][1]
+
+    @property
+    def result_schema_version(self) -> Literal[1, 2]:
+        self.ensure_verified()
+        return _PROMPT_IDENTITIES[self._prompt_version][2]
+
+    @property
+    def repository_instructions(self) -> tuple[str, ...]:
+        return self._repository_instructions
+
+    @property
+    def prompt_digest(self) -> str | None:
+        return self._prompt_digest
+
+    @property
+    def output_schema_json(self) -> str:
+        self.ensure_verified()
+        assert self._output_schema_json is not None
+        return self._output_schema_json
+
+    def ensure_verified(self) -> None:
+        if not self._verified:
+            raise PromptConfigError("execution requires a verified prompt bundle")
+
+    def with_repository_instructions(
+        self, instructions: RepositoryInstructions
+    ) -> PromptBuilder:
+        """Bind in-memory rules to the same verified v3 closure without mutation."""
+        self.ensure_verified()
+        if self._prompt_version != "v3":
+            raise PromptConfigError("only v3 supports rules rebinding")
+        builder = copy.copy(self)
+        builder._repository_instructions = instructions.instructions
+        builder._renderer = self._renderer_module.Renderer(
+            self._prompt_version,
+            self._system,
+            self._few_shots,
+            self._counter,
+            self._repair,
+            instructions.instructions,
+        )
+        return builder
+
+    def overflow_input_limit(self, limit: int) -> int:
+        self.ensure_verified()
+        return cast(int, self._renderer.overflow_input_limit(limit))
+
+    def repair_messages(self, raw_text: str, details: list[str]) -> list[ChatMessage]:
+        self.ensure_verified()
+        return [
+            ChatMessage(role=m.role, content=m.content)
+            for m in self._renderer.repair_messages(raw_text, details)
+        ]
 
     @classmethod
-    def load(
-        cls, root: Path, prompt_version: str, counter: TokenCounter | None = None
+    def load(  # noqa: PLR0913 -- verified roots, saved identity and typed user data
+        cls,
+        root: Path,
+        prompt_version: str,
+        counter: TokenCounter | None = None,
+        *,
+        expected_digest: str | None = None,
+        source_root: Path | None = None,
+        repository_instructions: RepositoryInstructions | None = None,
     ) -> PromptBuilder:
         """Load ``prompt_version`` from ``root`` after checking SHA-256 digests."""
         try:
-            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(
+                (root / "manifest.json").read_text("utf-8"),
+                object_pairs_hook=_unique_keys,
+            )
             entry = manifest["versions"][prompt_version]
-            for relative, expected in entry["sha256"].items():
-                digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()
-                if digest != expected:
-                    msg = f"prompt file {relative} does not match its SHA-256"
-                    raise PromptConfigError(msg)
-            system = (root / entry["system"]).read_text(encoding="utf-8")
-            raw_shots = json.loads((root / entry["few_shots"]).read_text("utf-8"))
-        except (OSError, KeyError, ValueError) as exc:
+            artifacts = _verify_artifacts(
+                root, prompt_version, entry, source_root or _SOURCE_ROOT
+            )
+            if (
+                entry["digest_format"] != "review-prompt-bundle/v1"
+                or entry["renderer_version"] not in _RENDERERS
+            ):
+                raise PromptConfigError("unsupported bundle descriptor")
+            descriptor = {
+                "digest_format": entry["digest_format"],
+                "prompt_version": prompt_version,
+                "renderer_version": entry["renderer_version"],
+                "artifacts": sorted(
+                    entry["artifacts"], key=lambda a: (a["role"], a["path"])
+                ),
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    descriptor,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if expected_digest is not None and digest != expected_digest:
+                raise PromptConfigError("prompt digest mismatch")
+            system = artifacts["system"].decode("utf-8")
+            raw_shots = json.loads(artifacts["few_shots"])
+            repair = RepairInputs.model_validate_json(artifacts["repair"])
+            module = _load_renderer(artifacts["renderer"], entry["renderer_version"])
+            schema_json = module.serialize_schema(
+                artifacts["llm_output_schema"], artifacts["review_result_schema"]
+            )
+            schema = json.loads(schema_json)
+            Draft202012Validator.check_schema(schema)
+            for shot in raw_shots:
+                Draft202012Validator(schema).validate(shot["output"])
+            shot_model = (
+                FewShotV2
+                if _PROMPT_IDENTITIES[prompt_version][1] == "schemas/llm-output/v2.json"
+                else FewShot
+            )
+            few_shots = [shot_model.model_validate(shot) for shot in raw_shots]
+        except (
+            OSError,
+            KeyError,
+            ValueError,
+            TypeError,
+            SyntaxError,
+            SchemaError,
+            JSONSchemaValidationError,
+        ) as exc:
             msg = f"cannot load prompt version {prompt_version!r}: {type(exc).__name__}"
             raise PromptConfigError(msg) from exc
-        few_shots = [FewShot.model_validate(shot) for shot in raw_shots]
-        return cls(
-            prompt_version=prompt_version,
-            system=system,
-            few_shots=few_shots,
-            counter=counter,
+        # Do not run the convenience constructor: it uses the current imported
+        # renderer for test-only assembly. Execution uses only the checked bytes.
+        builder = cls.__new__(cls)
+        builder._system = system
+        builder._few_shots = few_shots
+        builder._repair = repair
+        builder._prompt_version = prompt_version
+        builder._counter = counter or ConservativeTokenCounter()
+        builder._verified = True
+        builder._prompt_digest = digest
+        builder._renderer_module = module
+        instructions = repository_instructions or RepositoryInstructions(
+            instructions=()
         )
+        builder._repository_instructions = instructions.instructions
+        if entry["renderer_version"] == "review-renderer-v1":
+            if instructions.instructions:
+                raise PromptConfigError("v1 cannot render repository instructions")
+            builder._renderer = module.Renderer(
+                prompt_version, system, few_shots, builder._counter, repair
+            )
+        else:
+            builder._renderer = module.Renderer(
+                prompt_version,
+                system,
+                few_shots,
+                builder._counter,
+                repair,
+                instructions.instructions,
+            )
+        builder._output_schema_json = schema_json
+        return builder
 
-    def build(
+    def build(self, payload: ContextPayload, *, max_input_tokens: int) -> BuiltPrompt:
+        try:
+            rendered = self._renderer.build(payload, max_input_tokens=max_input_tokens)
+        except self._renderer_module.PromptTooLargeError as exc:
+            raise PromptTooLargeError(str(exc)) from None
+        return _to_prompt(rendered)
+
+    def build_repair(
         self,
         payload: ContextPayload,
         *,
+        raw_text: str,
+        details: list[str],
         max_input_tokens: int,
-        rules: str | None = None,
     ) -> BuiltPrompt:
-        """Assemble the prompt; metadata shrinks, rules drop whole, diff never does."""
-        fitted = self._fit(payload, max_input_tokens, rules=rules)
-        if fitted is not None:
-            return fitted
-        if rules:
-            # Rules are never trimmed: a partial rule changes its meaning (ADR 0002
-            # trust boundary). Drop them whole and say so.
-            fitted = self._fit(
+        self.ensure_verified()
+        try:
+            rendered = self._renderer.build_repair(
                 payload,
-                max_input_tokens,
-                rules=None,
-                extra_limitations=(_RULES_DROPPED_NOTE,),
+                raw_text=raw_text,
+                details=details,
+                max_input_tokens=max_input_tokens,
             )
-            if fitted is not None:
-                return fitted
-        msg = "chunk diff does not fit the input token limit"
-        raise PromptTooLargeError(msg)
-
-    def _fit(
-        self,
-        payload: ContextPayload,
-        max_input_tokens: int,
-        *,
-        rules: str | None,
-        extra_limitations: Sequence[str] = (),
-    ) -> BuiltPrompt | None:
-        """Best prompt across metadata levels that fits the budget, else None."""
-        files = [f.diff for f in payload.files]
-        shots = self._select_few_shots({f.language for f in files if f.language})
-        prefix = self._prefix(shots)
-        for level, metadata in enumerate(_metadata_levels(payload.metadata)):
-            messages = [
-                *prefix,
-                ChatMessage(role="user", content=_user_message(metadata, files, rules)),
-            ]
-            estimated = self._estimate(messages)
-            if estimated <= max_input_tokens:
-                return BuiltPrompt(
-                    messages=messages,
-                    prompt_version=self.prompt_version,
-                    estimated_tokens=estimated,
-                    limitations=([_TRIMMED_NOTE] if level else [])
-                    + list(extra_limitations),
-                    few_shot_ids=[shot.id for shot in shots],
-                    included_rules=rules,
-                )
-        return None
-
-    def _select_few_shots(self, languages: set[str]) -> list[FewShot]:
-        """One example with findings (chunk languages first, then file order)
-        plus the example without findings."""
-        with_findings = [s for s in self._few_shots if s.output.findings]
-        empty = [s for s in self._few_shots if not s.output.findings]
-        ranked = sorted(with_findings, key=lambda s: not languages & set(s.languages))
-        return ranked[:1] + empty[:1]
-
-    def _prefix(self, shots: list[FewShot]) -> list[ChatMessage]:
-        """System rules, then few-shot examples as user/assistant turns."""
-        messages = [ChatMessage(role="system", content=self._system)]
-        for shot in shots:
-            messages.append(
-                ChatMessage(
-                    role="user",
-                    content=_user_message(_metadata_block(shot.title), shot.files),
-                )
-            )
-            messages.append(
-                ChatMessage(role="assistant", content=shot.output.model_dump_json())
-            )
-        return messages
-
-    def _estimate(self, messages: list[ChatMessage]) -> int:
-        return estimate_messages(messages, self._counter)
+        except self._renderer_module.PromptTooLargeError as exc:
+            raise PromptTooLargeError(str(exc)) from None
+        return _to_prompt(rendered)
 
 
-def _metadata_block(title: str, output_language: str = "ru") -> str:
-    return f"title: {title}\noutput_language: {output_language}"
+def _to_prompt(rendered: Any) -> BuiltPrompt:
+    return BuiltPrompt(
+        messages=[
+            ChatMessage(role=m.role, content=m.content) for m in rendered.messages
+        ],
+        prompt_version=rendered.prompt_version,
+        estimated_tokens=rendered.estimated_tokens,
+        limitations=rendered.limitations,
+        few_shot_ids=rendered.few_shot_ids,
+        included_rules=getattr(rendered, "included_rules", None),
+    )
 
 
-def _metadata_levels(metadata: Metadata) -> list[str]:
-    """Metadata renderings from full to minimal (spec §5.4)."""
-    body = metadata.body or ""
-    commits = metadata.commit_messages
-    return [
-        _render_metadata(metadata, body, commits, with_discussions=True),
-        _render_metadata(
-            metadata,
-            body[:_TRIMMED_BODY_CHARS],
-            commits[:_TRIMMED_COMMITS],
-            with_discussions=False,
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PromptConfigError("duplicate manifest key")
+        result[key] = value
+    return result
+
+
+def _verify_artifacts(
+    root: Path, version: str, entry: dict[str, Any], source_root: Path
+) -> dict[str, bytes]:
+    # Paths are server-owned; manifest entries cannot select imports or files.
+    if not re.fullmatch(r"v[1-9][0-9]*", version):
+        raise PromptConfigError("unsupported prompt version")
+    if (
+        version not in _PROMPT_IDENTITIES
+        or entry["renderer_version"] != _PROMPT_IDENTITIES[version][0]
+    ):
+        raise PromptConfigError("unsupported prompt/renderer identity")
+    required = {
+        "system": f"{version}/system.md",
+        "few_shots": f"{version}/few_shots.json",
+        "repair": f"{version}/repair.json",
+        "renderer": _RENDERERS[entry["renderer_version"]][1],
+        "llm_output_schema": _PROMPT_IDENTITIES[version][1],
+        "review_result_schema": (
+            f"schemas/review-result/v{_PROMPT_IDENTITIES[version][2]}.json"
         ),
-        _render_metadata(metadata, "", [], with_discussions=False),
-    ]
-
-
-def _render_metadata(
-    metadata: Metadata, body: str, commits: list[str], *, with_discussions: bool
-) -> str:
-    lines = [
-        _metadata_block(metadata.title, metadata.output_language),
-        f"branches: {metadata.base_ref} <- {metadata.head_ref}",
-    ]
-    if body:
-        lines.append(f"body:\n{body}")
-    if commits:
-        lines.append("commits:\n" + "\n".join(f"- {m}" for m in commits))
-    if with_discussions and metadata.discussions:
-        lines.append(
-            "discussions:\n"
-            + "\n".join(f"- {d.author}: {d.body}" for d in metadata.discussions)
+    }
+    artifacts = entry["artifacts"]
+    if not isinstance(artifacts, list):
+        raise PromptConfigError("artifacts must be a list")
+    verified: dict[str, bytes] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "role",
+            "path",
+            "sha256",
+        }:
+            raise PromptConfigError("invalid artifact entry")
+        role, relative, expected = (
+            artifact["role"],
+            artifact["path"],
+            artifact["sha256"],
         )
-    return "\n".join(lines)
+        if role not in required or role in verified or relative != required[role]:
+            raise PromptConfigError("unsupported or duplicate artifact")
+        artifact_root = (
+            source_root
+            if role in {"renderer", "llm_output_schema", "review_result_schema"}
+            else root
+        )
+        path = (artifact_root / relative).resolve()
+        if not path.is_relative_to(artifact_root.resolve()):
+            raise PromptConfigError("artifact escapes bundle root")
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise PromptConfigError(
+                f"prompt file {relative} does not match its SHA-256"
+            )
+        verified[role] = data
+    if set(verified) != set(required):
+        raise PromptConfigError("missing required artifacts")
+    return verified
 
 
-def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
-    """Token estimate for a message list: content plus per-message framing."""
-    return sum(counter.count(m.content) + _MESSAGE_OVERHEAD_TOKENS for m in messages)
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+_RENDERERS = {
+    "review-renderer-v1": ("app.review.renderers.v1", "src/app/review/renderers/v1.py"),
+    "review-renderer-v2": ("app.review.renderers.v2", "src/app/review/renderers/v2.py"),
+    "review-renderer-v3": ("app.review.renderers.v3", "src/app/review/renderers/v3.py"),
+}
+
+
+_PROMPT_IDENTITIES: dict[str, tuple[str, str, Literal[1, 2]]] = {
+    "v1": ("review-renderer-v1", "schemas/llm-output/v1.json", 1),
+    "v2": ("review-renderer-v2", "schemas/llm-output/v1.json", 1),
+    "v3": ("review-renderer-v3", "schemas/llm-output/v2.json", 2),
+}
+
+
+def _load_renderer(source: bytes, renderer_version: str) -> ModuleType:
+    # The attested closure is deliberately project-import-free. Fail closed if a
+    # future change tries to delegate rendering to an unverified project module.
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(
+                alias.name not in {"json", "re", "posixpath"} for alias in node.names
+            ):
+                raise PromptConfigError("unverified renderer dependency")
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and (node.module != "typing" or node.level != 0)
+        ) or (
+            isinstance(node, ast.Name)
+            and node.id
+            in {
+                "__import__",
+                "eval",
+                "exec",
+                "compile",
+            }
+        ):
+            raise PromptConfigError("unverified renderer dependency")
+    name, path = _RENDERERS[renderer_version]
+    module = ModuleType(name)
+    # Defense against indirect import aliases as well as ordinary imports. This
+    # is a trusted-source closure guard, not a sandbox for hostile Python code.
+    module.__dict__["__builtins__"] = {
+        **vars(builtins),
+        "__import__": _renderer_import,
+    }
+    exec(compile(tree, path, "exec"), module.__dict__)
+    return module
+
+
+def _renderer_import(name: str, *args: Any, **kwargs: Any) -> ModuleType:
+    if name not in {"json", "re", "posixpath", "typing"}:
+        raise PromptConfigError("unverified renderer dependency")
+    return importlib.import_module(name)
+
+
+DELIMITER_TAGS = (
+    "repository_instructions",
+    "pr_metadata",
+    "diff",
+    "invalid_answer",
+    "repo_rules",
+    "findings",
+)
+_DELIMITER_TAG = re.compile(
+    rf"<\s*(/?)\s*({'|'.join(DELIMITER_TAGS)})\b[^>]*>", re.IGNORECASE
+)
 
 
 def neutralize(data: str) -> str:
+    """Keep untrusted data from opening or closing review/verifier delimiters."""
     return _DELIMITER_TAG.sub(r"[\1\2]", data)
 
 
-def _user_message(
-    metadata: str, files: list[FileDiff], rules: str | None = None
-) -> str:
-    diff = neutralize("\n\n".join(render_file_diff(f) for f in files))
-    message = (
-        f"<pr_metadata>\n{neutralize(metadata)}\n</pr_metadata>\n\n"
-        f"<diff>\n{diff}\n</diff>"
-    )
-    if rules:
-        message += f"\n\n<repo_rules>\n{neutralize(rules)}\n</repo_rules>"
-    return message
+def delimiter_block_list() -> str:
+    """Describe every protected block in verifier trust-boundary instructions."""
+    *head, last = DELIMITER_TAGS
+    return ", ".join(f"<{tag}>" for tag in head) + f" и <{last}>"
+
+
+def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
+    """Content estimate including chat-template framing for every message."""
+    return sum(counter.count(message.content) + 4 for message in messages)

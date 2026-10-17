@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from app.core.config import LLM
+from app.domain.frozen_configuration import ExecutionSettings
 from app.llm.errors import BudgetExceededError
 
 
@@ -18,13 +19,15 @@ class BudgetLimits:
     max_reflections: int = 0  # 0 = Reflection Pass is off (issue #25)
 
     @classmethod
-    def from_settings(cls, settings: LLM) -> BudgetLimits:
+    def from_settings(cls, settings: LLM | ExecutionSettings) -> BudgetLimits:
         return cls(
             max_requests=settings.run_max_requests,
             max_input_tokens=settings.run_max_input_tokens,
             max_output_tokens=settings.run_max_output_tokens,
             deadline_s=settings.run_deadline_s,
-            max_reflections=settings.run_max_reflections,
+            max_reflections=(
+                settings.run_max_reflections if isinstance(settings, LLM) else 0
+            ),
         )
 
 

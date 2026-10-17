@@ -1,20 +1,112 @@
 {
   "versions": {
     "v1": {
-      "system": "v1/system.md",
-      "few_shots": "v1/few_shots.json",
-      "sha256": {
-        "v1/system.md": "81ff225b4ad43eafe0a2c1ee8e7ef089d090bc6c560f4db111630baf393bbcd7",
-        "v1/few_shots.json": "07f413aa7fe51cde948cff2ac8d11c1adbbdaa44e32b495732cb8d7199736655"
-      }
+      "artifacts": [
+        {
+          "role": "system",
+          "path": "v1/system.md",
+          "sha256": "81ff225b4ad43eafe0a2c1ee8e7ef089d090bc6c560f4db111630baf393bbcd7"
+        },
+        {
+          "role": "few_shots",
+          "path": "v1/few_shots.json",
+          "sha256": "10979e736d31cc99ba35b2ce9b926a153d030ee7e6462c98616beddc1f0fd15a"
+        },
+        {
+          "role": "repair",
+          "path": "v1/repair.json",
+          "sha256": "84a6e0eb101c2c19aa7e76fc0835ae7d953ff94f843c14732b59e7f90d23f225"
+        },
+        {
+          "role": "renderer",
+          "path": "src/app/review/renderers/v1.py",
+          "sha256": "c536527dcad7a81094a8ccd96c16676ae004e7fc6712dd996492772f5ab90f94"
+        },
+        {
+          "role": "llm_output_schema",
+          "path": "schemas/llm-output/v1.json",
+          "sha256": "d1b2590fc3706cdf08c4889c93eb93f363e11721773a14645ee2d6722c3fa7e8"
+        },
+        {
+          "role": "review_result_schema",
+          "path": "schemas/review-result/v1.json",
+          "sha256": "1c7577562b3f9d13b173f5c87630a1ba89e99e27817214510149e103ff51edf1"
+        }
+      ],
+      "digest_format": "review-prompt-bundle/v1",
+      "renderer_version": "review-renderer-v1"
     },
     "v2": {
-      "system": "v2/system.md",
-      "few_shots": "v2/few_shots.json",
-      "sha256": {
-        "v2/system.md": "d0326b342bbe5431333ae39cd4d7f634fd9b5bdebccea7bb252df26a376d206a",
-        "v2/few_shots.json": "07f413aa7fe51cde948cff2ac8d11c1adbbdaa44e32b495732cb8d7199736655"
-      }
+      "artifacts": [
+        {
+          "role": "system",
+          "path": "v2/system.md",
+          "sha256": "c54e1a537624274b118510bf533ea1c704c932ce176867dfc6ff099130b068ec"
+        },
+        {
+          "role": "few_shots",
+          "path": "v2/few_shots.json",
+          "sha256": "10979e736d31cc99ba35b2ce9b926a153d030ee7e6462c98616beddc1f0fd15a"
+        },
+        {
+          "role": "repair",
+          "path": "v2/repair.json",
+          "sha256": "84a6e0eb101c2c19aa7e76fc0835ae7d953ff94f843c14732b59e7f90d23f225"
+        },
+        {
+          "role": "renderer",
+          "path": "src/app/review/renderers/v2.py",
+          "sha256": "dad9c7cac8560bda2c2c2f7843dd927726326226b348d9c63dd8aed6ed785cc2"
+        },
+        {
+          "role": "llm_output_schema",
+          "path": "schemas/llm-output/v1.json",
+          "sha256": "d1b2590fc3706cdf08c4889c93eb93f363e11721773a14645ee2d6722c3fa7e8"
+        },
+        {
+          "role": "review_result_schema",
+          "path": "schemas/review-result/v1.json",
+          "sha256": "1c7577562b3f9d13b173f5c87630a1ba89e99e27817214510149e103ff51edf1"
+        }
+      ],
+      "digest_format": "review-prompt-bundle/v1",
+      "renderer_version": "review-renderer-v2"
+    },
+    "v3": {
+      "artifacts": [
+        {
+          "role": "system",
+          "path": "v3/system.md",
+          "sha256": "d0326b342bbe5431333ae39cd4d7f634fd9b5bdebccea7bb252df26a376d206a"
+        },
+        {
+          "role": "few_shots",
+          "path": "v3/few_shots.json",
+          "sha256": "07f413aa7fe51cde948cff2ac8d11c1adbbdaa44e32b495732cb8d7199736655"
+        },
+        {
+          "role": "repair",
+          "path": "v3/repair.json",
+          "sha256": "84a6e0eb101c2c19aa7e76fc0835ae7d953ff94f843c14732b59e7f90d23f225"
+        },
+        {
+          "role": "renderer",
+          "path": "src/app/review/renderers/v3.py",
+          "sha256": "031705e46e018b4bbda9f81fbb0782725041892bc6671e8eae5ead124f9206fe"
+        },
+        {
+          "role": "llm_output_schema",
+          "path": "schemas/llm-output/v2.json",
+          "sha256": "87733600d84915a2e1be97b36588637633b58ad6f8645418c0e98b8fef6a8dab"
+        },
+        {
+          "role": "review_result_schema",
+          "path": "schemas/review-result/v2.json",
+          "sha256": "3e278f27945609b3f1110845e705b540aa2ed36ec979cdcac17401ce1f91f353"
+        }
+      ],
+      "digest_format": "review-prompt-bundle/v1",
+      "renderer_version": "review-renderer-v3"
     }
   }
 }

@@ -1,9 +1,7 @@
 [
   {
     "id": "python-unhandled-none",
-    "languages": [
-      "Python"
-    ],
+    "languages": ["Python"],
     "title": "Load user settings",
     "files": [
       {
@@ -22,30 +20,10 @@
             "new_start": 10,
             "new_count": 3,
             "lines": [
-              {
-                "kind": "context",
-                "text": "def load(user_id):",
-                "old_line": 10,
-                "new_line": 10
-              },
-              {
-                "kind": "deleted",
-                "text": "    return repo.get(user_id) or DEFAULTS",
-                "old_line": 11,
-                "new_line": null
-              },
-              {
-                "kind": "added",
-                "text": "    row = repo.get(user_id)",
-                "old_line": null,
-                "new_line": 11
-              },
-              {
-                "kind": "added",
-                "text": "    return row.settings",
-                "old_line": null,
-                "new_line": 12
-              }
+              {"kind": "context", "text": "def load(user_id):", "old_line": 10, "new_line": 10},
+              {"kind": "deleted", "text": "    return repo.get(user_id) or DEFAULTS", "old_line": 11, "new_line": null},
+              {"kind": "added", "text": "    row = repo.get(user_id)", "old_line": null, "new_line": 11},
+              {"kind": "added", "text": "    return row.settings", "old_line": null, "new_line": 12}
             ]
           }
         ]
@@ -65,8 +43,7 @@
           "explanation": "repo.get возвращает None, если записи нет. Тогда row.settings бросает AttributeError, и запрос завершается ошибкой 500 вместо значений по умолчанию.",
           "evidence": "Строка 12 обращается к row.settings без проверки; удалённая строка 11 возвращала DEFAULTS для этого случая.",
           "recommendation": "Вернуть DEFAULTS, если row is None.",
-          "proposed_diff_fix": "-    return row.settings\n+    return row.settings if row else DEFAULTS",
-          "rule_ref": null
+          "proposed_diff_fix": "-    return row.settings\n+    return row.settings if row else DEFAULTS"
         }
       ],
       "limitations": []
@@ -74,9 +51,7 @@
   },
   {
     "id": "typescript-sql-injection",
-    "languages": [
-      "TypeScript"
-    ],
+    "languages": ["TypeScript"],
     "title": "Search orders by customer",
     "files": [
       {
@@ -95,24 +70,9 @@
             "new_start": 1,
             "new_count": 3,
             "lines": [
-              {
-                "kind": "added",
-                "text": "export async function search(db: Db, name: string) {",
-                "old_line": null,
-                "new_line": 1
-              },
-              {
-                "kind": "added",
-                "text": "  return db.query(`SELECT * FROM orders WHERE customer = '${name}'`);",
-                "old_line": null,
-                "new_line": 2
-              },
-              {
-                "kind": "added",
-                "text": "}",
-                "old_line": null,
-                "new_line": 3
-              }
+              {"kind": "added", "text": "export async function search(db: Db, name: string) {", "old_line": null, "new_line": 1},
+              {"kind": "added", "text": "  return db.query(`SELECT * FROM orders WHERE customer = '${name}'`);", "old_line": null, "new_line": 2},
+              {"kind": "added", "text": "}", "old_line": null, "new_line": 3}
             ]
           }
         ]
@@ -132,8 +92,7 @@
           "explanation": "Значение name подставляется в текст запроса без экранирования. Строка вида ' OR '1'='1 возвращает все заказы, а более сложный ввод позволяет изменять данные.",
           "evidence": "Строка 2 интерполирует name в шаблонную строку SQL внутри db.query.",
           "recommendation": "Использовать параметризованный запрос: db.query('SELECT * FROM orders WHERE customer = $1', [name]).",
-          "proposed_diff_fix": null,
-          "rule_ref": null
+          "proposed_diff_fix": null
         }
       ],
       "limitations": []
@@ -160,30 +119,10 @@
             "new_start": 5,
             "new_count": 2,
             "lines": [
-              {
-                "kind": "deleted",
-                "text": "    t = sum(item.price for item in items)",
-                "old_line": 5,
-                "new_line": null
-              },
-              {
-                "kind": "deleted",
-                "text": "    return t",
-                "old_line": 6,
-                "new_line": null
-              },
-              {
-                "kind": "added",
-                "text": "    total = sum(item.price for item in items)",
-                "old_line": null,
-                "new_line": 5
-              },
-              {
-                "kind": "added",
-                "text": "    return total",
-                "old_line": null,
-                "new_line": 6
-              }
+              {"kind": "deleted", "text": "    t = sum(item.price for item in items)", "old_line": 5, "new_line": null},
+              {"kind": "deleted", "text": "    return t", "old_line": 6, "new_line": null},
+              {"kind": "added", "text": "    total = sum(item.price for item in items)", "old_line": null, "new_line": 5},
+              {"kind": "added", "text": "    return total", "old_line": null, "new_line": 6}
             ]
           }
         ]

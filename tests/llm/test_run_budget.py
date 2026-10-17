@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.core.config import LLM, Ollama
+from app.domain.frozen_configuration import ExecutionModel, ExecutionSettings
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.errors import BudgetExceededError
 
@@ -116,3 +117,22 @@ def test_limits_come_from_llm_settings() -> None:
         deadline_s=120,
         max_format_repairs=1,
     )
+
+
+def test_frozen_execution_limits_disable_reflection_without_policy_changes() -> None:
+    settings = ExecutionSettings(
+        eurorouter=ExecutionModel(model="frozen"),
+        ollama=ExecutionModel(model="unused"),
+        context_window=16384,
+        max_input_tokens=10000,
+        max_output_tokens=2000,
+        request_timeout_s=120.0,
+        run_max_requests=8,
+        run_max_input_tokens=80000,
+        run_max_output_tokens=16000,
+        run_deadline_s=600.0,
+        max_chunks=5,
+        temperature=0.0,
+    )
+    limits = BudgetLimits.from_settings(settings)
+    assert limits == BudgetLimits(8, 80000, 16000, 600.0, max_reflections=0)

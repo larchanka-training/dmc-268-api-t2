@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "eurorouter/review-v1": {
+      "provider": "eurorouter",
+      "base_url": "https://llm.invalid/v1",
+      "allowed_models": [
+        "test-model",
+        "fallback-model"
+      ],
+      "credential_env": "LLM__EUROROUTER__API_KEYS"
+    },
+    "ollama/review-v1": {
+      "provider": "ollama",
+      "base_url": "http://ollama.invalid:11434",
+      "allowed_models": [
+        "test-model",
+        "fallback-model"
+      ],
+      "credential_env": null
+    }
+  },
+  "admission": {
+    "primary": {
+      "profile_ref": "eurorouter/review-v1",
+      "model_ref": "test-model",
+      "model_digest": null
+    },
+    "policy": {
+      "schema_version": 1,
+      "generation": {
+        "temperature": 0.0
+      },
+      "routing": {
+        "primary_profile_ref": "eurorouter/review-v1",
+        "fallback": []
+      },
+      "limits": {
+        "context_window": 16384,
+        "max_input_tokens": 10000,
+        "max_output_tokens": 2000,
+        "request_timeout_ms": 120000,
+        "run_max_requests": 8,
+        "run_max_input_tokens": 80000,
+        "run_max_output_tokens": 16000,
+        "max_chunks": 5,
+        "analysis_duration_ms": 600000
+      },
+      "retry": {
+        "worker_max_attempts": 3,
+        "provider_max_attempts_per_operation": 3,
+        "max_transient_per_provider": 2,
+        "max_format_repairs": 1,
+        "max_overflow_rebuilds_per_chunk": 1,
+        "backoff_policy": "review-exponential-v1"
+      },
+      "token_estimator_version": "review-conservative-v1",
+      "repository_settings_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "prompt_version": "v2",
+    "prompt_digest": "a09dffb11fdd1481888eab77d2530e135e998765e22f9fc254a80cc94faef50b"
+  }
+}

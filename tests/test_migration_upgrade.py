@@ -352,3 +352,416 @@ async def test_upgrade_preflight_sees_old_writer_committing_during_migration(
         if process.returncode is None:
             process.terminate()
             await process.communicate()
+
+
+async def test_task_kind_upgrade_and_downgrade_preserve_existing_leases(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0005")
+    lease_id = uuid.uuid4()
+    await database.connection.execute(
+        "INSERT INTO task_lease (id,review_job_id,owner,expires_at,fencing_token) "
+        "VALUES ($1,$2,'existing-worker',clock_timestamp()+interval '90 seconds',17)",
+        lease_id,
+        job_id,
+    )
+    before = await database.connection.fetchrow(
+        "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+    )
+    database.migrate("upgrade", "0006")
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0006"
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT task_kind FROM task_lease WHERE id=$1", lease_id
+        )
+        == "analyze"
+    )
+    after = await database.connection.fetchrow(
+        "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+    )
+    assert after == before
+    for kind in (None, "other"):
+        with pytest.raises(asyncpg.PostgresError):
+            await database.connection.execute(
+                "UPDATE task_lease SET task_kind=$1 WHERE id=$2", kind, lease_id
+            )
+    await database.connection.execute(
+        "UPDATE task_lease SET task_kind='publish' WHERE id=$1", lease_id
+    )
+    database.migrate("downgrade", "0005")
+    assert (
+        await database.connection.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name='task_lease' AND column_name='task_kind'"
+        )
+        == 0
+    )
+    assert (
+        await database.connection.fetchrow(
+            "SELECT id,review_job_id,owner,expires_at,fencing_token FROM task_lease"
+        )
+        == before
+    )
+    database.migrate("upgrade", "head")
+    assert (
+        await database.connection.fetchval(
+            "SELECT task_kind FROM task_lease WHERE id=$1", lease_id
+        )
+        == "analyze"
+    )
+
+
+async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0006")
+    unpublished_id, published_id = uuid.uuid4(), uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at,
+         broker_published_at)
+        VALUES ($1,$3,1,'analyze',2,'',now(),NULL),
+               ($2,$3,1,'publish',3,'existing-trace',now(),now())""",
+        unpublished_id,
+        published_id,
+        job_id,
+    )
+    original_columns = (
+        "id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at,"
+        "broker_published_at"
+    )
+    before = await database.connection.fetch(
+        f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+    )
+
+    database.migrate("upgrade", "head")
+
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0014"
+    )
+    assert (
+        await database.connection.fetch(
+            f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+        )
+        == before
+    )
+    assert await database.connection.fetchval(
+        "SELECT count(*) FROM outbox_event "
+        "WHERE quarantined_at IS NULL AND quarantine_reason_code IS NULL"
+    ) == len(before)
+    await database.connection.execute(
+        "UPDATE outbox_event SET quarantined_at=now(), "
+        "quarantine_reason_code='INVALID_ENVELOPE' WHERE id=$1",
+        unpublished_id,
+    )
+    quarantined = await database.connection.fetchrow(
+        "SELECT quarantined_at,quarantine_reason_code,broker_published_at "
+        "FROM outbox_event WHERE id=$1",
+        unpublished_id,
+    )
+    assert quarantined is not None
+    assert quarantined["quarantined_at"] is not None
+    assert quarantined["quarantine_reason_code"] == "INVALID_ENVELOPE"
+    assert quarantined["broker_published_at"] is None
+    database.migrate("check")
+
+    database.migrate("downgrade", "0006")
+
+    assert (
+        await database.connection.fetch(
+            f"SELECT {original_columns} FROM outbox_event ORDER BY id"
+        )
+        == before
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name='outbox_event' "
+            "AND column_name IN ('quarantined_at','quarantine_reason_code')"
+        )
+        == 0
+    )
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+
+
+@pytest.mark.parametrize("field", ["quarantined_at", "quarantine_reason_code"])
+async def test_outbox_quarantine_requires_timestamp_and_safe_reason_together(
+    migration_database: MigrationDatabase,
+    field: str,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+    value = "now()" if field == "quarantined_at" else "'INVALID_ENVELOPE'"
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            f"UPDATE outbox_event SET {field}={value} WHERE id=$1", event_id
+        )
+
+
+async def test_outbox_quarantine_and_publication_are_mutually_exclusive(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code='INVALID_ENVELOPE',broker_published_at=now() "
+            "WHERE id=$1",
+            event_id,
+        )
+
+
+async def test_outbox_quarantine_persists_only_contract_reason_codes(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    event_id = uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO outbox_event
+        (id,review_job_id,schema_version,task_kind,attempt,trace_id,created_at)
+        VALUES ($1,$2,1,'analyze',1,'trace',now())""",
+        event_id,
+        job_id,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code='unsafe exception or payload' WHERE id=$1",
+            event_id,
+        )
+    for code in (
+        "UNSUPPORTED_SCHEMA_VERSION",
+        "UNKNOWN_TASK_KIND",
+        "INVALID_ENVELOPE",
+    ):
+        await database.connection.execute(
+            "UPDATE outbox_event SET quarantined_at=now(), "
+            "quarantine_reason_code=$1 WHERE id=$2",
+            code,
+            event_id,
+        )
+        assert (
+            await database.connection.fetchval(
+                "SELECT quarantine_reason_code FROM outbox_event WHERE id=$1", event_id
+            )
+            == code
+        )
+
+
+async def test_durable_accounting_upgrade_preserves_legacy_clocks_and_identity(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0008")
+    await database.connection.execute(
+        "UPDATE review_job SET started_at=now()-interval '5 minutes', "
+        "analysis_deadline_at=now()+interval '5 minutes' WHERE id=$1",
+        job_id,
+    )
+    columns = (
+        "model_settings,config_digest,status,started_at,"
+        "analysis_deadline_at,frozen_configuration_version"
+    )
+    before = await database.connection.fetchrow(
+        f"SELECT {columns} FROM review_job WHERE id=$1", job_id
+    )
+    database.migrate("upgrade", "0009")
+    after = await database.connection.fetchrow(
+        f"SELECT {columns} FROM review_job WHERE id=$1", job_id
+    )
+    assert after == before
+    assert (
+        await database.connection.fetchval("SELECT count(*) FROM review_llm_attempt")
+        == 0
+    )
+    assert tuple(
+        (
+            await database.connection.fetchrow(
+                "SELECT analysis_attempts,analysis_attempt_fence "
+                "FROM review_job WHERE id=$1",
+                job_id,
+            )
+        ).values()
+    ) == (0, None)
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+    database.migrate("downgrade", "0008")
+    assert (
+        await database.connection.fetchrow(
+            f"SELECT {columns} FROM review_job WHERE id=$1", job_id
+        )
+        == before
+    )
+    database.migrate("upgrade", "0009")
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+
+
+async def test_durable_repair_0010_round_trip_and_atomic_check(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+    before = await database.connection.fetchrow(
+        "SELECT config_digest, model_settings, analysis_attempts "
+        "FROM review_job WHERE id=$1",
+        job_id,
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.connection.execute(
+            "UPDATE review_job SET format_repair_id=$2 WHERE id=$1",
+            job_id,
+            uuid.uuid4(),
+        )
+    await database.connection.execute(
+        "UPDATE review_job SET format_repair_id=$2, "
+        "format_repair_claimed_at=clock_timestamp(), format_repair_fence=1, "
+        "format_repair_chunk_id=$3 WHERE id=$1",
+        job_id,
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    database.migrate("downgrade", "0009")
+    assert (
+        await database.connection.fetchval("SELECT version_num FROM alembic_version")
+        == "0009"
+    )
+    database.migrate("upgrade", "head")
+    database.migrate("check")
+    assert (
+        await database.connection.fetchrow(
+            "SELECT config_digest, model_settings, analysis_attempts "
+            "FROM review_job WHERE id=$1",
+            job_id,
+        )
+        == before
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT format_repair_id FROM review_job WHERE id=$1", job_id
+        )
+        is None
+    )
+
+
+async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata(
+    migration_database: MigrationDatabase,
+) -> None:
+    legacy_user = uuid.uuid4()
+    await migration_database.connection.execute(
+        'INSERT INTO "user" (id) VALUES ($1)', legacy_user
+    )
+    migration_database.migrate("upgrade", "head")
+    assert (
+        await migration_database.connection.fetchval(
+            "SELECT version_num FROM alembic_version"
+        )
+        == "0014"
+    )
+    assert (
+        await migration_database.connection.fetchval(
+            'SELECT id FROM "user" WHERE id=$1', legacy_user
+        )
+        == legacy_user
+    )
+    migration_database.migrate("check")
+    migration_database.migrate("downgrade", "0012")
+    assert (
+        await migration_database.connection.fetchval(
+            'SELECT id FROM "user" WHERE id=$1', legacy_user
+        )
+        == legacy_user
+    )
+    migration_database.migrate("upgrade", "head")
+    migration_database.migrate("check")
+
+
+async def test_rule_ref_migration_preserves_retained_v1_findings_and_round_trips(
+    migration_database: MigrationDatabase,
+) -> None:
+    database = migration_database
+    _, job_id = await _seed_legacy(database)
+    database.migrate("upgrade", "0013")
+    chunk_id, finding_id = uuid.uuid4(), uuid.uuid4()
+    await database.connection.execute(
+        """INSERT INTO chunk_result
+        (id,review_job_id,context_payload_id,schema_version,summary,limitations,
+         usage,latency_ms,created_at)
+        VALUES ($1,$2,NULL,1,'Retained v1','[]',
+                '{"input_tokens":17,"output_tokens":9}',3,now())""",
+        chunk_id,
+        job_id,
+    )
+    await database.connection.execute(
+        """INSERT INTO finding
+        (id,chunk_result_id,fingerprint,path,side,start_line,end_line,category,
+         severity,title,explanation,evidence,recommendation,proposed_diff_fix,created_at)
+        VALUES ($1,$2,'legacy-fingerprint','src/a.py','NEW',1,1,'correctness',
+                'high','Issue','Explanation','Evidence','Recommendation',NULL,now())""",
+        finding_id,
+        chunk_id,
+    )
+    before = await database.connection.fetchrow(
+        "SELECT * FROM chunk_result WHERE id=$1", chunk_id
+    )
+    for _ in range(2):
+        database.migrate("upgrade", "0014")
+        finding = await database.connection.fetchrow(
+            "SELECT fingerprint,rule_ref FROM finding WHERE id=$1", finding_id
+        )
+        assert finding is not None
+        assert tuple(finding) == ("legacy-fingerprint", None)
+        assert (
+            await database.connection.fetchrow(
+                "SELECT * FROM chunk_result WHERE id=$1", chunk_id
+            )
+            == before
+        )
+        await database.connection.execute(
+            "UPDATE finding SET rule_ref='SEC-1' WHERE id=$1", finding_id
+        )
+        assert (
+            await database.connection.fetchval(
+                "SELECT rule_ref FROM finding WHERE id=$1", finding_id
+            )
+            == "SEC-1"
+        )
+        database.migrate("check")
+        if _ == 0:
+            database.migrate("downgrade", "0013")

@@ -3,8 +3,9 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal, Self
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -42,6 +43,54 @@ class Webhook(BaseModel):
 
 class Github(BaseModel):
     token: SecretStr = SecretStr("")
+
+
+class Auth(BaseModel):
+    """GitHub browser OAuth only; validated lazily by auth endpoints."""
+
+    github_client_id: str = ""
+    github_client_secret: SecretStr = SecretStr("")
+    github_redirect_uri: str = ""
+    jwt_secret: SecretStr = SecretStr("")
+    credential_key: SecretStr = SecretStr("")
+    frontend_origins: list[str] = Field(default_factory=list)
+
+    def check_frontend_origins(self) -> None:
+        """Mutation trust comes only from explicit, exact origin configuration."""
+        if not self.frontend_origins:
+            raise ValueError("Frontend origins are not configured")
+        for origin in self.frontend_origins:
+            uri = urlsplit(origin)
+            if (
+                uri.scheme not in {"https", "http"}
+                or not uri.hostname
+                or uri.username is not None
+                or uri.password is not None
+                or origin != f"{uri.scheme}://{uri.netloc}"
+                or "*" in origin
+                or any(char.isspace() or ord(char) < 32 for char in origin)  # noqa: PLR2004
+                or (uri.port is not None and not 0 < uri.port < 65536)  # noqa: PLR2004
+            ):
+                raise ValueError("Invalid frontend origin")
+
+    def check_ready(self) -> None:
+        """Validate on use; absent auth secrets must not break other components."""
+        uri = urlsplit(self.github_redirect_uri)
+        if (
+            not self.github_client_id.strip()
+            or not self.github_client_secret.get_secret_value().strip()
+            or len(self.jwt_secret.get_secret_value().encode()) < 32  # noqa: PLR2004
+            or uri.scheme != "https"
+            or not uri.hostname
+            or uri.username is not None
+            or uri.password is not None
+            or uri.path != "/api/v1/auth/github/callback"
+            or uri.query
+            or uri.fragment
+            or (uri.port is not None and not 0 < uri.port < 65536)  # noqa: PLR2004
+        ):
+            raise ValueError("GitHub browser auth is not configured")
+        Fernet(self.credential_key.get_secret_value())
 
 
 class Logging(BaseModel):
@@ -106,7 +155,8 @@ class LLM(BaseModel):
     eurorouter: Eurorouter = Field(default_factory=Eurorouter)
     ollama: Ollama = Field(default_factory=Ollama)
 
-    prompt_version: str = "v2"
+    temperature: float = Field(default=0.0, ge=0, le=2, allow_inf_nan=False)
+    prompt_version: str = "v1"
     # Per-call limits (SD §14), shared by both providers (spec §5.4).
     context_window: int = Field(default=16384, ge=16384)
     max_input_tokens: int = Field(default=10000, gt=0)
@@ -178,6 +228,7 @@ class Settings(BaseSettings):
     redis: Redis = Field(default_factory=Redis)
     webhook: Webhook = Field(default_factory=Webhook)
     github: Github = Field(default_factory=Github)
+    auth: Auth = Field(default_factory=Auth)
     logging: Logging = Field(default_factory=Logging)
     llm: LLM = Field(default_factory=LLM)
 

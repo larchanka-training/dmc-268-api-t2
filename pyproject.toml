@@ -7,9 +7,13 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.19.2",
     "asyncpg>=0.31.0",
+    "cryptography>=46,<51",
     "fastapi>=0.141.1",
     "httpx>=0.28.1,<1",
+    "jsonschema>=4.25,<5",
     "pydantic-settings>=2.15.0",
+    "pyjwt>=2.10,<3",
+    "redis>=5,<9",
     "sqlalchemy[asyncio]>=2.0.52",
     "structlog>=26.1.0",
     "unidiff>=0.7.5,<0.8",
@@ -57,7 +61,6 @@ asyncio_mode = "auto"
 
 [dependency-groups]
 dev = [
-    "jsonschema>=4.25,<5",
     "mypy>=2.3.1",
     "openapi-spec-validator>=0.7,<0.8",
     "pytest>=9.1.1",

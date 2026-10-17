@@ -1,224 +1,320 @@
 # Pipeline specification — DMC-268 API
 
-This document is authoritative for asynchronous pipeline, lifecycle, retry,
-degradation, queue, lease, dead-letter, replay, and publication-recovery semantics.
-The HTTP contract and its request/response DTOs are owned exclusively by
-`openapi.yaml` and are not repeated here.
+Авторитетный контракт pipeline, lifecycle, retry, queue, lease, DLQ и recovery.
+HTTP endpoints и DTO определяет `openapi.yaml`. Требования Issue #13 и
+контракты PR #30/#31 сохраняются; текущая реализация не означает их полной активации.
 
-## 1. Review lifecycle
+## 1. Решение и границы
 
-`ReviewJob.status` is the only current lifecycle field:
+PostgreSQL — источник истины о ReviewJob, командах, результате, retry, lease и расходе LLM.
+Redis Streams — at-least-once transport; несколько deliveries одной команды допустимы.
+Transport не доказывает выполнение; enqueue, ACK и платный вызов — разные события.
+Безопасность повторного выполнения обеспечивают PostgreSQL authority, fencing,
+проверка durable результата и сохранённый бюджет, а не уникальность Redis delivery.
 
-```text
-QUEUED
-  -> FETCHING_DIFF
-  -> PARSING_CONTEXT
-  -> LLM_PROCESSING
-  -> COMPLETED | FAILED
-```
+Минимальный pipeline: API → transactional outbox → dispatcher → Redis → analysis worker
+→ сохранённый результат и подготовленный publish handoff. REST читает PostgreSQL.
+Один production execution path использует существующую frozen Gateway composition.
+Новые framework abstractions, scheduler tables и обходные execution paths не нужны.
+Publisher, SSE и Reflection Pass не активируются при минимальном завершении #13.
+Publish-команды и Publication сохраняются, но dispatcher отправляет только analyze.
+Остальные REST-требования Issue #13 сохраняются.
 
-`PARTIAL` and `SKIPPED` are terminal alternatives. `PARTIAL` means useful,
-validated output remains but is incomplete. `FAILED` means there is no usable
-result or mandatory trustworthy input is unavailable. `SKIPPED` is an intentional
-non-run caused by a lifecycle condition.
+## 2. Lifecycle и durable результат
 
-There is no current `stage`. Validation is internal to `LLM_PROCESSING`.
-`ReviewEvent.phase` may record an active phase and is nullable for queue,
-terminal, and general events.
-
-Every terminal transition sets `status` and `finished_at` in the same SQL
-`UPDATE` or ORM flush. The PostgreSQL CHECK is immediate, so two statements in
-one transaction are not sufficient.
-Active states require `finished_at IS NULL`; terminal states require it to be set.
-Terminal jobs are never silently reopened.
-
-## 2. Errors, retry, and degradation
-
-Accepted reason codes are:
+`ReviewJob.status` — единственное текущее lifecycle-поле:
 
 ```text
-QUEUE_DEADLINE_EXCEEDED
-VCS_RATE_LIMITED
-VCS_UNAVAILABLE
-VCS_ACCESS_DENIED
-PR_STALE_OR_CLOSED
-DIFF_UNTRUSTWORTHY
-SOURCE_BLOB_UNAVAILABLE
-AST_PARSE_FAILED
-LLM_TIMEOUT
-LLM_UNAVAILABLE
-LLM_OUTPUT_INVALID
-ANALYSIS_DEADLINE_EXCEEDED
+QUEUED → FETCHING_DIFF → PARSING_CONTEXT → LLM_PROCESSING
+       → COMPLETED | PARTIAL | FAILED | SKIPPED
 ```
 
-Only `VCS_RATE_LIMITED`, `VCS_UNAVAILABLE`, `LLM_TIMEOUT`, and
-`LLM_UNAVAILABLE` use generic retry. A retryable failure preserves the current
-active status; `retry_at` and the deadline fields control rescheduling.
+COMPLETED означает полноценный валидированный результат; PARTIAL — полезный,
+валидированный, но неполный результат. FAILED означает отсутствие пригодного
+результата либо обязательного доверенного входа; SKIPPED — намеренный non-run.
+Текущего `stage` нет; validation относится к LLM_PROCESSING.
+`ReviewEvent.phase` nullable и описывает только аудит фазы.
+Terminal `status` и `finished_at` меняются одним SQL UPDATE / ORM flush:
+active требует NULL finished_at, terminal — ненулевой. Terminal analysis не открывается заново.
+Publication lifecycle независим: сбой публикации не запускает analysis повторно.
 
-`LLM_OUTPUT_INVALID` permits exactly one format-repair attempt. Format repair is
-not a generic retry and does not reset analysis deadlines.
-Provider-level retry/failover and persisted worker retry share the same analysis
-deadline and request budget; their attempt counts must not multiply silently.
+Start-review transaction атомарно создаёт ReviewJob, начальную Publication,
+quota reservation и initial analyze OutboxEvent. Её rollback не оставляет команду.
+Успешный analysis transaction атомарно сохраняет summary, ChunkResult/Findings,
+terminal status/finished_at, Publication(PENDING) с началом/дедлайном цикла
+и canonical publish OutboxEvent. Анализ не объявляет публикацию успешной.
+FAILED/SKIPPED без полезного результата не требуют publish successor.
+При ошибке пригодный сохранённый результат остаётся PARTIAL с safe limitation.
+Полезный валидированный late output сохраняется как PARTIAL, не разрешая новую попытку после deadline.
 
-`ReviewEvent` is the append-only audit record for transitions, retry,
-degradation, and failure. Each event stores the current status, nullable phase and
-reason code, `retryable`, an attempt number starting at one, and optional safe
-details. Safe details never contain source, prompt, model reasoning, secrets, raw
-provider payloads, or stack traces. `ChunkResult` and `Finding` contain only
-validated analysis output.
-New reason-code writes use the accepted enum. Historical unknown reason codes
-remain in PostgreSQL audit records, but their public projection is `null`, never
-the raw legacy value.
+LLM возвращает только summary, findings и limitations. Verified prompt identities
+v1/v2 используют provider/result schema v1; rules-aware v3 использует schema v2.
+Gateway разрешает локальные `$ref` из проверенного closure и валидирует исходный
+JSON до parsing. Backend добавляет schema version, измеренную latency и usage
+только при наличии обоих token counts; identity, status, provenance, request
+counts и safe errors принадлежат backend. V1 wire не содержит `rule_ref`; v2
+требует nullable `rule_ref`. Stored versions, fingerprints и usage не переписываются.
+Подробный mapping и activation gates: `PROMPT_VERSION_CONTRACT.md`.
 
-## 2.1 Context and result validation boundary
+Reflection Pass разрешён только для verified prompt identity v3 при in-memory
+исполнении и выключен для historical v1/v2 и durable worker.
+Frozen repository instructions — единственный источник правил worker; environment
+и runtime arguments не заменяют их. Все его платные запросы проходят PostgreSQL
+ledger, включая retry, overflow и format repair.
 
-The context wire envelope includes `schema_version`, `review_id`, and `chunk_id`;
-`ContextPayload.payload_body` stores only snapshot, metadata, files, related
-symbols, coverage, and budget. The backend assembles the wire envelope from
-authoritative columns, validates the JSON Schema, then runs semantic validation
-before inference or persistence. The public domain helpers in
-`src/app/domain/contract_validation.py` are `validate_ranges(payload)` and
-`validate_hunks(hunks, public=False)`; HTTP diff projection uses `public=True`
-for its `old_lines`/`new_lines` count names. They check ordered 1-based ranges,
-hunk counts and exact contiguous old/new coordinates; path normalization is a
-separate input invariant. A zero-length hunk side may start at zero; a nonempty
-side must start at one or later. New contexts use output language `ru`, while a
-frozen legacy settings version may retain another nonempty language value.
+## 3. Retry, deadlines и платные запросы
 
-The LLM generates only summary, findings, and limitations according to
-`schemas/llm-output/v2.json`. The gateway must bundle its local Finding `$ref`
-before passing a structured-output schema to a provider. The backend validates
-and maps model output to `ReviewChunkResult`, adding the schema version, measured
-gateway latency, and usage only when both token counts are available. Review/chunk
-identity remains authoritative in context and persisted aggregates; status is a
-ReviewJob field, while provider/model provenance, request counts, and safe errors
-are backend-owned outside the model output. The open PR #18 gateway adapter must
-align its typed models with the checked-in schemas and shared fixtures in
-`schemas/examples/`; textual equality with a separately generated schema is
-not the wire contract.
-
-## 3. Deadlines and budgets
-
-- Queue deadline: 15 minutes from creation.
-- Analysis deadline: 10 minutes including generic retries and format repair.
-- Publication deadline: 5 minutes for a publication cycle.
-- Context and model token budgets are fixed in the persisted ContextPayload.
-
-Exceeding a deadline records the corresponding reason event and applies terminal
-semantics based on whether useful validated output exists. Retry scheduling must
-never extend an accepted deadline.
-
-## 4. Transactional outbox and Redis queue behavior
-
-Creation of a review, its initial publication state, quota reservation, and the
-initial analyze `OutboxEvent` belongs to one transaction. Completion of analysis
-and creation of publish work also belongs to one transaction.
-
-The normal queue envelope is validated against
-`schemas/queue/task-envelope.v1.json`. It contains only schema/event/review/task,
-attempt, and trace identity. Source, diff, prompt, and model result are never sent
-in the envelope.
-
-The v1 Redis-backed queue adapter must provide these observable guarantees;
-issue #13 owns the concrete worker/DLQ implementation:
-
-- separate analyze, publish, and dead-letter task kinds/channels;
-- acknowledged enqueue before marking the PostgreSQL outbox event published;
-- at-least-once processing and acknowledgement only after a durable processing
-  decision, with recovery of unacknowledged/claimed work;
-- normal envelope maximum size 16 KiB and task expiry after 20 minutes;
-- dead-letter retention for seven days;
-- analyze concurrency 1 and publish concurrency 4;
-- recovery interval 30 seconds;
-- worker heartbeat 15 seconds and lease duration 90 seconds;
-- at most three generic transient attempts per active phase;
-- no independent framework-level autoretry outside the persisted retry budget;
-- VCS request timeout 15 seconds;
-- Ollama request timeout 120 seconds.
-
-The Redis enqueue acknowledgement is not proof that a job completed. PostgreSQL
-outbox/job/lease state remains authoritative; recovery re-enqueues eligible work
-when a message is lost after enqueue, without reviving a terminal job.
-
-The v1 serializer emits only the canonical envelope fields. V1 consumers ignore
-unknown optional fields. Breaking envelope changes require a new major version
-and corresponding consumer.
-
-The dispatcher selects unpublished outbox records. It marks
-`broker_published_at` only after the queue adapter confirms enqueue. Consumers reject
-unsupported schema versions, unknown task kinds, and otherwise invalid envelopes
-before domain work begins.
-
-## 5. Leases and fencing
-
-At most one live `TaskLease` exists per review. A worker must acquire or renew the
-lease and use a monotonically increasing fencing token. Every persistence write
-for snapshot, context, chunk result, findings, terminal state, or publication
-must verify the current lease and fencing token. External calls occur outside an
-open PostgreSQL transaction.
-
-Recovery considers missing/expired leases, `retry_at`, lifecycle status, and all
-deadlines. It must not revive terminal work or create equivalent pending work.
-
-## 6. Dead-letter behavior
-
-Dead-letter records use the independently versioned schema
-`schemas/queue/dead/v1.json` and one of:
+Допустимые публичные reason codes остаются:
 
 ```text
-UNSUPPORTED_SCHEMA_VERSION
-UNKNOWN_TASK_KIND
-INVALID_ENVELOPE
+QUEUE_DEADLINE_EXCEEDED, VCS_RATE_LIMITED, VCS_UNAVAILABLE, VCS_ACCESS_DENIED,
+PR_STALE_OR_CLOSED, DIFF_UNTRUSTWORTHY, SOURCE_BLOB_UNAVAILABLE, AST_PARSE_FAILED,
+LLM_TIMEOUT, LLM_UNAVAILABLE, LLM_OUTPUT_INVALID, ANALYSIS_DEADLINE_EXCEEDED
 ```
 
-They contain only the required quarantine identity, reason, time, logical source
-task channel (`source_routing_key` in the versioned schema) and explicitly
-allowed copied identity fields. They never contain the
-raw/original queue payload, arbitrary unknown fields, raw exceptions/stacks,
-prompts, source, or provider responses. A dead record without a valid
-`source_event_id` is diagnostic-only and cannot be replayed. Additive optional
-fields remain v1-compatible for consumers, while the producer serializer enforces
-the documented safe-field allowlist. Breaking changes require a new dead-schema
-version. An unsupported dead-schema version is not recursively quarantined.
+Generic retry разрешён только для VCS_RATE_LIMITED, VCS_UNAVAILABLE,
+LLM_TIMEOUT и LLM_UNAVAILABLE: максимум три transient attempts на active phase.
+Он сохраняет active status и исходный deadline; PostgreSQL `retry_at` задаёт допуск.
+Redis delivery count и повторный enqueue не являются domain attempt counter.
+LLM_OUTPUT_INVALID допускает ровно одну format repair, не новый generic retry.
+Durable execution counter и HTTP request ledger сохраняют свои разные единицы учёта.
+Provider retry/fallback, worker retry и repair делят один deadline и request budget.
+Независимый framework autoretry запрещён.
 
-## 7. Operator replay
+| Граница | Значение / гарантия |
+|---|---|
+| Queue | 15 минут от создания |
+| Analysis | 10 минут, включая retry и repair; часы не сбрасываются при recovery |
+| Publication | 5 минут на начало новых попыток в принятом цикле |
+| VCS / Ollama timeout | 15 / 120 секунд, дополнительно ограничены остатком deadline |
+| Heartbeat / lease | 15 / 90 секунд |
+| Recovery interval | 30 секунд |
+| Concurrency | analyze 1; publish 4 — контракт будущей активации |
 
-Replay is operator-only and accepts a `source_event_id`. The operator service:
+Context/model token budgets фиксированы в сохранённом ContextPayload и не сбрасываются при recovery.
+Истечение queue/analysis deadline обрабатывает существующий fenced analysis handler:
+без нового GitHub/LLM HTTP, с reason event и terminal outcome по сохранённому результату.
+Transport recovery может доставить просроченную active команду именно для этого решения.
+Deadline ограничивает начало работы; при недоступных зависимостях момент записи
+terminal outcome может быть позже. Dispatcher не становится вторым analysis executor.
+Publication expiry запрещает новые provider attempts и progress writes;
+результат ранее начатой попытки можно записать только под исходным live publish lease.
 
-1. resolves the authoritative PostgreSQL `OutboxEvent`;
-2. rejects unsupported source schema versions;
-3. checks review lifecycle, deadlines, and active lease safety;
-4. rejects equivalent unpublished pending outbox work;
-5. creates a new `OutboxEvent` with a new event ID;
-6. preserves review, task, trace, and source schema-version identity;
-7. sets `attempt` to the source attempt plus one.
+Перед каждым платным HTTP, включая fallback/repair, PostgreSQL фиксирует fenced reservation.
+Settlement независим от result transaction; rollback результата не возвращает потраченный бюджет.
+Неизвестный usage остаётся зарезервированным, известный overrun блокирует следующие вызовы.
+Crash/restart, новый fence или повторная доставка не обнуляют расход и repair allowance.
+Неизвестный исторический бюджет закрывает выполнение; текущие defaults его не подменяют.
+Это ограничение допуска запросов; точно однократный remote HTTP и абсолютный billing cap
+при неизвестном usage/поведении провайдера не обещаются.
 
-Raw dead messages are never replayed.
+## 4. Queue, outbox и singleton dispatcher
 
-## 8. Publication recovery and reconciliation
+Envelope v1 соответствует `schemas/queue/task-envelope.v1.json`: только
+schema/event/review/task/attempt/trace identity, максимум 16 KiB UTF-8.
+Source, diff, prompt и model result через очередь не передаются.
+Serializer выдаёт canonical поля; consumer игнорирует неизвестные optional поля v1.
+Breaking change требует новую major schema. Analyze, publish и DLQ разделены.
+Обычная delivery истекает через 20 минут; её истечение не доказывает completion.
+Возраст определяется Redis server-generated XADD ID относительно Redis TIME; future ID не истекает.
+Expired delivery без completion proof остаётся pending и не запускает handler/HTTP;
+active job получает свежую delivery через тот же PG resend. После durable outcome старый duplicate ACK допустим.
 
-Analysis and publication lifecycles are independent. Publication retry never
-reruns analysis. A retry is eligible only when remote absence is confirmed for a
-`FAILED` publication. `UNKNOWN` requires reconciliation; `PARTIAL`, stale
-snapshots, active publication, and other ineligible states must not enqueue a
-retry.
+`broker_published_at` означает время последнего подтверждённого Redis enqueue.
+Он записывается только после enqueue acknowledgement и не служит completion receipt.
+Обрыв после XADD до PostgreSQL commit допускает дубликат той же canonical команды.
+Неподтверждённая отправка не получает publication marker; прежний подтверждённый marker
+при resend не стирается. Worker принимает команду до появления marker.
 
-Reconciliation checks provider state before changing `UNKNOWN` or retrying work.
-Provider references are stored as provider metadata but only safe opaque
-references may cross the public boundary.
+В первом rollout работает **ровно один активный dispatcher**, операции отправки последовательны.
+Deploy/restart: остановить прежний процесс, дождаться его выхода, затем запустить новый;
+при потере host сначала подтвердить его остановку. Rolling overlap и active replicas запрещены.
+Singleton — операционная предпосылка, не новый distributed-leader framework.
+Её нарушение может увеличить число deliveries; worker authority и cost limits остаются обязательными.
+Crash/restart одного dispatcher поддерживается без process-local recovery state.
 
-## 9. Dependency degradation
+Существующие dispatcher CLI и analysis CLI сохраняются. `--once` — ограниченный проход;
+dispatcher `--once` выполняет recovery sweep перед initial batch без ожидания.
+Continuous dispatcher делает recovery на старте, затем через 30 секунд после окончания
+предыдущего sweep по monotonic clock, также при initial backlog и пустой очереди.
+Ticks последовательны; пропущенные ticks не накапливаются. `--batch-size` по умолчанию
+100, положителен и capped at 100; `--poll-interval` по умолчанию 5 секунд, finite и
+минимум 0.01 секунды. Interruptible idle wait ограничен ближайшим recovery tick.
+Redis PING предшествует каждой итерации; connect/command timeouts — 5 секунд.
+SIGTERM/SIGINT прекращают новые batch/ticks; stop во время recovery запрещает
+следующий initial batch. Текущая ограниченная операция завершается, polling wait
+прерывается, Redis закрывается и engine освобождается. Оператор оставляет время
+на окончание batch; forced termination после XADD допускает duplicate.
+Ошибки Redis/PostgreSQL дают sanitized nonzero exit, а не успешный пустой проход.
+External I/O не удерживает PostgreSQL transaction. SQL/Redis operations имеют конечные timeouts.
+Эта спецификация не включает автоматическую активацию сервисов в Compose/CD.
 
-PostgreSQL is required for authoritative state and session checks; an
-unrecoverable PostgreSQL failure makes the service not ready. Other dependency
-failures disable only affected capabilities where safe:
+## 5. Минимальное восстановление потерянного Redis transport
 
-- VCS degradation blocks access revalidation, available-repository listing,
-  repository connection, pull-request listing, and starts;
-- Redis queue degradation blocks analysis dispatch but not stored reads;
-- model degradation blocks analysis progress but not stored reads;
-- publisher degradation blocks publication while preserving validated results;
-- session dependency degradation blocks authenticated operations.
+OutboxEvent сохраняет `broker_published_at`, `broker_message_id` и nullable
+`dispatch_not_before`; generation/CAS, recovery windows/counters удаляются.
+До каждой initial/resend XADD attempt dispatcher коммитит
+`dispatch_not_before = DB now + 90 секунд`. Одна reservation допускает не более одной
+XADD command attempt; скрытые command retries запрещены.
+Последний подтверждённый ID и marker при reservation сохраняются; заменяются
+только после подтверждённой отправки. Потерянный ответ допускает ограниченные
+дубликаты после persisted cooldown, без hidden retries и lifetime limit.
 
-Readiness exposes capability booleans defined by `openapi.yaml`, not raw
-dependency names, endpoints, credentials, or errors.
+Initial batch выбирает максимум 100 никогда не резервированных canonical analyze
+команд. Recovery рассматривает максимум 100 due active событий и делает максимум
+10 resend reservations за tick. Quarantine, live lease и future retry исключаются
+до LIMIT; истёкший queue/analysis deadline отменяет ожидание retry, позволяя
+существующему worker terminalize без нового HTTP. PostgreSQL eligibility повторно
+проверяется перед committed reservation. External I/O вне транзакции.
+
+При подтверждённом broker ID выполняется exact Redis ID probe:
+PRESENT с canonical identity откладывает проверку без resend; ABSENT/EXPIRED
+разрешают повторную eligibility check и committed throttle перед одной XADD.
+UNKNOWN является infrastructure failure, не успешным empty tick и не ABSENT.
+UNTRUSTED даёт безопасную диагностику без XADD/ACK/изменения canonical identity;
+следующая проверка откладывается, исключая горячий цикл.
+Persisted deferral обеспечивает fairness due backlog: healthy сообщения не должны
+постоянно занимать все candidate slots. Process-local dispatcher cursor и отдельный
+terminal diagnostics scan удаляются.
+
+Новая forward migration `0012_lean_outbox_transport.py` следует за `0011`;
+0011 и история PR #30 не переписываются. Конфликт PR #30 revisions 0008/0009 —
+integration blocker before merge, не blocker реализации LEAN-01 внутри PR #29.
+
+## 6. Pending recovery, leases и безопасный ACK
+
+Утрата Redis stream/payload восстанавливается из PostgreSQL (§5).
+Сохранённый PEL после смерти consumer восстанавливается существующей consumer group:
+continuous analysis worker каждые 30 секунд делает один bounded XAUTOCLAIM,
+min idle 90 секунд, COUNT 1; сохраняет returned cursor, включая пустой результат.
+Первый tick — через 30 секунд после trusted preflight; следующий — через 30 секунд
+после завершения bounded recovery. Новые и reclaimed deliveries исполняются
+последовательно; catch-up и накопления claimed batch нет. Analysis `--once` принимает
+только одну новую delivery, без recovery; каждый boot использует новый consumer owner.
+Identity/lease failures оставляют pending и позволяют continuous loop продолжиться;
+неожиданные infrastructure failures завершают CLI nonzero с sanitized error type.
+Missing group создаётся с id=0; deleted PEL IDs не доказывают completion и не создают работу.
+New delivery и reclaimed delivery используют один processing path и один execution slot.
+
+Один persistent TaskLease на ReviewJob: task kind, owner, expiry и возрастающий fence.
+Release истекает строку, не удаляет её и не обнуляет token; live lease не отбирается.
+Analyze claim допустим только для active analysis; publish claim — для полезного
+terminal analysis и Publication(PENDING) с будущим принятым deadline.
+Analyze claim не разрешает publish writes; публикация не меняет terminal ReviewJob.
+Heartbeat продлевает текущий claim; lease loss останавливает локальный handler.
+Cancellation не является гарантией отмены уже принятого remote запроса.
+Snapshot/context/result/findings/status/publication writes проверяют live fence
+в том же UoW, в том числе в SQL после lock wait; внешние вызовы идут вне transaction.
+LLM call admission дополнительно проверяет canonical command, deadline и durable budget.
+
+Consumer сверяет все canonical identity-поля с PostgreSQL до domain work.
+Missing/mismatched command или quarantined source остаётся pending без domain execution;
+это не invalid transport schema и не повод для DLQ.
+Handler return, retry_at и промежуточный commit сами по себе не разрешают ACK.
+ACK следует только после проверки committed durable decision:
+
+- FAILED/SKIPPED analysis с finished_at;
+- COMPLETED/PARTIAL analysis с подготовленной Publication и canonical,
+  nonquarantined publish successor, включая envelope size bound;
+- для будущего publisher: PUBLISHED/PARTIAL/SKIPPED с cycle timestamps и finished_at.
+
+Дубликат с таким proof ACK-ается без handler/LLM. Новый execution дополнительно требует
+успешного fenced release; commit до ACK failure безопасен при следующей delivery.
+Retry остаётся pending до due time; ACK по retry потребовал бы atomic replacement proof,
+который минимальный pipeline не вводит. Contention, lease loss, ошибки и incomplete
+handoff не ACK-аются. FAILED/UNKNOWN publication требуют отдельного решения/reconciliation.
+
+## 7. Invalid transport, DLQ и operator replay
+
+Permanently invalid unpublished outbox event сохраняется в PostgreSQL quarantine
+с paired quarantined_at/reason_code; published marker и quarantine взаимоисключены.
+Допустимы UNSUPPORTED_SCHEMA_VERSION, UNKNOWN_TASK_KIND, INVALID_ENVELOPE.
+Validation предшествует отправке; инфраструктурная ошибка не становится quarantine.
+Historically published invalid command сохраняется, получает safe alert и backoff.
+PostgreSQL quarantine не создаёт Redis DLQ record и не ACK-ает delivery.
+
+Invalid Redis envelope попадает в safe DLQ **до source XACK**; ошибка DLQ write оставляет pending.
+DLQ schema — `schemas/queue/dead/v1.json`, retention семь дней, те же три reason codes.
+Только allowlisted identity/time/source_routing_key; raw payload, unknown поля,
+source/prompt/provider output, secrets, exception text и stacks запрещены.
+Без valid source_event_id запись diagnostic-only. Unsupported dead schema не quarantine-ится рекурсивно.
+Idle retention/cleanup остаётся обязательной queue maintenance в существующем runtime,
+не новым recovery scheduler; её ещё не завершённую реализацию нельзя считать удаляемой.
+
+Replay operator-only: PostgreSQL source_event_id → проверка schema/lifecycle/lease/deadlines
+и отсутствия equivalent pending command → новый OutboxEvent/new ID с source attempt+1,
+тем же review/task/trace/schema. Raw DLQ не replay-ится; source не переписывается.
+Без этого validated operator seam replay остаётся недоступным, не ручным Redis XADD.
+
+## 8. Trust boundaries и командные интерфейсы
+
+Frozen settings/model/routing/prompt identities разрешаются по сохранённому job,
+verified deployment artifacts и allowlisted credentials; environment не заменяет policy.
+Исторические prompt artifacts/digests не пересчитываются новым renderer.
+Context wire собирается из authoritative schema/review/chunk columns и payload_body;
+payload_body содержит snapshot/metadata/files/related symbols/coverage/budget.
+До inference и persistence обязательны canonical JSON Schema и semantic validation:
+нормализованные paths, ordered 1-based ranges, hunk counts и contiguous coordinates.
+Zero-length side может начинаться с 0; nonempty — с 1. Новые contexts используют `ru`;
+frozen historical language сохраняется. Public diff использует свои count names.
+Raw LLM output содержит только schema-defined summary/findings/limitations;
+локальный Finding $ref bundled для provider schema. Backend проверяет output и
+обогащённый result, добавляет schema/latency/fingerprints; usage — только при наличии обоих token counts.
+Review/chunk identity, lifecycle, provenance, request counts и safe errors принадлежат backend.
+Source/rules — недоверенные данные, не system instructions; anchors проверяются по captured diff.
+ReviewEvent append-only: status, nullable phase/reason, retryable, attempt≥1, safe details;
+historical unknown reason остаётся в БД, публично проецируется как null.
+Safe details исключают source, prompts, model reasoning, secrets, raw provider payloads и stacks.
+
+`PublicationRepositoryPort` сохраняет get, analysis-fenced prepare и publish-fenced
+update в той же UoW; acquire/heartbeat после publication deadline запрещены.
+PR #30 сохраняет `handle(task, lease)`, task-kind/fence и DurableTaskOutcome контракт,
+atomic publication preparation, отдельную PR/ChangeRequest serialization и reconciliation.
+UNKNOWN не retry-ится автоматически; retry FAILED допустим только при confirmed remote absence;
+publication PARTIAL, stale snapshot и active publication не republish-ятся автоматически.
+Provider refs публично только safe opaque; read token не заменяет write credentials.
+SSE требует durable monotonic per-review sequence/replay, безопасных DTO и
+повторной access/session проверки; allocation и event write атомарны с переходом.
+Общий event append и миграции интегрируются при PR #30, без активации здесь.
+PR #31 сохраняет rules isolation, canonical rule_ref/schema mapping и исторические identities.
+Reflection выключен; его будущий HTTP обязан использовать тот же durable ledger и deadline.
+Подмена durable budget process-local reflection allowance недопустима.
+
+## 9. Наблюдаемость, проверка и согласование
+
+Incomplete handoff остаётся pending без ACK и повторного domain execution.
+Отдельного terminal scan/cursor/tick и автоматического предупреждения о structural
+handoff gap нет. Проверка сохранённых Publication/outbox данных и оповещение —
+операционная ответственность; наличие successor само по себе не доказывает его canonical validity.
+Диагностика использует только identity/counts/safe codes, без payloads и exception repr.
+Требование к readiness: PostgreSQL failure делает сервис not ready; Redis/model/publisher failures блокируют
+затронутую capability, сохраняя stored reads. VCS degradation блокирует starts,
+access revalidation и связанные repository/PR operations; session failure — authenticated operations.
+Readiness должен выдавать capability booleans из OpenAPI; endpoint пока не реализован.
+Healthcheck `/healthcheck` остаётся dependency-free liveness.
+
+## 10. Изменения архитектурных обещаний перед merge
+
+MASTER-02 / техлид согласует до merge следующие изменения прежнего контракта PR #29:
+
+1. Один активный dispatcher со stop-old-before-start-new заменяет поддержку
+   competing dispatcher generations; rolling overlap и active replicas не поддерживаются.
+2. Persisted throttle 90 секунд и максимум 10 resend reservations/tick заменяют
+   generation/CAS и rolling window 3/event/300s. Lifetime limit отсутствует;
+   ambiguous XADD допускает ограниченные Redis duplicates одной canonical PG команды.
+3. Exact confirmed-ID probe сохраняется. PRESENT deferral и UNTRUSTED backoff
+   сохраняются в PostgreSQL; отдельного terminal diagnostic scan/cursor больше нет.
+   Worker отказывает в ACK при incomplete handoff; автоматическое обнаружение/alert
+   удаляется, оператор отвечает за проверку сохранённых Publication/outbox данных.
+4. Publisher/SSE/Reflection остаются отдельной активацией с parked durable handoff;
+   численные deadlines/retry/lease/DLQ и публичные schemas не ослабляются.
+
+Перед merge требуется согласовать с владельцем PR #30 конфликт revision IDs
+0008/0009 и единую Alembic history. Опубликованная `0011` остаётся неизменной,
+LEAN-01 использует forward `0012`. До upgrade необходимо drain/stop всех старых
+worker/API/dispatcher процессов, использующих ORM OutboxEvent: старый binary
+обращается к удаляемым columns. После migration запускается новый binary;
+rolling mixed versions не поддерживаются. Rollback также требует остановки процессов:
+он восстанавливает удалённые counters нулями и не восстанавливает историю
+reservations. Retained broker ID, marker, throttle, quarantine и business data сохраняются.
+Никакая migration другого PR здесь не перенумеровывается и не применяется.

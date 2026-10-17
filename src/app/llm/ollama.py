@@ -3,13 +3,14 @@
 No authorization: Ollama lives in the closed application network.
 """
 
+import json
 import time
 
 import httpx
 from pydantic import BaseModel
 
 from app.llm._http import parse_structured, post_json
-from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
+from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest, known_token_usage
 from app.llm.errors import TransientProviderError
 
 
@@ -38,7 +39,11 @@ class OllamaClient(BaseLLMClient):
             "model": self._model,
             "messages": [m.model_dump() for m in request.messages],
             "stream": False,
-            "format": response_model.model_json_schema(),
+            "format": (
+                json.loads(request.output_schema_json)
+                if request.output_schema_json is not None
+                else response_model.model_json_schema()
+            ),
             "options": {
                 "temperature": request.temperature,
                 "num_predict": request.max_output_tokens,
@@ -53,12 +58,22 @@ class OllamaClient(BaseLLMClient):
         except KeyError, TypeError:
             msg = "malformed Ollama chat response"
             raise TransientProviderError(msg) from None
+        input_tokens = known_token_usage(data.get("prompt_eval_count"))
+        output_tokens = known_token_usage(data.get("eval_count"))
         return LLMCallResult[T](
-            parsed=parse_structured(content, response_model),
+            parsed=parse_structured(
+                content,
+                response_model,
+                output_schema_json=request.output_schema_json,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+            ),
             raw_text_len=len(content),
-            input_tokens=data.get("prompt_eval_count"),
-            output_tokens=data.get("eval_count"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             model=data.get("model") or self._model,
+            reported_model=data.get("model"),
             model_digest=self._model_digest,
             provider=self.name,
             latency_ms=latency_ms,

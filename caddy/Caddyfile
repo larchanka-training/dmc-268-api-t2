@@ -1,0 +1,21 @@
+{
+	auto_https disable_redirects
+}
+
+https://dmc268-t2.ddns.net {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	reverse_proxy 127.0.0.1:80
+}
+
+https://dmc268t2-staging.ddns.net {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	reverse_proxy 127.0.0.1:8080
+}

@@ -52,6 +52,13 @@ class PostgresHarness:
 
     async def cleanup(self) -> None:
         async with self.engine.begin() as connection:
+            review_ids = self.ids.get("review_job", set())
+            if review_ids:
+                await connection.execute(
+                    delete(models.ReviewEvent).where(
+                        models.ReviewEvent.review_job_id.in_(review_ids)
+                    )
+                )
             repository_ids = self.ids.get("repository", set())
             if repository_ids:
                 repository = Base.metadata.tables["repository"]

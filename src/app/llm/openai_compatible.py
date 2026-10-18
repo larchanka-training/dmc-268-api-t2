@@ -4,13 +4,14 @@ Nothing here is Eurorouter-specific: name, base URL, model and key come from
 configuration. One instance serves one API key.
 """
 
+import json
 import time
 
 import httpx
 from pydantic import BaseModel
 
 from app.llm._http import parse_structured, post_json
-from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
+from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest, known_token_usage
 from app.llm.errors import TransientProviderError
 
 
@@ -43,7 +44,11 @@ class OpenAICompatibleClient(BaseLLMClient):
                 "json_schema": {
                     "name": "review_output",
                     "strict": True,
-                    "schema": response_model.model_json_schema(),
+                    "schema": (
+                        json.loads(request.output_schema_json)
+                        if request.output_schema_json is not None
+                        else response_model.model_json_schema()
+                    ),
                 },
             },
         }
@@ -63,13 +68,24 @@ class OpenAICompatibleClient(BaseLLMClient):
             raise TransientProviderError(msg) from None
         # A refusal comes without content: treat it as invalid output.
         content = message.get("content") or ""
-        usage = data.get("usage") or {}
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        input_tokens = known_token_usage(usage.get("prompt_tokens"))
+        output_tokens = known_token_usage(usage.get("completion_tokens"))
         return LLMCallResult[T](
-            parsed=parse_structured(content, response_model),
+            parsed=parse_structured(
+                content,
+                response_model,
+                output_schema_json=request.output_schema_json,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+            ),
             raw_text_len=len(content),
-            input_tokens=usage.get("prompt_tokens"),
-            output_tokens=usage.get("completion_tokens"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             model=data.get("model") or self._model,
+            reported_model=data.get("model"),
             model_digest=None,
             provider=self.name,
             latency_ms=latency_ms,

@@ -1,2 +1,0 @@
-# Unified diff context prefixes must be retained, including on empty lines.
-docs/integrations/*.patch whitespace=-blank-at-eol

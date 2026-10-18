@@ -456,6 +456,20 @@ class BaseLLMClient(ABC):
 - Реализация по умолчанию `ConservativeTokenCounter`: `ceil(len(text.encode("utf-8")) / bytes_per_token) * (1 + safety_margin)`, стартовые значения `bytes_per_token = 3`, `safety_margin = 0.15`. Оценка консервативная: кириллица и код дают больше токенов, чем английский текст.
 - Точный токенизатор модели можно подключить позже через тот же протокол; выбор модели — открытый вопрос SD §16.
 
+Frozen `review-conservative-v1` фиксирует этот алгоритм `count(text)` с двумя
+округлениями вверх: `ceil(ceil(UTF8_bytes / 3) * 1.15)`. Verified renderer v1/v2
+сохраняет свою оценку messages и framing. Перед передачей в Gateway
+`ReviewService._send()` добавляет оценку verified `output_schema_json`, которую
+провайдер получает отдельно от messages. Gateway резервирует уже полный input
+estimate до HTTP; повторно schema не считает. Для текущих frozen schemas это
+1459 UTF-8 bytes → 487 базовых units → 561 токен.
+
+Это исправление состава accounting reservation не меняет алгоритм estimator,
+renderer bytes/digest или frozen policy. Изменение алгоритма, параметров либо
+контракта renderer потребует новой identity (например, `review-conservative-v2`
+для новых admission с сохранением v1 dispatch для исторических jobs).
+Существующие ledger reservations не пересчитываются задним числом.
+
 ### 5.4. Бюджет одного вызова
 
 Значения SD §14 (конфигурируемые):

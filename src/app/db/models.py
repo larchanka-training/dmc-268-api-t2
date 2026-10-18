@@ -12,8 +12,10 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    SmallInteger,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -33,6 +35,42 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+
+
+class GithubOAuthFlow(Base):
+    __tablename__ = "github_oauth_flow"
+
+    state_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    browser_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    return_to: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class GithubIdentity(Base):
+    __tablename__ = "github_identity"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id"), primary_key=True
+    )
+    external_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    login: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_token: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_session"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id"), nullable=False
+    )
+    csrf_token: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Repository(Base):
@@ -254,6 +292,25 @@ class ReviewJob(Base):
     model_settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict
     )
+    frozen_configuration_version: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True
+    )
+    analysis_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    format_repair_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    format_repair_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    format_repair_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    format_repair_chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    analysis_attempt_fence: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     prompt_version: Mapped[str] = mapped_column(Text, nullable=False)
     prompt_digest: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -308,6 +365,30 @@ class ReviewJob(Base):
     outbox_events: Mapped[list[OutboxEvent]] = relationship(back_populates="review_job")
 
     __table_args__ = (
+        CheckConstraint(
+            "(format_repair_id IS NULL AND format_repair_claimed_at IS NULL "
+            "AND format_repair_fence IS NULL AND format_repair_chunk_id IS NULL) OR "
+            "(format_repair_id IS NOT NULL AND format_repair_claimed_at IS NOT NULL "
+            "AND format_repair_fence IS NOT NULL AND format_repair_fence >= 1 "
+            "AND format_repair_chunk_id IS NOT NULL)",
+            name=conv("ck_review_job_repair_state"),
+        ),
+        CheckConstraint(
+            "(analysis_attempts = 0 AND analysis_attempt_fence IS NULL) OR "
+            "(analysis_attempts > 0 AND analysis_attempt_fence IS NOT NULL "
+            "AND analysis_attempt_fence >= 1)",
+            name=conv("ck_review_job_analysis_attempt_state"),
+        ),
+        CheckConstraint(
+            "frozen_configuration_version IS NULL OR frozen_configuration_version = 1",
+            name=conv("ck_review_job_frozen_configuration_version"),
+        ),
+        CheckConstraint(
+            "frozen_configuration_version IS NULL OR "
+            "COALESCE(jsonb_typeof(model_settings) = 'object' "
+            "AND model_settings->>'schema_version' = '1', false)",
+            name=conv("ck_review_job_frozen_settings_shape"),
+        ),
         CheckConstraint(
             "status IN "
             "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING',"
@@ -497,6 +578,7 @@ class Finding(Base):
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     recommendation: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_diff_fix: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rule_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
@@ -549,7 +631,8 @@ class Publication(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN "
-            "('NOT_READY','PENDING','PUBLISHED','PARTIAL','FAILED','UNKNOWN','SKIPPED')",
+            "('NOT_READY','PENDING','PUBLISHED','PARTIAL','FAILED','UNKNOWN',"
+            "'SKIPPED')",
             name="ck_publication_status",
         ),
     )
@@ -574,6 +657,14 @@ class OutboxEvent(Base):
     broker_published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    broker_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dispatch_not_before: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    quarantined_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    quarantine_reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     review_job: Mapped[ReviewJob] = relationship(back_populates="outbox_events")
 
@@ -583,6 +674,25 @@ class OutboxEvent(Base):
             "task_kind IN ('analyze','publish')", name="ck_outbox_task_kind"
         ),
         CheckConstraint("attempt > 0", name="ck_outbox_attempt_positive"),
+        CheckConstraint(
+            "(quarantined_at IS NULL) = (quarantine_reason_code IS NULL)",
+            name=conv("ck_outbox_quarantine_pair"),
+        ),
+        CheckConstraint(
+            "broker_published_at IS NULL OR quarantined_at IS NULL",
+            name=conv("ck_outbox_delivery_state"),
+        ),
+        CheckConstraint(
+            "quarantine_reason_code IS NULL OR quarantine_reason_code IN "
+            "('UNSUPPORTED_SCHEMA_VERSION','UNKNOWN_TASK_KIND','INVALID_ENVELOPE')",
+            name=conv("ck_outbox_quarantine_reason_code"),
+        ),
+        Index(
+            "ix_outbox_analyze_cursor",
+            "created_at",
+            "id",
+            postgresql_where=text("task_kind = 'analyze' AND quarantined_at IS NULL"),
+        ),
         Index("ix_outbox_unpublished", "broker_published_at", "created_at"),
     )
 
@@ -597,6 +707,7 @@ class TaskLease(Base):
         UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=False, unique=True
     )
     owner: Mapped[str] = mapped_column(Text, nullable=False)
+    task_kind: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -606,6 +717,9 @@ class TaskLease(Base):
 
     __table_args__ = (
         CheckConstraint("fencing_token > 0", name="ck_task_lease_fencing_positive"),
+        CheckConstraint(
+            "task_kind IN ('analyze','publish')", name="ck_task_lease_task_kind"
+        ),
         Index("ix_task_lease_expires_at", "expires_at"),
     )
 
@@ -721,4 +835,78 @@ class IdempotencyRecord(Base):
     __table_args__ = (
         UniqueConstraint("scope", "idempotency_key", name="uq_idempotency_scope_key"),
         Index("ix_idempotency_record_expires_at", "expires_at"),
+    )
+
+
+class ReviewLlmAttempt(Base):
+    __tablename__ = "review_llm_attempt"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    review_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=False
+    )
+    chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    call_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    analysis_attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_owner: Mapped[str] = mapped_column(Text, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider_profile_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    model_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    model_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reserved_input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    actual_input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    actual_output_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="RESERVED")
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "call_kind IN ('initial', 'repair', 'overflow_rebuild')",
+            name=conv("ck_review_llm_attempt_kind"),
+        ),
+        CheckConstraint(
+            "analysis_attempt >= 1 AND fencing_token >= 1 AND "
+            "length(lease_owner) > 0 AND length(provider_profile_ref) > 0 "
+            "AND length(model_ref) > 0",
+            name=conv("ck_review_llm_attempt_identity"),
+        ),
+        CheckConstraint(
+            "reserved_input_tokens >= 0 AND reserved_output_tokens > 0 AND "
+            "(actual_input_tokens IS NULL OR actual_input_tokens >= 0) AND "
+            "(actual_output_tokens IS NULL OR actual_output_tokens >= 0)",
+            name=conv("ck_review_llm_attempt_tokens"),
+        ),
+        CheckConstraint(
+            "(state = 'RESERVED' AND settled_at IS NULL AND "
+            "actual_input_tokens IS NULL AND actual_output_tokens IS NULL "
+            "AND error_code IS NULL AND latency_ms IS NULL) OR (state = "
+            "'SUCCEEDED' AND settled_at IS NOT NULL AND error_code IS NULL) "
+            "OR (state = 'ERROR' AND settled_at IS NOT NULL AND error_code "
+            "IS NOT NULL)",
+            name=conv("ck_review_llm_attempt_state"),
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code ~ '^[a-z0-9_.-]{1,64}$'",
+            name=conv("ck_review_llm_attempt_error_code"),
+        ),
+        CheckConstraint(
+            "settled_at IS NULL OR settled_at >= reserved_at",
+            name=conv("ck_review_llm_attempt_time"),
+        ),
+        CheckConstraint(
+            "latency_ms IS NULL OR latency_ms >= 0",
+            name=conv("ck_review_llm_attempt_latency"),
+        ),
+        Index(
+            "ix_review_llm_attempt_review_operation", "review_job_id", "operation_id"
+        ),
     )

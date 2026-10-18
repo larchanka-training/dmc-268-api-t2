@@ -428,3 +428,15 @@ def test_prepare_review_excludes_uncovered_deleted_only_line(
 
     assert prepared.comments == ()
     assert "Не опубликованы inline: 1" in prepared.body
+
+
+def test_prepare_review_includes_retained_rule_reference(
+    payload_data: dict[str, Any],
+) -> None:
+    """AC-PREP-15: v2 rule reference survives publication of a saved finding."""
+    review = publication_input(payload_data)
+    review = replace(review, findings=(replace(review.findings[0], rule_ref="R1"),))
+
+    prepared = prepare_github_review(review)
+
+    assert "Правило: R1" in str(prepared.comments[0]["body"])

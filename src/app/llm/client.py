@@ -17,9 +17,14 @@ class LLMRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     messages: list[ChatMessage]
-    temperature: float = 0.0  # SD §7
+    temperature: float = Field(
+        default=0.0, ge=0, le=2, allow_inf_nan=False, strict=True
+    )
     max_output_tokens: int = Field(gt=0)
     timeout_s: float = Field(gt=0)
+    # Immutable serialized provider schema supplied by a verified prompt bundle.
+    # Generic/test callers may still use their response model's schema.
+    output_schema_json: str | None = None
 
 
 class LLMCallResult[T: BaseModel](BaseModel):
@@ -30,6 +35,8 @@ class LLMCallResult[T: BaseModel](BaseModel):
     input_tokens: int | None
     output_tokens: int | None
     model: str
+    # Actual response selector, distinct from the legacy configured-model fallback.
+    reported_model: str | None = None
     model_digest: str | None
     provider: str
     latency_ms: int
@@ -45,3 +52,13 @@ class BaseLLMClient(ABC):
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, response_model: type[T]
     ) -> LLMCallResult[T]: ...
+
+
+MAX_USAGE_TOKENS = 9_223_372_036_854_775_807
+
+
+def known_token_usage(value: object) -> int | None:
+    """Provider data never receives coercion or an unsafe token refund."""
+    if type(value) is int and 0 <= value <= MAX_USAGE_TOKENS:
+        return value
+    return None

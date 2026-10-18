@@ -1,10 +1,11 @@
-"""Review SSE entry point; session validation is supplied by auth #29."""
+"""Review SSE entry point with authoritative browser session revalidation."""
 
 import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass
+from http import HTTPStatus
 from time import monotonic
 from typing import Annotated
 from uuid import UUID
@@ -15,10 +16,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse, StreamingResponse
 from structlog.contextvars import get_contextvars
 
+from app.api.auth import get_verified_session
+from app.api.errors import ApiError
 from app.application.review_events import (
     EventReplayUnavailableError,
     ReviewAccessDeniedError,
 )
+from app.core.config import Settings, get_settings
 from app.db.review_events import SqlAlchemyReviewEvents
 from app.db.session import async_session_factory
 
@@ -34,9 +38,28 @@ class StreamPrincipal:
     revalidate: Callable[[], Awaitable[bool]]
 
 
-async def get_current_user(request: Request) -> StreamPrincipal | None:
-    """Fail closed until #29 wires its active DB session dependency here."""
-    return None
+async def get_current_user(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> StreamPrincipal:
+    """Reuse browser auth without holding a request-scoped DB session open."""
+    sessions = getattr(
+        request.app.state, "review_event_sessions", async_session_factory
+    )
+    async with sessions() as session:
+        verified = await get_verified_session(request, settings, session)
+
+    async def revalidate() -> bool:
+        try:
+            async with sessions() as session:
+                await get_verified_session(request, settings, session)
+        except ApiError as error:
+            if error.status != HTTPStatus.UNAUTHORIZED:
+                raise
+            return False
+        return True
+
+    return StreamPrincipal(verified.user_id, revalidate)
 
 
 def get_review_events(request: Request) -> SqlAlchemyReviewEvents:
@@ -105,7 +128,13 @@ async def review_stream(  # noqa: PLR0911 - explicit pre-header failure response
             )
 
         async def body() -> AsyncIterator[str]:  # noqa: PLR0911 - stop on lost access/disconnect
-            if not await principal.revalidate():
+            async def authorized() -> bool:
+                try:
+                    return await principal.revalidate()
+                except ApiError:
+                    return False
+
+            if not await authorized():
                 return
             payload = {"schema_version": 1, **asdict(page.snapshot)}
             yield (
@@ -119,7 +148,7 @@ async def review_stream(  # noqa: PLR0911 - explicit pre-header failure response
             heartbeat_at = monotonic()
             while True:
                 for event in current.events if replay else ():
-                    if not await principal.revalidate():
+                    if not await authorized():
                         return
                     payload = {"schema_version": 1, **asdict(event)}
                     yield (
@@ -145,7 +174,7 @@ async def review_stream(  # noqa: PLR0911 - explicit pre-header failure response
                 await asyncio.sleep(POLL_SECONDS)
                 if await request.is_disconnected():
                     return
-                if not await principal.revalidate():
+                if not await authorized():
                     return
                 previous = current.snapshot
                 try:
@@ -154,7 +183,7 @@ async def review_stream(  # noqa: PLR0911 - explicit pre-header failure response
                     )
                 except ReviewAccessDeniedError:
                     return
-                if not await principal.revalidate():
+                if not await authorized():
                     return
                 if current.snapshot != previous:
                     payload = {"schema_version": 1, **asdict(current.snapshot)}

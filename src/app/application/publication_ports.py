@@ -21,6 +21,7 @@ class PersistedFinding:
     evidence: str
     recommendation: str
     proposed_diff_fix: str | None
+    rule_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

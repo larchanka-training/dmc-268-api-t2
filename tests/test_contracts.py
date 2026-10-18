@@ -22,7 +22,8 @@ from app.application.ports import (
     ReviewFinding,
 )
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
-from app.domain.settings import compute_rules_digest
+from app.domain.settings import compute_rules_digest, render_rules
+from app.main import create_app
 
 ROOT = Path(__file__).parents[1]
 SCHEMAS = ROOT / "schemas"
@@ -104,6 +105,18 @@ def _api_validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(
         {"$ref": f"#/components/schemas/{name}", "components": document["components"]}
     )
+
+
+def test_github_oauth_start_documents_service_unavailable() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    responses = api["paths"]["/api/v1/auth/github/start"]["get"]["responses"]
+    assert responses["503"]["$ref"] == "#/components/responses/ServiceUnavailable"
+
+
+def test_generated_openapi_documents_github_oauth_start_service_unavailable() -> None:
+    api = create_app().openapi()
+    responses = api["paths"]["/api/v1/auth/github/start"]["get"]["responses"]
+    assert responses["503"]["description"] == "SERVICE_UNAVAILABLE"
 
 
 def test_repository_access_revalidation_has_safe_unavailable_response() -> None:
@@ -301,6 +314,53 @@ def _review_result() -> dict[str, Any]:
     return _load_json(SCHEMAS / "examples" / "review-result.v1.json")
 
 
+def _review_result_v2() -> dict[str, Any]:
+    return _load_json(SCHEMAS / "examples" / "review-result.v2.json")
+
+
+def test_review_result_v2_accepts_example_and_requires_rule_ref() -> None:
+    validator = _validator(SCHEMAS / "review-result" / "v2.json")
+    result = _review_result_v2()
+    validator.validate(result)
+
+    assert result["schema_version"] == 2  # noqa: PLR2004
+    finding = copy.deepcopy(result["findings"][0])
+    finding["rule_ref"] = None
+    validator.validate({**result, "findings": [finding]})
+
+    del finding["rule_ref"]
+    with pytest.raises(ValidationError):
+        validator.validate({**result, "findings": [finding]})
+
+    finding["rule_ref"] = "SHAPE-VALID-UNKNOWN"
+    validator.validate({**result, "findings": [finding]})
+
+
+def test_review_result_v2_rejects_v1_shape_and_foreign_labels_semantics() -> None:
+    validator = _validator(SCHEMAS / "review-result" / "v2.json")
+    result = _review_result_v2()
+
+    with pytest.raises(ValidationError):
+        validator.validate({**result, "schema_version": 1})
+
+    stripped = [
+        {k: v for k, v in finding.items() if k != "rule_ref"}
+        for finding in result["findings"]
+    ]
+    with pytest.raises(ValidationError):
+        validator.validate({**result, "findings": stripped})
+
+
+def test_llm_output_v2_separates_model_output_from_backend_metadata() -> None:
+    result = _review_result_v2()
+    output = {key: result[key] for key in ("summary", "findings", "limitations")}
+    validator = _validator(SCHEMAS / "llm-output" / "v2.json")
+    validator.validate(output)
+    output["schema_version"] = "model-owned"
+    with pytest.raises(ValidationError):
+        validator.validate(output)
+
+
 def test_review_result_accepts_canonical_example_and_nullable_usage() -> None:
     validator = _validator(SCHEMAS / "review-result" / "v1.json")
     result = _review_result()
@@ -458,6 +518,18 @@ def test_rules_digest_is_deterministic_and_instruction_order_is_significant() ->
     )
 
 
+def test_render_rules_joins_instructions_as_bullet_lines() -> None:
+    rules = {"instructions": ["[SEC-1] No eval", "Validate input"]}
+
+    assert render_rules(rules) == "- [SEC-1] No eval\n- Validate input"
+
+
+def test_render_rules_of_empty_or_missing_rules_is_empty() -> None:
+    assert render_rules(None) == ""
+    assert render_rules({}) == ""
+    assert render_rules({"instructions": []}) == ""
+
+
 def test_application_ports_use_provider_neutral_typed_contracts() -> None:
     ref = PullRequestRef(repository_external_id="100", ref="main", sha="abc")
     pull_request = OpenPullRequest(
@@ -483,10 +555,11 @@ def test_application_ports_use_provider_neutral_typed_contracts() -> None:
         explanation="Explanation",
         evidence="Evidence",
         recommendation="Recommendation",
+        rule_ref="SEC-1",
         proposed_diff_fix=None,
     )
     result = ReviewChunkResult(
-        schema_version=1,
+        schema_version=2,
         summary="Summary",
         limitations=[],
         usage=None,

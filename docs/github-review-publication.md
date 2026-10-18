@@ -67,39 +67,65 @@ invent recovery. The queue owner must provide pending recovery and dead-letter
 policy. The existing webhook worker is an intake worker, not a review publisher.
 No publication worker is started implicitly by importing the API.
 
-## PR #29 integration
+Run the publisher explicitly against the same PostgreSQL and Redis as the
+analysis worker, after applying migrations and supplying the write credentials:
 
-Compatibility baseline: PR #29 head
-`1a1361d5cd997dbc43aeae9b8d98e13a39f0d295`, based on main
-`23b80ff3d34b0be6a84b2fa18533b1bd1dcd2350`. It is a dependency; its analysis,
-queue and authentication implementation is not copied into main by #24.
+```bash
+uv run python -m app.publication_worker --once
+uv run python -m app.publication_worker --poll-interval 1
+```
 
-When combining the changes:
+`--once` performs one bounded dispatch/receive pass. Continuous mode polls new
+publish deliveries and stops cleanly on SIGTERM/SIGINT. No analysis runtime
+manifest or LLM credential is required by this process. It uses the persisted
+canonical result; the analysis worker and its dispatcher are separate processes
+described in `docs/examples/analysis-runtime.md`.
 
-The [event writer bridge](integrations/pr29-event-writers.patch) is a reviewable
-patch against that pinned #29 head after combining #24. It contains the writer
-changes and a real Outbox → Redis → publication worker → durable ACK regression.
-Check it with `git apply --check docs/integrations/pr29-event-writers.patch`
-before applying. Recheck the patch if #29 changes; it does not merge #29 or
-retarget migration `0008` automatically.
+`PostgresPublicationDispatcher` sends only useful finished analyses with
+`Publication=PENDING`, a future publication deadline and a valid canonical
+outbox envelope. It rechecks eligibility under database locks, respects
+quarantine, active leases and unresolved operations on the same PR, and reserves
+a 90-second dispatch cooldown before broker I/O. The existing review worker owns
+the publish lease, heartbeat, durable terminal proof and ACK.
 
-1. Preserve #29's `TaskLease.task_kind`, review routes and repositories. Retarget
-   migration `0008` from `0005` to #29's `0007`; `0009` remains after `0008`.
-   Main alone intentionally has `0005 → 0008 → 0009`.
-2. Replace #29's direct `ReviewEvent(...)` inserts in analysis transitions,
-   failures and format repair with `append_review_event` in the same transaction.
-   Preserve internal phase/attempt/details and record the publication status at
-   that transition. A raw insert without `sequence` fails after migration `0008`.
-3. Append the publication `PENDING` event in the same unit of work as
-   `PublicationRepository.prepare`. Keep the existing atomic publish-outbox
-   creation; do not enqueue again in the publisher.
-4. Inject the publication handler into the existing `TaskHandlerPort` dispatch,
-   reusing worker leases and heartbeat. The completion result is compatible with
-   the worker's existing durable proof. Recovery for `FAILED/UNKNOWN` is still a
-   queue integration requirement.
-5. Bind SSE authentication to an active PostgreSQL session as described below.
-   Real session authentication and the production analysis composition root are
-   prerequisites for automatic end-to-end operation.
+The CLI does **not** run analyze-only pending recovery against the publish
+stream. Deliveries left pending by a crash or `FAILED/UNKNOWN` stay unacknowledged
+for explicit operator/queue-owner recovery. The continuous process logs only a
+safe deferred error type and continues with new deliveries; it never infers
+permission for another POST. `--once` exits unsuccessfully for these errors.
+Reconciliation still requires a separately granted live read-only authority;
+this CLI does not allocate it or expose a retry API.
+
+The default Compose `worker` service remains the existing sleep placeholder.
+Starting the API or updating its image does not activate either review worker.
+Enable the dedicated processes in the target environment as an explicit deploy
+step; browser OAuth also requires its own runtime auth settings.
+
+## Integrated dependencies (18 October 2026)
+
+The implementation is combined with main `6bc9542`, including merged PR #29
+(queue, durable analysis runtime, sessions and OAuth), #31 (versioned findings,
+rule references and reflection), and #32 (Fernet configuration).
+
+- Preserve the accepted migrations `0001`–`0014`. The previously unmerged #24
+  event and operation migrations are now `0015` and `0016`; existing deployed
+  migrations are not renumbered. Recreate any disposable database that applied
+  the old draft #24 `0008/0009` revisions before testing this branch.
+- Analysis transitions and retry audit use `append_review_event` in the same
+  unit of work, preserving phase, execution attempt, reason and safe details.
+  Publication preparation appends `PUBLICATION_PENDING` atomically with its
+  state change; the analysis handler keeps its existing publish outbox enqueue.
+- The publisher reuses the current worker, task-kind lease and durable ACK proof.
+  Publication transport is separate from the analysis dispatcher: it sends only
+  canonical `publish` commands and does not activate analyze recovery for them.
+- Both v1 findings and retained v2 `rule_ref` are supported. A saved rule
+  reference is included in the inline body; it is never invented by Publisher.
+- SSE uses the merged JWT-cookie/PostgreSQL session verifier. No authentication
+  override is required in production.
+
+The old pinned-#29 event-writer patch has been removed: its changes now live in
+these modules and are checked against the merged dependency, not a scratch-only
+copy. The UI nginx companion PR #24 was merged on 14 October.
 
 ## SSE contract
 
@@ -107,12 +133,12 @@ retarget migration `0008` automatically.
 `/events` JSON contract is unchanged. The stream returns `text/event-stream`,
 `Cache-Control: no-cache` and `X-Accel-Buffering: no`.
 
-The default `get_current_user` dependency fails closed with `401`. Override it
-with the application's session dependency returning
-`StreamPrincipal(user_id, revalidate)`. `revalidate` must check session expiry,
-revocation and the active user against PostgreSQL; accepting an arbitrary UUID
-or relying on the browser alone is insufficient. Repository access is checked
-on initial read and each poll. Access loss closes an already started stream.
+The `get_current_user` dependency calls the shared `get_verified_session` verifier
+using a short database session. The cookie JWT, active session, expiry/revocation
+and GitHub identity are checked before streaming and during delivery. Repository
+access is checked on initial read and every poll. No auth connection or database
+transaction is held for the stream lifetime. Session/access loss closes an
+already started stream; database failure before headers remains a safe `503`.
 
 Events:
 
@@ -154,8 +180,8 @@ Set `DMC268_RUN_DOCKER_TESTS=1` to include the production-image check.
 Tests replace the GitHub HTTP boundary with GitHub-shaped responses and use real
 services and PostgreSQL. Lost POST responses, stale PRs, actor/commit/range
 proof, paging, fencing, partial output, reconciliation, auth expiry and replay
-are covered. A real-PR acceptance run still requires the integrated worker,
-active session auth, a provisioned bot credential and an approved target PR.
+are covered. A real-PR acceptance run requires running the integrated processes,
+configuring session auth and a bot credential, and an approved target PR.
 Local tests do not claim that external acceptance step was executed.
 
 GitHub API reference: [pull request reviews](https://docs.github.com/en/rest/pulls/reviews),

@@ -6,6 +6,9 @@ provider/model provenance and request counts stay backend-side; ``usage`` is
 reported only when both token counts are known.
 """
 
+import uuid
+
+from app.application.analysis_ports import ReviewRunBudgetPort
 from app.application.ports import (
     BuiltContextPayload,
     ReviewChunkResult,
@@ -17,8 +20,6 @@ from app.review.schemas.context import ContextPayload
 from app.review.schemas.finding import ValidatedFinding
 from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome
 from app.review.service import ReviewService
-
-_SCHEMA_VERSION = 1
 
 
 class ChunkReviewFailedError(Exception):
@@ -35,12 +36,20 @@ class ChunkReviewFailedError(Exception):
 class LlmGatewayAdapter:
     """One instance per review run: ``budget`` is shared by its chunks."""
 
-    def __init__(self, service: ReviewService, budget: RunBudget) -> None:
+    def __init__(
+        self, service: ReviewService, budget: RunBudget | ReviewRunBudgetPort
+    ) -> None:
         self._service = service
         self._budget = budget
+        self._review_id: uuid.UUID | None = None
 
     async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
         context = ContextPayload.model_validate(payload.to_wire())
+        if self._review_id is None:
+            self._review_id = payload.review_id
+        elif self._review_id != payload.review_id:
+            msg = "LlmGatewayAdapter and its budget belong to one review run"
+            raise ValueError(msg)
         outcome = await self._service.review_chunk(context, self._budget)
         if outcome.status == ChunkStatus.FAILED:
             raise ChunkReviewFailedError(outcome)
@@ -55,7 +64,7 @@ def to_port_result(outcome: ReviewChunkOutcome) -> ReviewChunkResult:
         else None
     )
     return ReviewChunkResult(
-        schema_version=_SCHEMA_VERSION,
+        schema_version=outcome.schema_version,
         summary=outcome.summary or "",  # always set for COMPLETED
         limitations=list(outcome.limitations),
         usage=tokens,
@@ -76,5 +85,6 @@ def _to_port_finding(finding: ValidatedFinding) -> ReviewFinding:
         explanation=finding.explanation,
         evidence=finding.evidence,
         recommendation=finding.recommendation,
+        rule_ref=finding.rule_ref,
         proposed_diff_fix=finding.proposed_diff_fix,
     )

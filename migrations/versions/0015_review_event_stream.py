@@ -1,7 +1,7 @@
 """Sequence durable review events and preserve publication status per event.
 
-Revision ID: 0008
-Revises: 0005 (retarget to PR #29's 0007 when that branch is integrated)
+Revision ID: 0015
+Revises: 0014
 """
 
 from collections.abc import Sequence
@@ -9,8 +9,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0008"
-down_revision: str | None = "0005"
+revision: str = "0015"
+down_revision: str | None = "0014"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

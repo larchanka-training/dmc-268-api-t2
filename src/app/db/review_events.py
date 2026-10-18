@@ -66,7 +66,7 @@ async def append_review_event(  # noqa: PLR0913 - explicit persisted audit field
         reason_code=reason_code,
         retryable=retryable,
         attempt=attempt,
-        safe_details=safe_details if safe_details is not None else {},
+        **({"safe_details": safe_details} if safe_details else {}),
     )
     session.add(event)
     await session.flush()

@@ -7,6 +7,10 @@ and keys never go into error messages.
 
 class LLMGatewayError(Exception):
     error_code = "llm_error"
+    retryable = False
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
 
     def __init__(self, message: str = "") -> None:
         super().__init__(message or self.error_code)
@@ -16,6 +20,7 @@ class RateLimitedError(LLMGatewayError):
     """HTTP 429: the key/endpoint goes into cooldown."""
 
     error_code = "rate_limited"
+    retryable = True
 
     def __init__(self, retry_after: float | None = None) -> None:
         super().__init__()
@@ -26,10 +31,15 @@ class TransientProviderError(LLMGatewayError):
     """HTTP 500/502/503/504, connect/read timeouts, protocol errors."""
 
     error_code = "provider_unavailable"
+    retryable = True
 
     def __init__(self, message: str = "", *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class ProviderTimeoutError(TransientProviderError):
+    error_code = "provider_timeout"
 
 
 class AuthError(LLMGatewayError):
@@ -55,8 +65,19 @@ class SchemaValidationError(LLMGatewayError):
 
     error_code = "invalid_llm_output"
 
-    def __init__(self, details: list[str], raw_text: str) -> None:
+    def __init__(
+        self,
+        details: list[str],
+        raw_text: str,
+        *,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+    ) -> None:
         super().__init__()
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.latency_ms = latency_ms
         self.details = details
         # Kept only for the single format-repair request; never logged.
         self.raw_text = raw_text
@@ -65,12 +86,25 @@ class SchemaValidationError(LLMGatewayError):
 class BudgetExceededError(LLMGatewayError):
     error_code = "budget_exceeded"
 
+    def __init__(
+        self, message: str = "", *, error_code: str = "budget_exceeded"
+    ) -> None:
+        self.error_code = error_code
+        super().__init__(message)
+
 
 class LLMUnavailableError(LLMGatewayError):
     """All endpoints failed after the allowed attempts."""
 
     error_code = "llm_unavailable"
 
-    def __init__(self, last_error_code: str) -> None:
+    def __init__(self, last_error_code: str, *, retryable: bool = False) -> None:
         super().__init__(f"all providers failed, last error: {last_error_code}")
         self.last_error_code = last_error_code
+        self.retryable = retryable
+
+
+class ModelIdentityError(LLMGatewayError):
+    """The paid response is unusable under the frozen profile's model identity."""
+
+    error_code = "unexpected_model_identity"

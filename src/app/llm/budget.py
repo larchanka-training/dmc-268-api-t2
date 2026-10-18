@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from app.core.config import LLM
+from app.domain.frozen_configuration import ExecutionSettings
 from app.llm.errors import BudgetExceededError
 
 
@@ -15,14 +16,18 @@ class BudgetLimits:
     max_output_tokens: int
     deadline_s: float
     max_format_repairs: int = 1
+    max_reflections: int = 0  # 0 = Reflection Pass is off (issue #25)
 
     @classmethod
-    def from_settings(cls, settings: LLM) -> BudgetLimits:
+    def from_settings(cls, settings: LLM | ExecutionSettings) -> BudgetLimits:
         return cls(
             max_requests=settings.run_max_requests,
             max_input_tokens=settings.run_max_input_tokens,
             max_output_tokens=settings.run_max_output_tokens,
             deadline_s=settings.run_deadline_s,
+            max_reflections=(
+                settings.run_max_reflections if isinstance(settings, LLM) else 0
+            ),
         )
 
 
@@ -35,6 +40,7 @@ class BudgetState:
     input_tokens_used: int = 0
     output_tokens_used: int = 0
     format_repairs_used: int = 0
+    reflections_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,14 @@ class RunBudget:
         if used.format_repairs_used >= self._limits.max_format_repairs:
             return False
         self._state = replace(used, format_repairs_used=used.format_repairs_used + 1)
+        return True
+
+    def try_use_reflection(self) -> bool:
+        """Consume one Reflection Pass verification; False when spent/off."""
+        used = self._state
+        if used.reflections_used >= self._limits.max_reflections:
+            return False
+        self._state = replace(used, reflections_used=used.reflections_used + 1)
         return True
 
     def remaining_s(self) -> float:

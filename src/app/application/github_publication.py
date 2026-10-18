@@ -158,8 +158,10 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
             "line": item.end_line,
             "side": "LEFT" if item.side == "OLD" else "RIGHT",
             "body": mask_secrets(
-                f"**{item.severity}: {item.title}**\n\n{item.explanation}\n\n"
-                f"{item.recommendation}\n\n<!-- dmc268-finding:{item.fingerprint} -->"
+                f"**{item.severity}: {item.title}**\n\n"
+                + (f"Правило: {item.rule_ref}\n\n" if item.rule_ref else "")
+                + f"{item.explanation}\n\n{item.recommendation}\n\n"
+                f"<!-- dmc268-finding:{item.fingerprint} -->"
             ),
             **(
                 {

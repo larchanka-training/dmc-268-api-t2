@@ -74,3 +74,19 @@ class GithubWriteFailure(GithubFailure):
 
 class GithubPort(Protocol):
     async def fetch(self, request: GithubRequest) -> GithubSnapshot: ...
+
+
+class GithubRepositoryReader(Protocol):
+    """Current read access, using only the authenticated user's credentials."""
+
+    async def list_available_repositories(
+        self, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]: ...
+
+    async def get_repository(self, external_id: str) -> dict[str, Any]: ...
+
+    async def has_read_access(self, external_id: str) -> bool: ...
+
+    async def list_pull_requests(
+        self, external_id: str, owner: str, name: str, *, limit: int, page: int
+    ) -> tuple[list[dict[str, Any]], int | None]: ...

@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -12,7 +13,7 @@ import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import insert, literal, select, tuple_, update
+from sqlalchemy import delete, insert, literal, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -379,6 +380,43 @@ async def connect_repository(
             "can_manage_settings": role == "admin",
         },
     }
+
+
+@router.delete(
+    "/{id}/connection",
+    status_code=204,
+    operation_id="disconnectRepository",
+    responses={
+        401: {"description": "AUTHENTICATION_REQUIRED"},
+        403: {"description": "ACCESS_DENIED"},
+        404: {"description": "RESOURCE_NOT_FOUND"},
+        503: {"description": "SERVICE_UNAVAILABLE"},
+    },
+)
+async def disconnect_repository(
+    id: str,
+    verified: Annotated[VerifiedSession, Depends(get_verified_mutation_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    try:
+        repository_id = UUID(id)
+    except ValueError:
+        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.") from None
+    try:
+        await session.execute(
+            delete(RepositoryAccess).where(
+                RepositoryAccess.repository_id == repository_id,
+                RepositoryAccess.user_id == verified.user_id,
+            )
+        )
+        await session.commit()
+    except SQLAlchemyError, OSError:
+        with suppress(SQLAlchemyError, OSError):
+            await session.rollback()
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
+    return Response(status_code=204)
 
 
 def _decode_available_cursor(cursor: str, user_id: UUID, limit: int) -> int:

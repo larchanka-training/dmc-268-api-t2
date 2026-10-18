@@ -213,6 +213,31 @@ paths:
         '403': { $ref: '#/components/responses/AccessDenied' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/repositories/{id}/connection:
+    delete:
+      tags: [repositories]
+      operationId: disconnectRepository
+      description: >-
+        Removes only the current user's RepositoryAccess without contacting
+        GitHub. Repository, settings, review history, accepted jobs,
+        publications, OAuth credentials and other users' access are preserved.
+        Every valid UUID returns 204 when the user's connection is absent,
+        including unknown repositories. Repeated DELETE is safe. Invalid UUID
+        returns 404. A database or required configuration failure returns 503;
+        if the connection fails after commit, the outcome may be unknown and
+        DELETE can be retried safely. Reconnecting reuses the same Repository
+        ID, settings and history after checking current GitHub permissions.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '204':
+          description: The current user's connection is absent; no response body
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/repositories/{id}/pull-requests:
     get:
       tags: [repositories]

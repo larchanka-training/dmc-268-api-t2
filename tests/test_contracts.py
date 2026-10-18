@@ -143,6 +143,44 @@ def test_repository_connection_contract_matches_ui_sprint_two_flow() -> None:
         )
 
 
+def test_repository_disconnect_contract_is_personal_idempotent_and_bodyless() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    disconnect = api["paths"]["/api/v1/repositories/{id}/connection"]["delete"]
+    assert disconnect["operationId"] == "disconnectRepository"
+    assert disconnect["security"] == [{"cookieAuth": [], "csrfHeader": []}]
+    assert disconnect["parameters"] == [
+        {"$ref": "#/components/parameters/RepositoryId"},
+        {"$ref": "#/components/parameters/Origin"},
+    ]
+    assert "requestBody" not in disconnect
+    responses = disconnect["responses"]
+    assert set(responses) == {"204", "401", "403", "404", "503"}
+    assert "content" not in responses["204"]
+    assert responses["401"]["$ref"] == "#/components/responses/AuthenticationRequired"
+    assert responses["403"]["$ref"] == "#/components/responses/AccessDenied"
+    assert responses["404"]["$ref"] == "#/components/responses/ResourceNotFound"
+    assert responses["503"]["$ref"] == "#/components/responses/ServiceUnavailable"
+
+
+def test_generated_openapi_documents_repository_disconnect_outcomes() -> None:
+    api = create_app().openapi()
+    disconnect = api["paths"]["/api/v1/repositories/{id}/connection"]["delete"]
+    assert disconnect["operationId"] == "disconnectRepository"
+    assert "requestBody" not in disconnect
+    repository_id = next(
+        parameter
+        for parameter in disconnect["parameters"]
+        if parameter["name"] == "id" and parameter["in"] == "path"
+    )
+    assert repository_id["required"] is True
+    assert repository_id["schema"]["type"] == "string"
+    assert "format" not in repository_id["schema"]
+    responses = disconnect["responses"]
+    assert "content" not in responses["204"]
+    assert responses["503"]["description"] == "SERVICE_UNAVAILABLE"
+    assert {"204", "401", "403", "404", "503"} <= responses.keys()
+
+
 def test_session_refresh_contract_requires_active_session_origin_and_csrf() -> None:
     api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
     refresh = api["paths"]["/api/v1/auth/refresh"]["post"]
@@ -603,6 +641,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories", "get"),
         ("/api/v1/repositories/available", "get"),
         ("/api/v1/repositories/connect", "post"),
+        ("/api/v1/repositories/{id}/connection", "delete"),
         ("/api/v1/repositories/{id}/pull-requests", "get"),
         ("/api/v1/repositories/{id}/settings", "get"),
         ("/api/v1/repositories/{id}/settings", "put"),

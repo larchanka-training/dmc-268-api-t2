@@ -435,6 +435,59 @@ async def test_missing_or_invalid_auth_configuration_fails_closed_at_runtime(
     assert (await browser.get("/healthcheck")).status_code == HTTPStatus.OK
 
 
+async def test_start_rejects_fernet_key_missing_one_trailing_padding_character(
+    browser: httpx.AsyncClient,
+    auth_settings: Settings,
+    github_requests: list[httpx.Request],
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    valid_key = auth_settings.auth.credential_key.get_secret_value()
+    assert valid_key.endswith("=")
+    truncated_key = valid_key[:-1]
+    # Settings construction stays lazy, even for this precise malformed key.
+    auth_settings.auth = Settings.model_validate(
+        {"auth": auth_settings.auth.model_dump() | {"credential_key": truncated_key}}
+    ).auth
+    assert (await browser.get("/healthcheck")).status_code == HTTPStatus.OK
+
+    unavailable = await browser.get("/api/v1/auth/github/start", follow_redirects=False)
+    assert unavailable.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert unavailable.json() == {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "Service is unavailable.",
+        "request_id": unavailable.headers["x-request-id"],
+        "retryable": True,
+        "retry_after": None,
+    }
+    assert "location" not in unavailable.headers
+    assert "set-cookie" not in unavailable.headers
+    assert not github_requests
+    captured = capsys.readouterr()
+    outputs = (
+        unavailable.text
+        + str(unavailable.headers)
+        + captured.out
+        + captured.err
+        + caplog.text
+    )
+    for secret in (
+        valid_key,
+        truncated_key,
+        auth_settings.auth.jwt_secret.get_secret_value(),
+        auth_settings.auth.github_client_secret.get_secret_value(),
+    ):
+        assert secret not in outputs
+
+    auth_settings.auth.credential_key = SecretStr(valid_key)
+    available = await browser.get("/api/v1/auth/github/start", follow_redirects=False)
+    assert available.status_code == HTTPStatus.FOUND
+    assert available.headers["location"].startswith(
+        "https://github.com/login/oauth/authorize?"
+    )
+    assert "__Host-dmc_oauth=" in available.headers["set-cookie"]
+
+
 @pytest.mark.parametrize(
     "failure",
     [

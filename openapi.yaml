@@ -34,6 +34,7 @@ paths:
           headers:
             Location: { schema: { type: string } }
         '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/auth/github/callback:
     get:
       tags: [auth]

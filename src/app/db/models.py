@@ -438,6 +438,8 @@ class ReviewEvent(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    publication_status: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     phase: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -448,6 +450,13 @@ class ReviewEvent(Base):
     review_job: Mapped[ReviewJob] = relationship(back_populates="events")
 
     __table_args__ = (
+        UniqueConstraint("review_job_id", "sequence", name="uq_review_event_sequence"),
+        CheckConstraint("sequence >= 1", name="ck_review_event_sequence_positive"),
+        CheckConstraint(
+            "publication_status IS NULL OR publication_status IN "
+            "('NOT_READY','PENDING','PUBLISHED','PARTIAL','FAILED','UNKNOWN','SKIPPED')",
+            name="ck_review_event_publication_status",
+        ),
         CheckConstraint(
             "status IN "
             "('QUEUED','FETCHING_DIFF','PARSING_CONTEXT','LLM_PROCESSING',"

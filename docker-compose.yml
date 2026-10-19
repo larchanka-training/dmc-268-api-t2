@@ -29,7 +29,6 @@ services:
     # Заглушка вместо реального воркера: юнит деплоя существует уже сейчас,
     # логику очереди добавит задача про фоновые воркеры.
     command: ["sleep", "infinity"]
-    env_file: .env
     depends_on:
       db:
         condition: service_healthy

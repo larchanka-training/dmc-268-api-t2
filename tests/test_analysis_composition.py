@@ -298,6 +298,7 @@ async def test_production_configuration_failures_are_terminal_before_external_io
                 select(ReviewEvent).where(
                     ReviewEvent.review_job_id == review_id,
                     ReviewEvent.status == view["status"],
+                    ReviewEvent.event_type == "TRANSITION",
                 )
             )
         ).one()

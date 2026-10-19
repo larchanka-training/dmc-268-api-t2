@@ -301,6 +301,11 @@ async def test_pipeline_persists_valid_analysis_and_publication_handoff(  # noqa
         "LLM_PROCESSING",
         "COMPLETED",
     }
+    assert [
+        event.publication_status
+        for event in events
+        if event.event_type == "PUBLICATION_PENDING"
+    ] == ["PENDING"]
     assert publication.status == "PENDING" and publication.finished_at is None
     assert publication.started_at is not None and publication.deadline_at is not None
     assert publish.trace_id == "trace-analysis"

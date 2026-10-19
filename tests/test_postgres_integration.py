@@ -52,6 +52,13 @@ class PostgresHarness:
 
     async def cleanup(self) -> None:
         async with self.engine.begin() as connection:
+            review_ids = self.ids.get("review_job", set())
+            if review_ids:
+                await connection.execute(
+                    delete(models.ReviewEvent).where(
+                        models.ReviewEvent.review_job_id.in_(review_ids)
+                    )
+                )
             repository_ids = self.ids.get("repository", set())
             if repository_ids:
                 repository = Base.metadata.tables["repository"]
@@ -729,7 +736,7 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0014"
+        ).scalar_one() == "0016"
 
         result = await connection.execute(
             text(

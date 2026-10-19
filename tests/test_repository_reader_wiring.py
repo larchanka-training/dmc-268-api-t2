@@ -274,14 +274,18 @@ async def test_catalog_deadline_fails_without_partial_page_and_closes_http(
     catalog = wired_catalog
     await catalog.connect("alpha", "app")
     await catalog.connect("beta", "app")
+    # The real DB scan precedes the slow body; leave time to open the resource
+    # whose cancellation cleanup this parameter verifies.
     monkeypatch.setattr(
-        "app.api.repositories._READ_TIMEOUT_SECONDS", 0.04, raising=False
+        "app.api.repositories._READ_TIMEOUT_SECONDS",
+        0.25 if phase == "body" else 0.04,
+        raising=False,
     )
     closed: set[str] = set()
 
     class SlowBody(httpx.AsyncByteStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.5)
             yield b"{}"
 
         async def aclose(self) -> None:

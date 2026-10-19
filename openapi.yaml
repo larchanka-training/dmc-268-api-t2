@@ -477,6 +477,64 @@ paths:
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
+  /api/v1/reviews/{id}/events/stream:
+    get:
+      tags: [reviews]
+      operationId: streamReviewEvents
+      description: >-
+        Additive SSE endpoint; the JSON /events history is unchanged. Requires
+        the same active session and repository access on every database read.
+        Starts with a consistent current review.snapshot and its high-watermark
+        sequence, then emits persisted review.event records in sequence order.
+        Snapshots describe current state; replayed events are historical journal
+        entries and must not replace a newer snapshot in the UI. Only event
+        records carry SSE id v1:<review_id>:<sequence>. Without Last-Event-ID the
+        stream starts live after the snapshot watermark. With Last-Event-ID it
+        replays strictly later retained events, then continues live. Malformed
+        or cross-review cursors return 422. Unavailable or future cursors return
+        409 EVENT_REPLAY_UNAVAILABLE; reconnect without a cursor to resync.
+        Heartbeat comments have no id and create no domain events. The stream
+        closes after terminal analysis with settled publication, and after
+        FAILED or SKIPPED analysis whose publication is still NOT_READY.
+        It also closes on client disconnect, session expiry or repository
+        access revocation. Expiry and
+        revocation never redirect to OAuth; the UI checks /me and reconnects
+        after refresh or OAuth. Initial snapshots have no SSE id. Legacy event
+        publication_status may be null because its historical value is unknown.
+        No prompt, source, model reasoning, phase, attempt or safe_details are
+        exposed. Auth #29 must wire the fail-closed principal dependency before
+        authenticated runtime use. Future retention must preserve the latest
+        sequence anchor or introduce a permanent per-review counter.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string, maxLength: 64 }
+          description: Review-scoped cursor previously received as an SSE id.
+      x-sse-events:
+        review.snapshot: { $ref: '#/components/schemas/ReviewStreamSnapshot' }
+        review.event: { $ref: '#/components/schemas/ReviewStreamEvent' }
+      responses:
+        '200':
+          description: Current state followed by committed replay and live events.
+          headers:
+            Cache-Control: { schema: { const: no-cache } }
+            X-Accel-Buffering: { schema: { const: 'no' } }
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '409':
+          description: EVENT_REPLAY_UNAVAILABLE; reconnect without a cursor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/reviews/{id}/publication-retries:
     post:
       tags: [reviews]
@@ -655,7 +713,7 @@ components:
       enum: [NOT_READY, PENDING, PUBLISHED, PARTIAL, FAILED, UNKNOWN, SKIPPED]
     ErrorCode:
       type: string
-      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE]
+      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE, EVENT_REPLAY_UNAVAILABLE]
     Error:
       type: object
       additionalProperties: false
@@ -1002,6 +1060,31 @@ components:
         occurred_at: { type: string, format: date-time }
         event_type: { type: string }
         status: { $ref: '#/components/schemas/ReviewStatus' }
+        reason_code: { oneOf: [{ $ref: '#/components/schemas/ReasonCode' }, { type: 'null' }] }
+        retryable: { type: boolean }
+    ReviewStreamSnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema_version, review_id, sequence, status, publication_status]
+      properties:
+        schema_version: { const: 1 }
+        review_id: { type: string, format: uuid }
+        sequence: { type: integer, minimum: 0 }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        publication_status: { $ref: '#/components/schemas/PublicationStatus' }
+    ReviewStreamEvent:
+      type: object
+      additionalProperties: false
+      required: [schema_version, review_id, sequence, id, occurred_at, event_type, status, publication_status, reason_code, retryable]
+      properties:
+        schema_version: { const: 1 }
+        review_id: { type: string, format: uuid }
+        sequence: { type: integer, minimum: 1 }
+        id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        event_type: { type: string }
+        status: { $ref: '#/components/schemas/ReviewStatus' }
+        publication_status: { oneOf: [{ $ref: '#/components/schemas/PublicationStatus' }, { type: 'null' }] }
         reason_code: { oneOf: [{ $ref: '#/components/schemas/ReasonCode' }, { type: 'null' }] }
         retryable: { type: boolean }
     ReviewEventPage:

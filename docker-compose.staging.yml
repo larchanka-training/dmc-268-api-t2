@@ -45,6 +45,8 @@ services:
       # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
       WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
       GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+      GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
+      GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
     depends_on:
       db:
         condition: service_healthy

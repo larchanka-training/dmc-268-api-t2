@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +22,33 @@ class GithubSnapshot:
     raw_diff: str
 
 
+@dataclass(frozen=True, slots=True)
+class GithubReviewReference:
+    remote_review_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class GithubRemoteReview:
+    remote_review_id: str
+    body: str
+    commit_id: str
+    author_id: str
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class GithubRemoteComment:
+    remote_comment_id: str
+    body: str
+    path: str
+    line: int | None
+    start_line: int | None
+    side: str | None
+    start_side: str | None
+    commit_id: str
+    author_id: str
+
+
 class GithubFailure(Exception):  # noqa: N818 - public gateway contract
     def __init__(
         self, reason_code: str, retryable: bool, retry_after: int | None = None
@@ -30,6 +57,19 @@ class GithubFailure(Exception):  # noqa: N818 - public gateway contract
         self.retryable = retryable
         self.retry_after = retry_after
         super().__init__(reason_code)
+
+
+class GithubWriteFailure(GithubFailure):
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        remote_effect: Literal["absent", "unknown"],
+        retryable: bool = False,
+        retry_after: int | None = None,
+    ) -> None:
+        self.remote_effect = remote_effect
+        super().__init__(reason_code, retryable, retry_after)
 
 
 class GithubPort(Protocol):

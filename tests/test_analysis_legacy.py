@@ -93,7 +93,10 @@ async def test_legacy_job_terminalizes_without_inference_or_identity_rewrite(
         ) == identity
         event = (
             await session.scalars(
-                select(ReviewEvent).where(ReviewEvent.review_job_id == review_id)
+                select(ReviewEvent).where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.event_type == "TRANSITION",
+                )
             )
         ).one()
         assert event.safe_details == {

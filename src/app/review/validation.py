@@ -11,7 +11,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 from app.domain.enums import FindingSide
-from app.review.schemas.context import ContextPayload, Hunk, LineKind
+from app.review.schemas.context import ContextPayload, FileDiff, Hunk, LineKind
 from app.review.schemas.finding import LLMFindingV1, ValidatedFinding
 from app.review.schemas.result import ReviewChunkOutcome
 
@@ -149,12 +149,15 @@ def _has_evidence(finding: LLMFindingV1) -> bool:
 
 
 def _hits_changed_lines(finding: LLMFindingV1, payload: ContextPayload) -> bool:
+    return has_changed_anchor(finding, [file.diff for file in payload.files])
+
+
+def has_changed_anchor(finding: LLMFindingV1, files: list[FileDiff]) -> bool:
     """``start_line`` is a changed line of its side; the whole
     ``start_line..end_line`` range lies inside the same hunk (context lines
     allowed after the start)."""
     side, start = finding.side, finding.start_line
-    for file in payload.files:
-        diff = file.diff
+    for diff in files:
         path = diff.new_path if side == FindingSide.NEW else diff.old_path
         if path != finding.path:
             continue

@@ -43,6 +43,17 @@ class Webhook(BaseModel):
 
 class Github(BaseModel):
     token: SecretStr = SecretStr("")
+    write_token: SecretStr = SecretStr("")
+    bot_user_id: str = ""
+
+    @field_validator("bot_user_id")
+    @classmethod
+    def _canonical_bot_id(cls, value: str) -> str:
+        if value and (
+            not value.isascii() or not value.isdecimal() or value.startswith("0")
+        ):
+            raise ValueError("GITHUB__BOT_USER_ID must be a positive numeric string")
+        return value
 
 
 class Auth(BaseModel):

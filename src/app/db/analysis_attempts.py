@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 
-from sqlalchemy import func, insert, literal, select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_ports import BeginAnalysisDecision
@@ -12,7 +12,8 @@ from app.db.analysis_authority import (
     lock_analysis,
     validate_config_identity,
 )
-from app.db.models import ReviewEvent, ReviewJob
+from app.db.models import Publication, ReviewJob
+from app.db.review_events import append_review_event
 from app.domain.enums import ReviewReasonCode
 from app.domain.frozen_configuration import FrozenConfigurationError, ModelSettings
 
@@ -156,35 +157,35 @@ class PostgresAnalysisAttemptStore:
             )
             if changed is None:
                 raise LeaseLostError("Retry authority expired")
-            event = await session.scalar(
-                insert(ReviewEvent)
-                .from_select(
-                    [
-                        "review_job_id",
-                        "event_type",
-                        "status",
-                        "phase",
-                        "reason_code",
-                        "retryable",
-                        "attempt",
-                        "safe_details",
-                    ],
-                    select(
-                        literal(job.id),
-                        literal("FAILURE"),
-                        literal(job.status),
-                        literal(job.status),
-                        literal(reason.value),
-                        literal(True),
-                        literal(job.analysis_attempts),
-                        literal(
-                            {"error_code": error_code},
-                            type_=ReviewEvent.safe_details.type,
-                        ),
-                    ).where(live_fence(lease)),
+            await append_review_event(
+                session,
+                job.id,
+                event_type="FAILURE",
+                publication_status=(
+                    await session.scalar(
+                        select(Publication.status).where(
+                            Publication.review_job_id == job.id
+                        )
+                    )
                 )
-                .returning(ReviewEvent.id)
+                or "NOT_READY",
+                phase=job.status,
+                reason_code=reason.value,
+                retryable=True,
+                attempt=job.analysis_attempts,
+                safe_details={"error_code": error_code},
             )
-            if event is None:
+            if (
+                await session.scalar(
+                    select(ReviewJob.id).where(
+                        ReviewJob.id == job.id,
+                        ReviewJob.finished_at.is_(None),
+                        live_fence(lease),
+                        ReviewJob.analysis_attempt_fence == lease.fencing_token,
+                        ReviewJob.analysis_deadline_at > func.clock_timestamp(),
+                    )
+                )
+                is None
+            ):
                 raise LeaseLostError("Retry audit authority expired")
         return True

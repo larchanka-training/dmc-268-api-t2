@@ -359,6 +359,8 @@ jobs:
           EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
           GITHUB_API_TOKEN: ${{ secrets.GITHUB__TOKEN }}
+          GITHUB_PUBLISH_TOKEN: ${{ secrets.GITHUB__WRITE_TOKEN }}
+          GITHUB_BOT_USER_ID: ${{ secrets.GITHUB__BOT_USER_ID }}
         shell: bash
         run: |
           set -euo pipefail
@@ -392,6 +394,8 @@ jobs:
             # naming convention in docs/staging-deployment.md.
             append_optional 'WEBHOOK__SECRET' "${WEBHOOK_SECRET:-}"
             append_optional 'GITHUB__TOKEN' "${GITHUB_API_TOKEN:-}"
+            append_optional 'GITHUB__WRITE_TOKEN' "${GITHUB_PUBLISH_TOKEN:-}"
+            append_optional 'GITHUB__BOT_USER_ID' "${GITHUB_BOT_USER_ID:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \

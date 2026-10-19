@@ -35,15 +35,16 @@ from app.db.models import (
     ContextPayload,
     Finding,
     OutboxEvent,
+    Publication,
     Repository,
     RepositorySettings,
-    ReviewEvent,
     ReviewJob,
 )
 from app.db.repositories import (
     SqlAlchemyPublicationRepository,
     SqlAlchemyReviewJobRepository,
 )
+from app.db.review_events import append_review_event
 from app.db.task_leases import lock_owned_lease
 from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.contract_validation import validate_hunks, validate_ranges
@@ -145,23 +146,29 @@ class PostgresAnalysisHandler:
         details: dict[str, object] = {"error_code": error_code} if error_code else {}
         if job.analysis_attempts == 0:
             details["pre_execution"] = True
-        session.add(
-            ReviewEvent(
-                review_job_id=lease.review_job_id,
-                event_type="TRANSITION",
-                status=status.value,
-                phase=status.value
-                if status
-                in {
-                    ReviewStatus.FETCHING_DIFF,
-                    ReviewStatus.PARSING_CONTEXT,
-                    ReviewStatus.LLM_PROCESSING,
-                }
-                else None,
-                attempt=max(1, job.analysis_attempts),
-                reason_code=reason,
-                **({"safe_details": details} if details else {}),
+        await append_review_event(
+            session,
+            lease.review_job_id,
+            event_type="TRANSITION",
+            publication_status=(
+                await session.scalar(
+                    select(Publication.status).where(
+                        Publication.review_job_id == lease.review_job_id,
+                    )
+                )
             )
+            or "NOT_READY",
+            phase=status.value
+            if status
+            in {
+                ReviewStatus.FETCHING_DIFF,
+                ReviewStatus.PARSING_CONTEXT,
+                ReviewStatus.LLM_PROCESSING,
+            }
+            else None,
+            attempt=max(1, job.analysis_attempts),
+            reason_code=reason,
+            safe_details=details,
         )
 
     async def handle(  # noqa: PLR0911 -- explicit expected terminal/retry outcomes

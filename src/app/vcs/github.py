@@ -7,13 +7,22 @@ import json
 import math
 import re
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Any
 
 import httpx
 
-from app.application.github_ports import GithubFailure, GithubRequest, GithubSnapshot
+from app.application.github_ports import (
+    GithubFailure,
+    GithubRemoteComment,
+    GithubRemoteReview,
+    GithubRequest,
+    GithubReviewReference,
+    GithubSnapshot,
+    GithubWriteFailure,
+)
 
 __all__ = ["GithubClient", "GithubFailure", "GithubRequest", "GithubSnapshot"]
 
@@ -26,6 +35,7 @@ _MAX_ERROR_BYTES = 16 * 1024
 _MAX_RETRY_AFTER_DIGITS = 9
 _MAX_RESET_EPOCH_DIGITS = 10
 _TOTAL_TIMEOUT_SECONDS = 15
+_MAX_READ_PAGES = 20
 _MAX_PAGE = 2_147_483_647
 _SECONDARY_RETRY_AFTER_SECONDS = 60
 
@@ -299,9 +309,128 @@ def _available_repository(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _validate_request(request: GithubRequest) -> None:
+    if (
+        not _OWNER.fullmatch(request.owner)
+        or not _REPOSITORY.fullmatch(request.name)
+        or request.name in {".", ".."}
+        or not _EXTERNAL_ID.fullmatch(request.repository_external_id)
+        or type(request.number) is not int
+        or request.number < 1
+        or not _SHA.fullmatch(request.head_sha)
+        or not _SHA.fullmatch(request.base_sha)
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+
+
+def _has_next_page(response: httpx.Response, path: str, page: int) -> bool:
+    if not response.headers.get("link"):
+        return False
+    links = response.links
+    if not links:
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    for relation, link in links.items():
+        try:
+            url = httpx.URL(link["url"])
+        except KeyError, httpx.InvalidURL:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+        next_page = url.params.get("page", "")
+        if (
+            relation not in {"next", "prev", "first", "last"}
+            or url.scheme != "https"
+            or url.host != "api.github.com"
+            or url.port not in {None, 443}
+            or url.userinfo
+            or url.fragment
+            or url.path != path
+            or sorted(url.params.multi_items())
+            != [("page", next_page), ("per_page", "100")]
+            or not next_page.isascii()
+            or not next_page.isdecimal()
+            or len(next_page) > _MAX_RETRY_AFTER_DIGITS
+            or int(next_page) < 1
+            or (relation == "next" and int(next_page) != page + 1)
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    return "next" in links
+
+
+def _remote_review(item: dict[str, Any]) -> GithubRemoteReview:
+    remote_id = item.get("id")
+    body, commit_id, state = (
+        item.get("body"),
+        item.get("commit_id"),
+        item.get("state"),
+    )
+    user = item.get("user")
+    author_id = user.get("id") if isinstance(user, dict) else None
+    if (
+        type(remote_id) is not int
+        or remote_id <= 0
+        or not isinstance(body, str)
+        or not isinstance(commit_id, str)
+        or not _SHA.fullmatch(commit_id)
+        or type(author_id) is not int
+        or author_id <= 0
+        or not isinstance(state, str)
+        or not state
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    return GithubRemoteReview(str(remote_id), body, commit_id, str(author_id), state)
+
+
+def _remote_comment(item: dict[str, Any]) -> GithubRemoteComment:
+    remote_id = item.get("id")
+    body, path, commit_id = item.get("body"), item.get("path"), item.get("commit_id")
+    user = item.get("user")
+    author_id = user.get("id") if isinstance(user, dict) else None
+    line, start_line = item.get("line"), item.get("start_line")
+    side, start_side = item.get("side"), item.get("start_side")
+    if (
+        type(remote_id) is not int
+        or remote_id <= 0
+        or not isinstance(body, str)
+        or not isinstance(path, str)
+        or not path
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or not isinstance(commit_id, str)
+        or not _SHA.fullmatch(commit_id)
+        or type(author_id) is not int
+        or author_id <= 0
+        or any(
+            value is not None and (type(value) is not int or value < 1)
+            for value in (line, start_line)
+        )
+        or side not in ("LEFT", "RIGHT", None)
+        or start_side not in ("LEFT", "RIGHT", None)
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+    return GithubRemoteComment(
+        remote_comment_id=str(remote_id),
+        body=body,
+        path=path,
+        line=line,
+        start_line=start_line,
+        side=side,
+        start_side=start_side,
+        commit_id=commit_id,
+        author_id=str(author_id),
+    )
+
+
 class GithubClient:
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        timeout_seconds: float = _TOTAL_TIMEOUT_SECONDS,
+        authorize: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._client = client
+        self._timeout_seconds = timeout_seconds
+        self._authorize = authorize
 
     async def list_available_repositories(
         self, *, limit: int, page: int
@@ -422,6 +551,167 @@ class GithubClient:
             and permissions.get("pull") is True
         )
 
+    def with_authority(
+        self,
+        authorize: Callable[[], Awaitable[None]],
+    ) -> GithubClient:
+        """Scope the fence to one task without mutating the shared client."""
+        return GithubClient(
+            self._client,
+            timeout_seconds=self._timeout_seconds,
+            authorize=authorize,
+        )
+
+    async def check_pull(self, request: GithubRequest) -> None:
+        _validate_request(request)
+        url = (
+            f"https://api.github.com/repos/{request.owner}/{request.name}"
+            f"/pulls/{request.number}"
+        )
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                metadata = _pull_metadata(
+                    await self._get(url, "application/vnd.github+json"), request
+                )
+                if (
+                    type(metadata.get("number")) is not int
+                    or metadata["number"] != request.number
+                ):
+                    raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+
+    async def list_reviews(self, request: GithubRequest) -> list[GithubRemoteReview]:
+        _validate_request(request)
+        path = f"/repos/{request.owner}/{request.name}/pulls/{request.number}/reviews"
+        items = await self._read_pages(path)
+        return [_remote_review(item) for item in items]
+
+    async def list_review_comments(
+        self, request: GithubRequest, remote_review_id: str
+    ) -> list[GithubRemoteComment]:
+        _validate_request(request)
+        if not _EXTERNAL_ID.fullmatch(remote_review_id):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        path = (
+            f"/repos/{request.owner}/{request.name}/pulls/{request.number}"
+            f"/reviews/{remote_review_id}/comments"
+        )
+        items = await self._read_pages(path)
+        return [_remote_comment(item) for item in items]
+
+    async def _read_pages(self, path: str) -> list[dict[str, Any]]:
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                items: list[dict[str, Any]] = []
+                for page in range(1, _MAX_READ_PAGES + 1):
+                    response = await self._get(
+                        f"https://api.github.com{path}?per_page=100&page={page}",
+                        "application/vnd.github+json",
+                    )
+                    try:
+                        payload = response.json()
+                    except ValueError, UnicodeError:
+                        raise GithubFailure(
+                            "DIFF_UNTRUSTWORTHY", retryable=False
+                        ) from None
+                    if not isinstance(payload, list) or any(
+                        not isinstance(item, dict) for item in payload
+                    ):
+                        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+                    items.extend(payload)
+                    if not _has_next_page(response, path, page):
+                        return items
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+        raise GithubFailure("VCS_UNAVAILABLE", retryable=True)
+
+    async def create_review(
+        self,
+        request: GithubRequest,
+        *,
+        body: str,
+        comments: Sequence[dict[str, object]],
+    ) -> GithubReviewReference:
+        if (
+            not _OWNER.fullmatch(request.owner)
+            or not _REPOSITORY.fullmatch(request.name)
+            or request.name in {".", ".."}
+            or not _EXTERNAL_ID.fullmatch(request.repository_external_id)
+            or type(request.number) is not int
+            or request.number < 1
+            or not _SHA.fullmatch(request.head_sha)
+            or not _SHA.fullmatch(request.base_sha)
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        if self._authorize is not None:
+            await self._authorize()
+        try:
+            async with (
+                asyncio.timeout(self._timeout_seconds),
+                self._client.stream(
+                    "POST",
+                    f"https://api.github.com/repos/{request.owner}/{request.name}"
+                    f"/pulls/{request.number}/reviews",
+                    headers={"Accept": "application/vnd.github+json"},
+                    json={
+                        "commit_id": request.head_sha,
+                        "body": body,
+                        "event": "COMMENT",
+                        "comments": list(comments),
+                    },
+                    follow_redirects=False,
+                ) as upstream,
+            ):
+                content = bytearray()
+                limit = _MAX_RESPONSE_BYTES if upstream.is_success else _MAX_ERROR_BYTES
+                async for chunk in upstream.aiter_bytes():
+                    if len(content) + len(chunk) > limit:
+                        raise GithubWriteFailure(
+                            "VCS_UNAVAILABLE", remote_effect="unknown"
+                        )
+                    content.extend(chunk)
+                response = httpx.Response(
+                    upstream.status_code,
+                    headers={
+                        name: value
+                        for name, value in upstream.headers.items()
+                        if name
+                        not in {
+                            "content-encoding",
+                            "content-length",
+                            "transfer-encoding",
+                        }
+                    },
+                    content=bytes(content),
+                )
+        except httpx.RequestError, TimeoutError:
+            raise GithubWriteFailure(
+                "VCS_UNAVAILABLE", remote_effect="unknown"
+            ) from None
+        if not response.is_success:
+            if response.status_code in {401, 403, 404, 422, 429}:
+                try:
+                    _check_status(response, response.content)
+                except GithubFailure as error:
+                    raise GithubWriteFailure(
+                        error.reason_code,
+                        remote_effect="absent",
+                        retryable=error.retryable,
+                        retry_after=error.retry_after,
+                    ) from None
+            raise GithubWriteFailure("VCS_UNAVAILABLE", remote_effect="unknown")
+        try:
+            result = response.json()
+        except ValueError, UnicodeError:
+            raise GithubWriteFailure(
+                "VCS_UNAVAILABLE", remote_effect="unknown"
+            ) from None
+        remote_id = result.get("id") if isinstance(result, dict) else None
+        if type(remote_id) is not int or remote_id <= 0:
+            raise GithubWriteFailure("VCS_UNAVAILABLE", remote_effect="unknown")
+        return GithubReviewReference(remote_review_id=str(remote_id))
+
     async def fetch(self, request: GithubRequest) -> GithubSnapshot:
         try:
             async with asyncio.timeout(_TOTAL_TIMEOUT_SECONDS):
@@ -432,6 +722,8 @@ class GithubClient:
     async def _get(
         self, url: str, accept: str, *, token: str | None = None
     ) -> httpx.Response:
+        if self._authorize is not None:
+            await self._authorize()
         headers = {"Accept": accept}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"

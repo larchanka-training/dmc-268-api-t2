@@ -146,3 +146,18 @@ analysis handler и API запуска/чтения ревью. Полный pro
 
 Инфраструктура, Terraform, CI/CD (автодеплой `main` → staging, `develop` → develop-окружение) и процедура деплоя описаны в
 [`docs/staging-deployment.md`](docs/staging-deployment.md).
+
+## Публикация ревью и SSE
+
+GitHub Publisher использует сохранённый результат анализа и запускается отдельно:
+
+```bash
+uv run python -m app.publication_worker --once
+uv run python -m app.publication_worker --poll-interval 1
+```
+
+Нужны миграции, общие с analysis worker PostgreSQL/Redis и отдельные
+`GITHUB__WRITE_TOKEN` / `GITHUB__BOT_USER_ID`. API и Compose-заглушка `worker`
+не запускают публикацию автоматически. Контракты, SSE, recovery и интеграция
+с объединёнными зависимостями:
+[`docs/github-review-publication.md`](docs/github-review-publication.md).

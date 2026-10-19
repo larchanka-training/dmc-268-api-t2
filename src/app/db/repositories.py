@@ -15,6 +15,7 @@ from app.application.ports import (
     TaskLeaseSnapshot,
 )
 from app.db.models import ChangeRequest, OutboxEvent, Publication, ReviewJob, TaskLease
+from app.db.review_events import append_review_event
 from app.db.task_leases import lock_owned_lease, lock_publication
 from app.domain.enums import PublicationStatus, ReviewStatus, TaskKind
 from app.domain.frozen_configuration import FrozenConfigurationError, ModelSettings
@@ -218,6 +219,13 @@ class SqlAlchemyPublicationRepository:
             raise LeaseLostError(
                 "Analysis lease expired before publication preparation"
             )
+        await append_review_event(
+            self._session,
+            lease.review_job_id,
+            event_type="PUBLICATION_PENDING",
+            publication_status="PENDING",
+            attempt=1,
+        )
 
     async def update(
         self,

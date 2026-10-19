@@ -9,6 +9,7 @@ import pytest
 
 from app.application.github_publication import prepare_github_review
 from app.application.publication_ports import PersistedFinding, PublicationInput
+from app.vcs.diff import parse_diff
 
 REVIEW_ID = UUID("00000000-0000-0000-0000-000000000024")
 HEAD_SHA = "b" * 40
@@ -440,3 +441,100 @@ def test_prepare_review_includes_retained_rule_reference(
     prepared = prepare_github_review(review)
 
     assert "Правило: R1" in str(prepared.comments[0]["body"])
+
+
+def test_prepare_review_checks_old_coverage_per_mixed_change_block(
+    payload_data: dict[str, Any],
+) -> None:
+    """AC-PREP-16: skip uncovered OLD changes while retaining covered OLD anchors."""
+    review = publication_input(payload_data)
+    parsed = parse_diff("""diff --git a/src/review.py b/src/review.py
+index 1111111..2222222 100644
+--- a/src/review.py
++++ b/src/review.py
+@@ -10,3 +10,4 @@
+-unchecked_before
++unchecked_after
++extra_line
+ separator
+-checked_before
++checked_after
+""")
+    review.contexts[0]["files"] = parsed.files
+    review.coverage["included"][0]["ranges"] = [{"start_line": 13, "end_line": 13}]
+    review.coverage["skipped"] = [
+        {
+            "path": "src/review.py",
+            "ranges": [{"start_line": 10, "end_line": 11}],
+            "reason": "token_budget",
+        }
+    ]
+    review = replace(
+        review,
+        findings=(
+            replace(
+                review.findings[0],
+                fingerprint="uncovered-old",
+                side="OLD",
+                start_line=10,
+                end_line=10,
+                evidence="unchecked_before",
+            ),
+            replace(
+                review.findings[0],
+                fingerprint="covered-old",
+                side="OLD",
+                start_line=12,
+                end_line=12,
+                evidence="checked_before",
+            ),
+        ),
+    )
+
+    prepared = prepare_github_review(review)
+
+    assert [(comment["line"], comment["side"]) for comment in prepared.comments] == [
+        (12, "LEFT")
+    ]
+    assert str(prepared.comments[0]["body"]).endswith(
+        "<!-- dmc268-finding:covered-old -->"
+    )
+    assert "Не опубликованы inline: 1" in prepared.body
+
+
+def test_prepare_review_keeps_unmapped_old_deletion_in_overview(
+    payload_data: dict[str, Any],
+) -> None:
+    """AC-PREP-17: every OLD change in a mixed multiline range needs coverage proof."""
+    review = publication_input(payload_data)
+    parsed = parse_diff("""diff --git a/src/review.py b/src/review.py
+index 1111111..2222222 100644
+--- a/src/review.py
++++ b/src/review.py
+@@ -10,3 +10,3 @@
+-checked_before
++checked_after
++extra_line
+ separator
+-deleted_without_replacement
+""")
+    review.contexts[0]["files"] = parsed.files
+    review.coverage["included"][0]["ranges"] = [{"start_line": 10, "end_line": 11}]
+    review = replace(
+        review,
+        findings=(
+            replace(
+                review.findings[0],
+                side="OLD",
+                start_line=10,
+                end_line=12,
+                evidence="checked_before",
+            ),
+        ),
+    )
+
+    prepared = prepare_github_review(review)
+
+    assert prepared.comments == ()
+    assert "high: Проверяйте входные данные" in prepared.body
+    assert "Не опубликованы inline: 1" in prepared.body

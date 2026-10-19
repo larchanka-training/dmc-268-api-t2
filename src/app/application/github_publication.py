@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from itertools import groupby
 from typing import Protocol
 from uuid import UUID
 
@@ -42,6 +43,41 @@ class PreparedGithubReview:
     comments: tuple[dict[str, object], ...]
 
 
+def _old_changes_are_covered(
+    item: PersistedFinding, files: list[FileDiff], ranges: list[dict[str, int]]
+) -> bool:
+    """Project OLD replacements onto their contiguous NEW change blocks."""
+    for file in files:
+        for hunk in file.hunks:
+            for changed, lines in groupby(
+                hunk.lines, key=lambda line: line.kind != "context"
+            ):
+                if not changed:
+                    continue
+                block = tuple(lines)
+                if not any(
+                    line.kind == "deleted"
+                    and line.old_line is not None
+                    and item.start_line <= line.old_line <= item.end_line
+                    for line in block
+                ):
+                    continue
+                added = {
+                    line.new_line
+                    for line in block
+                    if line.kind == "added" and line.new_line is not None
+                }
+                if not added or not all(
+                    any(
+                        interval["start_line"] <= number <= interval["end_line"]
+                        for interval in ranges
+                    )
+                    for number in added
+                ):
+                    return False
+    return True
+
+
 def _publishable(item: PersistedFinding, review: PublicationInput) -> bool:
     try:
         finding = LLMFinding.model_validate(
@@ -73,31 +109,31 @@ def _publishable(item: PersistedFinding, review: PublicationInput) -> bool:
             )
             else "OLD"
         )
-        if item.side == coverage_side:
-            ranges = [
-                interval
-                for file in review.coverage["included"]
-                if file["path"] == _github_path(item, review)
-                for interval in file["ranges"]
-            ]
-            changed = {
-                number
-                for file in matching_files
-                for hunk in file.hunks
-                for line in hunk.lines
-                if line.kind == ("added" if item.side == "NEW" else "deleted")
-                and (number := (line.new_line if item.side == "NEW" else line.old_line))
-                is not None
-                and item.start_line <= number <= item.end_line
-            }
-            return all(
-                any(
-                    interval["start_line"] <= line <= interval["end_line"]
-                    for interval in ranges
-                )
-                for line in changed
+        ranges = [
+            interval
+            for file in review.coverage["included"]
+            if file["path"] == _github_path(item, review)
+            for interval in file["ranges"]
+        ]
+        if item.side != coverage_side:
+            return _old_changes_are_covered(item, matching_files, ranges)
+        changed = {
+            number
+            for file in matching_files
+            for hunk in file.hunks
+            for line in hunk.lines
+            if line.kind == ("added" if item.side == "NEW" else "deleted")
+            and (number := (line.new_line if item.side == "NEW" else line.old_line))
+            is not None
+            and item.start_line <= number <= item.end_line
+        }
+        return all(
+            any(
+                interval["start_line"] <= line <= interval["end_line"]
+                for interval in ranges
             )
-        return True
+            for line in changed
+        )
     except ValidationError, ValueError, KeyError, TypeError:
         return False
 

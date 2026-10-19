@@ -11,6 +11,14 @@ anchors against those contexts, maps OLD/NEW to LEFT/RIGHT, preserves multiline
 endpoints and uses the new path for a renamed file. Findings outside reviewed
 coverage or without a valid changed-line anchor remain in the Overview.
 
+Mixed diffs record coverage in NEW coordinates. An OLD inline range must be
+backed by covered NEW additions in each contiguous change block it touches;
+unchanged context separates blocks. This preserves OLD/NEW line offsets and
+does not treat another covered block in the same hunk as proof. If a touched
+deletion block has no NEW replacement, its coverage cannot be established this
+way and the finding stays in the Overview. Deleted-only files retain their
+OLD-coordinate coverage check.
+
 The Overview contains the summary, checked files, risks, skipped files and
 context quality. At most 20 unique fingerprints become inline comments, ordered
 by severity and location. Text is masked again before publication. This limit

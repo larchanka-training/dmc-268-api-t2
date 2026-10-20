@@ -45,7 +45,7 @@ GitHub
 
 FastAPI, оба воркера, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
 
-DNS и TLS/HTTPS пока не настроены (HTTP по IP).
+HTTPS завершает один контейнер Caddy на порту 443: `https://dmc268-t2.ddns.net/` для `main` (дальше на порт 80) и `https://dmc268t2-staging.ddns.net/` для `develop` (дальше на порт 8080). HTTP по IP на порту 80 остаётся, редиректа на HTTPS нет.
 
 ## Окружения
 
@@ -58,7 +58,7 @@ DNS и TLS/HTTPS пока не настроены (HTTP по IP).
 | Env-файл | `.env.staging` | `.env.staging.develop` |
 | Compose-проект | `dmc-268-t2-staging` | `dmc-268-t2-develop` |
 | Порт web | `80` | `8080` |
-| URL | `http://213.199.63.63/` | `http://213.199.63.63:8080/` |
+| URL | `https://dmc268-t2.ddns.net/` и `http://213.199.63.63/` | `https://dmc268t2-staging.ddns.net/` и `http://213.199.63.63:8080/` |
 
 Окружения изолированы: у каждого свои контейнеры PostgreSQL и Redis, свои volumes (префикс — имя compose-проекта) и свой env-файл на VPS. Пароль PostgreSQL общий (`STAGING_POSTGRES_PASSWORD`).
 
@@ -618,12 +618,4 @@ Staging проверен end-to-end:
 
 ## Оставшиеся инфраструктурные пункты
 
-Текущий staging работает по HTTP через IP.
-
-Ещё не настроены:
-
-* DNS hostname/subdomain;
-* TLS certificate;
-* HTTPS на `443`.
-
-Эти пункты требуют доступного домена/DNS-зоны или выделенного staging hostname.
+DNS-имена и HTTPS на порту 443 настроены: `https://dmc268-t2.ddns.net/` для `main`, `https://dmc268t2-staging.ddns.net/` для `develop`. HTTP на порту 80 остаётся, редиректа на HTTPS нет.

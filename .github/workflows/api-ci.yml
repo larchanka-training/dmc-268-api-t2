@@ -114,6 +114,22 @@ jobs:
       - name: Build API image
         run: docker build -t dmc-268-api-t2:${{ github.sha }} .
 
+  caddy:
+    name: Caddyfile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate Caddyfile
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2 \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
   compose:
     name: Compose config
     runs-on: ubuntu-24.04

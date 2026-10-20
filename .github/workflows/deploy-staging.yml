@@ -573,3 +573,96 @@ jobs:
             sleep 2
           done
           REMOTE
+
+      - name: Ensure Caddy HTTPS
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "mkdir -p /opt/caddy"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            caddy/Caddyfile \
+            "${SSH_USER}@${SSH_HOST}:/opt/caddy/Caddyfile.new"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "bash -s" \
+            <<'REMOTE'
+          set -euo pipefail
+
+          if ! docker run --rm \
+            -v /opt/caddy/Caddyfile.new:/etc/caddy/Caddyfile:ro \
+            caddy:2 \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          then
+            rm -f /opt/caddy/Caddyfile.new
+            exit 1
+          fi
+
+          cat /opt/caddy/Caddyfile.new > /opt/caddy/Caddyfile && rm -f /opt/caddy/Caddyfile.new
+
+          reload_caddy() {
+            local attempt restart_count
+            for attempt in $(seq 1 30); do
+              if docker inspect -f '{{.State.Running}}' caddy 2>/dev/null | grep -qx true; then
+                docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+                restart_count="$(docker inspect -f '{{.RestartCount}}' caddy)"
+                sleep 5
+                if docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' caddy 2>/dev/null | grep -qx "true false ${restart_count}"; then
+                  return 0
+                fi
+                echo "ERROR: caddy did not stay running after reload"
+                docker logs --tail=50 caddy || true
+                return 1
+              fi
+              sleep 1
+            done
+            echo "ERROR: caddy container did not become ready to reload"
+            docker logs --tail=50 caddy || true
+            return 1
+          }
+
+          if docker inspect caddy >/dev/null 2>&1; then
+            docker start caddy >/dev/null
+            reload_caddy
+            exit 0
+          fi
+
+          if docker run -d --name caddy --restart unless-stopped \
+            --network host \
+            -v caddy-data:/data \
+            -v caddy-config:/config \
+            -v /opt/caddy/Caddyfile:/etc/caddy/Caddyfile:ro \
+            caddy:2
+          then
+            reload_caddy
+            exit 0
+          fi
+
+          if docker inspect caddy >/dev/null 2>&1; then
+            docker start caddy >/dev/null
+            reload_caddy
+            exit 0
+          fi
+
+          echo "ERROR: failed to start caddy"
+          exit 1
+          REMOTE

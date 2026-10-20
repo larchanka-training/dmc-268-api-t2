@@ -59,3 +59,45 @@ def test_caddy_https_keeps_port_80_and_serves_both_names() -> None:
     assert "https://dmc268-t2.ddns.net/" in doc
     assert "https://dmc268t2-staging.ddns.net/" in doc
     assert "http://213.199.63.63/" in doc
+
+
+def test_caddy_deploy_validates_before_replace_and_waits_until_stable() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "deploy-staging.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+    run = next(step for step in steps if step.get("name") == "Ensure Caddy HTTPS")[
+        "run"
+    ]
+    validate = "caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+    replace = "mv -f /opt/caddy/Caddyfile.new /opt/caddy/Caddyfile"
+    assert ":/opt/caddy/Caddyfile.new" in run
+    assert "rm -f /opt/caddy/Caddyfile.new" in run
+    assert run.index(validate) < run.index(replace)
+    assert run.index(replace) < run.index("docker run -d")
+    after_create = run.split("docker run -d", maxsplit=1)[1]
+    assert after_create.index("reload_caddy") < after_create.index("exit 0")
+    after_exec = run.split(
+        "docker exec caddy caddy reload --config /etc/caddy/Caddyfile "
+        "--adapter caddyfile",
+        maxsplit=1,
+    )[1]
+    stable = "{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}"
+    assert after_exec.index("{{.RestartCount}}") < after_exec.index("sleep 5")
+    assert after_exec.index("sleep 5") < after_exec.index(stable)
+    assert after_exec.index("true false") < after_exec.index("return 0")
+    assert after_exec.index(stable) < after_exec.index("return 0")
+    assert "docker logs --tail=50 caddy" in after_exec
+    collision = after_create.split("exit 0", maxsplit=1)[1]
+    assert collision.index("docker start") < collision.index("reload_caddy")
+
+    ci = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "api-ci.yml").read_text(encoding="utf-8")
+    )
+    caddy_job = ci["jobs"]["caddy"]
+    assert "needs" not in caddy_job
+    ci_run = "\n".join(step.get("run", "") or "" for step in caddy_job.get("steps", []))
+    assert "caddy/Caddyfile:/etc/caddy/Caddyfile:ro" in ci_run
+    assert validate in ci_run

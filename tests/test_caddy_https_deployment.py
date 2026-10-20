@@ -72,7 +72,10 @@ def test_caddy_deploy_validates_before_replace_and_waits_until_stable() -> None:
         "run"
     ]
     validate = "caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
-    replace = "mv -f /opt/caddy/Caddyfile.new /opt/caddy/Caddyfile"
+    replace = (
+        "cat /opt/caddy/Caddyfile.new > /opt/caddy/Caddyfile"
+        " && rm -f /opt/caddy/Caddyfile.new"
+    )
     assert ":/opt/caddy/Caddyfile.new" in run
     assert "rm -f /opt/caddy/Caddyfile.new" in run
     assert run.index(validate) < run.index(replace)

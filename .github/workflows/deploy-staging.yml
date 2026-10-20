@@ -613,7 +613,7 @@ jobs:
             exit 1
           fi
 
-          mv -f /opt/caddy/Caddyfile.new /opt/caddy/Caddyfile
+          cat /opt/caddy/Caddyfile.new > /opt/caddy/Caddyfile && rm -f /opt/caddy/Caddyfile.new
 
           reload_caddy() {
             local attempt restart_count

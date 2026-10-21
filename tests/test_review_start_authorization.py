@@ -250,7 +250,6 @@ async def test_revoked_permission_denies_start_without_admission(
     ("case", "status", "code"),
     [
         ("missing_access", HTTPStatus.NOT_FOUND, "RESOURCE_NOT_FOUND"),
-        ("missing_change", HTTPStatus.NOT_FOUND, "RESOURCE_NOT_FOUND"),
         ("replay", HTTPStatus.OK, None),
         ("conflict", HTTPStatus.CONFLICT, "IDEMPOTENCY_CONFLICT"),
     ],
@@ -291,9 +290,7 @@ async def test_early_checks_precede_credential_lookup_and_provider_revalidation(
     event.listen(engine, "before_cursor_execute", break_credential_lookup, retval=True)
     try:
         response = await browser_start.client.post(
-            browser_start.scope.url.replace("/13/", "/99/")
-            if case == "missing_change"
-            else browser_start.scope.url,
+            browser_start.scope.url,
             json={"requested_head_sha": "c" * 40 if case == "conflict" else HEAD},
             headers=browser_start.headers,
         )

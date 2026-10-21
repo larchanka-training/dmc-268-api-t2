@@ -20,6 +20,7 @@ from app.application.ports import LeaseLostError
 from app.core.config import Logging, get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
+from app.core.sentry import configure_sentry
 from app.domain.frozen_configuration import FrozenConfigurationError
 from app.review.configuration import load_runtime_configuration
 
@@ -132,6 +133,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     configure_logging(Logging(format="json", file_enabled=False))
+    configure_sentry(get_settings())
     try:
         asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
     except Exception as error:

@@ -31,6 +31,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
       # process starts without them; the gateway checks its provider chain
       # only when it is built.
@@ -90,6 +91,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
       # process starts without them; the gateway checks its provider chain
       # only when it is built.
@@ -125,6 +127,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
     depends_on:
       db:
         condition: service_healthy

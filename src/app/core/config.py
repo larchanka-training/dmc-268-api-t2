@@ -104,6 +104,12 @@ class Auth(BaseModel):
         Fernet(self.credential_key.get_secret_value())
 
 
+class Sentry(BaseModel):
+    """Sentry settings (SENTRY__* env variables). Empty DSN leaves the SDK off."""
+
+    dsn: SecretStr = SecretStr("")
+
+
 class Logging(BaseModel):
     """Logging settings (LOGGING__* env variables)."""
 
@@ -241,6 +247,7 @@ class Settings(BaseSettings):
     github: Github = Field(default_factory=Github)
     auth: Auth = Field(default_factory=Auth)
     logging: Logging = Field(default_factory=Logging)
+    sentry: Sentry = Field(default_factory=Sentry)
     llm: LLM = Field(default_factory=LLM)
 
 

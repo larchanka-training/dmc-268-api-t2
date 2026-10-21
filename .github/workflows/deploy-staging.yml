@@ -361,6 +361,12 @@ jobs:
           GITHUB_API_TOKEN: ${{ secrets.GITHUB__TOKEN }}
           GITHUB_PUBLISH_TOKEN: ${{ secrets.GITHUB__WRITE_TOKEN }}
           GITHUB_BOT_USER_ID: ${{ secrets.GITHUB__BOT_USER_ID }}
+          AUTH_GITHUB_CLIENT_ID: ${{ vars.AUTH__GITHUB_CLIENT_ID }}
+          AUTH_GITHUB_CLIENT_SECRET: ${{ secrets.AUTH__GITHUB_CLIENT_SECRET }}
+          AUTH_GITHUB_REDIRECT_URI: ${{ vars.AUTH__GITHUB_REDIRECT_URI }}
+          AUTH_JWT_SECRET: ${{ secrets.AUTH__JWT_SECRET }}
+          AUTH_CREDENTIAL_KEY: ${{ secrets.AUTH__CREDENTIAL_KEY }}
+          AUTH_FRONTEND_ORIGINS: ${{ vars.AUTH__FRONTEND_ORIGINS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -396,6 +402,12 @@ jobs:
             append_optional 'GITHUB__TOKEN' "${GITHUB_API_TOKEN:-}"
             append_optional 'GITHUB__WRITE_TOKEN' "${GITHUB_PUBLISH_TOKEN:-}"
             append_optional 'GITHUB__BOT_USER_ID' "${GITHUB_BOT_USER_ID:-}"
+            append_optional 'AUTH__GITHUB_CLIENT_ID' "${AUTH_GITHUB_CLIENT_ID:-}"
+            append_optional 'AUTH__GITHUB_CLIENT_SECRET' "${AUTH_GITHUB_CLIENT_SECRET:-}"
+            append_optional 'AUTH__GITHUB_REDIRECT_URI' "${AUTH_GITHUB_REDIRECT_URI:-}"
+            append_optional 'AUTH__JWT_SECRET' "${AUTH_JWT_SECRET:-}"
+            append_optional 'AUTH__CREDENTIAL_KEY' "${AUTH_CREDENTIAL_KEY:-}"
+            append_optional 'AUTH__FRONTEND_ORIGINS' "${AUTH_FRONTEND_ORIGINS:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \

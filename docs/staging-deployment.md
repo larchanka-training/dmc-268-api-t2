@@ -310,6 +310,19 @@ POSTGRES__DB=dmc
 | `GITHUB__TOKEN` | `GITHUB__TOKEN` | Read token GitHub API для PR/compare; не Actions `GITHUB_TOKEN` |
 | `GITHUB__WRITE_TOKEN` | `GITHUB__WRITE_TOKEN` | Отдельный токен публикации GitHub с Pull requests write; только для API / будущего publisher |
 | `GITHUB__BOT_USER_ID` | `GITHUB__BOT_USER_ID` | Числовой ID бота для проверки авторства опубликованного ревью |
+| `AUTH__GITHUB_CLIENT_SECRET` | `AUTH__GITHUB_CLIENT_SECRET` | Секрет GitHub OAuth App для входа в браузере |
+| `AUTH__JWT_SECRET` | `AUTH__JWT_SECRET` | Секрет сессии, не короче 32 байт |
+| `AUTH__CREDENTIAL_KEY` | `AUTH__CREDENTIAL_KEY` | Ключ Fernet для сохранённых учётных данных |
+
+Три незасекреченных значения — GitHub Actions Variables с теми же именами, что у контейнера. Пустое значение не попадает в env-файл, и деплой из-за этого не падает.
+
+| Variable | Переменная контейнера | Назначение |
+|---|---|---|
+| `AUTH__GITHUB_CLIENT_ID` | `AUTH__GITHUB_CLIENT_ID` | Client id GitHub OAuth App |
+| `AUTH__GITHUB_REDIRECT_URI` | `AUTH__GITHUB_REDIRECT_URI` | `https://dmc268-t2.ddns.net/api/v1/auth/github/callback` |
+| `AUTH__FRONTEND_ORIGINS` | `AUTH__FRONTEND_ORIGINS` | JSON-список, `["https://dmc268-t2.ddns.net"]` |
+
+Все шесть имён получает только сервис `api`. Вход остаётся недоступен, пока набор неполный: API проверяет его в момент запроса, не при старте.
 
 `webhook-worker` запускает recovery GitHub intake отдельно от ReviewJob worker.
 Нужны PostgreSQL и доступ к GitHub API; подробности: [GitHub intake](github-webhook-intake.md).

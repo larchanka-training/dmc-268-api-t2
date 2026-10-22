@@ -145,11 +145,23 @@ def test_warning_logs_reach_sentry_and_info_logs_do_not(
 
 
 def _assert_entrypoint_enables_sentry(code: str) -> None:
+    """Run entrypoint code and require the configured DSN.
+
+    The script must stub the worker loop. CI has Postgres and Redis, and
+    Linux installs the process signal handlers, so the real loop does not
+    return before this timeout.
+    """
+    script = textwrap.dedent(code) + (
+        "\nclient = sentry_sdk.get_client()\n"
+        "dsn = client.options.get('dsn', '')\n"
+        "client.close(timeout=0)\n"
+        "print(dsn)\n"
+    )
     env = os.environ.copy()
     env["SENTRY__DSN"] = _DSN
     env["LOGGING__FILE_ENABLED"] = "false"
     completed = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
+        [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         timeout=30,
@@ -168,13 +180,30 @@ def test_webhook_worker_enables_sentry_when_dsn_is_set() -> None:
 
         import sentry_sdk
 
-        from app.webhook_worker import _run
+        import app.webhook_worker as worker
+
+        class _Connection:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(self, *_args: object) -> bool:
+                return False
+
+        async def _stop(*_args: object, **_kwargs: object) -> int:
+            return 0
+
+        class _Engine:
+            async def dispose(self) -> None:
+                return None
+
+        worker.github_connection = lambda _settings: _Connection()
+        worker.run_once = _stop
+        worker.engine = _Engine()
 
         try:
-            asyncio.run(_run(once=True))
+            asyncio.run(worker._run(once=True))
         except (Exception, SystemExit):
             pass
-        print(sentry_sdk.get_client().options.get("dsn", ""))
         """
     )
 
@@ -187,14 +216,17 @@ def test_analysis_worker_enables_sentry_when_dsn_is_set() -> None:
 
         import sentry_sdk
 
-        from app.analysis_worker import main
+        import app.analysis_worker as worker
 
+        async def _stop(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        worker.run = _stop
         sys.argv = ["analysis_worker", "--once"]
         try:
-            main()
+            worker.main()
         except (Exception, SystemExit):
             pass
-        print(sentry_sdk.get_client().options.get("dsn", ""))
         """
     )
 
@@ -207,13 +239,16 @@ def test_publication_worker_enables_sentry_when_dsn_is_set() -> None:
 
         import sentry_sdk
 
-        from app.publication_worker import main
+        import app.publication_worker as worker
 
+        async def _stop(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        worker.run = _stop
         sys.argv = ["publication_worker", "--once"]
         try:
-            main()
+            worker.main()
         except (Exception, SystemExit):
             pass
-        print(sentry_sdk.get_client().options.get("dsn", ""))
         """
     )

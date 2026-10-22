@@ -27,7 +27,7 @@ def configure_sentry(settings: Settings) -> None:
                 "request": {"mode": "denylist", "terms": pii_off_terms},
             },
             "http_bodies": [],
-            "url_query_params": {"mode": "denylist", "terms": pii_off_terms},
+            "url_query_params": {"mode": "off"},
             "graphql": {"document": False, "variables": False},
             "gen_ai": {"inputs": False, "outputs": False},
             "database_query_data": False,

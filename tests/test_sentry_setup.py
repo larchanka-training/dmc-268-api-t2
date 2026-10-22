@@ -5,11 +5,13 @@ import os
 import subprocess
 import sys
 import textwrap
+from http import HTTPStatus
 from pathlib import Path
 
 import pytest
 import sentry_sdk
 import yaml
+from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import create_app
@@ -101,7 +103,7 @@ def test_sentry_does_not_collect_request_bodies(
         "cookies": {"mode": "denylist", "terms": terms},
         "http_headers": {"request": {"mode": "denylist", "terms": terms}},
         "http_bodies": [],
-        "url_query_params": {"mode": "denylist", "terms": terms},
+        "url_query_params": {"mode": "off"},
         "graphql": {"document": False, "variables": False},
         "gen_ai": {"inputs": False, "outputs": False},
         "database_query_data": False,
@@ -109,6 +111,46 @@ def test_sentry_does_not_collect_request_bodies(
         "stack_frame_variables": False,
         "frame_context_lines": 5,
     }
+
+
+def test_oauth_callback_code_is_not_sent_to_sentry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GitHub callback's code and state never leave in a Sentry event."""
+    oauth_code = "oauth-code-9f3a"
+    oauth_state = "oauth-state-9f3a"
+    payloads: list[str] = []
+
+    class _Capture(sentry_sdk.transport.Transport):
+        def capture_envelope(self, envelope: object) -> None:
+            raw = envelope.serialize()  # type: ignore[attr-defined]
+            text = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+            payloads.append(text)
+
+    monkeypatch.setattr(
+        "sentry_sdk.client.make_transport",
+        lambda _options: _Capture(),
+    )
+    monkeypatch.setenv("SENTRY__DSN", _DSN)
+    get_settings.cache_clear()
+    app = create_app()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(
+            "/api/v1/auth/github/callback",
+            params={"code": oauth_code, "state": oauth_state},
+            follow_redirects=False,
+        )
+    sentry_sdk.flush()
+
+    callback = [
+        payload
+        for payload in payloads
+        if '"transaction":"/api/v1/auth/github/callback"' in payload
+    ]
+    assert response.status_code == HTTPStatus.SEE_OTHER
+    assert len(callback) == 1
+    assert oauth_code not in callback[0]
+    assert oauth_state not in callback[0]
 
 
 def test_warning_logs_reach_sentry_and_info_logs_do_not(

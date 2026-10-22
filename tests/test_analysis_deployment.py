@@ -22,6 +22,26 @@ def workflow_step(name: str) -> dict[str, Any]:
     return next(s for s in workflow["jobs"]["deploy"]["steps"] if s["name"] == name)
 
 
+@pytest.mark.parametrize(
+    "step_name", ["Validate deployment configuration", "Write runtime environment"]
+)
+def test_eurorouter_key_prefers_repository_override_to_organization_fallback(
+    step_name: str,
+) -> None:
+    assert workflow_step(step_name)["env"]["EUROROUTER_API_KEYS"] == (
+        "${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}"
+    )
+
+
+def test_eurorouter_endpoint_prefers_repository_to_organization_fallback() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/deploy-staging.yml").read_text()
+    )
+    assert workflow["jobs"]["deploy"]["env"]["EUROROUTER_BASE_URL"] == (
+        "${{ vars.STAGING_EUROROUTER_BASE_URL || vars.AI_DMC268_URL }}"
+    )
+
+
 def writer_environment() -> dict[str, str]:
     return {
         "PATH": os.environ["PATH"],

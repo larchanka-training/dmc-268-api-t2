@@ -72,7 +72,7 @@ jobs:
       # deployed to staging, the chain is Eurorouter only.
       LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
       LLM_FALLBACK_ENABLED: ${{ vars.STAGING_LLM_FALLBACK_ENABLED || 'false' }}
-      EUROROUTER_BASE_URL: ${{ vars.STAGING_EUROROUTER_BASE_URL }}
+      EUROROUTER_BASE_URL: ${{ vars.STAGING_EUROROUTER_BASE_URL || vars.AI_DMC268_URL }}
       EUROROUTER_MODEL: ${{ vars.STAGING_EUROROUTER_MODEL }}
       OLLAMA_BASE_URL: ${{ vars.STAGING_OLLAMA_BASE_URL || 'http://ollama:11434' }}
       OLLAMA_MODEL: ${{ vars.STAGING_OLLAMA_MODEL }}
@@ -157,7 +157,7 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSH_PASSWORD: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
-          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS }}
+          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -356,7 +356,7 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSHPASS: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
-          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS }}
+          EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
           GITHUB_API_TOKEN: ${{ secrets.GITHUB__TOKEN }}
           GITHUB_PUBLISH_TOKEN: ${{ secrets.GITHUB__WRITE_TOKEN }}

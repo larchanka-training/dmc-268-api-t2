@@ -45,7 +45,7 @@ def test_deploy_forwards_sentry_dsn_to_the_api_container() -> None:
     services = yaml.safe_load((ROOT / "docker-compose.staging.yml").read_text())[
         "services"
     ]
-    for name in ("api", "worker", "webhook-worker"):
+    for name in ("api", "worker", "outbox-dispatcher", "webhook-worker"):
         assert services[name]["environment"]["SENTRY__DSN"] == "${SENTRY__DSN:-}"
     for name in ("web", "db", "redis"):
         assert "SENTRY__DSN" not in services[name].get("environment", {})
@@ -288,6 +288,29 @@ def test_publication_worker_enables_sentry_when_dsn_is_set() -> None:
 
         worker.run = _stop
         sys.argv = ["publication_worker", "--once"]
+        try:
+            worker.main()
+        except (Exception, SystemExit):
+            pass
+        """
+    )
+
+
+def test_outbox_dispatcher_enables_sentry_when_dsn_is_set() -> None:
+    """outbox_dispatcher.main initializes Sentry before the one-shot loop."""
+    _assert_entrypoint_enables_sentry(
+        """
+        import sys
+
+        import sentry_sdk
+
+        import app.outbox_dispatcher as worker
+
+        async def _stop(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        worker._run = _stop
+        sys.argv = ["outbox_dispatcher", "--once"]
         try:
             worker.main()
         except (Exception, SystemExit):

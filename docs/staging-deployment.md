@@ -253,8 +253,8 @@ web -> api:8000
 
 Порядок включения после merge:
 
-1. В GitHub → Settings → Secrets and variables → Actions проверьте существующие Variables `STAGING_EUROROUTER_BASE_URL` и `STAGING_EUROROUTER_MODEL`: должны содержать утверждённые HTTPS endpoint и model ID. Не подставляйте тестовую модель из examples. Установите `STAGING_LLM_PRIMARY_PROVIDER=eurorouter`, `STAGING_LLM_FALLBACK_ENABLED=false`.
-2. Задайте Secrets `STAGING_EUROROUTER_API_KEYS` (ключи через запятую) и `GITHUB__TOKEN` (read-доступ к целевому репозиторию, PR и diff). Write token для анализа не нужен. Существующие настройки browser auth, webhook и PostgreSQL сохраняются.
+1. В GitHub → Settings → Secrets and variables → Actions проверьте утверждённый HTTPS endpoint: repository Variable `STAGING_EUROROUTER_BASE_URL` либо организационную `AI_DMC268_URL`, если override пуст. Model ID берётся из существующей repository Variable `STAGING_EUROROUTER_MODEL`. Не подставляйте тестовую модель из examples. Установите `STAGING_LLM_PRIMARY_PROVIDER=eurorouter`, `STAGING_LLM_FALLBACK_ENABLED=false`.
+2. Проверьте доступность организационного Secret `AI_DMC268_T2` либо задайте repository Secret `STAGING_EUROROUTER_API_KEYS` (ключи через запятую) для переопределения. Задайте `GITHUB__TOKEN` (read-доступ к целевому репозиторию, PR и diff). Write token для анализа не нужен. Существующие настройки browser auth, webhook и PostgreSQL сохраняются.
 3. Подготовьте проверенный **несекретный** manifest формата [analysis-runtime.md](examples/analysis-runtime.md) с утверждённой policy и prompt version/digest из соответствующего API image. Оставьте профиль `eurorouter/review-v1`, `credential_env=LLM__EUROROUTER__API_KEYS`, точные model ID и endpoint из шага 1, явный allowlist моделей, `admission.policy.routing.fallback=[]`. Полный формат можно взять из `docs/examples/analysis-runtime.v1.json`, но этот пример не готов к deployment: в нём тестовые selectors/endpoints. Значения credentials в JSON запрещены.
 4. Через SSH на VPS создайте `sudo install -d -m 0755 /opt/dmc-268-t2/analysis-runtime` и установите проверенный файл как `/opt/dmc-268-t2/analysis-runtime/analysis-runtime.v1.json` с владельцем root и режимом `0644` (`sudo install -o root -g root -m 0644 <approved-file> <destination>`). Manifest должен быть доступен на чтение и не редактироваться контейнерами. При обновлении уже активного manifest сначала остановите `worker` и `outbox-dispatcher` командой Compose с теми же `-p`, `--env-file` и `-f`, затем замените файл и выполните deployment заново.
 5. Установите repository Variable `STAGING_ANALYSIS_ENABLED=true`. Запустите `Deploy` из `main` с `environment=staging` после успешного API CI с T3. При обычном API-deploy `ui_sha` оставьте пустым. UI-only deploy сохраняет прежний API image; не используйте его для первого включения T3.
@@ -367,18 +367,20 @@ runtime factory; его очередь, session auth и production composition r
 
 | Имя в GitHub Actions | Тип | Переменная в контейнере |
 |---|---|---|
-| `STAGING_EUROROUTER_API_KEYS` | Secret (один ключ или несколько через запятую) | `LLM__EUROROUTER__API_KEYS` |
-| `STAGING_EUROROUTER_BASE_URL` | Variable, только `https://…/v1` | `LLM__EUROROUTER__BASE_URL` |
+| `STAGING_EUROROUTER_API_KEYS` → `AI_DMC268_T2` | Repository Secret → организационный fallback (один ключ или несколько через запятую) | `LLM__EUROROUTER__API_KEYS` |
+| `STAGING_EUROROUTER_BASE_URL` → `AI_DMC268_URL` | Repository Variable → организационный fallback, только `https://…/v1` | `LLM__EUROROUTER__BASE_URL` |
 | `STAGING_EUROROUTER_MODEL` | Variable | `LLM__EUROROUTER__MODEL` |
 | `STAGING_LLM_PRIMARY_PROVIDER` | Variable, `eurorouter` (по умолчанию) или `ollama` | `LLM__PRIMARY_PROVIDER` |
 | `STAGING_LLM_FALLBACK_ENABLED` | Variable, `false` (по умолчанию) или `true` | `LLM__FALLBACK_ENABLED` |
 | `STAGING_OLLAMA_BASE_URL`, `STAGING_OLLAMA_MODEL` | Variables, нужны только если Ollama в цепочке | `LLM__OLLAMA__BASE_URL`, `LLM__OLLAMA__MODEL` |
 
+Непустые repository overrides имеют приоритет; иначе используются организационные `AI_DMC268_T2` и `AI_DMC268_URL`, доступные репозиторию Team 2. `STAGING_EUROROUTER_MODEL` остаётся repository Variable. Подключение организационных настроек не включает анализ: `STAGING_ANALYSIS_ENABLED` оставьте отсутствующей или равной `false` до отдельного включения.
+
 Пока Ollama не развёрнута в staging, используется режим `eurorouter` без резерва.
 
 Шаг «Validate deployment configuration» предупреждает об отсутствующих LLM значениях без вывода ключей. При выключенном анализе это не блокирует API/webhook. При включённом T3 обязательный restricted preflight блокирует запуск analysis при неполной или несовместимой конфигурации. Frozen analysis использует model/policy из доверенного manifest, а не legacy routing-флаги; для MVP задайте Eurorouter без fallback, как описано выше. Неверные значения legacy-флагов и `BASE_URL` не на `https://` остаются ошибкой validation.
 
-Ротация ключа: обновить Secret `STAGING_EUROROUTER_API_KEYS` и перезапустить workflow deploy. Горячей смены ключа нет.
+Ротация ключа: обновить используемый Secret (`STAGING_EUROROUTER_API_KEYS` при непустом override, иначе `AI_DMC268_T2`) и перезапустить workflow deploy. Горячей смены ключа нет.
 
 Staging-хосту нужен исходящий HTTPS-доступ к Eurorouter.
 

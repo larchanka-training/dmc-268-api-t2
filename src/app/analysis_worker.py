@@ -133,8 +133,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     configure_logging(Logging(format="json", file_enabled=False))
-    configure_sentry(get_settings())
     try:
+        configure_sentry(get_settings())
         asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
     except Exception as error:
         reason = "runtime_failure"

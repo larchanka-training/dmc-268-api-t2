@@ -6,7 +6,7 @@ from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from pathlib import Path
 from typing import Annotated, Any, Never
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.routing import APIRoute
@@ -24,7 +24,7 @@ from app.api.review_start_dependencies import (
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
-from app.application.github_ports import GithubFailure, GithubRequest
+from app.application.github_ports import GithubFailure, GithubPullRequest, GithubRequest
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
@@ -189,16 +189,49 @@ def _pull_request_number(value: str) -> int:
     return number
 
 
-async def _revalidate_github(
+async def _revalidate_github(  # noqa: PLR0913, PLR0917 -- explicit provider identity and optional discovery
     authorizer: ReviewStartAuthorizer,
     user_id: UUID,
     repository_identity: RepositoryIdentity,
-    github_request: GithubRequest,
-    expected_change: ChangeRequestIdentity,
-) -> None:
+    number: int,
+    requested_head_sha: str,
+    expected_change: ChangeRequestIdentity | None,
+) -> tuple[ChangeRequestIdentity, GithubPullRequest | None]:
+    new_change = None
     try:
         await authorizer.authorize_start(
             user_id=user_id, repository=repository_identity
+        )
+        if expected_change is None:
+            async with github_runtime.github_pull_request_connection(
+                get_settings()
+            ) as reader:
+                new_change = await reader.get_pull_request(
+                    repository_identity.owner,
+                    repository_identity.name,
+                    repository_identity.external_id,
+                    number,
+                )
+            if new_change.head_sha != requested_head_sha:
+                raise ApiError(
+                    409, "PR_HEAD_MISMATCH", "Pull request head does not match."
+                )
+            expected_change = ChangeRequestIdentity(
+                str(number),
+                new_change.head_sha,
+                new_change.base_sha,
+                new_change.source_repository_external_id,
+                new_change.source_ref,
+                new_change.base_ref,
+                "open",
+            )
+        github_request = GithubRequest(
+            repository_identity.owner,
+            repository_identity.name,
+            repository_identity.external_id,
+            number,
+            requested_head_sha,
+            expected_change.base_sha,
         )
         async with github_runtime.github_connection(get_settings()) as github:
             snapshot = await github.fetch(github_request)
@@ -258,6 +291,7 @@ async def _revalidate_github(
         or metadata["base_ref"] != expected_change.base_ref
     ):
         raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    return expected_change, new_change
 
 
 async def _refuse_configuration(
@@ -401,12 +435,14 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         )
     )
     if change is None:
-        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
-    await _check_rerun(session, body.rerun_of, change)
-    if change.current_status != "open":
-        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
-    if body.requested_head_sha != change.head_sha:
-        raise ApiError(409, "PR_HEAD_MISMATCH", "Pull request head does not match.")
+        if body.rerun_of is not None:
+            raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    else:
+        await _check_rerun(session, body.rerun_of, change)
+        if change.current_status != "open":
+            raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+        if body.requested_head_sha != change.head_sha:
+            raise ApiError(409, "PR_HEAD_MISMATCH", "Pull request head does not match.")
     settings = await session.get(RepositorySettings, repository.current_settings_id)
     if settings is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
@@ -434,16 +470,9 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         repository.owner,
         repository.repo_name,
     )
-    github_request = GithubRequest(
-        repository.owner,
-        repository.repo_name,
-        repository.external_id,
-        pr_number,
-        body.requested_head_sha,
-        change.base_sha,
-    )
-    settings_id, rules_digest, change_id = settings.id, settings.rules_digest, change.id
-    expected_change = change_identity(change)
+    settings_id, rules_digest = settings.id, settings.rules_digest
+    change_id = change.id if change is not None else uuid4()
+    expected_change = change_identity(change) if change is not None else None
     expected_settings = settings_identity(settings)
     raw_settings_digest = compute_repository_settings_digest(
         id=settings.id,
@@ -459,11 +488,12 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         ]
     )
     await session.rollback()
-    await _revalidate_github(
+    expected_change, new_change = await _revalidate_github(
         authorizer,
         identity.user_id,
         repository_identity,
-        github_request,
+        pr_number,
+        body.requested_head_sha,
         expected_change,
     )
     try:
@@ -516,6 +546,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
             request_hash=request_hash,
             expected_change=expected_change,
             expected_settings=expected_settings,
+            new_change=new_change,
         )
     except tuple(_ADMISSION_ERRORS) as error:
         raise ApiError(*_ADMISSION_ERRORS[type(error)]) from None

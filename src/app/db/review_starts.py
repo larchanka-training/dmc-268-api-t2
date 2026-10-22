@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.github_ports import GithubPullRequest
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
@@ -113,7 +115,7 @@ async def _check_quotas(
         raise ReviewQuotaExceededError
 
 
-async def persist_start(  # noqa: PLR0913 -- frozen admission and idempotency snapshots
+async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with optional materialization
     command: StartReviewCommand,
     *,
     factory: async_sessionmaker[AsyncSession],
@@ -123,6 +125,7 @@ async def persist_start(  # noqa: PLR0913 -- frozen admission and idempotency sn
     request_hash: str,
     expected_change: ChangeRequestIdentity,
     expected_settings: str,
+    new_change: GithubPullRequest | None = None,
 ) -> tuple[UUID, str, bool]:
     repository_id = expected_repository.id
     async with SqlAlchemyUnitOfWork(factory) as uow:
@@ -157,6 +160,34 @@ async def persist_start(  # noqa: PLR0913 -- frozen admission and idempotency sn
             raise AdmissionResourceNotFoundError
         if repository.current_settings_id != command.repository_settings_id:
             raise SettingsVersionChangedError
+        if new_change is not None:
+            await uow.session.execute(
+                insert(ChangeRequest)
+                .values(
+                    id=command.change_request_id,
+                    repository_id=repository_id,
+                    external_number=expected_change.number,
+                    head_sha=new_change.head_sha,
+                    base_sha=new_change.base_sha,
+                    source_repository_external_id=new_change.source_repository_external_id,
+                    source_ref=new_change.source_ref,
+                    base_ref=new_change.base_ref,
+                    current_status="open",
+                    title=new_change.title,
+                    description=new_change.description,
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_change_request_repository_number"
+                )
+            )
+            change_id = await uow.session.scalar(
+                select(ChangeRequest.id).where(
+                    ChangeRequest.repository_id == repository_id,
+                    ChangeRequest.external_number == expected_change.number,
+                )
+            )
+            assert change_id is not None
+            command = replace(command, change_request_id=change_id)
         if command.rerun_of is not None:
             parent = await uow.session.scalar(
                 select(ReviewJob.id)

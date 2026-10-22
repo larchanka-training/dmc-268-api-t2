@@ -44,6 +44,7 @@ def github_transport() -> httpx.MockTransport:
             return httpx.Response(
                 HTTPStatus.OK,
                 json={
+                    "number": 13,
                     "title": "Fix division",
                     "body": "Description",
                     "state": "open",

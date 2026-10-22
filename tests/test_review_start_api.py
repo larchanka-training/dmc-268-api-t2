@@ -258,8 +258,15 @@ async def test_missing_repository_has_canonical_not_found(
 
 
 async def test_missing_pull_request_is_not_found(
-    client: httpx.AsyncClient, scope: StartScope
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    providers: FakeStartGithub,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "httpx._client.AsyncHTTPTransport",
+        lambda **kwargs: httpx.MockTransport(lambda request: httpx.Response(404)),
+    )
     response = await client.post(
         scope.url.replace("/13/", "/99/"),
         json={"requested_head_sha": HEAD},

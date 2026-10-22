@@ -32,7 +32,7 @@ GitHub
                          |     |     +-- /api/* -> FastAPI
                          |     |     +-- /healthcheck -> FastAPI
                          |     +-- FastAPI :8000
-                         |     +-- worker (заглушка review-очереди, тот же API-образ)
+                         |     +-- worker / outbox-dispatcher (opt-in analysis, тот же API-образ)
                          |     +-- webhook-worker (GitHub intake, тот же API-образ)
                          |     +-- PostgreSQL, Redis
                          |
@@ -43,7 +43,7 @@ GitHub
 
 Из application-сервисов публично доступен только web-контейнер каждого окружения: staging — порт `80`, develop — порт `8080`.
 
-FastAPI, оба воркера, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
+FastAPI, фоновые процессы, PostgreSQL и Redis доступны только внутри Docker network каждого окружения.
 
 HTTPS завершает один контейнер Caddy на порту 443: `https://dmc268-t2.ddns.net/` для `main` (дальше на порт 80) и `https://dmc268t2-staging.ddns.net/` для `develop` (дальше на порт 8080). HTTP по IP на порту 80 остаётся, редиректа на HTTPS нет.
 
@@ -183,6 +183,7 @@ docker-compose.staging.yml
 web
 api
 worker
+outbox-dispatcher
 webhook-worker
 db
 redis
@@ -240,9 +241,31 @@ web -> api:8000
 
 ### Worker
 
-Оба воркера запускаются из того же immutable API-образа, что и FastAPI, и обновляются тем же деплоем: API-образ — одна деплой-единица репозитория (один образ, три сервиса: `api`, `worker` и `webhook-worker`).
+Фоновые процессы запускаются из того же immutable API-образа, что и FastAPI, и обновляются тем же деплоем: `api`, `worker`, `outbox-dispatcher` и `webhook-worker`.
 
-Команда `worker` сейчас — заглушка (`sleep infinity`): логику review-очереди на Redis добавит отдельная задача. `webhook-worker` уже выполняет восстановление GitHub intake и не заменяет review-worker.
+`worker` выполняет `python -m app.analysis_worker`, `outbox-dispatcher` — `python -m app.outbox_dispatcher`. Обе команды работают постоянно, без `--once`, и включены в Compose profile `analysis`. По умолчанию профиль выключен. `webhook-worker` постоянно выполняет восстановление GitHub intake независимо от анализа.
+
+### Включение T3 MVP analysis на staging
+
+`StartReview → PostgreSQL Outbox → Redis → Analysis Worker → LLM → PostgreSQL → GET Review` использует существующий backend pipeline. Публикация в GitHub этим включением не запускается.
+
+До готовности конфигурации оставьте repository Variable `STAGING_ANALYSIS_ENABLED` отсутствующей или равной `false`. API и webhook-worker продолжают работать; StartReview без manifest возвращает безопасный `503`. Develop остаётся без analysis независимо от staging-флага. Имена Compose-проектов, сети, БД и каталоги окружений разделены как прежде.
+
+Порядок включения после merge:
+
+1. В GitHub → Settings → Secrets and variables → Actions проверьте существующие Variables `STAGING_EUROROUTER_BASE_URL` и `STAGING_EUROROUTER_MODEL`: должны содержать утверждённые HTTPS endpoint и model ID. Не подставляйте тестовую модель из examples. Установите `STAGING_LLM_PRIMARY_PROVIDER=eurorouter`, `STAGING_LLM_FALLBACK_ENABLED=false`.
+2. Задайте Secrets `STAGING_EUROROUTER_API_KEYS` (ключи через запятую) и `GITHUB__TOKEN` (read-доступ к целевому репозиторию, PR и diff). Write token для анализа не нужен. Существующие настройки browser auth, webhook и PostgreSQL сохраняются.
+3. Подготовьте проверенный **несекретный** manifest формата [analysis-runtime.md](examples/analysis-runtime.md) с утверждённой policy и prompt version/digest из соответствующего API image. Оставьте профиль `eurorouter/review-v1`, `credential_env=LLM__EUROROUTER__API_KEYS`, точные model ID и endpoint из шага 1, явный allowlist моделей, `admission.policy.routing.fallback=[]`. Полный формат можно взять из `docs/examples/analysis-runtime.v1.json`, но этот пример не готов к deployment: в нём тестовые selectors/endpoints. Значения credentials в JSON запрещены.
+4. Через SSH на VPS создайте `sudo install -d -m 0755 /opt/dmc-268-t2/analysis-runtime` и установите проверенный файл как `/opt/dmc-268-t2/analysis-runtime/analysis-runtime.v1.json` с владельцем root и режимом `0644` (`sudo install -o root -g root -m 0644 <approved-file> <destination>`). Manifest должен быть доступен на чтение и не редактироваться контейнерами. При обновлении уже активного manifest сначала остановите `worker` и `outbox-dispatcher` командой Compose с теми же `-p`, `--env-file` и `-f`, затем замените файл и выполните deployment заново.
+5. Установите repository Variable `STAGING_ANALYSIS_ENABLED=true`. Запустите `Deploy` из `main` с `environment=staging` после успешного API CI с T3. При обычном API-deploy `ui_sha` оставьте пустым. UI-only deploy сохраняет прежний API image; не используйте его для первого включения T3.
+
+Workflow записывает `COMPOSE_PROFILES=analysis` и `ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json` только для включённого staging. Один каталог manifest монтируется в API и worker как `:ro`. На develop используются другой deploy-каталог и пустой config path.
+
+После миграций и до запуска новых API/worker workflow выполняет `load_runtime_configuration()` и существующий `deployment_preflight()` внутри выбранного worker image. Gate проверяет read token, выбранный Eurorouter profile, отсутствие fallback, совпадение model/endpoint с утверждёнными Variables, prompt closure, совместимость pending jobs и локальную готовность LLM credentials. Он не читает Redis, не получает leases, не резервирует budget и не обращается к GitHub/LLM. Ошибка выводит только `Analysis preflight failed` и завершает deployment до старта analysis. Pending jobs с сохранённым fallback также блокируют MVP-включение, даже внутри одного провайдера. Существующий ограниченный scan pending jobs может блокировать запуск; сохранённые jobs для обхода gate не изменяйте.
+
+Успешный preflight проверяет локальную конфигурацию, а не действительность credentials у провайдеров. Реальный платный smoke-run требует отдельного согласования. Утверждённый staging manifest и готовность внешних credentials не подтверждаются локальными тестами.
+
+Dispatcher и analysis worker запускаются вместе с webhook-worker и проверяются на состояние running. Для worker задано `restart: on-failure:3`: прямой ручной запуск с ошибочной конфигурацией не создаёт бесконечный crash-loop. После устранения причины выполните deployment заново. Чтобы выключить анализ, установите `STAGING_ANALYSIS_ENABLED=false` и повторите deployment: оба analysis-сервиса останавливаются, config path API очищается. Уже принятые jobs сохраняются в БД до следующего включения.
 
 Воркеры не публикуют порты наружу и доступны только внутри Docker network.
 
@@ -340,7 +363,7 @@ runtime factory; его очередь, session auth и production composition r
 
 ### LLM gateway: ключ Eurorouter
 
-Ключ Eurorouter идёт тем же путём, что и пароль PostgreSQL: GitHub Actions Secret → `.env.staging` на VPS → переменные окружения контейнера `api` (позже — analyze worker). Подробности: `docs/llm-gateway-review-pipeline.md` §6, §6a.
+Ключ Eurorouter идёт тем же путём, что и пароль PostgreSQL: GitHub Actions Secret → `.env.staging` на VPS → переменные окружения API и analysis worker. Значения записываются через существующий formatter с экранированием dotenv/Compose и передаются по SSH stdin, без вывода в log. Подробности: `docs/llm-gateway-review-pipeline.md` §6, §6a.
 
 | Имя в GitHub Actions | Тип | Переменная в контейнере |
 |---|---|---|
@@ -353,7 +376,7 @@ runtime factory; его очередь, session auth и production composition r
 
 Пока Ollama не развёрнута в staging, используется режим `eurorouter` без резерва.
 
-Шаг «Validate deployment configuration» проверяет, что для провайдеров из цепочки заданы нужные значения. Значение ключа при этом не выводится. Если Eurorouter в цепочке, а ключа нет, шаг выводит warning, и deploy продолжается: API и воркеры стартуют без `LLM__*`, а gateway проверяет цепочку только при сборке (`LLMConfigError`). Ошибкой остаются неверные значения флагов и `BASE_URL` не на `https://`.
+Шаг «Validate deployment configuration» предупреждает об отсутствующих LLM значениях без вывода ключей. При выключенном анализе это не блокирует API/webhook. При включённом T3 обязательный restricted preflight блокирует запуск analysis при неполной или несовместимой конфигурации. Frozen analysis использует model/policy из доверенного manifest, а не legacy routing-флаги; для MVP задайте Eurorouter без fallback, как описано выше. Неверные значения legacy-флагов и `BASE_URL` не на `https://` остаются ошибкой validation.
 
 Ротация ключа: обновить Secret `STAGING_EUROROUTER_API_KEYS` и перезапустить workflow deploy. Горячей смены ключа нет.
 
@@ -446,7 +469,7 @@ API CI (quality, build, publish)
 Deploy (workflow_run после успешного API CI)
 ```
 
-Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main` или `develop`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`). Обновляются API и оба воркера (один образ), версия UI сохраняется (см. ниже).
+Workflow стартует через событие `workflow_run` после успешного завершения API CI на `main` или `develop`. API image берётся из коммита, который собрал API CI (`workflow_run.head_sha`). Обновляются API и включённые фоновые процессы (один образ), версия UI сохраняется (см. ниже).
 
 Версия UI при этом сохраняется: если `ui_sha` не указан, workflow читает текущий `UI_IMAGE` из env-файла окружения на VPS и обновляет только `API_IMAGE` (см. ADR `docs/adr/0001-autonomous-cd.md`).
 
@@ -506,7 +529,7 @@ alembic upgrade head
 
 13. запускает API;
 14. ждёт Docker healthcheck API;
-15. запускает `worker` и `webhook-worker` и проверяет, что оба в состоянии running;
+15. запускает `webhook-worker` и, при включённом analysis после успешного preflight, `worker` и `outbox-dispatcher`; проверяет состояние running;
 16. запускает web/Nginx;
 17. проверяет web endpoint окружения (`http://127.0.0.1/` для staging, `http://127.0.0.1:8080/` для develop);
 18. выполняет logout из GHCR.
@@ -543,7 +566,7 @@ Docker build
 GHCR API image sha-<api-commit>
 ```
 
-Backend и оба воркера деплоятся автоматически: после успешного API CI workflow `Deploy` обновляет `API_IMAGE` в окружении, соответствующем ветке, сохраняя текущую версию UI.
+Backend и включённые фоновые процессы деплоятся автоматически: после успешного API CI workflow `Deploy` обновляет `API_IMAGE` в окружении, соответствующем ветке, сохраняя текущую версию UI.
 
 Frontend после публикации образа инициирует деплой своей версии: UI-репозиторий запускает `Deploy` с `ui_sha` через PAT (см. `docs/ui-cd-handoff.md`), либо деплой запускается вручную.
 

@@ -16,6 +16,7 @@ import httpx
 
 from app.application.github_ports import (
     GithubFailure,
+    GithubPullRequest,
     GithubRemoteComment,
     GithubRemoteReview,
     GithubRequest,
@@ -432,6 +433,53 @@ class GithubClient:
         self._timeout_seconds = timeout_seconds
         self._authorize = authorize
 
+    async def get_pull_request(
+        self, owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest:
+        if (
+            not _OWNER.fullmatch(owner)
+            or not _REPOSITORY.fullmatch(name)
+            or name in {".", ".."}
+            or not _EXTERNAL_ID.fullmatch(repository_external_id)
+            or type(number) is not int
+            or number < 1
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                pull = _json_object(
+                    await self._get(
+                        f"https://api.github.com/repos/{owner}/{name}/pulls/{number}",
+                        "application/vnd.github+json",
+                        missing_pull=True,
+                    )
+                )
+                if type(pull.get("number")) is not int or pull["number"] != number:
+                    raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+                if pull.get("state") != "open":
+                    raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
+                head = _listed_ref(pull.get("head"))
+                base = _listed_ref(pull.get("base"))
+                if base["repository_external_id"] != repository_external_id:
+                    raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+                return GithubPullRequest(
+                    head_sha=head["sha"],
+                    base_sha=base["sha"],
+                    source_repository_external_id=head["repository_external_id"],
+                    source_ref=head["ref"],
+                    base_ref=base["ref"],
+                    title=_listed_text(pull.get("title"), allow_empty=True),
+                    description=(
+                        ""
+                        if pull.get("body") is None
+                        else _listed_text(pull["body"], allow_empty=True)
+                    ),
+                )
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+        except RecursionError:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False) from None
+
     async def list_available_repositories(
         self, *, limit: int, page: int
     ) -> tuple[list[dict[str, Any]], int | None]:
@@ -720,7 +768,12 @@ class GithubClient:
             raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
 
     async def _get(
-        self, url: str, accept: str, *, token: str | None = None
+        self,
+        url: str,
+        accept: str,
+        *,
+        token: str | None = None,
+        missing_pull: bool = False,
     ) -> httpx.Response:
         if self._authorize is not None:
             await self._authorize()
@@ -731,6 +784,8 @@ class GithubClient:
             async with self._client.stream(
                 "GET", url, headers=headers, follow_redirects=False
             ) as response:
+                if missing_pull and response.status_code == HTTPStatus.NOT_FOUND:
+                    raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
                 ambiguous_forbidden = (
                     response.status_code == HTTPStatus.FORBIDDEN
                     and response.headers.get("x-ratelimit-remaining") != "0"

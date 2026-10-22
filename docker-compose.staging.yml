@@ -32,9 +32,9 @@ services:
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
       SENTRY__DSN: ${SENTRY__DSN:-}
-      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
-      # process starts without them; the gateway checks its provider chain
-      # only when it is built.
+      ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
+      # Legacy gateway settings remain available. Frozen analysis selects its
+      # model/policy from ANALYSIS__CONFIG_PATH; deployment checks consistency.
       LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
       LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
       LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
@@ -54,6 +54,8 @@ services:
       AUTH__FRONTEND_ORIGINS: ${AUTH__FRONTEND_ORIGINS:-}
       GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
       GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
+    volumes:
+      - ./analysis-runtime:/app/runtime:ro
     depends_on:
       db:
         condition: service_healthy
@@ -76,11 +78,9 @@ services:
 
   worker:
     image: ${API_IMAGE:?API_IMAGE is required}
-    restart: unless-stopped
-    # Заглушка вместо реального воркера: юнит деплоя существует уже сейчас
-    # (CD обновляет его вместе с API), логику очереди добавит задача про
-    # фоновые воркеры — той же командой в этом же сервисе.
-    command: ["sleep", "infinity"]
+    profiles: [analysis]
+    restart: "on-failure:3"
+    command: ["python", "-m", "app.analysis_worker"]
     environment:
       POSTGRES__HOST: db
       POSTGRES__PORT: "5432"
@@ -92,9 +92,8 @@ services:
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
       SENTRY__DSN: ${SENTRY__DSN:-}
-      # LLM gateway (docs/llm-gateway-review-pipeline.md §6). Optional: the
-      # process starts without them; the gateway checks its provider chain
-      # only when it is built.
+      ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
+      # Execution uses the trusted manifest, plus credentials from environment.
       LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
       LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
       LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
@@ -104,7 +103,32 @@ services:
       LLM__OLLAMA__MODEL: ${LLM__OLLAMA__MODEL:-}
       # Секреты времени выполнения: деплой-workflow прокидывает их в env-файл,
       # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
-      WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+    volumes:
+      - ./analysis-runtime:/app/runtime:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  outbox-dispatcher:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    profiles: [analysis]
+    restart: unless-stopped
+    command: ["python", "-m", "app.outbox_dispatcher"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
     depends_on:
       db:
         condition: service_healthy

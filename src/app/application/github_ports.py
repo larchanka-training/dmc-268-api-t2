@@ -23,6 +23,23 @@ class GithubSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class GithubPullRequest:
+    head_sha: str
+    base_sha: str
+    source_repository_external_id: str
+    source_ref: str
+    base_ref: str
+    title: str
+    description: str
+
+
+class GithubPullRequestReader(Protocol):
+    async def get_pull_request(
+        self, owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest: ...
+
+
+@dataclass(frozen=True, slots=True)
 class GithubReviewReference:
     remote_review_id: str
 

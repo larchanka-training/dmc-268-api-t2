@@ -18,8 +18,6 @@ def test_staging_runs_intake_recovery_and_forwards_read_token() -> None:
     recovery = compose["services"]["webhook-worker"]
     assert recovery["command"] == ["python", "-m", "app.webhook_worker"]
     assert recovery["environment"]["GITHUB__TOKEN"] == "${GITHUB__TOKEN:-}"
-    assert compose["services"]["worker"]["command"] == ["sleep", "infinity"]
-    assert "GITHUB__TOKEN" not in compose["services"]["worker"]["environment"]
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/deploy-staging.yml").read_text()
     )

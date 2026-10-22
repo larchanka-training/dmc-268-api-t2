@@ -67,6 +67,7 @@ jobs:
       SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       UI_SHA: ${{ inputs.ui_sha }}
+      ANALYSIS_ENABLED: ${{ vars.STAGING_ANALYSIS_ENABLED || 'false' }}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6a). Until Ollama is
       # deployed to staging, the chain is Eurorouter only.
       LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
@@ -199,9 +200,8 @@ jobs:
               ;;
           esac
 
-          # Missing LLM values do not block the deploy: no deployed process
-          # calls an LLM yet, and the gateway checks its chain when it is
-          # built (LLM.check_provider_chain). Malformed values still fail.
+          # Inactive analysis does not block API/webhook deployment. When
+          # enabled, the restricted preflight below is mandatory before start.
           llm_missing=()
           if [[ " ${chain} " == *" eurorouter "* ]]; then
             # The key value is never printed, only its presence is checked.
@@ -386,6 +386,12 @@ jobs:
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
             printf 'WEB_PORT=%s\n' "${WEB_PORT}"
+            if [[ "${ENV_NAME:-}" == staging && "${ANALYSIS_ENABLED:-false}" == true ]]; then
+              printf 'COMPOSE_PROFILES=analysis\n'
+              printf 'ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json\n'
+            else
+              printf 'COMPOSE_PROFILES=\nANALYSIS__CONFIG_PATH=\n'
+            fi
             printf 'POSTGRES__USER=dmc\n'
             append_optional 'POSTGRES__PASSWORD' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
@@ -393,7 +399,7 @@ jobs:
             printf 'LLM__FALLBACK_ENABLED=%s\n' "${LLM_FALLBACK_ENABLED}"
             printf 'LLM__EUROROUTER__BASE_URL=%s\n' "${EUROROUTER_BASE_URL}"
             printf 'LLM__EUROROUTER__MODEL=%s\n' "${EUROROUTER_MODEL}"
-            printf 'LLM__EUROROUTER__API_KEYS=%s\n' "${EUROROUTER_API_KEYS}"
+            append_optional 'LLM__EUROROUTER__API_KEYS' "${EUROROUTER_API_KEYS}"
             printf 'LLM__OLLAMA__BASE_URL=%s\n' "${OLLAMA_BASE_URL}"
             printf 'LLM__OLLAMA__MODEL=%s\n' "${OLLAMA_MODEL}"
             # Runtime secrets passthrough: GitHub Encrypted Secrets ->
@@ -474,6 +480,10 @@ jobs:
 
           compose pull
 
+          # Stop the previous image's analysis processes before migrations or
+          # activation changes. This also retires the old sleep placeholder.
+          compose --profile analysis stop worker outbox-dispatcher
+
           compose up -d db redis
 
           echo "Waiting for PostgreSQL and Redis..."
@@ -504,6 +514,65 @@ jobs:
 
           echo "Running database migrations..."
           compose run --rm --no-deps --interactive=false -T api alembic upgrade head </dev/null
+
+          analysis_services=()
+          if grep -qx 'COMPOSE_PROFILES=analysis' "${ENV_FILE}"; then
+            analysis_services=(outbox-dispatcher worker)
+            echo "Checking analysis configuration without provider requests..."
+            compose run --rm --no-deps -T worker python - <<'PREFLIGHT'
+          import asyncio
+          import os
+          from pathlib import Path
+
+          from sqlalchemy import select
+
+          from app.review.configuration import load_runtime_configuration
+
+          async def check():
+              if not os.environ.get("GITHUB__TOKEN", "").strip():
+                  raise ValueError("github_read_token_missing")
+              runtime = load_runtime_configuration()
+              if runtime.admission.primary.profile_ref != "eurorouter/review-v1":
+                  raise ValueError("mvp_provider_mismatch")
+              if set(runtime.profiles) != {"eurorouter/review-v1"}:
+                  raise ValueError("mvp_inventory_mismatch")
+              if runtime.admission.policy.routing.fallback:
+                  raise ValueError("mvp_fallback_forbidden")
+              if runtime.admission.primary.model_ref != os.environ.get("LLM__EUROROUTER__MODEL"):
+                  raise ValueError("approved_model_mismatch")
+              profile = runtime.profiles[runtime.admission.primary.profile_ref]
+              if profile.base_url != os.environ.get("LLM__EUROROUTER__BASE_URL"):
+                  raise ValueError("approved_endpoint_mismatch")
+              from app.db.session import async_session_factory, engine
+              from app.db.models import ReviewJob
+              try:
+                  report = await runtime.deployment_preflight(
+                      async_session_factory, Path(".agents/reviewer")
+                  )
+                  if not report.ready:
+                      raise ValueError("analysis_not_ready")
+                  async with async_session_factory() as session:
+                      fallback_job = await session.scalar(
+                          select(ReviewJob.id).where(
+                              ReviewJob.status.in_((
+                                  "QUEUED", "FETCHING_DIFF", "PARSING_CONTEXT", "LLM_PROCESSING"
+                              )),
+                              ReviewJob.frozen_configuration_version == 1,
+                              ReviewJob.model_settings["routing"]["fallback"] != [],
+                          ).limit(1)
+                      )
+                  if fallback_job is not None:
+                      raise ValueError("mvp_pending_fallback_unsupported")
+              finally:
+                  await engine.dispose()
+
+          try:
+              asyncio.run(check())
+          except Exception:
+              raise SystemExit("Analysis preflight failed") from None
+          print("Analysis preflight passed")
+          PREFLIGHT
+          fi
 
           echo "Starting API..."
           compose up -d api
@@ -539,9 +608,9 @@ jobs:
           done
 
           echo "Starting workers..."
-          compose up -d worker webhook-worker
+          compose up -d webhook-worker "${analysis_services[@]}"
 
-          for service in worker webhook-worker; do
+          for service in webhook-worker "${analysis_services[@]}"; do
             echo "Waiting for ${service}..."
             for attempt in $(seq 1 30); do
               worker_id="$(compose ps -q "${service}")"

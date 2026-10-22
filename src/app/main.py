@@ -11,6 +11,7 @@ from app.api.errors import ApiError, api_error_response
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.core.middleware import RequestIdMiddleware
+from app.core.sentry import configure_sentry
 from app.db.session import engine
 
 logger = structlog.get_logger(__name__)
@@ -28,7 +29,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Build the FastAPI application."""
 
-    configure_logging(get_settings().logging)
+    settings = get_settings()
+    configure_logging(settings.logging)
+    configure_sentry(settings)
 
     app = FastAPI(
         title="DMC-268 API",

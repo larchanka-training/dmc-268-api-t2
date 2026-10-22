@@ -31,6 +31,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
       ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
       # Legacy gateway settings remain available. Frozen analysis selects its
       # model/policy from ANALYSIS__CONFIG_PATH; deployment checks consistency.
@@ -90,6 +91,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
       ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
       # Execution uses the trusted manifest, plus credentials from environment.
       LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
@@ -127,6 +129,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
     depends_on:
       db:
         condition: service_healthy
@@ -149,6 +152,7 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
     depends_on:
       db:
         condition: service_healthy

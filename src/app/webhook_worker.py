@@ -11,6 +11,7 @@ from app.application.webhook_ports import WebhookInbox
 from app.core.config import get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
+from app.core.sentry import configure_sentry
 from app.db.session import async_session_factory, engine
 from app.db.webhook_inbox import SqlAlchemyWebhookInbox
 
@@ -25,6 +26,7 @@ async def run_once(inbox: WebhookInbox, github: GithubPort) -> int:
 async def _run(*, once: bool) -> None:
     settings = get_settings()
     configure_logging(settings.logging)
+    configure_sentry(settings)
     try:
         async with github_connection(settings) as github:
             while True:

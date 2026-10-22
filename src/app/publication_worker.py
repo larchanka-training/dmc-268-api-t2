@@ -151,11 +151,13 @@ def main() -> None:
     args = parser.parse_args()
     import structlog  # noqa: PLC0415 -- keep argument parsing independent
 
-    from app.core.config import Logging  # noqa: PLC0415
+    from app.core.config import Logging, get_settings  # noqa: PLC0415
     from app.core.logging_config import configure_logging  # noqa: PLC0415
+    from app.core.sentry import configure_sentry  # noqa: PLC0415
 
     configure_logging(Logging(format="json", file_enabled=False))
     try:
+        configure_sentry(get_settings())
         asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
     except Exception as error:
         structlog.get_logger().error(

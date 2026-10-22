@@ -15,6 +15,7 @@ from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
 from app.adapters.redis_queue import RedisQueue
 from app.core.config import Logging, get_settings
 from app.core.logging_config import configure_logging
+from app.core.sentry import configure_sentry
 
 
 def _batch_size(value: str) -> int:
@@ -113,6 +114,7 @@ def main() -> None:
     args = parser.parse_args()
     configure_logging(Logging(format="json", file_enabled=False))
     try:
+        configure_sentry(get_settings())
         asyncio.run(
             _run(
                 once=args.once,

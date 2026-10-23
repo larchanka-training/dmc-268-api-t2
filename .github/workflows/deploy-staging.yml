@@ -327,6 +327,23 @@ jobs:
           echo "Deploying API image: ${api_image}"
           echo "Deploying UI image: ${ui_image}"
 
+      - name: Prepare staging analysis manifest
+        if: env.ENV_NAME == 'staging'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="${API_IMAGE##*:sha-}"
+          [[ "${source_sha}" =~ ^[0-9a-fA-F]{40}$ ]]
+          source_sha="${source_sha,,}"
+          git fetch --no-tags --depth=1 origin "${source_sha}"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "${source_sha}"
+          git show "${source_sha}:deploy/analysis-runtime.staging.json" > analysis-runtime.selected.json
+          python3 -m json.tool analysis-runtime.selected.json >/dev/null
+          {
+            echo "MANIFEST_SOURCE_SHA=${source_sha}"
+            echo "MANIFEST_SHA256=$(sha256sum analysis-runtime.selected.json | cut -d' ' -f1)"
+          } >> "${GITHUB_ENV}"
+
       - name: Prepare deployment directory
         env:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
@@ -350,6 +367,22 @@ jobs:
             -o PubkeyAuthentication=no \
             docker-compose.staging.yml \
             "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/docker-compose.staging.yml"
+
+      - name: Transfer staging analysis manifest
+        if: env.ENV_NAME == 'staging'
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e scp \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            analysis-runtime.selected.json deploy/install-analysis-manifest.py \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
 
       - name: Write runtime environment
         env:
@@ -459,7 +492,7 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' bash -s" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' bash -s" \
             <<'REMOTE'
           set -euo pipefail
 
@@ -483,6 +516,19 @@ jobs:
           # Stop the previous image's analysis processes before migrations or
           # activation changes. This also retires the old sleep placeholder.
           compose --profile analysis stop worker outbox-dispatcher
+
+          if [[ "${ENV_NAME}" == staging ]]; then
+            # Preserve root ownership; never fall back to a user-writable file.
+            if [[ "$(id -u)" == 0 ]]; then
+              python3 install-analysis-manifest.py analysis-runtime.selected.json "${MANIFEST_SHA256}"
+            else
+              sudo -n python3 install-analysis-manifest.py analysis-runtime.selected.json "${MANIFEST_SHA256}"
+            fi
+            # Validate using the selected image's schema, even with analysis off.
+            compose --profile analysis run --rm --no-deps --interactive=false -T worker \
+              python -c 'from pathlib import Path; from app.review.configuration import load_runtime_configuration; load_runtime_configuration(Path("/app/runtime/analysis-runtime.v1.json"))' </dev/null
+            rm -f analysis-runtime.selected.json install-analysis-manifest.py
+          fi
 
           compose up -d db redis
 

@@ -246,6 +246,7 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
         "fi\n"
     )
     (binary / "curl").write_text("#!/bin/sh\nexit 0\n")
+    (binary / "sudo").write_text("#!/bin/sh\nexit 0\n")
     for executable in binary.iterdir():
         executable.chmod(0o755)
     remote = workflow_step("Deploy application")["run"].split("<<'REMOTE'\n", 1)[1]
@@ -256,6 +257,7 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
         env={
             "PATH": f"{binary}:{os.environ['PATH']}",
             "DEPLOY_TRACE": str(trace),
+            "MANIFEST_SHA256": "a" * 64,
             "DEPLOY_PATH": str(tmp_path),
             "ENV_FILE": ".env.test",
             "ENV_NAME": target,

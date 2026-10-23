@@ -256,8 +256,10 @@ web -> api:8000
 1. В GitHub → Settings → Secrets and variables → Actions проверьте, что effective HTTPS endpoint равен `https://api.eurouter.ai/api/v1`: repository Variable `STAGING_EUROROUTER_BASE_URL` либо организационная `AI_DMC268_URL`, если override пуст. Repository Variable `STAGING_EUROROUTER_MODEL` должна быть равна `qwen3-coder-next-80b`. Эти значения должны совпадать с versioned staging manifest. Установите `STAGING_LLM_PRIMARY_PROVIDER=eurorouter`, `STAGING_LLM_FALLBACK_ENABLED=false`.
 2. Проверьте доступность организационного Secret `AI_DMC268_T2` либо задайте repository Secret `STAGING_EUROROUTER_API_KEYS` (ключи через запятую) для переопределения. Задайте repository Secret `STAGING_GITHUB_READ_TOKEN` (read-доступ к целевому репозиторию, PR и diff); workflow передаст его контейнерам как `GITHUB__TOKEN`. Write token для анализа не нужен. Существующие настройки browser auth, webhook и PostgreSQL сохраняются.
 3. Источник **несекретного** staging manifest — [deploy/analysis-runtime.staging.json](../deploy/analysis-runtime.staging.json) из того же merged commit, что и выбранный API image. Он содержит только профиль `eurorouter/review-v1`, allowlist из одной модели `qwen3-coder-next-80b`, `credential_env=LLM__EUROROUTER__API_KEYS` и пустой `admission.policy.routing.fallback`. Prompt — `v2`, digest `a09dffb11fdd1481888eab77d2530e135e998765e22f9fc254a80cc94faef50b`; соответствие packaged artifacts проверяется regression-тестом и preflight внутри image. Сохраняйте утверждённые ограничения: context `16384`, input/output `10000/2000`, на run — до `8` запросов и `80000/16000` токенов, до `5` chunks, timeout запроса `120000 ms`, analysis duration `600000 ms`; retry policy также не меняйте без отдельного согласования. Формат описан в [analysis-runtime.md](examples/analysis-runtime.md); `docs/examples/analysis-runtime.v1.json` содержит тестовые selectors/endpoints и для staging не используется. Значения credentials в JSON запрещены.
-4. Вручную доставьте `deploy/analysis-runtime.staging.json` на VPS, например через SCP как `/tmp/analysis-runtime.staging.json`. CD не копирует manifest. Через SSH выполните `sudo install -d -o root -g root -m 0755 /opt/dmc-268-t2/analysis-runtime`, затем `sudo install -o root -g root -m 0644 /tmp/analysis-runtime.staging.json /opt/dmc-268-t2/analysis-runtime/analysis-runtime.v1.json`. Manifest должен быть доступен на чтение и не редактироваться контейнерами; каталог монтируется в API и worker как `/app/runtime:ro`. При обновлении уже активного manifest сначала остановите `worker` и `outbox-dispatcher` командой Compose с теми же `-p`, `--env-file` и `-f`, затем замените файл и выполните deployment заново.
-5. Установите repository Variable `STAGING_ANALYSIS_ENABLED=true`. Запустите `Deploy` из `main` с `environment=staging` после успешного API CI с T3. При обычном API-deploy `ui_sha` оставьте пустым. UI-only deploy сохраняет прежний API image; не используйте его для первого включения T3.
+4. CD автоматически доставляет manifest через существующий SSH/SCP с pinned host key. После `Resolve image versions` workflow извлекает SHA **выбранного `API_IMAGE`**, fetch-ит этот commit, проверяет `FETCH_HEAD^{commit}`, читает `deploy/analysis-runtime.staging.json` через `git show` и вычисляет SHA-256. При UI-only deployment используется сохранённый API image и его commit, даже если checkout/API CI уже новее. Отсутствующий commit/manifest или неверный JSON блокируют deployment.
+5. После остановки прежних `worker` и `outbox-dispatcher`, до migrations/preflight, root-only installer проверяет SHA-256 и JSON, доверенные каталоги (root:root без group/world write, без symlink), атомарно заменяет `/opt/dmc-268-t2/analysis-runtime/analysis-runtime.v1.json` через временный файл в том же каталоге и `rename`, выполняет `fsync`, проверяет содержимое и `root:root 0644`. Затем выбранный API image валидирует runtime schema, в том числе при выключенном analysis. Ошибка любого gate завершает deployment без запуска analysis; старые процессы уже остановлены. Каталог остаётся read-only mount `/app/runtime:ro`.
+6. **Права deployment-пользователя:** на VPS требуется Python 3 (только stdlib installer, без зависимостей приложения); нужен root либо уже разрешённый `sudo -n python3` для installer. Terraform bootstrap требует root, но это не доказывает права пользователя из `VPS_DMC268_U`; без доступа к VPS они не подтверждены. Если workflow сообщает `root or noninteractive sudo is required`, `sudo: a password is required` или `untrusted manifest directory`, это блокер установки, права manifest не ослаблять. Минимальное операционное решение — администратор обеспечивает root-owned каталоги и запускает доставку под существующим root deployment account либо устанавливает root-owned helper с узким noninteractive sudo правилом (при таком правиле вызов installer нужно направить на helper). Не выдавайте широкое sudo разрешение ради этого deployment. Terraform для доставки менять не требуется.
+7. Установите repository Variable `STAGING_ANALYSIS_ENABLED=true`. Запустите `Deploy` из `main` с `environment=staging` после успешного API CI с T3. При обычном API-deploy `ui_sha` оставьте пустым. UI-only deploy сохраняет прежний API image; не используйте его для первого включения T3.
 
 Workflow записывает `COMPOSE_PROFILES=analysis` и `ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json` только для включённого staging. Один каталог manifest монтируется в API и worker как `:ro`. На develop используются другой deploy-каталог и пустой config path.
 
@@ -517,11 +519,11 @@ gh workflow run deploy-staging.yml \
 3. настраивает SSH с strict host key checking;
 4. проверяет Docker и Docker Compose на VPS;
 5. определяет `API_IMAGE` и `UI_IMAGE`: обновляется только инициировавшая сторона, версия другой стороны читается из текущего env-файла окружения;
-6. копирует `docker-compose.staging.yml`;
+6. для staging извлекает manifest из SHA выбранного `API_IMAGE` и проверяет источник; копирует `docker-compose.staging.yml`, manifest и installer через SCP;
 7. создаёт env-файл окружения (включая passthrough секретов);
 8. временно авторизуется в GHCR;
 9. выполняет `docker compose pull`;
-10. запускает PostgreSQL и Redis;
+10. останавливает прежние analysis-процессы; только для staging атомарно устанавливает manifest с проверкой SHA-256, root:root 0644 и runtime schema выбранного image; запускает PostgreSQL и Redis;
 11. ждёт их healthchecks;
 12. выполняет:
 
@@ -529,7 +531,7 @@ gh workflow run deploy-staging.yml \
 alembic upgrade head
 ```
 
-13. запускает API;
+13. при включённом staging analysis выполняет restricted preflight; запускает API;
 14. ждёт Docker healthcheck API;
 15. запускает `webhook-worker` и, при включённом analysis после успешного preflight, `worker` и `outbox-dispatcher`; проверяет состояние running;
 16. запускает web/Nginx;

@@ -342,6 +342,7 @@ jobs:
           {
             echo "MANIFEST_SOURCE_SHA=${source_sha}"
             echo "MANIFEST_SHA256=$(sha256sum analysis-runtime.selected.json | cut -d' ' -f1)"
+            echo "INSTALLER_SHA256=$(sha256sum deploy/install-analysis-manifest.py | cut -d' ' -f1)"
           } >> "${GITHUB_ENV}"
 
       - name: Prepare deployment directory
@@ -419,6 +420,11 @@ jobs:
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
             printf 'WEB_PORT=%s\n' "${WEB_PORT}"
+            if [[ "${ENV_NAME:-}" == staging ]]; then
+              printf 'ANALYSIS_RUNTIME_DIR=/opt/dmc-268-t2-runtime/analysis-runtime\n'
+            else
+              printf 'ANALYSIS_RUNTIME_DIR=./analysis-runtime\n'
+            fi
             if [[ "${ENV_NAME:-}" == staging && "${ANALYSIS_ENABLED:-false}" == true ]]; then
               printf 'COMPOSE_PROFILES=analysis\n'
               printf 'ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json\n'
@@ -492,7 +498,7 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' bash -s" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash -s" \
             <<'REMOTE'
           set -euo pipefail
 
@@ -518,12 +524,24 @@ jobs:
           compose --profile analysis stop worker outbox-dispatcher
 
           if [[ "${ENV_NAME}" == staging ]]; then
-            # Preserve root ownership; never fall back to a user-writable file.
-            if [[ "$(id -u)" == 0 ]]; then
-              python3 install-analysis-manifest.py analysis-runtime.selected.json "${MANIFEST_SHA256}"
-            else
-              sudo -n python3 install-analysis-manifest.py analysis-runtime.selected.json "${MANIFEST_SHA256}"
+            # The uploaded installer is writable by the SSH user. Anchor its
+            # bytes to the runner checkout, and execute only those verified bytes.
+            # -I excludes cwd/PYTHONPATH/sitecustomize before stdlib imports.
+            installer_python=(/usr/bin/python3 -I)
+            if [[ "$(id -u)" != 0 ]]; then
+              installer_python=(sudo -n "${installer_python[@]}")
             fi
+            "${installer_python[@]}" -c '
+          import hashlib, os, stat, sys
+          with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+              if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                  raise SystemExit("Installer must be a regular file")
+              code = stream.read()
+          if hashlib.sha256(code).hexdigest() != sys.argv[2]:
+              raise SystemExit("Installer integrity mismatch")
+          sys.argv = [sys.argv[1], *sys.argv[3:]]
+          exec(compile(code, sys.argv[0], "exec"), {"__name__": "__main__"})
+          ' install-analysis-manifest.py "${INSTALLER_SHA256}" analysis-runtime.selected.json "${MANIFEST_SHA256}"
             # Validate using the selected image's schema, even with analysis off.
             compose --profile analysis run --rm --no-deps --interactive=false -T worker \
               python -c 'from pathlib import Path; from app.review.configuration import load_runtime_configuration; load_runtime_configuration(Path("/app/runtime/analysis-runtime.v1.json"))' </dev/null

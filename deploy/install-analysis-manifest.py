@@ -26,7 +26,7 @@ def install(source: Path, digest: str) -> None:
     document = json.loads(body)
     if not isinstance(document, dict) or document.get("schema_version") != 1:
         raise ValueError("invalid manifest document")
-    directory = Path("/opt/dmc-268-t2/analysis-runtime")
+    directory = Path("/opt/dmc-268-t2-runtime/analysis-runtime")
     for parent in (*reversed(directory.parents), directory):
         if not parent.exists() and not parent.is_symlink():
             parent.mkdir(mode=0o755)

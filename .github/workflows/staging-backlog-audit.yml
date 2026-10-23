@@ -1,0 +1,190 @@
+name: Staging backlog audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize with staging deployment so the target is stable during the audit.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      SSH_USER: ${{ secrets.VPS_DMC268_U }}
+      SSHPASS: ${{ secrets.VPS_DMC268_P }}
+    steps:
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_HOST}" || -z "${SSH_USER}" || -z "${SSHPASS}" ]]; then
+            echo '::error::Existing VPS SSH configuration is unavailable'
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${SSH_HOST} ${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Audit staging backlog
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 120s sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
+            "${SSH_USER}@${SSH_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/dmc-268-t2
+
+          compose() {
+            timeout 60s docker compose -p dmc-268-t2-staging \
+              --env-file .env.staging -f docker-compose.staging.yml "$@"
+          }
+
+          for service in worker outbox-dispatcher; do
+            if ! states="$(compose --profile analysis ps --all --format '{{.State}}' "$service" 2>/dev/null)"; then
+              echo '::error::Service status unavailable'
+              exit 1
+            fi
+            if [[ -z "$states" ]]; then
+              echo "$service: absent (expected disabled)"
+            else
+              while IFS= read -r state; do
+                case "$state" in
+                  exited|created|dead) echo "$service: $state (expected disabled)" ;;
+                  running|restarting|paused|removing)
+                    echo "::warning::$service: $state; expected disabled" ;;
+                  *) echo '::error::Unexpected service state'; exit 1 ;;
+                esac
+              done <<< "$states"
+            fi
+          done
+
+          if ! compose exec -T api python -I - 2>/dev/null <<'PY'
+          import asyncio
+          import json
+          import os
+
+          import asyncpg
+
+          async def audit():
+              connection = await asyncpg.connect(
+                  host="db", port=5432,
+                  user=os.environ["POSTGRES__USER"],
+                  password=os.environ["POSTGRES__PASSWORD"],
+                  database=os.environ["POSTGRES__DB"],
+                  timeout=5, command_timeout=10,
+                  server_settings={
+                      "default_transaction_read_only": "on",
+                      "statement_timeout": "10000",
+                      "lock_timeout": "1000",
+                      "idle_in_transaction_session_timeout": "15000",
+                  },
+              )
+              try:
+                  async with connection.transaction(isolation="repeatable_read", readonly=True):
+                      queries = {
+                          "review_jobs_by_status": """
+                              SELECT status, count(*) AS count FROM review_job
+                              GROUP BY status ORDER BY status
+                          """,
+                          "unfinished_reviews": """
+                              SELECT count(*) AS total,
+                                  count(*) FILTER (WHERE started_at IS NULL AND queue_deadline_at <= now()) AS queue_expired,
+                                  count(*) FILTER (WHERE analysis_deadline_at <= now()) AS analysis_expired
+                              FROM review_job WHERE finished_at IS NULL
+                          """,
+                          "analyze_outbox": """
+                              SELECT
+                                  count(*) FILTER (WHERE broker_published_at IS NULL AND quarantined_at IS NULL) AS unpublished,
+                                  count(*) FILTER (WHERE broker_published_at IS NOT NULL) AS published,
+                                  count(*) FILTER (WHERE dispatch_not_before > now() AND quarantined_at IS NULL) AS deferred,
+                                  count(*) FILTER (WHERE quarantined_at IS NOT NULL) AS quarantined
+                              FROM outbox_event WHERE task_kind = 'analyze'
+                          """,
+                          "active_analysis_leases": """
+                              SELECT count(*) AS count FROM task_lease
+                              WHERE task_kind = 'analyze' AND expires_at > now()
+                          """,
+                          "outstanding_webhook_receipts": """
+                              SELECT count(*) AS count FROM webhook_receipt
+                              WHERE processing_status IN ('PENDING', 'PROCESSING')
+                          """,
+                      }
+                      for label, query in queries.items():
+                          rows = await connection.fetch(query)
+                          print(label + "=" + json.dumps([dict(row) for row in rows]))
+                  print("Outbox deferred overlaps published/unpublished; quarantined is excluded from unpublished/deferred.")
+              finally:
+                  await connection.close()
+
+          try:
+              asyncio.run(audit())
+          except Exception:
+              raise SystemExit("PostgreSQL audit failed") from None
+          PY
+          then
+            echo '::error::PostgreSQL audit failed (API container, connection, schema or timeout); counts incomplete'
+            exit 1
+          fi
+
+          if ! compose exec -T api python -I - 2>/dev/null <<'REDIS_PY'
+          import asyncio
+          import json
+
+          from redis.asyncio import Redis
+          from redis.exceptions import ResponseError
+
+          async def audit():
+              client = Redis(
+                  host="redis", port=6379, db=0, decode_responses=True, protocol=2,
+                  socket_connect_timeout=5, socket_timeout=5,
+                  lib_name=None, lib_version=None,
+              )
+              try:
+                  for kind in ("analyze", "publish", "dead"):
+                      key = "dmc268:review-tasks:" + kind
+                      length = await client.xlen(key)
+                      try:
+                          groups = await client.xinfo_groups(key)
+                      except ResponseError as error:
+                          if str(error) != "no such key":
+                              raise
+                          groups = []
+                      metrics = [{
+                          "pending": int(group["pending"]),
+                          "lag": None if group.get("lag") is None else int(group["lag"]),
+                          "consumers": int(group["consumers"]),
+                      } for group in groups]
+                      print(json.dumps({"stream": key, "length": length, "groups": metrics}))
+                  print("XLEN is retained stream entries, not waiting jobs; lag=null means unknown; Redis metrics sampled live.")
+              finally:
+                  await client.aclose()
+
+          try:
+              asyncio.run(audit())
+          except Exception:
+              raise SystemExit("Redis audit failed") from None
+          REDIS_PY
+          then
+            echo '::error::Redis audit failed (API container, connection, type or timeout); counts incomplete'
+            exit 1
+          fi
+          REMOTE

@@ -55,7 +55,7 @@ services:
       GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
       GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
     volumes:
-      - ./analysis-runtime:/app/runtime:ro
+      - ${ANALYSIS_RUNTIME_DIR:-./analysis-runtime}:/app/runtime:ro
     depends_on:
       db:
         condition: service_healthy
@@ -105,7 +105,7 @@ services:
       # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
       GITHUB__TOKEN: ${GITHUB__TOKEN:-}
     volumes:
-      - ./analysis-runtime:/app/runtime:ro
+      - ${ANALYSIS_RUNTIME_DIR:-./analysis-runtime}:/app/runtime:ro
     depends_on:
       db:
         condition: service_healthy

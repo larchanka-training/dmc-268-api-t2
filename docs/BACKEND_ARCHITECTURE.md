@@ -231,6 +231,37 @@ OutboxEvent(publish), если результат допускает публи�
 проверяют порядок диапазонов, hunk counts и точные contiguous old/new
 координаты. Для HTTP diff используется `public=True` с полями
 `old_lines`/`new_lines`; пути нормализуются отдельно до этих проверок.
+`GET /api/v1/reviews/{id}/diff` читает только сохранённые PostgreSQL
+`ContextPayload.payload_body["files"]`, без GitHub/LLM. Cookie-session и
+`RepositoryAccess` проверяются до чтения context; отсутствующий, неверный UUID
+или недоступный review возвращает одинаковый безопасный 404. Ответ содержит
+только OpenAPI `Diff`: пути, status, hunks (`old_count/new_count` →
+`old_lines/new_lines`), строки (`text` → `content`) и координаты. Prompt,
+source windows, whole file, blob SHA, language и provider metadata не выдаются.
+
+Проекция читает authority, retention evidence и contexts одним SQL statement
+(единый snapshot даже после запроса cookie-auth), в порядке `(created_at, id)`;
+первое появление файла определяет порядок files. Файлы объединяются по path,
+совпадающие публичные hunks дедуплицируются независимо от chunk-local IDs и
+сортируются по old/new start. Проверяются schema version 1, типы без coercion,
+пути, статусы и стороны, counts/contiguous coordinates, конфликты file identity
+и перекрытия hunks. Неизвестные внутренние поля игнорируются, не копируются.
+Невалидные сохранённые данные дают безопасный 503 `SERVICE_UNAVAILABLE` без
+частичного diff. Явно сохранённый `files: []` даёт 200; отсутствие contexts — 404,
+включая terminal review без доказательства retention.
+
+410 `DIFF_EXPIRED` выдаётся, если есть canonical `ChunkResult` с NULL
+`context_payload_id`: существующий writer всегда сохраняет результат со ссылкой
+на context, а FK обнуляет её при удалении context. Это проверяется до проекции,
+так что частично удалённый diff также даёт 410. Миграция для этого не нужна.
+**Ограничение хранения:** удаление context до сохранения результата, либо вместе
+с результатом, не оставляет доказательства. Такой исторический случай безопасно
+возвращает 404; угадывать retention по status/возрасту нельзя. Если будущий
+retention должен покрывать такие удаления с обязательным 410, минимальное
+дополнение — nullable `ReviewJob.diff_expired_at`, выставляемый retention в той
+же транзакции удаления. В этом изменении retention writer и миграции не
+добавляются.
+
 `ChunkResult` хранит результат соответствующего вызова
 и имеет долговременную ссылку на ReviewJob. Ссылка на ContextPayload nullable и использует
 составной FK по `(review_job_id, context_payload_id)`: БД разрешает только context

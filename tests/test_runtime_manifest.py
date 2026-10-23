@@ -13,6 +13,63 @@ from app.review.prompt import PromptBuilder
 PROMPTS = Path(__file__).resolve().parents[1] / ".agents/reviewer"
 
 
+def test_versioned_staging_manifest_preserves_approved_configuration() -> None:
+    runtime = configuration.load_runtime_configuration(
+        PROMPTS.parents[1] / "deploy/analysis-runtime.staging.json"
+    )
+    assert tuple(runtime.profiles) == ("eurorouter/review-v1",)
+    profile = runtime.profiles["eurorouter/review-v1"]
+    assert (profile.provider, profile.base_url, profile.allowed_models) == (
+        "eurorouter",
+        "https://api.eurouter.ai/api/v1",
+        ("qwen3-coder-next-80b",),
+    )
+    assert profile.api_keys == ()
+    assert dict(runtime.credential_env) == {
+        "eurorouter/review-v1": "LLM__EUROROUTER__API_KEYS"
+    }
+    admission = runtime.admission
+    assert admission.primary.model_dump() == {
+        "profile_ref": "eurorouter/review-v1",
+        "model_ref": "qwen3-coder-next-80b",
+        "model_digest": None,
+    }
+    assert admission.prompt_version == "v2"
+    bundle = PromptBuilder.load(
+        PROMPTS, admission.prompt_version, expected_digest=admission.prompt_digest
+    )
+    bundle.ensure_verified()
+    assert bundle.prompt_digest == (
+        "a09dffb11fdd1481888eab77d2530e135e998765e22f9fc254a80cc94faef50b"
+    )
+    assert admission.policy.model_dump(mode="json") == {
+        "schema_version": 1,
+        "generation": {"temperature": 0.0},
+        "routing": {"primary_profile_ref": "eurorouter/review-v1", "fallback": []},
+        "limits": {
+            "context_window": 16384,
+            "max_input_tokens": 10000,
+            "max_output_tokens": 2000,
+            "request_timeout_ms": 120000,
+            "run_max_requests": 8,
+            "run_max_input_tokens": 80000,
+            "run_max_output_tokens": 16000,
+            "max_chunks": 5,
+            "analysis_duration_ms": 600000,
+        },
+        "retry": {
+            "worker_max_attempts": 3,
+            "provider_max_attempts_per_operation": 3,
+            "max_transient_per_provider": 2,
+            "max_format_repairs": 1,
+            "max_overflow_rebuilds_per_chunk": 1,
+            "backoff_policy": "review-exponential-v1",
+        },
+        "token_estimator_version": "review-conservative-v1",
+        "repository_settings_digest": "0" * 64,
+    }
+
+
 def manifest_values() -> dict[str, Any]:
     return {
         "schema_version": 1,

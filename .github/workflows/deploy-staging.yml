@@ -358,7 +358,7 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
           EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
-          GITHUB_API_TOKEN: ${{ secrets.GITHUB__TOKEN }}
+          GITHUB_API_TOKEN: ${{ secrets.STAGING_GITHUB_READ_TOKEN }}
           GITHUB_PUBLISH_TOKEN: ${{ secrets.GITHUB__WRITE_TOKEN }}
           GITHUB_BOT_USER_ID: ${{ secrets.GITHUB__BOT_USER_ID }}
           AUTH_GITHUB_CLIENT_ID: ${{ vars.AUTH__GITHUB_CLIENT_ID }}

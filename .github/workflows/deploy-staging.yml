@@ -657,6 +657,74 @@ jobs:
           done
           REMOTE
 
+      - name: Install Postgres backup
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${ENV_NAME}" == "develop" ]]; then
+            cron_schedule='45 3 * * *'
+          else
+            cron_schedule='15 3 * * *'
+          fi
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "install -d -m 700 '${DEPLOY_PATH}/backups'"
+
+          sshpass -e scp \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            scripts/backup-postgres.sh \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/backup-postgres.sh"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "chmod 755 '${DEPLOY_PATH}/backup-postgres.sh'"
+
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            "${SSH_USER}@${SSH_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' CRON_SCHEDULE='${cron_schedule}' bash -s" \
+            <<'REMOTE'
+          set -euo pipefail
+
+          if ! command -v crontab >/dev/null 2>&1; then
+            echo "ERROR: crontab is not installed"
+            exit 1
+          fi
+
+          marker="# dmc-postgres-backup ${COMPOSE_PROJECT}"
+          line="${CRON_SCHEDULE} ${DEPLOY_PATH}/backup-postgres.sh ${COMPOSE_PROJECT} ${ENV_FILE}"
+          existing="$(crontab -l 2>/dev/null || true)"
+          filtered="$(printf '%s\n' "${existing}" | grep -v -F "${marker}" | grep -v -F "${DEPLOY_PATH}/backup-postgres.sh" || true)"
+          {
+            if [[ -n "${filtered}" ]]; then
+              printf '%s\n' "${filtered}"
+            fi
+            printf '%s\n' "${marker}"
+            printf '%s\n' "${line}"
+          } | crontab -
+
+          "${DEPLOY_PATH}/backup-postgres.sh" "${COMPOSE_PROJECT}" "${ENV_FILE}"
+          REMOTE
+
       - name: Ensure Caddy HTTPS
         env:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}

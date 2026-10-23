@@ -444,7 +444,12 @@ paths:
     get:
       tags: [reviews]
       operationId: getReviewDiff
-      description: Stored bounded diff; never returns a prompt payload. Not paginated in v1.
+      description: >-
+        Stored bounded diff; never returns a prompt payload. Not paginated in v1.
+        Returns 404 when no stored diff is available, including before capture.
+        Returns 410 only with evidence of removed context from a retained result,
+        including partial context loss. A saved empty files array returns 200.
+        Invalid or unsupported historical diff data returns a safe 503.
       security: [{ cookieAuth: [] }]
       parameters:
         - $ref: '#/components/parameters/ReviewId'
@@ -458,6 +463,7 @@ paths:
         '403': { $ref: '#/components/responses/AccessDenied' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
         '410': { $ref: '#/components/responses/DiffExpired' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/reviews/{id}/events:
     get:
       tags: [reviews]

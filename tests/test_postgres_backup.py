@@ -55,6 +55,11 @@ def _bash() -> str:
     pytest.fail("bash is required to run scripts/backup-postgres.sh")
 
 
+def _write_exe(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8", newline="\n")
+    path.chmod(0o755)
+
+
 def test_backup_script_keeps_seven_daily_dumps(tmp_path: Path) -> None:
     """A successful run stores one gzip per UTC day and drops older dumps."""
     bash = _bash()
@@ -65,24 +70,15 @@ def test_backup_script_keeps_seven_daily_dumps(tmp_path: Path) -> None:
     shutil.copy(script, work / "backup-postgres.sh")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "docker").write_text(
+    _write_exe(
+        bin_dir / "docker",
         "#!/bin/bash\n"
         'printf \'%s\\n\' "$*" > "${DOCKER_ARGS}"\n'
         "printf 'CREATE TABLE kept (id int);\\n'\n",
-        encoding="utf-8",
-        newline="\n",
     )
-    (bin_dir / "flock").write_text(
-        "#!/bin/bash\nexit 0\n", encoding="utf-8", newline="\n"
-    )
-    (bin_dir / "install").write_text(
-        '#!/bin/bash\nmkdir -p "${@: -1}"\n',
-        encoding="utf-8",
-        newline="\n",
-    )
-    (bin_dir / "chmod").write_text(
-        "#!/bin/bash\nexit 0\n", encoding="utf-8", newline="\n"
-    )
+    _write_exe(bin_dir / "flock", "#!/bin/bash\nexit 0\n")
+    _write_exe(bin_dir / "install", '#!/bin/bash\nmkdir -p "${@: -1}"\n')
+    _write_exe(bin_dir / "chmod", "#!/bin/bash\nexit 0\n")
     tools = _tool_dir(bash)
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join([str(bin_dir), tools, env.get("PATH", "")])
@@ -147,22 +143,13 @@ def test_failed_dump_is_not_kept(tmp_path: Path) -> None:
     shutil.copy(script, work / "backup-postgres.sh")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "docker").write_text(
+    _write_exe(
+        bin_dir / "docker",
         "#!/bin/bash\nprintf 'ran\\n' > \"${DOCKER_ARGS}\"\nexit 1\n",
-        encoding="utf-8",
-        newline="\n",
     )
-    (bin_dir / "flock").write_text(
-        "#!/bin/bash\nexit 0\n", encoding="utf-8", newline="\n"
-    )
-    (bin_dir / "install").write_text(
-        '#!/bin/bash\nmkdir -p "${@: -1}"\n',
-        encoding="utf-8",
-        newline="\n",
-    )
-    (bin_dir / "chmod").write_text(
-        "#!/bin/bash\nexit 0\n", encoding="utf-8", newline="\n"
-    )
+    _write_exe(bin_dir / "flock", "#!/bin/bash\nexit 0\n")
+    _write_exe(bin_dir / "install", '#!/bin/bash\nmkdir -p "${@: -1}"\n')
+    _write_exe(bin_dir / "chmod", "#!/bin/bash\nexit 0\n")
     kept = work / "backups" / "dmc-2000-01-01.sql.gz"
     kept.parent.mkdir()
     kept.write_bytes(b"old")

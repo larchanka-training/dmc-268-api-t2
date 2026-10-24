@@ -20,7 +20,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_postgres_integration import _create_change_request
 from test_repositories_api import Catalog
 from test_repository_onboarding_api import github_repository, mutation_headers
-from test_review_start_api import BASE, HEAD, AllowedAuthorizer, FakeStartGithub
+from test_review_start_api import (
+    BASE,
+    HEAD,
+    AllowedAuthorizer,
+    FakeStartGithub,
+    fake_pull_requests,
+)
 
 from app.api.review_start_dependencies import (
     get_review_configuration_resolver,
@@ -138,6 +144,7 @@ async def race(
         )
     )
     monkeypatch.setattr(github_runtime, "github_connection", gateway)
+    fake_pull_requests(monkeypatch, github)
     try:
         yield RaceScope(onboarding, repository_id, settings_id, payload, github)
     finally:

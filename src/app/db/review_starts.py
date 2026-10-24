@@ -115,6 +115,45 @@ async def _check_quotas(
         raise ReviewQuotaExceededError
 
 
+async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimistic-lock identities
+    session: AsyncSession,
+    command: StartReviewCommand,
+    repository_id: UUID,
+    saved_change: ChangeRequestIdentity,
+    expected_change: ChangeRequestIdentity,
+    live: GithubPullRequest,
+) -> None:
+    """Refresh a previously seen PR row to what GitHub just reported.
+
+    The row is a cache of the provider PR: pushes after the last start must be
+    admitted, and older in-flight runs must see their head as stale.
+    """
+    saved = await session.scalar(
+        select(ChangeRequest)
+        .where(
+            ChangeRequest.id == command.change_request_id,
+            ChangeRequest.repository_id == repository_id,
+        )
+        .with_for_update()
+    )
+    if saved is None:
+        raise AdmissionResourceNotFoundError
+    # Another start may have moved the row while GitHub was read; never
+    # overwrite a newer head with the state this request observed earlier.
+    # A concurrent start that already refreshed it to this same state is fine.
+    if change_identity(saved) not in {saved_change, expected_change}:
+        if saved.head_sha != saved_change.head_sha:
+            raise ReviewHeadMismatchError
+        raise AdmissionResourceNotFoundError
+    saved.head_sha = live.head_sha
+    saved.base_sha = live.base_sha
+    saved.source_repository_external_id = live.source_repository_external_id
+    saved.source_ref = live.source_ref
+    saved.base_ref = live.base_ref
+    saved.title = live.title
+    saved.description = live.description
+
+
 async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with optional materialization
     command: StartReviewCommand,
     *,
@@ -126,6 +165,7 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
     expected_change: ChangeRequestIdentity,
     expected_settings: str,
     new_change: GithubPullRequest | None = None,
+    saved_change: ChangeRequestIdentity | None = None,
 ) -> tuple[UUID, str, bool]:
     repository_id = expected_repository.id
     async with SqlAlchemyUnitOfWork(factory) as uow:
@@ -160,7 +200,16 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
             raise AdmissionResourceNotFoundError
         if repository.current_settings_id != command.repository_settings_id:
             raise SettingsVersionChangedError
-        if new_change is not None:
+        if new_change is not None and saved_change is not None:
+            await _refresh_saved_change(
+                uow.session,
+                command,
+                repository_id,
+                saved_change,
+                expected_change,
+                new_change,
+            )
+        elif new_change is not None:
             await uow.session.execute(
                 insert(ChangeRequest)
                 .values(

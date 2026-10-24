@@ -28,7 +28,11 @@ def test_caddy_https_keeps_port_80_and_serves_both_names() -> None:
     steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
     names = [step.get("name") for step in steps]
     caddy = next(step for step in steps if step.get("name") == "Ensure Caddy HTTPS")
-    assert names.index("Ensure Caddy HTTPS") == names.index("Deploy application") + 1
+    deploy_at = names.index("Deploy application")
+    backup_at = names.index("Install Postgres backup")
+    caddy_at = names.index("Ensure Caddy HTTPS")
+    assert backup_at == deploy_at + 1
+    assert caddy_at == backup_at + 1
     assert caddy["env"]["SSH_USER"] == "${{ secrets.VPS_DMC268_U }}"
     assert caddy["env"]["SSHPASS"] == "${{ secrets.VPS_DMC268_P }}"
     run = caddy["run"]

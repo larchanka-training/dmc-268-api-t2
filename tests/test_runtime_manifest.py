@@ -22,7 +22,7 @@ def test_versioned_staging_manifest_preserves_approved_configuration() -> None:
     assert (profile.provider, profile.base_url, profile.allowed_models) == (
         "eurorouter",
         "https://api.eurouter.ai/api/v1",
-        ("qwen3-coder-next-80b",),
+        ("mistral-small-4",),
     )
     assert profile.api_keys == ()
     assert dict(runtime.credential_env) == {
@@ -31,7 +31,7 @@ def test_versioned_staging_manifest_preserves_approved_configuration() -> None:
     admission = runtime.admission
     assert admission.primary.model_dump() == {
         "profile_ref": "eurorouter/review-v1",
-        "model_ref": "qwen3-coder-next-80b",
+        "model_ref": "mistral-small-4",
         "model_digest": None,
     }
     assert admission.prompt_version == "v2"

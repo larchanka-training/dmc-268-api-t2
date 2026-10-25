@@ -39,6 +39,8 @@ from app.api.review_start_dependencies import (
 from app.application.github_ports import (
     GithubFailure,
     GithubPort,
+    GithubPullRequest,
+    GithubPullRequestReader,
     GithubRequest,
     GithubSnapshot,
 )
@@ -60,6 +62,8 @@ from app.review.configuration import (
 )
 
 RETRY_AFTER_SECONDS = 30
+# Saved scope PR and the second PR from add_second_pr.
+FAKE_PR_NUMBERS = frozenset({13, 14})
 CONCURRENT_REQUESTS = 2
 
 
@@ -290,7 +294,7 @@ async def test_invalid_start_body_is_canonical_validation_error(
 
 
 async def test_saved_head_mismatch_is_conflict(
-    client: httpx.AsyncClient, scope: StartScope
+    client: httpx.AsyncClient, scope: StartScope, providers: FakeStartGithub
 ) -> None:
     response = await client.post(
         scope.url, json={"requested_head_sha": "c" * 40}, headers=HEADERS
@@ -562,6 +566,7 @@ async def test_github_revalidation_refuses_stale_pr(
 
     app.dependency_overrides[get_review_start_authorizer] = Allowed
     monkeypatch.setattr(github_runtime, "github_connection", gateway)
+    fake_pull_requests(monkeypatch)
     response = await client.post(
         scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
     )
@@ -593,6 +598,24 @@ class AllowedAuthorizer:
 class FakeStartGithub:
     def __init__(self) -> None:
         self.calls = 0
+        # Live PR as GitHub reports it; matches the saved scope row (no push yet).
+        self.pull_request = GithubPullRequest(
+            head_sha=HEAD,
+            base_sha=BASE,
+            source_repository_external_id="123456",
+            source_ref="feature/postgres-validation",
+            base_ref="main",
+            title="Fix division",
+            description="Description",
+        )
+
+    async def get_pull_request(
+        self, owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest:
+        # Same-repository PR: the source repository is the base repository.
+        return replace(
+            self.pull_request, source_repository_external_id=repository_external_id
+        )
 
     async def fetch(self, request: GithubRequest) -> GithubSnapshot:
         self.calls += 1
@@ -614,6 +637,39 @@ class FakeStartGithub:
         )
 
 
+def fake_pull_requests(
+    monkeypatch: pytest.MonkeyPatch, github: FakeStartGithub | None = None
+) -> FakeStartGithub:
+    """Serve live PR reads for the saved scope PRs; other numbers stay real HTTP."""
+    fake = github or FakeStartGithub()
+    real_pull_requests = github_runtime.github_pull_request_connection
+
+    class PullRequests:
+        def __init__(self, real: GithubPullRequestReader) -> None:
+            self.real = real
+
+        async def get_pull_request(
+            self, owner: str, name: str, repository_external_id: str, number: int
+        ) -> GithubPullRequest:
+            if number in FAKE_PR_NUMBERS:
+                return await fake.get_pull_request(
+                    owner, name, repository_external_id, number
+                )
+            return await self.real.get_pull_request(
+                owner, name, repository_external_id, number
+            )
+
+    @asynccontextmanager
+    async def pull_requests(
+        settings: Settings,
+    ) -> AsyncIterator[GithubPullRequestReader]:
+        async with real_pull_requests(settings) as real:
+            yield PullRequests(real)
+
+    monkeypatch.setattr(github_runtime, "github_pull_request_connection", pull_requests)
+    return fake
+
+
 @pytest.fixture
 def providers(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> FakeStartGithub:
     github = FakeStartGithub()
@@ -624,6 +680,7 @@ def providers(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> FakeStartGithub:
 
     app.dependency_overrides[get_review_start_authorizer] = AllowedAuthorizer
     monkeypatch.setattr(github_runtime, "github_connection", gateway)
+    fake_pull_requests(monkeypatch, github)
     return github
 
 
@@ -2086,3 +2143,100 @@ async def test_admission_rejects_noninteger_frozen_configuration_marker(
     )
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
     assert response.json()["message"] == "Review configuration is unavailable."
+
+
+async def test_concurrent_starts_after_push_admit_one_review_for_the_new_head(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    # Saved row still names the pre-push commit; GitHub reports HEAD.
+    async with postgres.engine.begin() as conn:
+        await conn.execute(
+            update(models.ChangeRequest)
+            .where(models.ChangeRequest.id == scope.change)
+            .values(head_sha="d" * 40)
+        )
+    both_ready = asyncio.Event()
+    original = configured.fetch
+    entered = 0
+
+    async def fetch(request: GithubRequest) -> GithubSnapshot:
+        nonlocal entered
+        entered += 1
+        if entered == CONCURRENT_REQUESTS:
+            both_ready.set()
+        await asyncio.wait_for(both_ready.wait(), 10)
+        return await original(request)
+
+    configured.fetch = fetch  # type: ignore[method-assign]
+    responses = await asyncio.gather(
+        *(
+            client.post(
+                scope.url,
+                json={"requested_head_sha": HEAD},
+                headers={**HEADERS, "Idempotency-Key": f"double-click-{index}"},
+            )
+            for index in range(CONCURRENT_REQUESTS)
+        )
+    )
+
+    assert sorted(response.status_code for response in responses) == [
+        HTTPStatus.ACCEPTED,
+        HTTPStatus.CONFLICT,
+    ]
+    conflict = next(r for r in responses if r.status_code == HTTPStatus.CONFLICT)
+    assert conflict.json()["code"] == "REVIEW_ALREADY_ACTIVE"
+
+
+async def test_concurrent_refresh_to_same_head_with_new_base_is_not_found(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    # Saved row names the pre-push commit; GitHub reports HEAD.
+    async with postgres.engine.begin() as conn:
+        await conn.execute(
+            update(models.ChangeRequest)
+            .where(models.ChangeRequest.id == scope.change)
+            .values(head_sha="d" * 40)
+        )
+    original = configured.get_pull_request
+
+    async def get_pull_request(
+        owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest:
+        # Another start saved the same new head with a retargeted base first.
+        async with postgres.engine.begin() as conn:
+            await conn.execute(
+                update(models.ChangeRequest)
+                .where(models.ChangeRequest.id == scope.change)
+                .values(head_sha=HEAD, base_sha="e" * 40)
+            )
+        return await original(owner, name, repository_external_id, number)
+
+    configured.get_pull_request = get_pull_request  # type: ignore[method-assign]
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["code"] == "RESOURCE_NOT_FOUND"
+    async with postgres.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                select(
+                    models.ChangeRequest.head_sha, models.ChangeRequest.base_sha
+                ).where(models.ChangeRequest.id == scope.change)
+            )
+        ).one()
+        assert tuple(row) == (HEAD, "e" * 40)
+        assert not (
+            await conn.scalars(
+                select(models.ReviewJob.id).where(
+                    models.ReviewJob.repository_id == scope.repository
+                )
+            )
+        ).all()

@@ -189,42 +189,39 @@ def _pull_request_number(value: str) -> int:
     return number
 
 
-async def _revalidate_github(  # noqa: PLR0913, PLR0917 -- explicit provider identity and optional discovery
+async def _revalidate_github(
     authorizer: ReviewStartAuthorizer,
     user_id: UUID,
     repository_identity: RepositoryIdentity,
     number: int,
     requested_head_sha: str,
-    expected_change: ChangeRequestIdentity | None,
-) -> tuple[ChangeRequestIdentity, GithubPullRequest | None]:
-    new_change = None
+) -> tuple[ChangeRequestIdentity, GithubPullRequest]:
     try:
         await authorizer.authorize_start(
             user_id=user_id, repository=repository_identity
         )
-        if expected_change is None:
-            async with github_runtime.github_pull_request_connection(
-                get_settings()
-            ) as reader:
-                new_change = await reader.get_pull_request(
-                    repository_identity.owner,
-                    repository_identity.name,
-                    repository_identity.external_id,
-                    number,
-                )
-            if new_change.head_sha != requested_head_sha:
-                raise ApiError(
-                    409, "PR_HEAD_MISMATCH", "Pull request head does not match."
-                )
-            expected_change = ChangeRequestIdentity(
-                str(number),
-                new_change.head_sha,
-                new_change.base_sha,
-                new_change.source_repository_external_id,
-                new_change.source_ref,
-                new_change.base_ref,
-                "open",
+        # The saved PR row is only a cache: pushes after the first start move the
+        # head on GitHub, so every start re-reads the live PR and refreshes the row.
+        async with github_runtime.github_pull_request_connection(
+            get_settings()
+        ) as reader:
+            new_change = await reader.get_pull_request(
+                repository_identity.owner,
+                repository_identity.name,
+                repository_identity.external_id,
+                number,
             )
+        if new_change.head_sha != requested_head_sha:
+            raise ApiError(409, "PR_HEAD_MISMATCH", "Pull request head does not match.")
+        expected_change = ChangeRequestIdentity(
+            str(number),
+            new_change.head_sha,
+            new_change.base_sha,
+            new_change.source_repository_external_id,
+            new_change.source_ref,
+            new_change.base_ref,
+            "open",
+        )
         github_request = GithubRequest(
             repository_identity.owner,
             repository_identity.name,
@@ -441,8 +438,6 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         await _check_rerun(session, body.rerun_of, change)
         if change.current_status != "open":
             raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
-        if body.requested_head_sha != change.head_sha:
-            raise ApiError(409, "PR_HEAD_MISMATCH", "Pull request head does not match.")
     settings = await session.get(RepositorySettings, repository.current_settings_id)
     if settings is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
@@ -472,7 +467,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     )
     settings_id, rules_digest = settings.id, settings.rules_digest
     change_id = change.id if change is not None else uuid4()
-    expected_change = change_identity(change) if change is not None else None
+    saved_change = change_identity(change) if change is not None else None
     expected_settings = settings_identity(settings)
     raw_settings_digest = compute_repository_settings_digest(
         id=settings.id,
@@ -494,7 +489,6 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         repository_identity,
         pr_number,
         body.requested_head_sha,
-        expected_change,
     )
     try:
         config = await resolver.resolve(
@@ -547,6 +541,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
             expected_change=expected_change,
             expected_settings=expected_settings,
             new_change=new_change,
+            saved_change=saved_change,
         )
     except tuple(_ADMISSION_ERRORS) as error:
         raise ApiError(*_ADMISSION_ERRORS[type(error)]) from None

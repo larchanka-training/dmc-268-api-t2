@@ -282,3 +282,62 @@ async def test_personal_permission_denial_precedes_missing_pr_discovery(
         "/repositories/123456"
     ]
     await assert_no_materialization(unknown_start, postgres)
+
+
+STALE_SAVED_HEAD = "d" * 40
+
+
+async def test_start_after_push_refreshes_saved_pr_head_from_github(
+    browser_start: BrowserStart, postgres: PostgresHarness
+) -> None:
+    # The PR was first seen at an older commit; GitHub now reports HEAD.
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.ChangeRequest)
+            .where(models.ChangeRequest.id == browser_start.scope.change)
+            .values(head_sha=STALE_SAVED_HEAD)
+        )
+
+    response = await browser_start.start()
+
+    assert response.status_code == HTTPStatus.ACCEPTED
+    review_id = UUID(response.json()["review_id"])
+    async with postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(models.ChangeRequest.head_sha).where(
+                    models.ChangeRequest.id == browser_start.scope.change
+                )
+            )
+            == HEAD
+        )
+        assert (
+            await connection.scalar(
+                select(models.ReviewJob.requested_head_sha).where(
+                    models.ReviewJob.id == review_id
+                )
+            )
+            == HEAD
+        )
+
+
+async def test_start_for_superseded_head_is_conflict_and_admits_nothing(
+    browser_start: BrowserStart, postgres: PostgresHarness
+) -> None:
+    # Saved row and request both name the old commit, but GitHub has moved on.
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.ChangeRequest)
+            .where(models.ChangeRequest.id == browser_start.scope.change)
+            .values(head_sha=STALE_SAVED_HEAD)
+        )
+
+    response = await browser_start.client.post(
+        browser_start.scope.url,
+        json={"requested_head_sha": STALE_SAVED_HEAD},
+        headers=browser_start.headers,
+    )
+
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "PR_HEAD_MISMATCH"
+    await assert_no_admission(browser_start, postgres)

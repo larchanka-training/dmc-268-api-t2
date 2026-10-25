@@ -5,7 +5,7 @@
       "provider": "eurorouter",
       "base_url": "https://api.eurouter.ai/api/v1",
       "allowed_models": [
-        "qwen3-coder-next-80b"
+        "mistral-small-4"
       ],
       "credential_env": "LLM__EUROROUTER__API_KEYS"
     }
@@ -13,7 +13,7 @@
   "admission": {
     "primary": {
       "profile_ref": "eurorouter/review-v1",
-      "model_ref": "qwen3-coder-next-80b",
+      "model_ref": "mistral-small-4",
       "model_digest": null
     },
     "policy": {

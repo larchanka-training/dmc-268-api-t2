@@ -59,6 +59,9 @@ exclude = ["migrations/"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "chaos: fault-injection scenarios (LLM/API outages, worker crashes); run as the dedicated chaos CI job",
+]
 
 [dependency-groups]
 dev = [

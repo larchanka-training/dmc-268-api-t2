@@ -10,6 +10,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_analysis_terminal import freeze
+from test_frozen_configuration import save_policy
 from test_postgres_integration import PostgresHarness
 from test_runtime_manifest import PROMPTS, manifest_values, write_manifest
 
@@ -118,3 +119,60 @@ async def test_preparation_accepts_synthetic_execution_credentials_without_infer
         )
         assert worker is not None
     assert not await redis_client.exists(f"{stream_prefix}:analyze")
+
+
+@pytest.mark.parametrize(
+    ("change", "error_code"),
+    [
+        # Frozen before the approved model was switched in the manifest.
+        ({"model_ref": "retired-model"}, "unsupported_model_profile"),
+        ({"prompt_digest": "0" * 64}, "unsupported_prompt_bundle"),
+    ],
+)
+async def test_incompatible_pending_review_does_not_block_startup_and_fails(  # noqa: PLR0913, PLR0917
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+    tmp_path: Path,
+    change: dict[str, str],
+    error_code: str,
+) -> None:
+    factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
+    await freeze(factory, review_id)
+    await save_policy(postgres, review_id, **change)
+    runtime = load_runtime_configuration(write_manifest(tmp_path, manifest_values()))
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    assert await PostgresOutboxDispatcher(factory, queue).dispatch_batch() == 1
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: pytest.fail("unexpected HTTP"))
+    ) as http:
+        worker = await analysis_composition.prepare_postgres_analysis_worker(
+            factory,
+            queue,
+            runtime=runtime,
+            environ={"LLM__EUROROUTER__API_KEYS": "synthetic-test-key"},
+            github=GithubClient(http),
+            http=http,
+            prompt_root=PROMPTS,
+            schemas_dir=Path("schemas"),
+            owner="incompatible-backlog",
+        )
+        assert await worker.run_once()
+    async with factory() as session:
+        job = await session.get(ReviewJob, review_id)
+        assert job is not None
+        assert job.status == "FAILED" and job.finished_at is not None
+        event = (
+            await session.scalars(
+                select(ReviewEvent).where(
+                    ReviewEvent.review_job_id == review_id,
+                    ReviewEvent.status == "FAILED",
+                )
+            )
+        ).one()
+        assert event.safe_details == {"error_code": error_code}
+        assert (
+            await session.scalar(select(func.count()).select_from(ReviewLlmAttempt))
+            == 0
+        )

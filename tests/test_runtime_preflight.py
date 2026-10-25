@@ -79,11 +79,13 @@ async def test_offline_backlog_preflight_reports_compatibility_without_mutation(
         "artifacts": "unsupported_prompt_bundle",
     }
     assert report.checked_jobs == 1
-    assert report.ready == (defect in {"none", "legacy"})
+    # Only a broken runtime blocks; an incompatible job is left to the worker.
+    assert report.ready == (defect != "artifacts")
     if defect != "none":
         assert expected[defect] in [issue.code for issue in report.issues]
     if defect not in {"none", "artifacts"}:
         assert report.issues[0].job_id == review_id
+        assert not report.issues[0].blocking
     assert "unknown-private-model" not in repr(report)
     assert "source" not in repr(report)
 

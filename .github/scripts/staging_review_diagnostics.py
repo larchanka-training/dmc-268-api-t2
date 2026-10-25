@@ -95,6 +95,15 @@ PROVIDER_CODES = {
     "invalid_request_error",
     "model_not_available",
     "unsupported_model",
+    # Server-side (5xx) codes and types of OpenAI-compatible routers.
+    "server_error",
+    "service_unavailable",
+    "api_error",
+    "provider_error",
+    "upstream_error",
+    "overloaded_error",
+    "no_available_providers",
+    "model_overloaded",
 }
 TRANSPORT_ERRORS = {
     "ConnectError",

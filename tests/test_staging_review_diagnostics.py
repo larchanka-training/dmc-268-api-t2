@@ -302,6 +302,27 @@ def test_opt_in_logs_project_only_safe_failure_fields_in_review_window(
     assert SECRET not in result.stdout + result.stderr
 
 
+def test_opt_in_logs_project_server_error_provider_code(diagnostic_cli: Any) -> None:
+    data = saved_review()
+    data["logs"] = [
+        {
+            "event": "llm_attempt_failed",
+            "timestamp": "2026-10-23T12:00:30+00:00",
+            "provider": "eurorouter",
+            "attempt": 1,
+            "error_code": "provider_unavailable",
+            "detail": "HTTP 503 (service_unavailable)",
+        }
+    ]
+    result = diagnostic_cli(data, logs="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    [event] = json.loads(result.stdout)["worker_logs"]["events"]
+    assert (event["http_status"], event["provider_error_code"]) == (
+        503,
+        "service_unavailable",
+    )
+
+
 @pytest.mark.parametrize(
     "mode, expected, exit_code",
     [

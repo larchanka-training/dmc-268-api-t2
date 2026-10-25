@@ -2188,3 +2188,55 @@ async def test_concurrent_starts_after_push_admit_one_review_for_the_new_head(
     ]
     conflict = next(r for r in responses if r.status_code == HTTPStatus.CONFLICT)
     assert conflict.json()["code"] == "REVIEW_ALREADY_ACTIVE"
+
+
+async def test_concurrent_refresh_to_same_head_with_new_base_is_not_found(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    # Saved row names the pre-push commit; GitHub reports HEAD.
+    async with postgres.engine.begin() as conn:
+        await conn.execute(
+            update(models.ChangeRequest)
+            .where(models.ChangeRequest.id == scope.change)
+            .values(head_sha="d" * 40)
+        )
+    original = configured.get_pull_request
+
+    async def get_pull_request(
+        owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest:
+        # Another start saved the same new head with a retargeted base first.
+        async with postgres.engine.begin() as conn:
+            await conn.execute(
+                update(models.ChangeRequest)
+                .where(models.ChangeRequest.id == scope.change)
+                .values(head_sha=HEAD, base_sha="e" * 40)
+            )
+        return await original(owner, name, repository_external_id, number)
+
+    configured.get_pull_request = get_pull_request  # type: ignore[method-assign]
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["code"] == "RESOURCE_NOT_FOUND"
+    async with postgres.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                select(
+                    models.ChangeRequest.head_sha, models.ChangeRequest.base_sha
+                ).where(models.ChangeRequest.id == scope.change)
+            )
+        ).one()
+        assert tuple(row) == (HEAD, "e" * 40)
+        assert not (
+            await conn.scalars(
+                select(models.ReviewJob.id).where(
+                    models.ReviewJob.repository_id == scope.repository
+                )
+            )
+        ).all()

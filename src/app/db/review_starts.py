@@ -142,7 +142,7 @@ async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimisti
     # overwrite a newer head with the state this request observed earlier.
     # A concurrent start that already refreshed it to this same state is fine.
     if change_identity(saved) not in {saved_change, expected_change}:
-        if saved.head_sha != saved_change.head_sha:
+        if saved.head_sha != live.head_sha:
             raise ReviewHeadMismatchError
         raise AdmissionResourceNotFoundError
     saved.head_sha = live.head_sha

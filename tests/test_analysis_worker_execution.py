@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 from redis.asyncio.connection import Connection
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_analysis_gateway import OUTPUT
@@ -255,26 +255,18 @@ async def test_debug_http_failure_never_logs_transport_exception_repr(
     assert "ConnectError(" not in output
 
 
-@pytest.mark.parametrize("defect", ["credentials", "frozen-prompt"])
 @pytest.mark.usefixtures("runtime_environment")
 async def test_preparation_failure_closes_http_without_receive_or_provider_call(
     postgres: PostgresHarness,
     redis_client: Redis,
     review_id: uuid.UUID,
     monkeypatch: pytest.MonkeyPatch,
-    defect: str,
 ) -> None:
+    # An incompatible frozen prompt no longer fails preparation; see
+    # test_incompatible_pending_review_does_not_block_startup_and_fails.
     factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
     await freeze(factory, review_id)
-    if defect == "credentials":
-        monkeypatch.delenv("LLM__EUROROUTER__API_KEYS")
-    else:
-        async with factory.begin() as session:
-            await session.execute(
-                update(ReviewJob)
-                .where(ReviewJob.id == review_id)
-                .values(prompt_digest="0" * 64)
-            )
+    monkeypatch.delenv("LLM__EUROROUTER__API_KEYS")
     transports: list[httpx.MockTransport] = []
     closed: list[httpx.MockTransport] = []
 

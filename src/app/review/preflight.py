@@ -95,7 +95,9 @@ async def offline_preflight(
                 route.profile_ref for route in config.policy.routing.fallback
             )
         except FrozenConfigurationError as exc:
-            issues.append(PreflightIssue(job_id, exc.reason))
+            # The worker terminalizes this job as FAILED before any HTTP, so
+            # one incompatible review must not keep analysis from starting.
+            issues.append(PreflightIssue(job_id, exc.reason, False))
     return PreflightReport(
         runtime.identity,
         min(len(jobs), scan_limit),

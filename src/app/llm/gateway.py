@@ -24,7 +24,6 @@ from app.llm.errors import (
     BudgetExceededError,
     LLMGatewayError,
     LLMUnavailableError,
-    ModelIdentityError,
     ProviderTimeoutError,
     RateLimitedError,
     TransientProviderError,
@@ -239,11 +238,6 @@ class LLMGateway:
                         error_code=None,
                         latency_ms=result.latency_ms,
                     )
-                if (
-                    endpoint.expected_model is not None
-                    and result.reported_model != endpoint.expected_model
-                ):
-                    raise ModelIdentityError
                 logger.info(
                     "llm_attempt_succeeded",
                     provider=pool.name,

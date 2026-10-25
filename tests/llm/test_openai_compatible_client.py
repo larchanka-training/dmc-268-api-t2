@@ -67,7 +67,7 @@ def _client(
     )
 
 
-async def test_sends_strict_json_schema_and_returns_parsed_result() -> None:
+async def test_sends_json_schema_and_returns_parsed_result() -> None:
     sent: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -95,7 +95,9 @@ async def test_sends_strict_json_schema_and_returns_parsed_result() -> None:
         "type": "json_schema",
         "json_schema": {
             "name": "review_output",
-            "strict": True,
+            # Strict mode makes providers such as Mistral reject the schema
+            # (lookahead patterns); the response is validated locally anyway.
+            "strict": False,
             "schema": Answer.model_json_schema(),
         },
     }

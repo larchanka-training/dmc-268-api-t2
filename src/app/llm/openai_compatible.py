@@ -43,7 +43,10 @@ class OpenAICompatibleClient(BaseLLMClient):
                 "type": "json_schema",
                 "json_schema": {
                     "name": "review_output",
-                    "strict": True,
+                    # Strict mode makes providers such as Mistral reject the
+                    # schema (lookahead patterns); parse_structured validates
+                    # the response against the full schema anyway.
+                    "strict": False,
                     "schema": (
                         json.loads(request.output_schema_json)
                         if request.output_schema_json is not None

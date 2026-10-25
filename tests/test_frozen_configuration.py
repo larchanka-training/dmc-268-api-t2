@@ -19,7 +19,6 @@ from app.domain.frozen_configuration import RepositoryInstructions, admission_po
 from app.domain.settings import compute_rules_digest
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.client import ChatMessage, LLMRequest
-from app.llm.errors import ModelIdentityError
 from app.llm.tokens import ConservativeTokenCounter
 from app.review.configuration import (
     FrozenConfigurationError,
@@ -373,7 +372,7 @@ async def test_unsupported_saved_configuration_never_reaches_http(  # noqa: PLR0
     assert requests == []
 
 
-async def test_unexpected_response_model_is_not_a_usable_result(
+async def test_routed_response_model_name_is_a_usable_result(
     postgres: PostgresHarness,
     client: httpx.AsyncClient,
     scope: StartScope,
@@ -398,8 +397,10 @@ async def test_unexpected_response_model_is_not_a_usable_result(
     outcome = await execute(
         postgres, review, payload_data, requests, transport=httpx.MockTransport(respond)
     )
-    assert outcome.error_code == "unexpected_model_identity"
-    assert len(requests) == 1 and outcome.summary is None
+    # Routers report their own model alias (e.g. mistral-small-latest), so
+    # the reported name is informational and never refuses a paid result.
+    assert outcome.error_code is None
+    assert len(requests) == 1 and outcome.summary == "ok"
 
 
 @pytest.mark.parametrize(
@@ -553,7 +554,7 @@ async def test_failed_same_provider_fallback_retains_primary_model_identity(
 
 
 @pytest.mark.parametrize("provider", ["eurorouter", "ollama"])
-async def test_missing_response_identity_refuses_frozen_result_after_usage_settlement(
+async def test_missing_response_identity_is_accepted_after_usage_settlement(
     postgres: PostgresHarness,
     client: httpx.AsyncClient,
     scope: StartScope,
@@ -616,12 +617,11 @@ async def test_missing_response_identity_refuses_frozen_result_after_usage_settl
                 PROMPTS, config.prompt_version, expected_digest=config.prompt_digest
             ).output_schema_json,
         )
-        with pytest.raises(ModelIdentityError) as failure:
-            await gateway.generate_structured(
-                request, LLMReviewOutput, budget=budget, input_tokens=50
-            )
-    assert failure.value.error_code == "unexpected_model_identity"
-    assert len(requests) == 1  # No retry, key rotation or fallback for this refusal.
+        result = await gateway.generate_structured(
+            request, LLMReviewOutput, budget=budget, input_tokens=50
+        )
+    assert result.parsed.summary == "ok"
+    assert len(requests) == 1  # No retry, key rotation or fallback.
     state = budget.state()
     assert (state.requests_used, state.input_tokens_used, state.output_tokens_used) == (
         1,

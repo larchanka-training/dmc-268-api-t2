@@ -54,7 +54,7 @@ def _publisher(
     return GithubPublisher(
         PostgresPublicationStore(async_sessionmaker(engine)),
         GithubClient(httpx.AsyncClient(transport=transport)),
-        authority=authority,  # type: ignore[arg-type]
+        authority=authority,
         bot_user_id="9002",
     )
 

@@ -48,7 +48,7 @@ def _publisher(
         GithubClient(
             httpx.AsyncClient(transport=httpx.MockTransport(provider.respond))
         ),
-        authority=authority,  # type: ignore[arg-type]
+        authority=authority,
         bot_user_id="9002",
     )
 

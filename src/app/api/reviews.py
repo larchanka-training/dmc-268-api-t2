@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import AuthenticatedPrincipal, get_authenticated_principal
 from app.api.errors import ApiError
+from app.api.review_diff import project_diff
 from app.api.review_dto import Coverage
 from app.db.models import (
     ChangeRequest,
@@ -153,6 +154,56 @@ async def review_detail(
         "retry_at": review.retry_at,
         "error": error,
     }
+
+
+@router.get("/{id}/diff")
+async def review_diff(
+    id: str,
+    principal: Principal,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    # Cookie verification may already have started this session's transaction.
+    # Read authority, retention evidence and contexts in ONE statement snapshot.
+    # Changing isolation here would be ignored after the authentication query.
+    lost_context = (
+        select(ChunkResult.id)
+        .where(
+            ChunkResult.review_job_id == ReviewJob.id,
+            ChunkResult.context_payload_id.is_(None),
+        )
+        .correlate(ReviewJob)
+        .exists()
+    )
+    rows = (
+        await session.execute(
+            select(ContextPayload, lost_context)
+            .select_from(ReviewJob)
+            .join(
+                RepositoryAccess,
+                RepositoryAccess.repository_id == ReviewJob.repository_id,
+            )
+            .outerjoin(ContextPayload, ContextPayload.review_job_id == ReviewJob.id)
+            .where(
+                ReviewJob.id == _review_uuid(id),
+                RepositoryAccess.user_id == principal.user_id,
+            )
+            .order_by(ContextPayload.created_at, ContextPayload.id)
+        )
+    ).all()
+    if not rows:
+        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    # Canonical results are created with a context link; retention nulls it.
+    if rows[0][1]:
+        raise ApiError(410, "DIFF_EXPIRED", "Stored diff has expired.")
+    contexts = [context for context, _ in rows if context is not None]
+    if not contexts:
+        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    try:
+        return project_diff(contexts)
+    except ValueError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Stored diff is unavailable."
+        ) from None
 
 
 @router.get("/{id}/findings")

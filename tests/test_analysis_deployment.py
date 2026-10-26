@@ -59,7 +59,11 @@ def writer_environment() -> dict[str, str]:
     }
 
 
-def compose_config(*, enabled: bool = False) -> dict[str, Any]:
+def compose_config(
+    *,
+    enabled: bool = False,
+    runtime_directory: str = "/opt/dmc-268-t2-runtime/analysis-runtime",
+) -> dict[str, Any]:
     result = subprocess.run(
         [
             "docker",
@@ -78,6 +82,7 @@ def compose_config(*, enabled: bool = False) -> dict[str, Any]:
             "POSTGRES__PASSWORD": "synthetic-test-password",
             "POSTGRES__DB": "test",
             "COMPOSE_PROFILES": "analysis" if enabled else "",
+            "ANALYSIS_RUNTIME_DIR": runtime_directory,
             "ANALYSIS__CONFIG_PATH": "/app/runtime/analysis-runtime.v1.json"
             if enabled
             else "",
@@ -134,12 +139,17 @@ def test_api_and_worker_share_read_only_trusted_manifest_when_enabled(
         )
         mount = next(v for v in service["volumes"] if v["target"] == "/app/runtime")
         assert mount["type"] == "bind"
-        assert mount["source"] == str(ROOT / "analysis-runtime")
+        assert mount["source"] == "/opt/dmc-268-t2-runtime/analysis-runtime"
         assert mount["read_only"] is True
     assert (
         compose_config()["services"]["api"]["environment"]["ANALYSIS__CONFIG_PATH"]
         == ""
     )
+    develop = compose_config(runtime_directory="./analysis-runtime")["services"]["api"]
+    mount = next(v for v in develop["volumes"] if v["target"] == "/app/runtime")
+    assert mount["source"] == str(ROOT / "analysis-runtime")
+    assert mount["read_only"] is True
+    assert develop["environment"]["ANALYSIS__CONFIG_PATH"] == ""
     if os.environ.get("DMC268_RUN_DOCKER_TESTS") != "1":
         return
     runtime_dir = tmp_path / "analysis-runtime"
@@ -165,6 +175,7 @@ def test_api_and_worker_share_read_only_trusted_manifest_when_enabled(
         "POSTGRES__PASSWORD": "synthetic-test",
         "POSTGRES__DB": "test",
         "ANALYSIS__CONFIG_PATH": "/app/runtime/analysis-runtime.v1.json",
+        "ANALYSIS_RUNTIME_DIR": str(runtime_dir),
     }
     probe = (
         "import errno, os\nfrom pathlib import Path\n"
@@ -231,6 +242,11 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
         timeout=10,
     )
     entries = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert entries["ANALYSIS_RUNTIME_DIR"] == (
+        "/opt/dmc-268-t2-runtime/analysis-runtime"
+        if target == "staging"
+        else "./analysis-runtime"
+    )
     assert entries["COMPOSE_PROFILES"] == profile
     assert entries["ANALYSIS__CONFIG_PATH"] == (
         "/app/runtime/analysis-runtime.v1.json" if profile else ""
@@ -246,8 +262,12 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
         "fi\n"
     )
     (binary / "curl").write_text("#!/bin/sh\nexit 0\n")
+    (binary / "sudo").write_text("#!/bin/sh\nexit 0\n")
     for executable in binary.iterdir():
         executable.chmod(0o755)
+    backup = tmp_path / "backup-postgres.sh"
+    backup.write_text("#!/bin/sh\nexit 0\n")
+    backup.chmod(0o755)
     remote = workflow_step("Deploy application")["run"].split("<<'REMOTE'\n", 1)[1]
     remote = remote.split("\nREMOTE", 1)[0]
     trace = tmp_path / "trace"
@@ -256,6 +276,8 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
         env={
             "PATH": f"{binary}:{os.environ['PATH']}",
             "DEPLOY_TRACE": str(trace),
+            "MANIFEST_SHA256": "a" * 64,
+            "INSTALLER_SHA256": "b" * 64,
             "DEPLOY_PATH": str(tmp_path),
             "ENV_FILE": ".env.test",
             "ENV_NAME": target,

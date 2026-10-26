@@ -1,0 +1,91 @@
+name: Staging review diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      review_id:
+        description: Canonical lowercase UUID of the existing staging review
+        required: true
+        type: string
+      include_worker_logs:
+        description: Include allowlisted failure fields from the review time window (no review attribution)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Keep the deployed containers stable while reading their DB and logs.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      SSH_USER: ${{ secrets.VPS_DMC268_U }}
+      SSHPASS: ${{ secrets.VPS_DMC268_P }}
+    steps:
+      - name: Validate review UUID before SSH
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${REVIEW_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo '::error::review_id must be a canonical lowercase UUID'
+            exit 1
+          fi
+
+      - name: Checkout main workflow source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_HOST}" || -z "${SSH_USER}" || -z "${SSHPASS}" ]]; then
+            echo '::error::Existing VPS SSH configuration is unavailable'
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${SSH_HOST} ${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Diagnose existing staging review
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          INCLUDE_WORKER_LOGS: ${{ inputs.include_worker_logs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Validate again at the interpolation boundary; only these two tokens
+          # enter the remote command. Neither input becomes executable source.
+          [[ "${REVIEW_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || exit 1
+          [[ "${INCLUDE_WORKER_LOGS}" == true || "${INCLUDE_WORKER_LOGS}" == false ]] || exit 1
+          if ! timeout 120s sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
+            "${SSH_USER}@${SSH_HOST}" \
+            "python3 -I - '${REVIEW_ID}' '${INCLUDE_WORKER_LOGS}'" \
+            < .github/scripts/staging_review_diagnostics.py 2>/dev/null
+          then
+            echo '::error::Diagnostic failed (SSH, container, PostgreSQL or bounded read); see safe status above'
+            exit 1
+          fi

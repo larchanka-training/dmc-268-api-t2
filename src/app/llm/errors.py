@@ -102,9 +102,3 @@ class LLMUnavailableError(LLMGatewayError):
         super().__init__(f"all providers failed, last error: {last_error_code}")
         self.last_error_code = last_error_code
         self.retryable = retryable
-
-
-class ModelIdentityError(LLMGatewayError):
-    """The paid response is unusable under the frozen profile's model identity."""
-
-    error_code = "unexpected_model_identity"

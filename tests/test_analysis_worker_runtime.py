@@ -61,7 +61,9 @@ def invoke(
     )
 
 
-@pytest.mark.parametrize("defect", ["credentials", "manifest", "artifacts", "history"])
+# A pending job incompatible with the manifest no longer blocks startup; see
+# test_incompatible_pending_review_does_not_block_startup_and_fails.
+@pytest.mark.parametrize("defect", ["credentials", "manifest", "artifacts"])
 async def test_untrusted_startup_fails_before_receive_or_mutation(
     postgres: PostgresHarness,
     redis_client: Redis,
@@ -87,11 +89,7 @@ async def test_untrusted_startup_fails_before_receive_or_mutation(
     try:
         before = await state()
         entries = await redis_client.xrange(f"{STREAM}:analyze")
-        values = manifest_values()
-        if defect == "history":
-            values["profiles"]["eurorouter/review-v1"]["allowed_models"] = ["other"]
-            values["admission"]["primary"]["model_ref"] = "other"
-        environment = environment_for(write_manifest(tmp_path, values))
+        environment = environment_for(write_manifest(tmp_path, manifest_values()))
         if defect != "credentials":
             environment["LLM__EUROROUTER__API_KEYS"] = "synthetic-test-key"
         if defect == "manifest":

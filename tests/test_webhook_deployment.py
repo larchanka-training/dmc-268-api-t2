@@ -25,7 +25,9 @@ def test_staging_runs_intake_recovery_and_forwards_read_token() -> None:
     runtime = next(
         step for step in steps if step.get("name") == "Write runtime environment"
     )
-    assert runtime["env"]["GITHUB_API_TOKEN"] == "${{ secrets.GITHUB__TOKEN }}"
+    assert runtime["env"]["GITHUB_API_TOKEN"] == (
+        "${{ secrets.STAGING_GITHUB_READ_TOKEN }}"
+    )
     assert "append_optional 'GITHUB__TOKEN'" in runtime["run"]
 
 

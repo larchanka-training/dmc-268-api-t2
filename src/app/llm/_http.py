@@ -69,15 +69,18 @@ def _raise_for_status(response: httpx.Response) -> None:
         msg = f"HTTP {status}"
         raise AuthError(msg)
     if status in _TRANSIENT_STATUSES:
-        msg = f"HTTP {status}"
-        raise TransientProviderError(msg, status_code=status)
+        raise TransientProviderError(_status_detail(response), status_code=status)
     if status == 400 and _is_context_overflow(response):  # noqa: PLR2004
         msg = "HTTP 400: context overflow"
         raise ContextOverflowError(msg)
-    msg = f"HTTP {status}"
+    raise ProviderRequestError(_status_detail(response))
+
+
+def _status_detail(response: httpx.Response) -> str:
+    msg = f"HTTP {response.status_code}"
     if code := _provider_error_code(response):
         msg = f"{msg} ({code})"
-    raise ProviderRequestError(msg)
+    return msg
 
 
 def _provider_error_code(response: httpx.Response) -> str | None:

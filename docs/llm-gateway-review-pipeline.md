@@ -175,7 +175,7 @@ sequenceDiagram
     P-->>S: messages, prompt_version, оценка токенов
     S->>G: generate_structured(request, LLMReviewOutput)
     G->>B: резерв входа и max_output
-    G->>E: POST /chat/completions, json_schema strict
+    G->>E: POST /chat/completions, json_schema
     alt Ответ 2xx
         E-->>G: JSON + usage
     else 429, 5xx или таймаут после ротации ключей
@@ -374,12 +374,13 @@ class BaseLLMClient(ABC):
 
 | Провайдер | Клиент | Endpoint | Structured output | Usage | Роль |
 |---|---|---|---|---|---|
-| `eurorouter` | `OpenAICompatibleClient` | `POST {base_url}/chat/completions`, заголовок `Authorization: Bearer <key>` | `response_format = {"type": "json_schema", "json_schema": {"name": "review_output", "schema": ..., "strict": true}}`, `temperature`, `max_tokens` | `usage.prompt_tokens` / `usage.completion_tokens` | **Основной** |
+| `eurorouter` | `OpenAICompatibleClient` | `POST {base_url}/chat/completions`, заголовок `Authorization: Bearer <key>` | `response_format = {"type": "json_schema", "json_schema": {"name": "review_output", "schema": ..., "strict": false}}`, `temperature`, `max_tokens` | `usage.prompt_tokens` / `usage.completion_tokens` | **Основной** |
 | `ollama` | `OllamaClient` | `POST {base_url}/api/chat`, `stream=false`, без авторизации (закрытая сеть) | `format = response_model.model_json_schema()`, `options.temperature`, `options.num_predict`, `options.num_ctx` | `prompt_eval_count` / `eval_count` | **Резервный** |
 
 - Оба клиента используют общий `httpx.AsyncClient`, который передаётся через конструктор (в тестах — через `MockTransport`). Время жизни клиента привязано к lifespan процесса worker.
-- `OpenAICompatibleClient` не содержит логики, специфичной для Eurorouter: имя, `base_url`, модель и ключи приходят из конфигурации. Если Eurorouter отклоняет `strict`/`json_schema` для выбранной модели, это ошибка конфигурации (`ProviderRequestError`), а не повод молча перейти на свободный JSON.
-- **Решено (29.09.2026):** Eurorouter предоставляет OpenAI-совместимый API (`/v1/chat/completions`) и принимает стандартные параметры запроса OpenAI, включая Structured Outputs (`response_format.type = "json_schema"`, `json_schema.strict = true`). В работе используются свежие модели, которые это поддерживают. Конкретная модель по-прежнему задаётся GitHub Variable.
+- `OpenAICompatibleClient` не содержит логики, специфичной для Eurorouter: имя, `base_url`, модель и ключи приходят из конфигурации. Если Eurorouter отклоняет `json_schema` для выбранной модели, это ошибка конфигурации (`ProviderRequestError`), а не повод молча перейти на свободный JSON.
+- **Решено (25.10.2026):** `json_schema.strict = false`. В строгом режиме Mistral (`mistral-small-4`) отвечает `400 invalid_request_error`: его грамматика не принимает lookahead в `pattern` схемы. Ответ всё равно проверяется локально по полной схеме (`parse_structured`). Поле `model` ответа только логируется и не сверяется с ожидаемой моделью: роутер может вернуть свой алиас (например, `mistral-small-latest`).
+- **Решено (29.09.2026):** Eurorouter предоставляет OpenAI-совместимый API (`/v1/chat/completions`) и принимает стандартные параметры запроса OpenAI, включая Structured Outputs (`response_format.type = "json_schema"`). В работе используются свежие модели, которые это поддерживают. Конкретная модель по-прежнему задаётся GitHub Variable.
 - Поддержка `temperature`, `max_tokens`/`num_predict` и strict JSON Schema выбранными моделями обоих провайдеров проверяется до допуска модели в конфигурацию (SD §7) opt-in smoke-тестом `tests/llm/test_live_provider.py` (`DMC268_LLM_SMOKE=1` + `LLM__*`). Тест вызывает каждый провайдер отдельно, без резерва, и требует `COMPLETED` с одного запроса (без format repair). В CI он пропускается: ключей там нет. **Статус: с реальной моделью ещё не запускался** (§9).
 - Ответы Eurorouter могут содержать поле роутинга с фактической моделью (`model`). Именно оно пишется в `ReviewChunkOutcome.model`; если поля нет — модель из конфигурации.
 
@@ -629,7 +630,7 @@ class ReviewService:
 | Вопрос | Предлагаемое решение до согласования | Кто решает |
 |---|---|---|
 | Какая модель Ollama (резерв), её digest и поддержка structured output с `num_ctx ≥ 16384`; когда Ollama появится в staging | До развёртывания — `FALLBACK_ENABLED=false` в staging | Agentic + DevOps (SD §16) |
-| Принимает ли выбранная модель Eurorouter `temperature`, `max_tokens` и `response_format.json_schema.strict` | Прогнать `tests/llm/test_live_provider.py` с ключом staging и приложить вывод к PR; до этого модель в staging не включается | Agentic + DevOps |
+| Принимает ли выбранная модель Eurorouter `temperature`, `max_tokens` и `response_format.json_schema` | Прогнать `tests/llm/test_live_provider.py` с ключом staging и приложить вывод к PR; до этого модель в staging не включается | Agentic + DevOps |
 | Точный токенизатор моделей | До выбора моделей — `ConservativeTokenCounter` | Agentic |
 | Сравнимость quality gates (SD §14) при ответах двух разных моделей | Метрики LLM Evaluation считаются по `provider/model` отдельно; данные разных моделей не смешиваются | QA |
 
@@ -657,7 +658,7 @@ class ReviewService:
 - `ContextPayload`: пример из SD §6 валиден; `HunkLine` с `kind=added` и `old_line != null` отклоняется; несогласованный `new_count` отклоняется; `schema_version = 2` отклоняется.
 
 **Gateway (`tests/llm/`)**
-- Eurorouter: в запросе есть `response_format` типа `json_schema` со `strict: true`, `temperature=0`, `max_tokens`, заголовок `Authorization`; usage разбирается из `usage`; фактическая модель берётся из поля `model` ответа.
+- Eurorouter: в запросе есть `response_format` типа `json_schema` со `strict: false`, `temperature=0`, `max_tokens`, заголовок `Authorization`; usage разбирается из `usage`; фактическая модель берётся из поля `model` ответа.
 - Ollama: в запросе есть `format` со схемой, `temperature=0`, `num_predict`, `num_ctx`, нет заголовка `Authorization`; usage разбирается из `prompt_eval_count`/`eval_count`.
 - 429 на ключе A при свободном ключе B → следующий запрос сразу идёт с ключом B, sleep не вызывается.
 - 429 с `Retry-After: 2` при единственном ключе и выключенном резерве → фейковый sleep вызван со значением ≥ 2 с, затем повтор.

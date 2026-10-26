@@ -67,7 +67,7 @@ def _client(
     )
 
 
-async def test_sends_strict_json_schema_and_returns_parsed_result() -> None:
+async def test_sends_json_schema_and_returns_parsed_result() -> None:
     sent: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -95,7 +95,9 @@ async def test_sends_strict_json_schema_and_returns_parsed_result() -> None:
         "type": "json_schema",
         "json_schema": {
             "name": "review_output",
-            "strict": True,
+            # Strict mode makes providers such as Mistral reject the schema
+            # (lookahead patterns); the response is validated locally anyway.
+            "strict": False,
             "schema": Answer.model_json_schema(),
         },
     }
@@ -236,3 +238,32 @@ async def test_request_error_without_safe_provider_code_has_status_only(
         await _client(lambda _: response).generate_structured(_request(), Answer)
 
     assert str(error.value) == "HTTP 400"
+
+
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        (
+            httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": 503,
+                        "type": "service_unavailable",
+                        "message": "upstream said: <prompt excerpt>",
+                    }
+                },
+            ),
+            "HTTP 503 (service_unavailable)",
+        ),
+        (httpx.Response(502, text="<html>Bad Gateway</html>"), "HTTP 502"),
+    ],
+)
+async def test_server_error_keeps_safe_provider_code(
+    response: httpx.Response, detail: str
+) -> None:
+    with pytest.raises(TransientProviderError) as error:
+        await _client(lambda _: response).generate_structured(_request(), Answer)
+
+    assert str(error.value) == detail
+    assert error.value.status_code == response.status_code

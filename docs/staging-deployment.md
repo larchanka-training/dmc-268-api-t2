@@ -285,7 +285,7 @@ PostgreSQL не публикует порт наружу.
 dmc-268-t2-staging_db-data
 ```
 
-Ежедневные дампы staging лежат на диске VPS: `/opt/dmc-268-t2/backups/dmc-YYYY-MM-DD.sql.gz`, семь файлов, каталог с правами `700`. Восстановление описано в [postgres-backup.md](proposals/postgres-backup.md).
+Ежедневные дампы staging лежат на диске VPS: `/opt/dmc-268-t2/backups/dmc-YYYY-MM-DD.sql.gz`, семь файлов. Каталог `/opt/dmc-268-t2/backups/predeploy/` хранит дамп каждого деплоя за последние семь дат UTC. Каталог с правами `700`. Восстановление описано в [postgres-backup.md](proposals/postgres-backup.md).
 
 ### Redis
 

@@ -31,8 +31,8 @@ def test_caddy_https_keeps_port_80_and_serves_both_names() -> None:
     deploy_at = names.index("Deploy application")
     backup_at = names.index("Install Postgres backup")
     caddy_at = names.index("Ensure Caddy HTTPS")
-    assert backup_at == deploy_at + 1
-    assert caddy_at == backup_at + 1
+    assert caddy_at == deploy_at + 1
+    assert backup_at == caddy_at + 1
     assert caddy["env"]["SSH_USER"] == "${{ secrets.VPS_DMC268_U }}"
     assert caddy["env"]["SSHPASS"] == "${{ secrets.VPS_DMC268_P }}"
     run = caddy["run"]

@@ -21,14 +21,14 @@ Before this change, nothing in this repo created a dump, a backup directory, or 
 
 No new GitHub workflow. A `schedule` workflow runs on a GitHub runner. The runner has no Postgres data, so the job would still SSH in, and GitHub may delay or skip that schedule when the repo is idle. The dump has to be created on the VPS, next to the database, including on days when nobody pushes.
 
-The existing Deploy job installs the schedule, the same way it already copies the Caddyfile. After `Deploy application` succeeds, and before `Ensure Caddy HTTPS`, a new step copies one script and installs one crontab line for the SSH user. A later deploy replaces that line and does not touch the rest of the crontab. The step does not write `/etc/cron.d` and does not use `sudo`.
+The existing Deploy job installs the schedule, the same way it already copies the Caddyfile. `Deploy application` copies the script and runs it with `predeploy` before `alembic upgrade head`. `Ensure Caddy HTTPS` is next. `Install Postgres backup` then refreshes the script and the crontab line and does not run the script. A later deploy replaces that line and does not touch the rest of the crontab. The step does not write `/etc/cron.d` and does not use `sudo`.
 
 | Environment | Script on the VPS | Dump directory | Cron |
 |---|---|---|---|
 | staging | `/opt/dmc-268-t2/backup-postgres.sh` | `/opt/dmc-268-t2/backups` | `15 3 * * *` |
 | develop | `/opt/dmc-268-t2-develop/backup-postgres.sh` | `/opt/dmc-268-t2-develop/backups` | `45 3 * * *` |
 
-The directory mode is `700`. Each dump file is mode `600`. Dumps are not inside `db-data`, and they are not committed. Seven newest `dmc-*.sql.gz` files are kept. An older file is deleted only after a new dump has been written and checked. A second run on the same UTC date replaces that day's file.
+The directory mode is `700`. Each dump file is mode `600`. Dumps are not inside `db-data`, and they are not committed. Daily files are `backups/dmc-YYYY-MM-DD.sql.gz`: seven names, one per UTC date, in `backups/` and not under `backups/predeploy/`. An older daily file is deleted only after a new dump has been written and checked, and deletion follows the date in the filename. A second run of the two-argument script on the same UTC date replaces that day's file. `predeploy` writes a new `backups/predeploy/dmc-<YYYYMMDDTHHMMSSZ>.sql.gz` and does not replace an existing daily file. Predeploy files whose UTC date is today or one of the previous six days stay, with no per-day count. They are not part of the seven daily names.
 
 The copy survives a bad migration and a container recreate. It does not survive the VPS disk dying, because the files are on that same disk. Cron uses the VPS local clock. The dump file name uses the UTC date.
 
@@ -49,26 +49,25 @@ docker compose \
   pg_dump -U dmc -d dmc --no-owner --no-acl
 ```
 
-The host runs `gzip`. `postgres:18-alpine` is not asked to provide `gzip`. The stream is written to `backups/dmc-YYYY-MM-DD.sql.gz.partial`, then `gzip -t` runs, then the file is renamed to `backups/dmc-YYYY-MM-DD.sql.gz`. `pipefail` is on, so a failed `pg_dump` does not become a kept dump. The `.partial` file is deleted when `pg_dump` or `gzip -t` fails. `pg_dump` uses the container's local socket. The password is not an argument and is not printed. The script sets `PATH` so cron can find `docker` and `gzip`. `flock` on `backups/backup.lock` stops a second copy from starting. One status line is appended to `backups/backup.log`, and that log is trimmed to the last 30 lines.
+The host runs `gzip`. `postgres:18-alpine` is not asked to provide `gzip`. The two-argument stream is written to `backups/dmc-YYYY-MM-DD.sql.gz.partial`, then `gzip -t` runs, then the file is renamed to `backups/dmc-YYYY-MM-DD.sql.gz`. A third argument, `predeploy`, writes `backups/predeploy/dmc-<YYYYMMDDTHHMMSSZ>.sql.gz` the same way, with a new name on every run. After a good predeploy dump, if today's daily file is absent, the script copies that gzip to the daily name and leaves the predeploy file in place. `pipefail` is on, so a failed `pg_dump` does not become a kept dump. The `.partial` file is deleted when `pg_dump` or `gzip -t` fails. `pg_dump` uses the container's local socket. The password is not an argument and is not printed. The script sets `PATH` so cron can find `docker` and `gzip`. `umask 077` is set before the lock, the directory, or the `.partial` file. `predeploy` takes `backups/backup.lock` with `flock -w 600` and exits 1 on timeout. The two-argument run uses `flock -n`; when the lock is held it appends `skip-lock` and exits 0. Every run appends `ok`, `fail`, or `skip-lock` to `backups/backup.log`, and that log is trimmed to the last 30 lines.
 
-- `.github/workflows/deploy-staging.yml`. New step `Install Postgres backup`, after `Deploy application`, before `Ensure Caddy HTTPS`. It reuses `secrets.VPS_DMC268_U`, `secrets.VPS_DMC268_P`, and `SSH_HOST`.
+- `.github/workflows/deploy-staging.yml`. `Deploy application` copies the script and runs it with `predeploy` after Postgres is healthy and before `alembic upgrade head`. `Ensure Caddy HTTPS` is next. `Install Postgres backup` then refreshes the script and the crontab line and does not run the script. It reuses `secrets.VPS_DMC268_U`, `secrets.VPS_DMC268_P`, and `SSH_HOST`.
 
 On the VPS, for the environment this run is deploying:
 
-1. `install -d -m 700` the dump directory, then `scp` the script to `${DEPLOY_PATH}/backup-postgres.sh` and mark it executable.
-2. Install the SSH user's crontab line. The marker is `# dmc-postgres-backup` plus the Compose project name. Lines for the other environment stay. If `crontab` is missing, the step fails and names that fact. It does not install packages.
-3. Run the script once, with that environment's project name and env file, so a dump exists before the next 03:15 on the VPS clock.
+1. `Deploy application` does `install -d -m 700` for `backups/` and `backups/predeploy/`, then `scp`s the script to `${DEPLOY_PATH}/backup-postgres.sh`, marks it executable, and runs it with `predeploy`. That run, including the copy when today's daily file is absent, is the dump that exists before the next 03:15. Cron may still replace the daily file at 03:15.
+2. `Install Postgres backup` installs the SSH user's crontab line. The marker is `# dmc-postgres-backup` plus the Compose project name. Lines for the other environment stay. If `crontab` is missing, the step fails and names that fact. It does not install packages. `crontab -l` is empty only when the failure says `no crontab`. Any other non-zero status exits 1 and does not write a new table. The cron command appends to `backups/cron.log`.
 
 `docker-compose.staging.yml` is unchanged. The script calls the `db` service that is already defined there.
 
-- `docs/staging-deployment.md`. Under `### PostgreSQL`, state that daily dumps for staging are `/opt/dmc-268-t2/backups/dmc-YYYY-MM-DD.sql.gz`, seven files, mode `700` on the directory, on the VPS disk. Name this file as the restore procedure. Do not paste the restore commands into that section.
+- `docs/staging-deployment.md`. Under `### PostgreSQL`, name both trees: `/opt/dmc-268-t2/backups/dmc-YYYY-MM-DD.sql.gz` (seven files) and `/opt/dmc-268-t2/backups/predeploy/` (every deploy from the last seven UTC dates). Directory mode `700`, on the VPS disk. Name this file as the restore procedure. Do not paste the restore commands into that section.
 
 Unchanged:
 
 - `docker-compose.staging.yml`
 - Redis, and any Redis backup
 - `infra/terraform/**`
-- The Caddy step, except that the backup step is inserted before it
+- Step order: `Deploy application` (predeploy, then `alembic upgrade head`), then `Ensure Caddy HTTPS`, then `Install Postgres backup`
 - `SENTRY__DSN` and the worker command
 
 The workflow definition that Deploy runs is the one on API `main`. The cron line appears on the first Deploy after this change is on `main`.
@@ -81,7 +80,7 @@ gzip -t /opt/dmc-268-t2/backups/dmc-*.sql.gz
 crontab -l
 ```
 
-The directory mode is `700`. `gzip -t` exits 0. `crontab -l` contains `/opt/dmc-268-t2/backup-postgres.sh` and `dmc-268-t2-staging`. A second run of the script on the same UTC date leaves a single file for that date, and the directory never holds more than seven `dmc-*.sql.gz` files.
+The directory mode is `700`. `gzip -t` exits 0. `crontab -l` contains `/opt/dmc-268-t2/backup-postgres.sh` and `dmc-268-t2-staging`. A second run of the two-argument script on the same UTC date leaves a single file for that date. Two `predeploy` runs leave two files under `backups/predeploy/`. Daily names in `backups/` stay at seven. Predeploy files from the last seven UTC dates stay.
 
 ## GitHub
 
@@ -103,7 +102,21 @@ The dump is plain SQL (`pg_dump` without a custom format) with `--no-owner --no-
 
 `dmc` is the superuser created by `POSTGRES_USER`. The `postgres` database exists beside `dmc`. Drop and create `dmc` while connected to `postgres`.
 
-Pick the dump to load and run `gzip -t` on it. If that file's name is today's UTC date, copy it aside first (`dmc-YYYY-MM-DD.sql.gz.keep`). The backup script replaces the file for today's UTC date, so a run after that copy does not destroy the dump you chose.
+### Bad migration
+
+The dump to load is `backups/predeploy/dmc-<YYYYMMDDTHHMMSSZ>.sql.gz` from the deploy that ran that migration: the snapshot taken before `alembic`. Do not load a later predeploy file from a retry. Do not set `DUMP` to today's daily name. Cron may have replaced a daily file seeded by the pre-migration copy, and that daily file is then the migrated database. Do not run `./backup-postgres.sh` before that load. A two-argument run replaces today's daily file and is not how the pre-migration snapshot is chosen.
+
+`gzip -t` the chosen predeploy file, then use the drop, create, and `psql` load below with that `DUMP`. Skip `alembic upgrade head` after the load when the damage is a migration you do not want reapplied. Deploy the older image first, then restore, and do not run upgrade until the image and the dump are the pair you want.
+
+```bash
+cd /opt/dmc-268-t2
+DUMP=backups/predeploy/dmc-YYYYMMDDTHHMMSSZ.sql.gz
+gzip -t "$DUMP"
+```
+
+### Other damage
+
+When the damage is not that migration and the chosen file is today's daily name, copy it aside first (`dmc-YYYY-MM-DD.sql.gz.keep`). The two-argument script replaces the file for today's UTC date, so a run after that copy does not destroy the dump you chose.
 
 If the current database is still readable, run the script once after that copy. The new file is a snapshot of the database you are about to replace. Load the `.keep` copy, or an older day's file. Do not load the file the script just wrote unless that snapshot is the state you want.
 
@@ -115,7 +128,7 @@ cp -n backups/dmc-YYYY-MM-DD.sql.gz "$DUMP"
 gzip -t "$DUMP"
 ```
 
-Skip the `cp` when the chosen file is an older day, and set `DUMP` to that `.sql.gz` instead. The script does not replace older names. `gzip -t` has to exit 0 before the load below. Stop the processes that open Postgres. Leave `db` running:
+Skip the `cp` and the script when the chosen file is an older day, and set `DUMP` to that `.sql.gz` instead. The two-argument script does not replace older names. `gzip -t` has to exit 0 before the load below. Stop the processes that open Postgres. Leave `db` running:
 
 ```bash
 docker compose \

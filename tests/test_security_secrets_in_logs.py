@@ -11,20 +11,24 @@ import hmac
 import json
 import logging
 import random
+import uuid
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 
 import httpx
+import jwt
 import pytest
 import structlog
 from pydantic import BaseModel, ConfigDict, SecretStr
 
+from app.application.github_ports import GithubRequest
 from app.core.config import (
     LLM,
     Eurorouter,
+    Github,
     Logging,
     Ollama,
     Settings,
@@ -32,6 +36,7 @@ from app.core.config import (
     get_settings,
 )
 from app.core.logging_config import configure_logging
+from app.core.publication_runtime import github_publisher_connection
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.client import ChatMessage, LLMRequest
 from app.llm.providers import build_gateway
@@ -75,10 +80,11 @@ def _audit(path: Path) -> str:
     return path.read_text("utf-8")
 
 
-def _assert_no_secrets(path: Path) -> None:
+def _assert_no_secrets(path: Path) -> str:
     rendered = _audit(path)
     for name, value in SECRETS.items():
         assert value not in rendered, f"secret {name} leaked into the logs"
+    return rendered
 
 
 async def test_llm_gateway_logs_attempts_without_api_keys(log_file: Path) -> None:
@@ -88,6 +94,9 @@ async def test_llm_gateway_logs_attempts_without_api_keys(log_file: Path) -> Non
         verdict: str
 
     scripted: dict[str, deque[httpx.Response]] = defaultdict(deque)
+    # The primary key is rejected by the provider: the failed-attempt branch
+    # runs for real, then the fallback key serves the call.
+    scripted[SECRETS["llm"]].append(httpx.Response(401, json={"error": "denied"}))
 
     def handler(request: httpx.Request) -> httpx.Response:
         key = request.headers["authorization"].removeprefix("Bearer ")
@@ -131,6 +140,7 @@ async def test_llm_gateway_logs_attempts_without_api_keys(log_file: Path) -> Non
 
     rendered = _audit(log_file)
     assert "llm_attempt" in rendered  # production events were captured
+    assert "llm_attempt_failed" in rendered  # the rejected-attempt branch ran
     _assert_no_secrets(log_file)
     assert "secondary-key" not in rendered  # every credential, not only the first
 
@@ -197,3 +207,78 @@ async def test_webhook_intake_logs_rejections_without_secrets(log_file: Path) ->
     for line in rendered.splitlines():
         if line.strip():
             json.loads(line)
+
+
+async def test_publication_client_keeps_write_token_out_of_logs(
+    log_file: Path,
+) -> None:
+    """The sentinel write token really flows through the publication client."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The production credential seam put the sentinel on the wire.
+        assert request.headers["authorization"] == (f"Bearer {SECRETS['github_write']}")
+        return httpx.Response(
+            200,
+            json={
+                "state": "open",
+                "number": 42,
+                "title": "Review",
+                "body": None,
+                "head": {"sha": "a" * 40, "ref": "topic", "repo": {"id": 101}},
+                "base": {"sha": "b" * 40, "ref": "main", "repo": {"id": 100}},
+            },
+        )
+
+    settings = Settings(
+        github=Github(
+            write_token=SecretStr(SECRETS["github_write"]), bot_user_id="9002"
+        )
+    )
+    async with github_publisher_connection(
+        settings, transport=httpx.MockTransport(handler)
+    ) as github:
+        await github.check_pull(
+            GithubRequest(
+                owner="larchanka-training",
+                name="demo",
+                repository_external_id="100",
+                number=42,
+                head_sha="a" * 40,
+                base_sha="b" * 40,
+            )
+        )
+
+    structlog.get_logger().info("audit_probe")
+    rendered = _assert_no_secrets(log_file)
+    assert rendered.strip(), "the audit file captured no records at all"
+
+
+async def test_jwt_signing_secret_stays_out_of_logs(log_file: Path) -> None:
+    """The sentinel secret signs and verifies a session through the exact
+    production calls (github_auth signing, auth.py verification options), so
+    a leak of the signing secret or of the derived bearer cookie would fail
+    the scan."""
+    now = datetime.now(UTC)
+    claims = {
+        "sub": str(uuid.uuid4()),
+        "sid": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + timedelta(minutes=30),
+        "iss": "dmc268",
+        "aud": "dmc268-browser",
+    }
+    encoded = jwt.encode(claims, SECRETS["jwt"], algorithm="HS256")
+    verified = jwt.decode(
+        encoded,
+        SECRETS["jwt"],
+        algorithms=["HS256"],
+        issuer="dmc268",
+        audience="dmc268-browser",
+        options={"require": ["sub", "sid", "iat", "exp"]},
+    )
+    assert verified["sub"] == claims["sub"]
+
+    structlog.get_logger().info("audit_probe")
+    rendered = _assert_no_secrets(log_file)
+    assert rendered.strip(), "the audit file captured no records at all"
+    assert encoded not in rendered  # the cookie itself is a bearer credential

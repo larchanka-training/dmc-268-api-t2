@@ -214,6 +214,9 @@ class FakeGithub:
         self.comment_change: dict[str, Any] = {}
         self.review_change: dict[str, Any] = {}
         self.metadata = pull_metadata()
+        # Head the fake reports for records it creates; tests moving the PR
+        # head (new push) set this to the new SHA.
+        self.head = HEAD
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         self.requests.append((request.method, request.url.path))
@@ -228,7 +231,7 @@ class FakeGithub:
                 {
                     "id": 9001,
                     "body": payload["body"],
-                    "commit_id": HEAD,
+                    "commit_id": self.head,
                     "state": "COMMENTED",
                     "user": {"id": 9002},
                 }
@@ -239,7 +242,7 @@ class FakeGithub:
                     **item,
                     "id": 9003 + index,
                     "user": {"id": 9002},
-                    "commit_id": HEAD,
+                    "commit_id": self.head,
                 }
                 for index, item in enumerate(payload["comments"])
             ]

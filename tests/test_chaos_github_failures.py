@@ -127,9 +127,12 @@ async def test_lost_post_response_never_rewrites_and_reconciles_to_exactly_once(
     assert state.provider_metadata is not None
     assert state.provider_metadata.get("remote_review_id") == "9001"
 
-    # Quiescence: the durable outcome is PUBLISHED, the parked delivery is
-    # superseded, and the dispatcher refuses to create further work.
-    await redis_client.delete(f"{stream_prefix}:publish")
+    # Quiescence without touching the queue: the durable outcome is terminal,
+    # so the dispatcher enqueues nothing and no provider HTTP happens. The
+    # parked delivery itself stays in the consumer PEL: production has no
+    # publish-stream reclaim (the open F-2 limitation, see issue #52) — the
+    # test documents the parking instead of faking an automatic recovery.
+    # Stream deletion happens only in the stream_prefix fixture cleanup.
     async with sessions.begin() as session:
         await session.execute(
             update(OutboxEvent)
@@ -147,10 +150,10 @@ async def test_lost_post_response_never_rewrites_and_reconciles_to_exactly_once(
         )
         is False
     )
-    assert untouched.posts == []
+    assert untouched.posts == [] and untouched.requests == []
     pending = await redis_client.xpending(f"{stream_prefix}:publish", "review-workers")
-    assert pending["pending"] == 0
-    assert await redis_client.xlen(f"{stream_prefix}:publish") == 0
+    assert pending["pending"] == 1  # parked delivery retained, never reclaimed
+    assert await redis_client.xlen(f"{stream_prefix}:publish") == 1
 
 
 async def test_github_429_lands_terminal_failed_without_retry_hammering(
@@ -180,7 +183,12 @@ async def test_github_429_lands_terminal_failed_without_retry_hammering(
     assert state is not None and state.status == "FAILED"
     assert state.provider_metadata is not None
     assert state.provider_metadata.get("confirmed_absent") is True
+    # Exactly one POST attempt: the durable FAILED parks the delivery without
+    # client-side retry hammering (a rejected POST lands in posts, not in
+    # reviews, so the count of posts is what pins the no-retry contract).
+    assert len(limited.posts) == 1
     assert limited.reviews == []  # the POST never landed on the remote
+    http_calls = len(limited.requests)
     pending = await redis_client.xpending(f"{stream_prefix}:publish", "review-workers")
     assert pending["pending"] == 1
 
@@ -193,4 +201,5 @@ async def test_github_429_lands_terminal_failed_without_retry_hammering(
     outcome = await publisher.publish(review_job_id=review_id)
     assert outcome["status"] == "FAILED"
     assert outcome["confirmed_absent"] is True
-    assert limited.reviews == []
+    assert len(limited.posts) == 1
+    assert len(limited.requests) == http_calls

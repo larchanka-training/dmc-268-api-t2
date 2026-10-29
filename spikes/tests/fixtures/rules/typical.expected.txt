@@ -1,0 +1,1 @@
+typical.md: 6 rule(s) accepted, 3 ignore glob(s), 0 error(s), 0 warning(s)

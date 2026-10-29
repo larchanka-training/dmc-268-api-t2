@@ -32,7 +32,7 @@ packages = ["src/app"]
 line-length = 88
 target-version = "py314"
 src = ["src"]
-extend-exclude = ["migrations", "docs"]
+extend-exclude = ["migrations", "docs", "spikes"]
 
 [tool.ruff.lint]
 select = [
@@ -54,11 +54,13 @@ select = [
 [tool.mypy]
 strict = true
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
-exclude = ["migrations/"]
+exclude = ["migrations/", "spikes/"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# spikes/ are throw-away prototypes with their own pytest.ini: run them explicitly.
+addopts = ["--ignore=spikes"]
 
 [dependency-groups]
 dev = [

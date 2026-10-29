@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/specs/rules-parsed/v2.json",
+  "title": "Parsed repository rules v2 (proposed)",
+  "description": "Output of the .review/rules.md parser. Becomes the canonical RepositorySettings.rules document (v2). Proposed; not yet part of schemas/.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source",
+    "version",
+    "extends",
+    "scope",
+    "rules",
+    "ignore_globs",
+    "diagnostics",
+    "rejected"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "ref_sha", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?:[^/\\u0000\\\\]+/)*\\.review/rules\\.md$"
+        },
+        "ref_sha": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "version": { "enum": [1, null] },
+    "extends": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "type": "string", "pattern": "^\\.review/[A-Za-z0-9._/-]+\\.md$" }
+    },
+    "scope": { "type": "array", "items": { "$ref": "#/$defs/glob" } },
+    "rules": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/rule" } },
+    "ignore_globs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/glob" } },
+    "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+    "rejected": { "type": "boolean" },
+    "dropped_chars": { "type": "integer", "minimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "rejected": { "const": true } } },
+      "then": {
+        "properties": {
+          "rules": { "maxItems": 0 },
+          "ignore_globs": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "glob": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!!)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*/$)(?!(?:\\*\\*?/?)+$).+$"
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "section",
+        "severity",
+        "paths",
+        "text",
+        "allow_inline_ignore",
+        "enabled",
+        "origin",
+        "declared"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^(?:SYS-)?[A-Z][A-Z0-9]{1,7}-[0-9]{1,4}$" },
+        "section": { "enum": ["security", "performance", "style"] },
+        "severity": { "enum": ["low", "medium", "high", "critical", null] },
+        "paths": { "type": "array", "items": { "$ref": "#/$defs/glob" } },
+        "text": { "type": "string", "maxLength": 1000 },
+        "allow_inline_ignore": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "origin": { "const": "repo" },
+        "declared": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["severity", "paths", "allow_inline_ignore", "enabled", "text"]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "id": { "not": { "pattern": "^SYS-" } } } },
+          "then": {
+            "properties": { "severity": { "type": "string" }, "text": { "minLength": 1 } }
+          }
+        }
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "level", "line", "message"],
+      "properties": {
+        "code": {
+          "enum": [
+            "file-too-large",
+            "invalid-encoding",
+            "forbidden-character",
+            "unterminated-frontmatter",
+            "unsupported-version",
+            "invalid-extends",
+            "too-many-extends",
+            "extends-not-found",
+            "extends-cycle",
+            "invalid-frontmatter-key",
+            "invalid-frontmatter-value",
+            "unsupported-yaml",
+            "invalid-scope",
+            "unknown-section",
+            "invalid-rule-id",
+            "duplicate-rule-id",
+            "invalid-attribute",
+            "missing-severity",
+            "invalid-severity",
+            "invalid-paths-glob",
+            "text-too-long",
+            "empty-rule-text",
+            "too-many-rules",
+            "invalid-ignore-glob",
+            "too-many-ignores",
+            "dropped-free-text",
+            "markup-in-text"
+          ]
+        },
+        "level": { "enum": ["error", "warning"] },
+        "line": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string", "maxLength": 300 }
+      }
+    }
+  }
+}

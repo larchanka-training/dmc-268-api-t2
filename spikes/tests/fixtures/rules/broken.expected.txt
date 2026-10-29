@@ -1,0 +1,15 @@
+broken.md:2: error: unsupported-version: version must be 1
+broken.md:3: error: invalid-extends: must be .review/*.md, no '..'
+broken.md:4: error: invalid-frontmatter-key: bad key 'colour'
+broken.md:8: warning: dropped-free-text: line outside the grammar
+broken.md:10: error: invalid-severity: 'urgent' not in ('low', 'medium', 'high', 'critical')
+broken.md:12: error: invalid-rule-id: bad id 'sec-2'
+broken.md:14: error: invalid-attribute: bad attribute 'color=red'
+broken.md:16: error: empty-rule-text: SEC-4 has no text
+broken.md:18: error: unknown-section: unknown section 'Misc'
+broken.md:20: warning: dropped-free-text: line outside the grammar
+broken.md:21: warning: dropped-free-text: line outside the grammar
+broken.md:25: error: invalid-ignore-glob: '**': matches-everything
+broken.md:26: error: invalid-ignore-glob: '/etc/passwd': absolute
+broken.md:27: error: invalid-ignore-glob: '!keep/**': negation-unsupported
+broken.md: 0 rule(s) accepted, 0 ignore glob(s), 11 error(s), 3 warning(s)

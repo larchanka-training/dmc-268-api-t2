@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/specs/llm-output/v3.json",
+  "title": "LLMReviewOutput v3 (proposed)",
+  "description": "Model-generated fields only. Differs from llm-output/v2: the model returns diff line labels instead of side/start_line/end_line, and may list the identifiers a finding refers to. Coordinates are resolved by code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "limitations"],
+  "properties": {
+    "summary": { "type": "string", "maxLength": 2000 },
+    "findings": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/finding" } },
+    "limitations": { "type": "array", "maxItems": 10, "items": { "type": "string" } }
+  },
+  "$defs": {
+    "label": { "type": "string", "pattern": "^(?:R[0-9]+|L[0-9]+|C[0-9]+/[0-9]+)$" },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "start_label",
+        "end_label",
+        "category",
+        "severity",
+        "title",
+        "explanation",
+        "evidence",
+        "recommendation",
+        "rule_ref",
+        "symbols",
+        "proposed_diff_fix"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
+        },
+        "start_label": { "$ref": "#/$defs/label" },
+        "end_label": { "$ref": "#/$defs/label" },
+        "category": { "enum": ["security", "correctness", "performance", "maintainability"] },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "title": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 },
+        "rule_ref": { "type": ["string", "null"], "maxLength": 32 },
+        "symbols": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "type": "string", "pattern": "^[A-Za-z_$][A-Za-z0-9_$.]{0,127}$" }
+        },
+        "proposed_diff_fix": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

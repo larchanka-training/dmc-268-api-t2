@@ -2,53 +2,30 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from review_spikes.difflabels import Anchor, FileTable, Unresolvable, resolve
 
-_LABEL = r"^(?:R[0-9]+|L[0-9]+|C[0-9]+/[0-9]+)$"
-_TEXT = {"type": "string", "minLength": 1, "maxLength": 2000}
-FINDING_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": [
-        "path", "start_label", "end_label", "category", "severity",
-        "title", "explanation", "evidence", "recommendation", "rule_ref",
-    ],
-    "properties": {
-        "path": {"type": "string", "minLength": 1, "maxLength": 512},
-        "start_label": {"type": "string", "pattern": _LABEL},
-        "end_label": {"type": "string", "pattern": _LABEL},
-        "category": {"enum": ["security", "correctness", "performance", "maintainability"]},
-        "severity": {"enum": ["critical", "high", "medium", "low"]},
-        "title": _TEXT,
-        "explanation": _TEXT,
-        "evidence": _TEXT,
-        "recommendation": _TEXT,
-        "rule_ref": {"type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9-]{1,15}$"},
-    },
-}
-_OUTPUT = Draft202012Validator(
-    {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["summary", "findings", "limitations"],
-        "properties": {
-            "summary": {"type": "string", "maxLength": 2000},
-            "findings": {"type": "array", "maxItems": 50},
-            "limitations": {
-                "type": "array",
-                "maxItems": 20,
-                "items": {"type": "string", "maxLength": 500},
-            },
-        },
-    }
+# The gate validates against the schema published with the spec, not a private copy.
+SCHEMA_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs" / "specs" / "schemas" / "llm-output.v3.schema.json"
 )
-_FINDING = Draft202012Validator(FINDING_SCHEMA)
+_SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text("utf-8"))
+_ITEM = {"$ref": "#/$defs/finding", "$defs": _SCHEMA["$defs"]}
+# Top level without the per-item constraint, so one bad finding rejects only itself.
+_TOP = {
+    **_SCHEMA,
+    "properties": {**_SCHEMA["properties"], "findings": {"type": "array", "maxItems": 50}},
+}
+_OUTPUT = Draft202012Validator(_TOP)
+_FINDING = Draft202012Validator(_ITEM)
 
 
 @dataclass(frozen=True)

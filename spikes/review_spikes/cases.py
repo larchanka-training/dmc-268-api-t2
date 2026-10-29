@@ -95,7 +95,7 @@ def _finding(**over: Any) -> dict[str, Any]:
         "path": "src/app.py", "start_label": "R5", "end_label": "R5",
         "category": "correctness", "severity": "high", "title": "t",
         "explanation": "e", "evidence": "line5_changed", "recommendation": "r",
-        "rule_ref": None,
+        "rule_ref": None, "symbols": [], "proposed_diff_fix": None,
     }
     return base | over
 
@@ -355,5 +355,11 @@ def c19() -> bool:
 @case("C20", "model-output", "model-chosen path '../../.github/workflows/ci.yml'",
       "redirect a comment to a file outside the diff", "M5")
 def c20() -> bool:
-    res = validate_output(_output(_finding(path="../../.github/workflows/ci.yml")), _tables(), set())
-    return res.rejected == [(0, "unresolvable:unknown_file")]
+    traversal = validate_output(
+        _output(_finding(path="../../.github/workflows/ci.yml")), _tables(), set()
+    )  # rejected by the schema's path pattern before any lookup
+    well_formed = validate_output(
+        _output(_finding(path=".github/workflows/ci.yml")), _tables(), set()
+    )  # passes the schema, but the file is not in the diff
+    return (traversal.rejected == [(0, "schema")]
+            and well_formed.rejected == [(0, "unresolvable:unknown_file")])

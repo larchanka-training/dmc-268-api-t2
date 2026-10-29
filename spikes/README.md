@@ -52,6 +52,11 @@ only.
    one test (the "marker not stripped" mutant survives alone because `<` -> `&lt;`
    also neutralises the marker; removing both fails C13/C14).
 
+9. **The gate validates against the published schema**, `docs/specs/schemas/llm-output.v3.schema.json`,
+   not a private copy (an earlier copy lacked `symbols` and `proposed_diff_fix`, so "examples
+   are schema-valid" was unproven). Side effect: a `../..` path now dies at the schema's `path`
+   pattern, earlier than the resolver (case C20 checks both layers).
+
 ## Unverified API facts (carry `TODO: verify` into the specs)
 
 See `UNVERIFIED` in `mapping.py`. In short: `subject_type` inside

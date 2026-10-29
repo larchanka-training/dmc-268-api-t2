@@ -35,7 +35,11 @@
     "extends": {
       "type": "array",
       "maxItems": 3,
-      "items": { "type": "string", "pattern": "^\\.review/[A-Za-z0-9._/-]+\\.md$" }
+      "items": {
+        "type": "string",
+        "pattern": "^\\.review/[A-Za-z0-9._/-]+\\.md$",
+        "not": { "pattern": "\\.\\." }
+      }
     },
     "scope": { "type": "array", "items": { "$ref": "#/$defs/glob" } },
     "rules": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/rule" } },

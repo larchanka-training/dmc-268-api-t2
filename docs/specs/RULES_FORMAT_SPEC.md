@@ -9,7 +9,7 @@
 | **Approvers** | Tech Lead · Security · VCS-integrations owner (roles; names TBD) |
 | **Companion** | [CONTEXT_AND_VERIFICATION_SPEC.md](CONTEXT_AND_VERIFICATION_SPEC.md) |
 | **Builds on** | [ADR 0002](../adr/0002-rules-from-base-branch.md), [PROMPT_VERSION_CONTRACT.md](../PROMPT_VERSION_CONTRACT.md), [schemas/settings/v1.json](../../schemas/settings/v1.json), `CONTEXT.md` (`rule_ref`) |
-| **Evidence** | [spikes/](../../spikes/README.md), 167 passing tests; every claim below marked **[spike]** is exercised there |
+| **Evidence** | [spikes/](../../spikes/README.md), 169 passing tests; every claim below marked **[spike]** is exercised there |
 | **Schemas** | [rules-parsed.v2.schema.json](schemas/rules-parsed.v2.schema.json) (proposed) |
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in
@@ -91,7 +91,7 @@ Each decision lists alternatives and why they lost. Status is **Proposed** unles
   and itself injectable.
 - **Rationale.** The rule *text* is the only free-form field and is bounded (1000
   characters), NFKC-normalised, and rendered as data (see the companion spec, control
-  M3/M4). Frontmatter is a three-key subset; YAML specials (`& * ! | > { % @` and
+  PI-3/PI-4 in the companion spec). Frontmatter is a three-key subset; YAML specials (`& * ! | > { % @` and
   backtick) are rejected **[spike]**.
 
 ### ADR-R3 — Severity vocabulary and semantics
@@ -142,6 +142,11 @@ Each decision lists alternatives and why they lost. Status is **Proposed** unles
   still run on those paths. **Provisional** — it was not confirmed by the requester; the
   spike implements it. Alternative: ignore silences everything, simplest but lets a
   repository exclude e.g. `**/*.py` from secret scanning. See OQ-3.
+- **Consequence to be aware of.** System Hard rules default to all paths, so a file matched
+  by `# Ignore` is still sent to the model and costs tokens; `# Ignore` therefore only
+  suppresses Repo/Soft *findings*, it saves nothing. The current `ignores.globs`
+  (`review/filtering.py`, `IgnorePolicy.extra_globs`) skips such files entirely. Resolving
+  this needs either an explicit "skip entirely" mode or Hard rules with narrower `paths`.
 
 ---
 
@@ -228,9 +233,9 @@ scope: "src/**"
 
 | ID | Requirement |
 |---|---|
-| RF-24 | Unknown or duplicate attributes ⇒ `invalid-attribute`; invalid id ⇒ `invalid-rule-id`; duplicate id in one file ⇒ `duplicate-rule-id`; missing/invalid severity ⇒ `missing-severity` / `invalid-severity`. Any error drops that rule only. |
+| RF-24 | Unknown or duplicate attributes ⇒ `invalid-attribute`; invalid id ⇒ `invalid-rule-id`; duplicate id in one file ⇒ `duplicate-rule-id` (the **first** definition is kept, every later one is dropped); missing/invalid severity ⇒ `missing-severity` / `invalid-severity`. Any error drops that rule only. |
 | RF-25 | Glob syntax: `*` (no `/`), `**` (any depth), `?`; a glob without `/` matches the basename at any depth. A glob MUST NOT be empty, absolute, start with `!`, contain `..` segments, `\`, NUL, `//`, end with `/`, or match everything (`*`, `**`, `**/*`). **[spike R09]** |
-| RF-26 | Text containing tag-like sequences (`<name`, `</`, `<!`, `<\|`) is kept (it may legitimately discuss HTML) but reported as warning `markup-in-text`; it is only ever rendered as data inside nonce-delimited blocks (companion spec M3). **[spike R05, R06]** |
+| RF-26 | Text containing tag-like sequences (`<name`, `</`, `<!`, `<\|`) is kept (it may legitimately discuss HTML) but reported as warning `markup-in-text`; it is only ever rendered as data inside nonce-delimited blocks (companion spec PI-3). **[spike R05, R06]** |
 
 ### 3.6 Grammar (EBNF)
 
@@ -308,7 +313,7 @@ flowchart TB
 | RF-39 | Override of a **Hard** rule: only `severity` may be declared and it MUST NOT be lower than the current one; any other declared attribute (`paths`, `enabled`, `allow_inline_ignore`, `text`) ⇒ rejected `hard-immutable:[…]`; lower severity ⇒ rejected `hard-severity-lower`. |
 | RF-40 | Override of a **Soft** rule: any of `severity`, `paths`, `enabled`, `allow_inline_ignore` MAY be declared; undeclared attributes keep the system value (`declared` set in the canonical document). |
 | RF-41 | A rejected override MUST leave the system rule unchanged and MUST be reported in the Overview notice (rule id + reason). **[spike R08]** |
-| RF-42 | A rule applies to a path iff it is `enabled`, the path matches `paths` (or `paths` is empty), and (rule is Hard **or** the path matches no ignore glob). **[spike]** |
+| RF-42 | A rule applies to a path iff it is `enabled`, the path matches `paths` (or `paths` is empty), and (rule is Hard **or** the path matches no ignore glob). A finding **without** `rule_ref` located in an ignored path is dropped in Pass 3 (companion spec FP-8). **[spike]** |
 | RF-43 | The prompt receives, per chunk, the Hard rules and the Repo/Soft rules applicable to at least one file of the chunk, rendered `- [ID] text`. The `rule_ref` whitelist of that prompt is exactly the rendered ids. |
 
 ### 5.2 What a repository can and cannot do
@@ -353,7 +358,7 @@ System set for the examples: Hard `SYS-SEC-1` (high); Soft `SYS-STY-1` (low),
 | 9 | `[SYS-NOPE-1] severity=high` | **Rejected** | `unknown-system-rule` |
 | 10 | Root `[SEC-1] severity=low`; nested `src/api/.review/rules.md` `[SEC-1] severity=critical` | `src/api/**` files: critical; other files: low | nearest wins |
 | 11 | `# Ignore` → `vendor/**` | `vendor/x.py`: Soft and Repo rules silenced; Hard `SYS-SEC-1` still applies | ADR-R7 |
-| 12 | Same id twice in one file | Both dropped (error) | `duplicate-rule-id` |
+| 12 | Same id twice in one file | First kept, later one dropped (error) | `duplicate-rule-id` |
 | 13 | Nested file `[SYS-SEC-1] enabled=false` | **Rejected**, as #4 | `hard-immutable:['enabled']` |
 | 14 | Inline `review-ignore-next-line SYS-SEC-1` | Directive rejected | `hard-rule` |
 | 15 | Inline ignore of `SEC-3` where `allow_inline_ignore` is unset | Directive rejected | `not-allowed-by-base-rules` |
@@ -366,7 +371,8 @@ System set for the examples: Hard `SYS-SEC-1` (high); Soft `SYS-STY-1` (low),
 
 The parser output is validated against
 [`schemas/rules-parsed.v2.schema.json`](schemas/rules-parsed.v2.schema.json)
-(draft 2020-12, `additionalProperties: false`). Shape:
+(draft 2020-12, `additionalProperties: false`). Schematic shape — placeholders such as
+`<40|64 hex>` and `"…"` are **not** valid values; the schema-valid document is §6.2:
 
 ```json
 {
@@ -587,7 +593,9 @@ scope: "src/**"
 ```text
 typical.md: 6 rule(s) accepted, 3 ignore glob(s), 0 error(s), 0 warning(s)
 ```
-Exit code 0. Semantics: `SEC-1` is critical on API/auth paths only; `SEC-2` and `STY-1` may
+Exit code 0 *assuming `.review/shared.md` exists*: the CLI does not resolve `extends`
+targets unless `--check-extends` is given (RF-60), whereas the service reports
+`extends-not-found` for a missing target (RF-18). Semantics: `SEC-1` is critical on API/auth paths only; `SEC-2` and `STY-1` may
 be silenced inline; `[SYS-SEC-1] severity=critical` raises a Hard rule (allowed, RF-39);
 `[SYS-STY-1] enabled=false` disables a Soft rule (RF-40); `vendor/**` etc. silence Soft/Repo
 rules (Hard still run, ADR-R7).
@@ -651,8 +659,8 @@ the review runs on System rules only and the Overview reports "0 applied, 4 drop
 | Claim | Where |
 |---|---|
 | Grammar, limits, hard rejections, frontmatter hardening | `spikes/tests/test_spike_rules.py` (parser tests), injection cases R03, R06, R07, R09, R10, R11 |
-| Conflict table §5.4 rows 1–9, 11, 14, 15 | `test_conflict_table`, `test_ignore_globs_silence_soft_and_repo_rules_but_not_hard`, inline-ignore tests |
-| Nested nearest-wins (row 10) with `scope` | `test_nested_rules_nearest_wins_and_scope_filters` |
+| Conflict table §5.4 rows 1–9, 11, 12, 14, 15 | `test_conflict_table`, `test_ignore_globs_silence_soft_and_repo_rules_but_not_hard`, `test_duplicate_id_keeps_first_and_drops_later`, inline-ignore tests |
+| Nested nearest-wins (row 10) with `scope`; nested file cannot defeat a Hard rule (row 13) | `test_nested_rules_nearest_wins_and_scope_filters`, `test_nested_file_cannot_disable_hard_rule` |
 | Base-only loading (RF-1) | injection cases R01, R02 (selection logic only; no VCS I/O) |
 | Linter output of §9 | `test_linter_output_matches_expected_example` |
 | Defences are load-bearing | 12 deliberate breakages, each caught (spikes README, finding 8) |
@@ -669,7 +677,7 @@ scope of nested files (RF-45), tree discovery and the nested-file cap (RF-3, RF-
 |---|---|---|---|
 | OQ-1 | Organisation-wide shared rules (`extends` across repositories)? | Tech Lead | Out of scope for 0.1; same-repo only. |
 | OQ-2 | Relation between file rules and the existing UI-edited `RepositorySettings.rules`: is the file the single source, or are UI rules a second Repo layer? | Tech Lead, VCS owner | File wins on equal ids; UI rules form a lower Repo layer with identical permissions. |
-| OQ-3 | Do `# Ignore` globs silence Hard rules? (ADR-R7) | Security | No — Hard rules still run (as prototyped). |
+| OQ-3 | Do `# Ignore` globs silence Hard rules? (ADR-R7) Note the cost consequence: with "no", ignored files still reach the model, unlike today's `ignores.globs`. | Security, Tech Lead | No — Hard rules still run (as prototyped); decide whether a separate "skip entirely" ignore mode is needed. |
 | OQ-4 | Is overriding the published severity with the rule's severity (ADR-R3, RF-54) acceptable? | Tech Lead | Yes. |
 | OQ-5 | Content of the System Hard/Soft catalogue (ids, texts, which are Hard). | Security | Illustrative only: `SYS-SEC-1` hard-coded credentials, `SYS-SEC-2` injection sinks; final list to be approved. |
 | OQ-6 | `review-ignore-file` placed outside the provided context (top of file, no hunk there). Honour via a base-blob lookup? | VCS owner | Not honoured in 0.1. |

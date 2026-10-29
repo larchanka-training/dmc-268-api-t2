@@ -9,7 +9,7 @@
 | **Approvers** | Tech Lead · Security · VCS-integrations owner (roles; names TBD) |
 | **Companion** | [RULES_FORMAT_SPEC.md](RULES_FORMAT_SPEC.md) |
 | **Builds on** | [ADR 0002](../adr/0002-rules-from-base-branch.md), [PROMPT_VERSION_CONTRACT.md](../PROMPT_VERSION_CONTRACT.md), [github-review-publication.md](../github-review-publication.md), [PIPELINE_SPEC.md](../PIPELINE_SPEC.md), `schemas/context/v1.json`, `schemas/llm-output/v2.json`, System Design §6, §7, §12 |
-| **Evidence** | [spikes/](../../spikes/README.md), 167 passing tests; claims marked **[spike]** are exercised there |
+| **Evidence** | [spikes/](../../spikes/README.md), 169 passing tests; claims marked **[spike]** are exercised there |
 | **Schemas** | [llm-output.v3.schema.json](schemas/llm-output.v3.schema.json) (proposed) |
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in
@@ -86,6 +86,22 @@ flowchart LR
     PUB --> API["GitHub / GitLab API"]
     LT -. "resolve labels" .-> P2
 ```
+
+| ID | Requirement |
+|---|---|
+### 2.1 Decision index
+
+| ID | Decision | Main alternative rejected | Why | Where |
+|---|---|---|---|---|
+| ADR-C1 | tree-sitter for Python and TS/TSX; windows elsewhere | stdlib `ast` + tree-sitter; language servers; regex | One engine, error-tolerant, already named in System Design §6 | §3.1 |
+| ADR-C2 | Tiered context under a hard token budget | One flat "as much as fits" context | Predictable degradation; diff always wins | §3.3 |
+| ADR-C3 | Per-call random-nonce delimiters + instruction hierarchy (prompt v4) | Static tags + `neutralize()` (today) | A forged static closing tag is indistinguishable from the real one **[spike]** | §4.2 PI-3, PI-4 |
+| ADR-C4 | Model has no tools; publication is deterministic code after validation | Tool-using agent | Bounds what a steered model can do; matches System Design non-goals | §4.2 PI-5 |
+| ADR-C5 | Model returns diff line labels; code resolves coordinates | Model writes `side` + numbers (v2); GitHub `position` | Removes OLD/NEW confusion at the source; `position` depends on hunk offsets and is "closing down" | §5.1 |
+| ADR-C6 | Placement order INLINE → FILE → Overview; never drop for placement | Drop unplaceable findings | Keeps signal; matches today's Overview fallback | §5.3 |
+| ADR-C7 | Fingerprint v2 from rule, path and line content | Keep v1 (title + line range) | v1 changes with the model's wording and with line shifts **[spike]** | §5.4 |
+| ADR-C8 | Five ordered passes with per-pass counters | One post-filter | Each rejection must be measurable (MT-3, MT-4) | §6 |
+| ADR-C9 | Golden-set metrics plus a red-team gate as acceptance | Manual review | Reproducible thresholds that block regressions | §4.3, §7 |
 
 | ID | Requirement |
 |---|---|
@@ -289,7 +305,7 @@ Two layers:
 
 ## 5. Mapping diff lines to VCS API
 
-### 5.1 Label scheme (ADR-C5 = ADR-8)
+### 5.1 Label scheme (ADR-C5)
 
 **Decision.** The model never writes line numbers or sides. Each diff line shown to it has
 a per-file label; it answers with `path`, `start_label`, `end_label`; code resolves them.
@@ -456,7 +472,7 @@ flowchart TD
 | MP-11 | A finding is never dropped because it cannot be placed; it appears in the Overview (existing behaviour, kept). |
 | MP-12 | Error handling MUST follow the table above; a 422/400 MUST NOT be retried unchanged. |
 
-### 5.4 Idempotency: fingerprint v2 (ADR-C7 = ADR-10)
+### 5.4 Idempotency: fingerprint v2 (ADR-C7)
 
 ```
 fingerprint = sha256( "v2" 0x00 rule_key 0x00 path 0x00 normalised_lines 0x00 occurrence )
@@ -639,7 +655,7 @@ licences checked. Reported with Wilson 95 % confidence intervals.
 
 | Metric | Target | Status |
 |---|---|---|
-| Precision (MT-1) | **≥ 0.70** | Proposed (ADR-12), revisit after first measurement |
+| Precision (MT-1) | **≥ 0.70** | Proposed (ADR-C9), revisit after first measurement |
 | FP-rate (MT-2) | **≤ 0.15** | Proposed |
 | TP loss: Pass 1–3 each (MT-3) | ≤ 5 % | Proposed |
 | TP loss: Pass 4 (MT-3) | ≤ 10 % | Proposed |
@@ -666,12 +682,14 @@ licences checked. Reported with Wilson 95 % confidence intervals.
 | Label table and resolver incl. rename, delete, binary, no-EOL, CRLF, quoted path, ranges | `test_spike_difflabels.py` (29 tests) |
 | GitHub/GitLab payloads, placement fallbacks, error classes, fingerprint v2 | `test_spike_mapping.py` |
 | Rules parser, precedence, inline ignores, linter | `test_spike_rules.py` (see RULES_FORMAT_SPEC §10) |
-| 31 injection cases, 8 testable controls each exercised, negative controls | `test_spike_injection.py`, Appendix B |
+| 31 injection cases, 8 testable controls each exercised, negative controls; the output gate validates against the published `llm-output.v3` schema (a `../` path dies at the schema, a well-formed path outside the diff at the resolver) | `test_spike_injection.py`, Appendix B |
 | Real defect found by the suite | role-token replacement kept the raw token (fixed; case C16) |
 | Defences are load-bearing | 12 deliberate breakages, each caught (spikes README) |
 
 **Not covered:** AST extraction, symbol check (Pass 3), verifier (Pass 4), budget tiers, golden-set
-metrics, the real model's behaviour, and every call against a live GitHub/GitLab.
+metrics, the real model's behaviour, and every call against a live GitHub/GitLab. The spike's
+prompt assembler knows only the blocks `pr_metadata`, `diff`, `repo_rules`; the `source_context`
+block (PI-3a) and the nonce blocks of the Reflection and repair prompts are specified but not prototyped.
 
 ---
 

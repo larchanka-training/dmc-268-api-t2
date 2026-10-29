@@ -332,3 +332,23 @@ def test_linter_output_matches_expected_example(name):
     parsed = parse_rules((FIX / f"{name}.md").read_bytes())
     expected = (FIX / f"{name}.expected.txt").read_text("utf-8").rstrip("\n")
     assert format_report(f"{name}.md", parsed) == expected
+
+
+def test_duplicate_id_keeps_first_and_drops_later():
+    src = "# Security\n- [SEC-1] severity=low\n  first\n- [SEC-1] severity=high\n  second\n"
+    parsed = parse_rules(src)
+    assert [(r.severity, r.text) for r in parsed.rules] == [("low", "first")]
+    assert codes(parsed) == ["duplicate-rule-id"] and not parsed.ok
+
+
+def test_nested_file_cannot_disable_hard_rule():
+    root = parse_rules("# Security\n- [SEC-1] severity=low\n  root\n")
+    nested = parse_rules(
+        '---\nscope: "src/api/**"\n---\n# Security\n- [SYS-SEC-1] severity=high enabled=false\n'
+    )
+    assert nested.ok and nested.rules[0].id == "SYS-SEC-1"
+    chain = rules_for_path("src/api/x.py", [root, nested])
+    result = merged(*chain.values())
+    outcome = {d.rule_id: (d.applied, d.reason) for d in result.decisions}
+    assert outcome["SYS-SEC-1"] == (False, "hard-immutable:['enabled']")
+    assert result.rules["SYS-SEC-1"].enabled and result.rules["SYS-SEC-1"].severity == "high"

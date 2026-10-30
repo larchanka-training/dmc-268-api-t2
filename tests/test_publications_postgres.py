@@ -86,13 +86,14 @@ async def seed_review(
     payload: dict[str, Any],
     *,
     change_id: uuid.UUID | None = None,
+    head_sha: str = HEAD,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     repository_id, settings_id, review_id = (uuid.uuid4() for _ in range(3))
     context_id, chunk_id = uuid.uuid4(), uuid.uuid4()
     now = datetime.now(UTC)
     payload = deepcopy(payload)
     payload["snapshot"].update(
-        head_sha=HEAD,
+        head_sha=head_sha,
         base_sha=BASE,
         merge_base_sha=MERGE_BASE,
         base_repository_id="100",
@@ -160,7 +161,7 @@ async def seed_review(
                 config_digest="config-v1",
                 rules_digest="rules-v1",
                 trigger_type="manual",
-                requested_head_sha=HEAD,
+                requested_head_sha=head_sha,
                 snapshot_provider="github",
                 base_sha=BASE,
                 merge_base_sha=MERGE_BASE,

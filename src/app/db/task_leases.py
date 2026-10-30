@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.application.ports import TaskKind, TaskLeaseSnapshot
+from app.application.publication_ports import PublicationAuthority
 from app.db.models import Publication, ReviewJob, TaskLease
+from app.db.publication_models import PublicationOperation
 from app.db.session import async_session_factory
 
 LEASE_DURATION = timedelta(seconds=90)
@@ -66,6 +68,19 @@ async def lock_publication(
         await session.scalars(
             select(Publication)
             .where(Publication.review_job_id == review_job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+
+
+async def lock_publication_operation(
+    session: AsyncSession, review_job_id: uuid.UUID
+) -> PublicationOperation | None:
+    return (
+        await session.scalars(
+            select(PublicationOperation)
+            .where(PublicationOperation.review_job_id == review_job_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -160,6 +175,61 @@ class PostgresTaskLeaseStore:
                 lease.fencing_token += 1
             await session.flush()
             return _snapshot(lease, now)
+
+    async def acquire_reconciliation(
+        self, review_job_id: uuid.UUID, *, owner: str
+    ) -> PublicationAuthority | None:
+        """Operator takeover over a parked UNKNOWN publication (issue #52).
+
+        Unlike acquire(), eligibility is the parked UNKNOWN outcome itself and
+        the grant is forced over any live lease: fencing advances past the
+        operation, so the previous owner can no longer prove authority. The
+        claim only authorizes provider reads via reconcile(); it never permits
+        another POST and never resumes PENDING work.
+        """
+        async with self._session_factory.begin() as session:
+            review = await lock_review_job(session, review_job_id)
+            if review is None:
+                return None
+            lease = await lock_task_lease(session, review_job_id)
+            publication = await lock_publication(session, review_job_id)
+            operation = await lock_publication_operation(session, review_job_id)
+            # A SHARE relation lock permits row locking but delays INSERT/UPDATE.
+            # Obtain the mutation lock before sampling eligibility and lease time.
+            await session.execute(text("LOCK TABLE task_lease IN ROW EXCLUSIVE MODE"))
+            now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            if (
+                review.status not in {"COMPLETED", "PARTIAL"}
+                or review.finished_at is None
+                or publication is None
+                or publication.status != "UNKNOWN"
+                or operation is None
+                or operation.state != "UNKNOWN"
+            ):
+                return None
+            fencing = (
+                max(
+                    lease.fencing_token if lease is not None else 0,
+                    operation.fencing_token,
+                )
+                + 1
+            )
+            if lease is None:
+                lease = TaskLease(
+                    review_job_id=review_job_id,
+                    owner=owner,
+                    task_kind="publish",
+                    expires_at=now + LEASE_DURATION,
+                    fencing_token=fencing,
+                )
+                session.add(lease)
+            else:
+                lease.owner = owner
+                lease.task_kind = "publish"
+                lease.expires_at = now + LEASE_DURATION
+                lease.fencing_token = fencing
+            await session.flush()
+            return PublicationAuthority(review_job_id, owner, fencing)
 
     async def renew(self, lease: TaskLeaseSnapshot) -> TaskLeaseSnapshot | None:
         async with self._session_factory.begin() as session:

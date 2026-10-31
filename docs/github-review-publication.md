@@ -177,6 +177,28 @@ all history, otherwise a sequence could be reused. No event purge is added here.
 The UI nginx location disables buffering/cache and has a 60-second read timeout
 (greater than heartbeat). It forwards cookies and `Last-Event-ID` to the API.
 
+## Resolving a parked UNKNOWN (operator runbook)
+
+A lost POST response parks the publication in durable `UNKNOWN` and expires the
+lease; no production path ever re-enters that write. The operator CLI is the
+way to resolve it without hand-written SQL:
+
+```bash
+python -m app.publication_reconcile <review_id> [--owner reconcile-<name>]
+```
+
+The command grants an operator claim over the parked lease
+(`PostgresTaskLeaseStore.acquire_reconciliation`: allowed only for a completed
+review whose publication and operation are both `UNKNOWN`; the fencing token
+advances past the operation, so any previous owner loses authority), then runs
+the reconciliation seam. It only reads the provider (list reviews/comments,
+never a POST) and resolves the durable outcome to `PUBLISHED`, `PARTIAL`, or
+`FAILED` (with confirmed absence). Output is one JSON line with the outcome;
+exit codes: `0` — resolved, `3` — still `UNKNOWN` (remote absence alone cannot
+release the PR-scoped operation; retry later), `1` — error or nothing to
+reconcile (not `UNKNOWN`, unknown review). The parked queue delivery is not
+touched; after a resolved outcome every later worker pass is a no-op.
+
 ## Verification
 
 Use the repository's Ruff, mypy and pytest commands. Set

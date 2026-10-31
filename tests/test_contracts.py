@@ -647,6 +647,8 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories/{id}/settings", "put"),
         ("/api/v1/repositories/{id}/pull-requests/{number}/reviews", "post"),
         ("/api/v1/repositories/{id}/reviews", "get"),
+        ("/api/v1/repositories/{id}/analytics", "get"),
+        ("/api/v1/repositories/{id}/quotas", "get"),
         ("/api/v1/reviews/{id}", "get"),
         ("/api/v1/reviews/{id}/findings", "get"),
         ("/api/v1/reviews/{id}/diff", "get"),

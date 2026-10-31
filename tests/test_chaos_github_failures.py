@@ -26,6 +26,7 @@ from app.application.publication_ports import PublicationAuthority
 from app.core.config import Github, Settings
 from app.db.models import OutboxEvent, TaskLease
 from app.db.publications import PostgresPublicationStore
+from app.db.task_leases import PostgresTaskLeaseStore
 from app.publication_worker import run_once
 from app.vcs.github import GithubClient
 
@@ -62,7 +63,12 @@ def _publisher(
 async def _takeover_authority(
     engine: AsyncEngine, review_id: uuid.UUID
 ) -> PublicationAuthority:
-    """Bump the parked lease's fencing token, as an operator takeover would."""
+    """Bump the parked lease's fencing token, as an operator takeover would.
+
+    Only the FAILED-redelivery test still models the takeover by hand: the
+    production grant (acquire_reconciliation) covers the UNKNOWN outcome
+    (issue #52); re-entry into publish() for a terminal FAILED is separate.
+    """
     async with async_sessionmaker(engine).begin() as session:
         row = (
             await session.execute(
@@ -111,7 +117,10 @@ async def test_lost_post_response_never_rewrites_and_reconciles_to_exactly_once(
     assert pending["pending"] == 1
 
     # Publish-level redelivery: the retained UNKNOWN returns with zero HTTP.
-    authority = await _takeover_authority(engine, review_id)
+    authority = await PostgresTaskLeaseStore(sessions).acquire_reconciliation(
+        review_id, owner="reconcile-operator"
+    )
+    assert authority is not None and authority.fencing_token > 0
     publisher = _publisher(engine, authority, httpx.MockTransport(lost.respond))
     outcome = await publisher.publish(review_job_id=review_id)
     assert outcome["status"] == "UNKNOWN"

@@ -219,6 +219,9 @@ def deployment_environment(tmp_path: Path) -> tuple[str, dict[str, str], Path]:
     for path in binary.iterdir():
         path.chmod(0o755)
     (tmp_path / ".env.test").write_text("COMPOSE_PROFILES=analysis\n")
+    backup = tmp_path / "backup-postgres.sh"
+    backup.write_text("#!/bin/sh\nexit 0\n")
+    backup.chmod(0o755)
     trace = tmp_path / "trace"
     remote = workflow_step("Deploy application")["run"].split("<<'REMOTE'\n", 1)[1]
     remote = remote.split("\nREMOTE", 1)[0]

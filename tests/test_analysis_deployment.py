@@ -265,6 +265,9 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
     (binary / "sudo").write_text("#!/bin/sh\nexit 0\n")
     for executable in binary.iterdir():
         executable.chmod(0o755)
+    backup = tmp_path / "backup-postgres.sh"
+    backup.write_text("#!/bin/sh\nexit 0\n")
+    backup.chmod(0o755)
     remote = workflow_step("Deploy application")["run"].split("<<'REMOTE'\n", 1)[1]
     remote = remote.split("\nREMOTE", 1)[0]
     trace = tmp_path / "trace"

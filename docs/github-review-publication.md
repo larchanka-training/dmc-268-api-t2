@@ -21,8 +21,12 @@ OLD-coordinate coverage check.
 
 The Overview contains the summary, checked files, risks, skipped files and
 context quality. At most 20 unique fingerprints become inline comments, ordered
-by severity and location. Text is masked again before publication. This limit
-does not discard findings from the retained analysis or hide omitted comments.
+by severity and location. Fingerprints already published by earlier cycles of
+the same PR are excluded from inline comments and are listed under «Уже
+отмечено в прошлых циклах» instead (at most 20 listed, ordered the same way);
+the omitted count excludes those listed as already noted. Text is masked again
+before publication. These limits do not discard findings from the retained
+analysis or hide omitted comments.
 
 Before HTTP, the store persists a review marker and payload hash and serializes
 operations by ChangeRequest. An unresolved operation cannot be replaced by a
@@ -43,7 +47,18 @@ Proof uses the review marker, configured bot ID, captured commit, review state,
 and each comment's fingerprint, path, side and range. Provider IDs are retained
 in publication metadata. Human text with the same marker is not bot output.
 Repeated delivery of a finished cycle returns its retained outcome without HTTP.
-Fingerprint deduplication covers a review payload; a new analysis is a new cycle.
+Fingerprint deduplication covers a review payload. A new analysis starts a new
+cycle, but a cycle suppresses repeats of fingerprints the bot already published
+in earlier cycles of the same PR (`dmc268-finding:` markers): before the publish
+claim is taken, the publisher reads earlier-cycle reviews and comments under the
+live publish lease, and a repeat is named in the Overview instead of being
+posted again. The current cycle's own comments never enter this set.
+
+Reconciliation re-derives the same suppression set before the payload check, so
+a parked outcome stays verifiable. If earlier-cycle comments change between
+publish and reconciliation (for example a comment was deleted manually), the
+set no longer matches and reconciliation refuses with «Reconciliation payload is
+unavailable»; the outcome stays `UNKNOWN` until resolved manually.
 
 `GithubPublisher.reconcile(review_job_id=...)` is a **read-only GitHub operation**
 under a fresh publish lease with a higher fencing token. It can confirm presence

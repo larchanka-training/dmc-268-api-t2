@@ -5,6 +5,7 @@ from __future__ import annotations
 # ruff: noqa: RUF001 - publication text is intentionally Russian
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from itertools import groupby
@@ -148,8 +149,15 @@ def _github_path(item: PersistedFinding, review: PublicationInput) -> str:
     return item.path
 
 
-def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
-    """Render saved analysis without another model call."""
+def prepare_github_review(
+    review: PublicationInput, *, published: frozenset[str] = frozenset()
+) -> PreparedGithubReview:
+    """Render saved analysis without another model call.
+
+    ``published`` carries fingerprints already published in earlier review
+    cycles: those findings are not posted again as inline comments, they are
+    only named as already noted in the review body (issue #53).
+    """
     expected = {
         "provider": "github",
         "base_repository_id": review.repository_external_id,
@@ -177,7 +185,7 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         if _publishable(item, review):
             unique.setdefault(item.fingerprint, item)
     severity = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    publishable = sorted(
+    ranked = sorted(
         unique.values(),
         key=lambda item: (
             severity[item.severity],
@@ -187,7 +195,9 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
             item.end_line,
             item.fingerprint,
         ),
-    )[:20]
+    )
+    noted = [item for item in ranked if item.fingerprint in published][:20]
+    publishable = [item for item in ranked if item.fingerprint not in published][:20]
     comments: tuple[dict[str, object], ...] = tuple(
         {
             "path": _github_path(item, review),
@@ -210,7 +220,14 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         }
         for item in publishable
     )
-    omitted = len(review.findings) - len(comments)
+    omitted = len(review.findings) - len(comments) - len(noted)
+    already_noted = ""
+    if noted:
+        already_noted = "\n\nУже отмечено в прошлых циклах:\n" + "\n".join(
+            f"- {item.path}: {item.severity}: {item.title} "
+            f"<!-- dmc268-finding:{item.fingerprint} -->"
+            for item in noted
+        )
     return PreparedGithubReview(
         request=GithubRequest(
             review.owner,
@@ -224,6 +241,7 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         body=mask_secrets(
             f"{marker}\n## Обзор AI-ревью\n\n{review.summary}\n\n"
             f"Проверенные файлы:\n{files}\n\nРиски:\n{risks}"
+            f"{already_noted}"
             f"\n\nНе опубликованы inline: {omitted}"
             f"\n\nНе проверены:\n{skipped or 'Нет пропущенных файлов.'}"
             f"\n\nКачество контекста: {review.coverage['context_quality']}"
@@ -275,6 +293,10 @@ class GithubPublisher:
 
     async def _require_authority(self, claim: PublicationClaim) -> None:
         if not await self._store.check_authority(claim):
+            raise PublicationAuthorityError("Publication authority is unavailable")
+
+    async def _require_lease(self) -> None:
+        if not await self._store.check_publication_authority(self._authority):
             raise PublicationAuthorityError("Publication authority is unavailable")
 
     @staticmethod
@@ -352,6 +374,55 @@ class GithubPublisher:
                         references[finding.fingerprint] = comment.remote_comment_id
         return references
 
+    @staticmethod
+    def _marker_cycle_id(body: str) -> UUID | None:
+        """Review id of the cycle that published this overview, if ours."""
+        match = re.fullmatch(
+            r"<!-- dmc268-review:v1 review=(\S+) head=\S+ config=\S+ -->",
+            body.split("\n", 1)[0],
+        )
+        if match is None:
+            return None
+        try:
+            return UUID(match.group(1))
+        except ValueError:
+            return None
+
+    async def _already_noted_fingerprints(
+        self,
+        review: PublicationInput,
+        github: GithubPublicationGateway,
+    ) -> frozenset[str]:
+        """Fingerprints the bot published in earlier cycles of this PR.
+
+        The reads happen before the claim exists, so they carry no operation;
+        the gateway is still lease-fenced to keep expired workers off the
+        provider (the same posture as AC-PUB-15).
+        """
+        request = GithubRequest(
+            review.owner,
+            review.name,
+            review.repository_external_id,
+            review.number,
+            review.head_sha,
+            review.base_sha,
+        )
+        fingerprints: set[str] = set()
+        for item in await github.list_reviews(request):
+            if item.author_id != self._bot_user_id:
+                continue
+            if self._marker_cycle_id(item.body) == review.review_id:
+                continue
+            for comment in await github.list_review_comments(
+                request, item.remote_review_id
+            ):
+                if comment.author_id != self._bot_user_id:
+                    continue
+                fingerprints.update(
+                    re.findall(r"<!-- dmc268-finding:(.*?) -->", comment.body)
+                )
+        return frozenset(fingerprints)
+
     async def publish(  # noqa: PLR0911, PLR0912 - explicit durable outcome branches
         self,
         *,
@@ -374,7 +445,11 @@ class GithubPublisher:
         review = await self._store.load(review_job_id)
         if review is None:
             raise LookupError("Frozen publication input is unavailable")
-        prepared = prepare_github_review(review)
+        noted = await self._already_noted_fingerprints(
+            review,
+            self._github.with_authority(self._require_lease),
+        )
+        prepared = prepare_github_review(review, published=noted)
         payload_hash = self._payload_hash(prepared)
         claim = await self._store.begin(
             review_job_id,
@@ -476,16 +551,17 @@ class GithubPublisher:
         review = await self._store.load(review_job_id)
         if operation is None or review is None:
             raise PublicationAuthorityError("Reconciliation input is unavailable")
-        prepared = prepare_github_review(review)
+        github = self._github.with_authority(
+            lambda: self._require_reconciliation_authority(review_job_id)
+        )
+        await self._require_reconciliation_authority(review_job_id)
+        noted = await self._already_noted_fingerprints(review, github)
+        prepared = prepare_github_review(review, published=noted)
         if (
             operation.marker != prepared.marker
             or operation.payload_hash != self._payload_hash(prepared)
         ):
             raise PublicationAuthorityError("Reconciliation payload is unavailable")
-        github = self._github.with_authority(
-            lambda: self._require_reconciliation_authority(review_job_id)
-        )
-        await self._require_reconciliation_authority(review_job_id)
         reviews = await github.list_reviews(prepared.request)
         matching = [
             item

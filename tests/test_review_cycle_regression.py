@@ -9,10 +9,11 @@ Cycle 2 models a real new commit: the PR head moves to a fresh SHA before the
 second cycle publishes, so the cycle semantics are exercised on a new push,
 not a re-delivery of the old head.
 
-Known limitation, not the target contract: a cross-cycle repeat of the same
-finding on an unchanged line is still published (markers are review-scoped).
-Suppressing such repeats is the open sprint-4 acceptance (issue #53,
-dmc-268-ui-t2#28/#33); this test pins today's behavior until it lands.
+Cross-cycle suppression (issue #53): a repeat of a finding the bot already
+published in an earlier cycle is not posted again as an inline comment; the
+new review names it as "already noted" in its body. Suppression reads
+fingerprints from earlier-cycle comments before the publish claim is taken,
+so payload_hash stays deterministic for reconciliation.
 """
 
 # ruff: noqa: PLR2004 -- literal post and review counts
@@ -84,8 +85,8 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
     cycle_1_body = provider.reviews[0]["body"]
 
     # A new push starts a new cycle: the PR head moves to a new commit, and
-    # the same findings on the unchanged lines are re-reported (the known
-    # cross-cycle limitation pinned until #53 lands).
+    # the same finding on the unchanged line is suppressed by its fingerprint
+    # from the earlier cycle (issue #53).
     async with async_sessionmaker(engine)() as session:
         change_id = await session.scalar(
             select(ReviewJob.change_request_id).where(ReviewJob.id == review_1)
@@ -129,10 +130,12 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
     assert provider.posts[1]["commit_id"] != head_sha
     assert f"review={review_2}" in provider.posts[1]["body"]
     assert review_1 != review_2
-    # Cross-cycle repeat of the unchanged-line finding is the pinned current
-    # limitation: it lands in the new review; the old review is never edited
-    # or merged into.
-    assert provider.posts[1]["comments"] == provider.posts[0]["comments"]
+    # Cross-cycle suppression (#53): the unchanged-line repeat is not posted
+    # again as an inline comment; the new review names it as already noted.
+    # The old review is never edited or merged into.
+    assert provider.posts[1]["comments"] == []
+    assert "Уже отмечено" in provider.posts[1]["body"]
+    assert "<!-- dmc268-finding:finding-v1 -->" in provider.posts[1]["body"]
     assert provider.reviews[0]["body"] == cycle_1_body
     assert len(provider.reviews) == 2
 
@@ -141,3 +144,93 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
     assert outcome_again == outcome_1
     assert len(provider.posts) == 2
     assert len(provider.reviews) == 2
+
+
+async def test_reconcile_of_suppressed_cycle_resolves_without_new_writes(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """Reconciliation reproduces the suppressed payload, not a duplicate.
+
+    Cycle 2 loses the POST response (durable UNKNOWN). Reconciliation must
+    re-derive the same suppression set from earlier-cycle comments and land
+    PUBLISHED; recomputing the payload without suppression would reject the
+    frozen operation it saved itself.
+    """
+    engine = publication_engine
+    store, authority = await setup_publication(engine, payload_data)
+    review_1 = authority.review_job_id
+    provider = TwoCycleGithub()
+    publisher_1 = _publisher(store, provider, authority)
+
+    outcome_1 = await publisher_1.publish(review_job_id=review_1)
+    assert outcome_1["status"] == "PUBLISHED"
+    cycle_1_comments = list(provider.comments)
+    # Cycle 1 kept remote id 9001; cycle 2 will take the distinct id 9002.
+    provider.comments_for_review = {"9001": cycle_1_comments}
+
+    async with async_sessionmaker(engine)() as session:
+        change_id = await session.scalar(
+            select(ReviewJob.change_request_id).where(ReviewJob.id == review_1)
+        )
+    new_head = "e" * 40
+    review_2, _ = await seed_review(
+        engine, payload_data, change_id=change_id, head_sha=new_head
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ChangeRequest)
+            .where(ChangeRequest.id == change_id)
+            .values(head_sha=new_head)
+        )
+        await connection.execute(
+            insert(TaskLease).values(
+                **lease_values(
+                    id=uuid4(),
+                    review_job_id=review_2,
+                    owner="cycle-2",
+                    fencing_token=1,
+                    expires_at=datetime.now(UTC) + timedelta(seconds=90),
+                )
+            )
+        )
+    authority_2 = PublicationAuthority(review_2, "cycle-2", 1)
+    provider.review_change = {"id": 9002}
+    provider.head = new_head
+    provider.metadata = {
+        **provider.metadata,
+        "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
+    }
+    # The accepted POST response is lost: the remote effect happened, the
+    # outcome parks as UNKNOWN.
+    provider.lose_post_response = True
+    outcome_2 = await _publisher(store, provider, authority_2).publish(
+        review_job_id=review_2
+    )
+    assert outcome_2["status"] == "UNKNOWN"
+    assert len(provider.posts) == 2
+    assert "Уже отмечено" in provider.reviews[-1]["body"]
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(TaskLease)
+            .where(TaskLease.review_job_id == review_2)
+            .values(
+                owner="reconciler",
+                fencing_token=2,
+                expires_at=datetime.now(UTC) + timedelta(seconds=90),
+            )
+        )
+    resolved = await GithubPublisher(
+        store,
+        GithubClient(
+            httpx.AsyncClient(transport=httpx.MockTransport(provider.respond))
+        ),
+        authority=PublicationAuthority(review_2, "reconciler", 2),
+        bot_user_id="9002",
+    ).reconcile(review_job_id=review_2)
+
+    assert resolved["status"] == "PUBLISHED", f"resolved={resolved}"
+    assert len(provider.posts) == 2  # reconciliation never POSTs again
+    state = await store.get(review_2)
+    assert state is not None and state.status == "PUBLISHED"

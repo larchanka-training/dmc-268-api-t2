@@ -171,6 +171,32 @@ class PostgresPublicationStore:
             )
             return current is not None
 
+    async def check_publication_authority(
+        self, authority: PublicationAuthority
+    ) -> bool:
+        """A live publish lease permits claim-free provider reads."""
+        if authority.task_kind != "publish":
+            return False
+        async with self._sessions() as session:
+            current = await session.scalar(
+                select(TaskLease.id).where(
+                    TaskLease.review_job_id == authority.review_job_id,
+                    TaskLease.owner == authority.owner,
+                    TaskLease.fencing_token == authority.fencing_token,
+                    TaskLease.expires_at > func.clock_timestamp(),
+                    or_(
+                        literal_column(
+                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
+                        ).is_(None),
+                        literal_column(
+                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
+                        )
+                        == "publish",
+                    ),
+                )
+            )
+            return current is not None
+
     async def get(self, review_id: UUID) -> PublicationState | None:
         async with self._sessions() as session:
             publication = await session.scalar(

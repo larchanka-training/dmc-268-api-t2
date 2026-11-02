@@ -100,6 +100,11 @@ class PublicationStore(Protocol):
 
     async def check_authority(self, claim: PublicationClaim) -> bool: ...
 
+    async def check_publication_authority(
+        self,
+        authority: PublicationAuthority,
+    ) -> bool: ...
+
     async def check_reconciliation_authority(
         self,
         review_id: UUID,

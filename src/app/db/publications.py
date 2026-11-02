@@ -260,6 +260,20 @@ class PostgresPublicationStore:
                 operation.state,
             )
 
+    async def mark_bot_denied(self, claim: PublicationClaim) -> None:
+        """Flag the repository integration; RepositoryAccess rows are kept."""
+        async with self._sessions.begin() as session:
+            await session.execute(
+                update(Repository)
+                .where(
+                    Repository.id
+                    == select(ReviewJob.repository_id)
+                    .where(ReviewJob.id == claim.review_id)
+                    .scalar_subquery()
+                )
+                .values(integration_status="bot_denied")
+            )
+
     async def save(
         self,
         claim: PublicationClaim,
@@ -532,4 +546,5 @@ class PostgresPublicationStore:
                     )
                     for finding in findings
                 ),
+                integration_status=repository.integration_status,
             )

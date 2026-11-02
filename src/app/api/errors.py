@@ -14,23 +14,27 @@ class ApiError(Exception):
         *,
         retryable: bool = False,
         retry_after: int | None = None,
+        **extra: object,
     ) -> None:
         self.status = status
         self.code = code
         self.message = message
         self.retryable = retryable
         self.retry_after = retry_after
+        self.extra = extra
 
 
 async def api_error_response(request: Request, error: Exception) -> JSONResponse:
     assert isinstance(error, ApiError)
+    content: dict[str, object] = {
+        "code": error.code,
+        "message": error.message,
+        "request_id": get_contextvars()["request_id"],
+        "retryable": error.retryable,
+        "retry_after": error.retry_after,
+    }
+    content.update(error.extra)
     return JSONResponse(
         status_code=error.status,
-        content={
-            "code": error.code,
-            "message": error.message,
-            "request_id": get_contextvars()["request_id"],
-            "retryable": error.retryable,
-            "retry_after": error.retry_after,
-        },
+        content=content,
     )

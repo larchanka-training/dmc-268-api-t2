@@ -6,7 +6,7 @@ import binascii
 import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -27,6 +27,7 @@ from app.api.auth import (
 from app.api.errors import ApiError
 from app.application.github_ports import GithubFailure, GithubRepositoryReader
 from app.core.config import Settings, get_settings
+from app.core.github_runtime import github_connection
 from app.db.models import (
     GithubIdentity,
     Repository,
@@ -43,6 +44,7 @@ _MAX_CURSOR_LENGTH = 1024
 _CURSOR_FIELDS = 4
 _READ_TIMEOUT_SECONDS = 15
 _MAX_PROVIDER_PAGE = 2_147_483_647
+_BOT_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 
 
 async def get_repository_reader(
@@ -261,13 +263,59 @@ class ConnectRepositoryRequest(BaseModel):
     external_id: str = Field(pattern=r"^[1-9][0-9]*$")
 
 
+async def _require_bot_write_access(
+    settings: Settings, repository: dict[str, Any]
+) -> None:
+    """Check access: the bot must have Write+ on the repository being connected."""
+    bot_token = settings.github.token.get_secret_value()
+    if not bot_token:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        )
+    async with github_connection(settings) as port:
+        bot = cast(GithubClient, port)
+        try:
+            _, bot_login = await bot.get_identity(bot_token)
+        except GithubFailure as error:
+            if error.reason_code == "VCS_ACCESS_DENIED":
+                # Bad bot token is server misconfiguration, not the caller's fault.
+                raise ApiError(
+                    503,
+                    "SERVICE_UNAVAILABLE",
+                    "Service is unavailable.",
+                    retryable=True,
+                ) from None
+            raise
+        try:
+            permission = await bot.get_collaborator_permission(
+                repository["owner"], repository["name"], bot_login
+            )
+        except GithubFailure as error:
+            if error.reason_code != "VCS_ACCESS_DENIED":
+                raise
+            permission = "none"  # GitHub hides the repo from the bot: no access.
+    if permission in _BOT_WRITE_PERMISSIONS:
+        return
+    if repository["role"] != "admin":
+        raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+    owner, name = repository["owner"], repository["name"]
+    raise ApiError(
+        409,
+        "BOT_ACCESS_REQUIRED",
+        "Grant the bot Write access on this repository, then try again.",
+        bot_login=bot_login,
+        access_url=f"https://github.com/{owner}/{name}/settings/access",
+    )
+
+
 @router.post("/connect", status_code=201, operation_id="connectRepository")
-async def connect_repository(
+async def connect_repository(  # noqa: PLR0913, PLR0917 -- explicit auth, GitHub, DB and settings boundaries
     request: Request,
     response: Response,
     verified: Annotated[VerifiedSession, Depends(get_verified_mutation_session)],
     reader: Annotated[GithubRepositoryReader, Depends(get_repository_reader)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, object]:
     try:
         body = ConnectRepositoryRequest.model_validate(await request.json())
@@ -277,6 +325,7 @@ async def connect_repository(
     try:
         async with asyncio.timeout(_READ_TIMEOUT_SECONDS):
             repository = await reader.get_repository(body.external_id)
+            await _require_bot_write_access(settings, repository)
     except TimeoutError:
         raise ApiError(
             503,
@@ -314,13 +363,23 @@ async def connect_repository(
                 existing = (
                     await session.execute(
                         select(
-                            Repository.id, Repository.owner, Repository.repo_name
+                            Repository.id,
+                            Repository.owner,
+                            Repository.repo_name,
+                            Repository.integration_status,
                         ).where(
                             Repository.provider_name == "github",
                             Repository.external_id == repository["external_id"],
                         )
                     )
                 ).one()
+                if existing.integration_status != "healthy":
+                    # The bot Write+ check above passed, so Check again recovers.
+                    await session.execute(
+                        update(Repository)
+                        .where(Repository.id == existing.id)
+                        .values(integration_status="healthy")
+                    )
                 repository_id = existing.id
                 repository["owner"], repository["name"] = (
                     existing.owner,

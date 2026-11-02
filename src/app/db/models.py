@@ -86,6 +86,9 @@ class Repository(Base):
     current_settings_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    integration_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="healthy", server_default="healthy"
+    )
 
     change_requests: Mapped[list[ChangeRequest]] = relationship(
         back_populates="repository"
@@ -116,6 +119,10 @@ class Repository(Base):
             ["repository_settings.repository_id", "repository_settings.id"],
             name="fk_repository_current_settings_same_repository",
             use_alter=True,
+        ),
+        CheckConstraint(
+            "integration_status IN ('healthy','bot_denied')",
+            name="ck_repository_integration_status",
         ),
     )
 

@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 from sqlalchemy import delete, event, select, update
 from test_repositories_api import Catalog
 from test_repository_reader_wiring import browser_cookie
@@ -23,6 +24,9 @@ pytest_plugins = (
     "test_repositories_api",
     "test_repository_reader_wiring",
 )
+
+
+_BOT_TOKEN = "worker-secret-must-never-be-used"
 
 
 def github_repository(
@@ -44,6 +48,31 @@ def available_dto(repository: dict[str, Any]) -> dict[str, str]:
         "owner": repository["owner"]["login"],
         "name": repository["name"],
     }
+
+
+def bot_write_permission_response(
+    request: httpx.Request,
+    *,
+    permission: str = "write",
+    permission_status: int = 200,
+    identity_status: int = 200,
+) -> httpx.Response | None:
+    """Answer bot Bearer checks used by connect Check access; else None."""
+    if request.headers.get("Authorization") != f"Bearer {_BOT_TOKEN}":
+        return None
+    if request.url.path == "/user":
+        if identity_status != HTTPStatus.OK:
+            return httpx.Response(identity_status, json={"message": "denied"})
+        return httpx.Response(200, json={"id": 999001, "login": "dmc-bot"})
+    if "/collaborators/" in request.url.path and request.url.path.endswith(
+        "/permission"
+    ):
+        if permission_status != HTTPStatus.OK:
+            return httpx.Response(permission_status, json={"message": "denied"})
+        return httpx.Response(
+            200, json={"permission": permission, "role_name": permission}
+        )
+    raise AssertionError(f"Unexpected bot GitHub path: {request.url.path}")
 
 
 @pytest_asyncio.fixture
@@ -183,6 +212,266 @@ def mutation_headers(user: uuid.UUID) -> dict[str, str]:
     }
 
 
+async def test_connect_does_not_persist_when_bot_lacks_write_permission(
+    onboarding: Catalog,
+) -> None:
+    """User can see the repo, but bot collaborator permission is only read."""
+    payload = github_repository()
+    external_id = str(payload["id"])
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission="read")
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        if request.url.path == "/user/repos":
+            return httpx.Response(200, json=[payload])
+        assert request.url.path == f"/repositories/{external_id}"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert response.status_code not in {HTTPStatus.OK, HTTPStatus.CREATED}
+    async with onboarding.postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(Repository.id).where(Repository.external_id == external_id)
+            )
+        ) is None
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.id).where(
+                    RepositoryAccess.user_id == onboarding.user
+                )
+            )
+        ) is None
+
+
+async def test_connect_returns_bot_access_required_when_admin_and_bot_lacks_write(
+    onboarding: Catalog,
+) -> None:
+    """Repo admin connects while bot only has read → 409 BOT_ACCESS_REQUIRED."""
+    payload = github_repository()
+    payload["permissions"]["admin"] = True
+    external_id = str(payload["id"])
+    owner = payload["owner"]["login"]
+    name = payload["name"]
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission="read")
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        if request.url.path == "/user/repos":
+            return httpx.Response(200, json=[payload])
+        assert request.url.path == f"/repositories/{external_id}"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    body = response.json()
+    assert body["code"] == "BOT_ACCESS_REQUIRED"
+    assert body["bot_login"] == "dmc-bot"
+    assert body["access_url"] == f"https://github.com/{owner}/{name}/settings/access"
+    assert isinstance(body["message"], str) and body["message"]
+    async with onboarding.postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(Repository.id).where(Repository.external_id == external_id)
+            )
+        ) is None
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.id).where(
+                    RepositoryAccess.user_id == onboarding.user
+                )
+            )
+        ) is None
+
+
+async def test_connect_forbids_non_admin_when_bot_lacks_write_without_invite_ux(
+    onboarding: Catalog,
+) -> None:
+    """Non-admin (reviewer) + bot read only → 403, no BOT_ACCESS_REQUIRED invite UX."""
+    payload = github_repository()
+    assert payload["permissions"]["admin"] is False
+    external_id = str(payload["id"])
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission="read")
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        if request.url.path == "/user/repos":
+            return httpx.Response(200, json=[payload])
+        assert request.url.path == f"/repositories/{external_id}"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    body = response.json()
+    assert body["code"] != "BOT_ACCESS_REQUIRED"
+    assert "access_url" not in body
+    assert "bot_login" not in body
+    async with onboarding.postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(Repository.id).where(Repository.external_id == external_id)
+            )
+        ) is None
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.id).where(
+                    RepositoryAccess.user_id == onboarding.user
+                )
+            )
+        ) is None
+
+
+async def _connect_with_bot_responses(
+    onboarding: Catalog,
+    *,
+    admin: bool,
+    permission_status: int = 200,
+    identity_status: int = 200,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    payload = github_repository()
+    payload["permissions"]["admin"] = admin
+    external_id = str(payload["id"])
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(
+            request,
+            permission_status=permission_status,
+            identity_status=identity_status,
+        )
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    return response, payload
+
+
+async def _assert_nothing_persisted(onboarding: Catalog, external_id: str) -> None:
+    async with onboarding.postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(Repository.id).where(Repository.external_id == external_id)
+            )
+        ) is None
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.id).where(
+                    RepositoryAccess.user_id == onboarding.user
+                )
+            )
+        ) is None
+
+
+@pytest.mark.parametrize("permission_status", [404, 403])
+async def test_connect_admin_gets_bot_access_required_when_permission_call_denied(
+    onboarding: Catalog, permission_status: int
+) -> None:
+    """Permission lookup denied by GitHub → bot has no access, not caller denied."""
+    response, payload = await _connect_with_bot_responses(
+        onboarding, admin=True, permission_status=permission_status
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    body = response.json()
+    assert body["code"] == "BOT_ACCESS_REQUIRED"
+    assert body["bot_login"] == "dmc-bot"
+    owner, name = payload["owner"]["login"], payload["name"]
+    assert body["access_url"] == f"https://github.com/{owner}/{name}/settings/access"
+    await _assert_nothing_persisted(onboarding, str(payload["id"]))
+
+
+@pytest.mark.parametrize("permission_status", [404, 403])
+async def test_connect_non_admin_forbidden_without_invite_when_permission_call_denied(
+    onboarding: Catalog, permission_status: int
+) -> None:
+    response, payload = await _connect_with_bot_responses(
+        onboarding, admin=False, permission_status=permission_status
+    )
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    body = response.json()
+    assert body["code"] == "ACCESS_DENIED"
+    assert "access_url" not in body
+    assert "bot_login" not in body
+    await _assert_nothing_persisted(onboarding, str(payload["id"]))
+
+
+@pytest.mark.parametrize("identity_status", [401, 403])
+@pytest.mark.parametrize("admin", [True, False])
+async def test_connect_reports_service_unavailable_when_bot_identity_rejected(
+    onboarding: Catalog, identity_status: int, admin: bool
+) -> None:
+    """AC5: a bad bot token is server misconfiguration, not caller ACCESS_DENIED."""
+    response, payload = await _connect_with_bot_responses(
+        onboarding, admin=admin, identity_status=identity_status
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    body = response.json()
+    assert body["code"] == "SERVICE_UNAVAILABLE"
+    assert "access_url" not in body
+    assert "bot_login" not in body
+    await _assert_nothing_persisted(onboarding, str(payload["id"]))
+
+
+async def test_connect_reports_service_unavailable_when_bot_token_misconfigured(
+    onboarding: Catalog,
+    reader_settings: Settings,
+) -> None:
+    """Empty GITHUB__TOKEN → server-config error, not BOT_ACCESS_REQUIRED invite UX."""
+    payload = github_repository()
+    payload["permissions"]["admin"] = True
+    external_id = str(payload["id"])
+    reader_settings.github.token = SecretStr("")
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission="read")
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        if request.url.path == "/user/repos":
+            return httpx.Response(200, json=[payload])
+        assert request.url.path == f"/repositories/{external_id}"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    body = response.json()
+    assert body["code"] == "SERVICE_UNAVAILABLE"
+    assert body["code"] != "BOT_ACCESS_REQUIRED"
+    assert "access_url" not in body
+    assert "bot_login" not in body
+
+
 async def test_connect_creates_repository_access_and_initial_settings_atomically(
     onboarding: Catalog,
 ) -> None:
@@ -190,6 +479,9 @@ async def test_connect_creates_repository_access_and_initial_settings_atomically
     external_id = str(payload["id"])
 
     def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
         assert request.headers["Authorization"] == "Bearer test-user-secret"
         if request.url.path == "/user/repos":
             return httpx.Response(200, json=[payload])
@@ -245,7 +537,14 @@ async def test_repeated_connect_reuses_connection_and_preserves_custom_settings(
     onboarding: Catalog,
 ) -> None:
     payload = github_repository()
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
     request = {"provider": "github", "external_id": str(payload["id"])}
     headers = mutation_headers(onboarding.user)
     first = await onboarding.client.post(
@@ -293,12 +592,128 @@ async def test_repeated_connect_reuses_connection_and_preserves_custom_settings(
     assert pointer == before[0].id
 
 
+async def test_connect_keeps_bot_denied_and_access_while_bot_still_lacks_write(
+    onboarding: Catalog,
+) -> None:
+    """AC6: while the bot still lacks Write+, bot_denied stays and access is kept."""
+    payload = github_repository()
+    bot_permission = {"value": "write"}
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission=bot_permission["value"])
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    request = {"provider": "github", "external_id": str(payload["id"])}
+    first = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json=request,
+        headers=mutation_headers(onboarding.user),
+    )
+    assert first.status_code == HTTPStatus.CREATED
+    repository_id = uuid.UUID(first.json()["id"])
+    async with onboarding.postgres.engine.begin() as connection:
+        await connection.execute(
+            update(Repository)
+            .where(Repository.id == repository_id)
+            .values(integration_status="bot_denied")
+        )
+    bot_permission["value"] = "read"
+
+    for user in (onboarding.other, onboarding.user):
+        refused = await onboarding.client.post(
+            "/api/v1/repositories/connect",
+            json=request,
+            headers=mutation_headers(user),
+        )
+        assert refused.status_code == HTTPStatus.FORBIDDEN
+        assert refused.json()["code"] == "ACCESS_DENIED"
+
+    async with onboarding.postgres.engine.connect() as connection:
+        users = list(
+            await connection.scalars(
+                select(RepositoryAccess.user_id).where(
+                    RepositoryAccess.repository_id == repository_id
+                )
+            )
+        )
+        status = await connection.scalar(
+            select(Repository.integration_status).where(Repository.id == repository_id)
+        )
+    assert status == "bot_denied"
+    assert users == [onboarding.user]
+    listed = await onboarding.client.get(
+        "/api/v1/repositories", headers=browser_cookie(onboarding.user)
+    )
+    assert [item["id"] for item in listed.json()["items"]] == [str(repository_id)]
+
+
+async def test_connect_recovers_bot_denied_integration_when_bot_has_write(
+    onboarding: Catalog,
+) -> None:
+    """Check again: a successful bot Write+ check clears bot_denied."""
+    payload = github_repository()
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    request = {"provider": "github", "external_id": str(payload["id"])}
+    first = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json=request,
+        headers=mutation_headers(onboarding.user),
+    )
+    assert first.status_code == HTTPStatus.CREATED
+    repository_id = uuid.UUID(first.json()["id"])
+    async with onboarding.postgres.engine.begin() as connection:
+        await connection.execute(
+            update(Repository)
+            .where(Repository.id == repository_id)
+            .values(integration_status="bot_denied")
+        )
+
+    again = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json=request,
+        headers=mutation_headers(onboarding.user),
+    )
+    assert again.status_code == HTTPStatus.OK
+    assert again.json()["id"] == str(repository_id)
+
+    async with onboarding.postgres.engine.connect() as connection:
+        status = await connection.scalar(
+            select(Repository.integration_status).where(Repository.id == repository_id)
+        )
+        users = list(
+            await connection.scalars(
+                select(RepositoryAccess.user_id).where(
+                    RepositoryAccess.repository_id == repository_id
+                )
+            )
+        )
+    assert status == "healthy"
+    assert users == [onboarding.user]
+
+
 async def test_connect_derives_and_refreshes_role_from_current_github_permissions(
     onboarding: Catalog,
 ) -> None:
     payload = github_repository()
     payload["permissions"]["admin"] = True
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
     request = {"provider": "github", "external_id": str(payload["id"])}
     headers = mutation_headers(onboarding.user)
     admin = await onboarding.client.post(
@@ -331,6 +746,9 @@ async def test_concurrent_connect_has_one_repository_and_settings_version(
 
     async def provider(request: httpx.Request) -> httpx.Response:
         nonlocal arrived
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
         assert request.url.path == f"/repositories/{payload['id']}"
         arrived += 1
         if arrived == len(users):
@@ -359,7 +777,14 @@ async def test_concurrent_connect_has_one_repository_and_settings_version(
     )
     assert all(response.json() == responses[0].json() for response in responses)
     repository_id = uuid.UUID(responses[0].json()["id"])
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+
+    def list_provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = list_provider
     for user in set(users):
         listed = await onboarding.client.get(
             "/api/v1/repositories", headers=browser_cookie(user)
@@ -429,7 +854,14 @@ async def test_connect_rechecks_access_to_exact_id_including_repeated_connection
     onboarding: Catalog, failure: str
 ) -> None:
     payload = github_repository()
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
     request = {"provider": "github", "external_id": str(payload["id"])}
     headers = mutation_headers(onboarding.user)
     first = await onboarding.client.post(
@@ -441,9 +873,14 @@ async def test_connect_rechecks_access_to_exact_id_including_repeated_connection
     elif failure == "different_id":
         payload["id"] += 1
     else:
-        onboarding.provider = lambda request: httpx.Response(
-            404, json={"message": "private-provider-metadata"}
-        )
+
+        def missing(request: httpx.Request) -> httpx.Response:
+            bot = bot_write_permission_response(request)
+            if bot is not None:
+                return bot
+            return httpx.Response(404, json={"message": "private-provider-metadata"})
+
+        onboarding.provider = missing
     denied = await onboarding.client.post(
         "/api/v1/repositories/connect", json=request, headers=headers
     )
@@ -458,6 +895,9 @@ async def test_late_postgres_failure_rolls_back_whole_connection(
     payload = github_repository()
 
     def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
         return httpx.Response(
             200, json=[payload] if request.url.path == "/user/repos" else payload
         )
@@ -518,6 +958,9 @@ async def test_new_endpoints_release_postgres_before_github_http(
 
     def provider(request: httpx.Request) -> httpx.Response:
         assert not active, "PostgreSQL connection held during GitHub HTTP"
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
         return httpx.Response(
             200, json=[payload] if request.url.path == "/user/repos" else payload
         )

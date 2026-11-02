@@ -310,6 +310,11 @@ class GithubPublisher:
             and remote.state == "COMMENTED"
         )
 
+    async def _note_denial(self, claim: PublicationClaim, reason_code: str) -> None:
+        # A bot denial flags the integration; it never removes access links.
+        if reason_code == "VCS_ACCESS_DENIED":
+            await self._store.mark_bot_denied(claim)
+
     async def _unknown_overview(
         self,
         claim: PublicationClaim,
@@ -317,6 +322,7 @@ class GithubPublisher:
         *,
         reason_code: str = "VCS_UNAVAILABLE",
     ) -> dict[str, object]:
+        await self._note_denial(claim, reason_code)
         metadata: dict[str, object] = {
             "confirmed_absent": False,
             "reason_code": reason_code,
@@ -352,7 +358,7 @@ class GithubPublisher:
                         references[finding.fingerprint] = comment.remote_comment_id
         return references
 
-    async def publish(  # noqa: PLR0911, PLR0912 - explicit durable outcome branches
+    async def publish(  # noqa: PLR0911, PLR0912, PLR0915 - explicit durable outcome branches
         self,
         *,
         review_job_id: UUID,
@@ -386,6 +392,10 @@ class GithubPublisher:
             raise PublicationAuthorityError("Publication authority is unavailable")
         github = self._github.with_authority(lambda: self._require_authority(claim))
         await self._require_authority(claim)
+        if review.integration_status != "healthy":
+            blocked: dict[str, object] = {"reason_code": "INTEGRATION_UNHEALTHY"}
+            await self._store.save(claim, status="SKIPPED", provider_metadata=blocked)
+            return {"status": "SKIPPED", **blocked}
         try:
             await github.check_pull(prepared.request)
         except GithubFailure as error:
@@ -435,6 +445,7 @@ class GithubPublisher:
                 ):
                     return await self._unknown_overview(claim, remote.remote_review_id)
         except GithubWriteFailure as error:
+            await self._note_denial(claim, error.reason_code)
             status = "FAILED" if error.remote_effect == "absent" else "UNKNOWN"
             metadata = {
                 "reason_code": error.reason_code,

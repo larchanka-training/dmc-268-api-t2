@@ -923,6 +923,7 @@ async def test_mark_bot_denied_requires_live_authority(
     claim = await store.begin(
         authority.review_job_id, authority=authority, marker="m", payload_hash="h"
     )
+    assert claim is not None
     values: dict[str, Any] = (
         {"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
         if loss == "expired"

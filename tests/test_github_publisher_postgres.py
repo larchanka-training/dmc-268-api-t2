@@ -909,3 +909,33 @@ async def test_publisher_rate_limit_does_not_mark_integration_unhealthy(
         ).publish(review_job_id=authority.review_job_id)
 
     assert await _integration(publication_engine, repository_id) == "healthy"
+
+
+@pytest.mark.parametrize("loss", ["expired", "wrong_fencing"])
+async def test_mark_bot_denied_requires_live_authority(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+    loss: str,
+) -> None:
+    """AC6: a stale writer cannot flag the repository as bot_denied."""
+    store, authority = await setup_publication(publication_engine, payload_data)
+    repository_id, _ = await _seed_access(publication_engine, authority.review_job_id)
+    claim = await store.begin(
+        authority.review_job_id, authority=authority, marker="m", payload_hash="h"
+    )
+    values: dict[str, Any] = (
+        {"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
+        if loss == "expired"
+        else {"fencing_token": 2}
+    )
+    async with publication_engine.begin() as connection:
+        await connection.execute(
+            update(TaskLease)
+            .where(TaskLease.review_job_id == authority.review_job_id)
+            .values(**values)
+        )
+
+    with pytest.raises(PublicationAuthorityError):
+        await store.mark_bot_denied(claim)
+
+    assert await _integration(publication_engine, repository_id) == "healthy"

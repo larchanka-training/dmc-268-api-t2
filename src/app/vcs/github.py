@@ -19,6 +19,7 @@ from app.application.github_ports import (
     GithubPullRequest,
     GithubRemoteComment,
     GithubRemoteReview,
+    GithubRepositoryMismatch,
     GithubRequest,
     GithubReviewReference,
     GithubSnapshot,
@@ -144,7 +145,7 @@ def _pull_metadata(response: httpx.Response, request: GithubRequest) -> dict[str
     ):
         raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
     if str(base_repo["id"]) != request.repository_external_id:
-        raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        raise GithubRepositoryMismatch()
     return pull
 
 
@@ -461,7 +462,7 @@ class GithubClient:
                 head = _listed_ref(pull.get("head"))
                 base = _listed_ref(pull.get("base"))
                 if base["repository_external_id"] != repository_external_id:
-                    raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+                    raise GithubRepositoryMismatch()
                 return GithubPullRequest(
                     head_sha=head["sha"],
                     base_sha=base["sha"],

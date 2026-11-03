@@ -262,17 +262,36 @@ class PostgresPublicationStore:
 
     async def mark_bot_denied(self, claim: PublicationClaim) -> None:
         """Flag the repository integration; RepositoryAccess rows are kept."""
+        if (
+            claim.authority.review_job_id != claim.review_id
+            or claim.authority.task_kind != "publish"
+        ):
+            raise PublicationAuthorityError("Publication authority is not current")
         async with self._sessions.begin() as session:
-            await session.execute(
+            denied = await session.scalar(
                 update(Repository)
                 .where(
                     Repository.id
                     == select(ReviewJob.repository_id)
                     .where(ReviewJob.id == claim.review_id)
-                    .scalar_subquery()
+                    .scalar_subquery(),
+                    self._live_authority(claim),
+                    select(PublicationOperation.id)
+                    .where(
+                        PublicationOperation.id == claim.operation_id,
+                        PublicationOperation.review_job_id == claim.review_id,
+                        PublicationOperation.owner == claim.authority.owner,
+                        PublicationOperation.fencing_token
+                        == claim.authority.fencing_token,
+                        PublicationOperation.state == "IN_FLIGHT",
+                    )
+                    .exists(),
                 )
                 .values(integration_status="bot_denied")
+                .returning(Repository.id)
             )
+            if denied is None:
+                raise PublicationAuthorityError("Publication authority is not current")
 
     async def save(
         self,

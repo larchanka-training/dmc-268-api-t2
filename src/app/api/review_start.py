@@ -24,7 +24,12 @@ from app.api.review_start_dependencies import (
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
-from app.application.github_ports import GithubFailure, GithubPullRequest, GithubRequest
+from app.application.github_ports import (
+    GithubFailure,
+    GithubPullRequest,
+    GithubRepositoryMismatch,
+    GithubRequest,
+)
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
@@ -246,7 +251,7 @@ async def _revalidate_github(
             snapshot = await github.fetch(github_request)
     except GithubFailure as error:
         if error.reason_code == "VCS_ACCESS_DENIED":
-            if bot_stage:
+            if bot_stage and not isinstance(error, GithubRepositoryMismatch):
                 raise _BotDeniedError from None
             raise ApiError(403, "ACCESS_DENIED", "Access is denied.") from None
         if error.reason_code == "PR_STALE_OR_CLOSED":

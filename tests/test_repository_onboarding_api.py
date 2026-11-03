@@ -251,6 +251,57 @@ async def test_connect_does_not_persist_when_bot_lacks_write_permission(
         ) is None
 
 
+async def test_connect_rejects_when_token_owner_is_not_configured_bot(
+    onboarding: Catalog, reader_settings: Settings
+) -> None:
+    """Token owner id differs from GITHUB__BOT_USER_ID → 503, nothing persisted."""
+    reader_settings.github.bot_user_id = "424242"
+    payload = github_repository()
+    external_id = str(payload["id"])
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request, permission="write")
+        if bot is not None:
+            return bot
+        assert request.headers["Authorization"] == "Bearer test-user-secret"
+        if request.url.path == "/user/repos":
+            return httpx.Response(200, json=[payload])
+        assert request.url.path == f"/repositories/{external_id}"
+        return httpx.Response(200, json=payload)
+
+    onboarding.provider = provider
+    response = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    body = response.json()
+    assert body["code"] == "SERVICE_UNAVAILABLE"
+    assert "bot_login" not in body
+    async with onboarding.postgres.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(Repository.id).where(Repository.external_id == external_id)
+            )
+        ) is None
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.id).where(
+                    RepositoryAccess.user_id == onboarding.user
+                )
+            )
+        ) is None
+
+    reader_settings.github.bot_user_id = "999001"
+    positive = await onboarding.client.post(
+        "/api/v1/repositories/connect",
+        json={"provider": "github", "external_id": external_id},
+        headers=mutation_headers(onboarding.user),
+    )
+    assert positive.status_code == HTTPStatus.CREATED
+
+
 async def test_connect_returns_bot_access_required_when_admin_and_bot_lacks_write(
     onboarding: Catalog,
 ) -> None:

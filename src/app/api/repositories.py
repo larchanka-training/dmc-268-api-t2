@@ -275,7 +275,7 @@ async def _require_bot_write_access(
     async with github_connection(settings) as port:
         bot = cast(GithubClient, port)
         try:
-            _, bot_login = await bot.get_identity(bot_token)
+            bot_id, bot_login = await bot.get_identity(bot_token)
         except GithubFailure as error:
             if error.reason_code == "VCS_ACCESS_DENIED":
                 # Bad bot token is server misconfiguration, not the caller's fault.
@@ -286,6 +286,11 @@ async def _require_bot_write_access(
                     retryable=True,
                 ) from None
             raise
+        configured = settings.github.bot_user_id
+        if configured and bot_id != configured:
+            raise ApiError(
+                503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+            )
         try:
             permission = await bot.get_collaborator_permission(
                 repository["owner"], repository["name"], bot_login

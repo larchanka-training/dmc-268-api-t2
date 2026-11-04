@@ -108,7 +108,7 @@ def test_deploy_writes_separate_publication_credentials() -> None:
 
 
 def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
-    """Deploy must recreate api and fail closed if authorize Location lacks scope=repo."""
+    """Deploy recreates api/web; fails if authorize Location lacks scope=repo."""
     workflow = (ROOT / ".github/workflows/deploy-staging.yml").read_text(
         encoding="utf-8"
     )

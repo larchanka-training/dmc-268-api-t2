@@ -4,11 +4,11 @@
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from sqlalchemy import insert, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from test_publications_postgres import (
     BASE,
@@ -26,7 +26,7 @@ from app.application.publication_ports import (
     PublicationAuthority,
     PublicationAuthorityError,
 )
-from app.db.models import TaskLease
+from app.db.models import Repository, RepositoryAccess, ReviewJob, TaskLease, User
 from app.db.publications import PostgresPublicationStore
 from app.vcs.github import GithubClient
 
@@ -759,3 +759,184 @@ async def test_provider_read_failure_does_not_lose_publication_decision(
     state = await store.get(authority.review_job_id)
     assert state is not None and state.status == "UNKNOWN"
     assert "provider-secret" not in str(state.provider_metadata)
+
+
+async def _seed_access(engine: AsyncEngine, review_id: UUID) -> tuple[UUID, UUID]:
+    user_id = uuid4()
+    async with engine.begin() as connection:
+        repository_id = await connection.scalar(
+            select(ReviewJob.repository_id).where(ReviewJob.id == review_id)
+        )
+        assert repository_id is not None
+        await connection.execute(insert(User).values(id=user_id))
+        await connection.execute(
+            insert(RepositoryAccess).values(
+                id=uuid4(), user_id=user_id, repository_id=repository_id, role="admin"
+            )
+        )
+    return repository_id, user_id
+
+
+async def _integration(engine: AsyncEngine, repository_id: UUID) -> str:
+    async with engine.connect() as connection:
+        return str(
+            await connection.scalar(
+                select(Repository.integration_status).where(
+                    Repository.id == repository_id
+                )
+            )
+        )
+
+
+async def test_publisher_skips_new_publication_when_integration_unhealthy(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """AC6: an unhealthy repository gets no new publish attempt and keeps access."""
+    store, authority = await setup_publication(publication_engine, payload_data)
+    repository_id, user_id = await _seed_access(
+        publication_engine, authority.review_job_id
+    )
+    async with publication_engine.begin() as connection:
+        await connection.execute(
+            update(Repository)
+            .where(Repository.id == repository_id)
+            .values(integration_status="bot_denied")
+        )
+    provider = FakeGithub()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(provider.respond)
+    ) as http:
+        result = await GithubPublisher(
+            store,
+            GithubClient(http),
+            authority=authority,
+            bot_user_id="9002",
+        ).publish(review_job_id=authority.review_job_id)
+
+    assert result["status"] == "SKIPPED"
+    assert result["reason_code"] == "INTEGRATION_UNHEALTHY"
+    assert provider.requests == []
+    state = await store.get(authority.review_job_id)
+    assert state is not None and state.status == "SKIPPED"
+    async with publication_engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.user_id).where(
+                    RepositoryAccess.repository_id == repository_id
+                )
+            )
+        ) == user_id
+
+
+@pytest.mark.parametrize(
+    ("stage", "status", "outcome"),
+    [
+        ("preflight", 401, "UNKNOWN"),
+        ("preflight", 404, "UNKNOWN"),
+        ("before", 403, "UNKNOWN"),
+        ("comments", 401, "UNKNOWN"),
+        ("post", 401, "FAILED"),
+        ("post", 403, "FAILED"),
+    ],
+)
+async def test_publisher_bot_denial_marks_integration_unhealthy_and_keeps_access(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+    stage: str,
+    status: int,
+    outcome: str,
+) -> None:
+    """AC6: bot 401/403/404 flags the repository; RepositoryAccess is never removed."""
+    store, authority = await setup_publication(publication_engine, payload_data)
+    repository_id, user_id = await _seed_access(
+        publication_engine, authority.review_job_id
+    )
+    provider = FakeGithub()
+    if stage == "post":
+        provider.reject_post = status
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and (
+            (stage == "preflight" and request.url.path.endswith("/pulls/42"))
+            or (
+                stage == "before"
+                and request.url.path.endswith("/reviews")
+                and not provider.posts
+            )
+            or (stage == "comments" and request.url.path.endswith("/comments"))
+        ):
+            return httpx.Response(status, json={"message": "provider-secret"})
+        return provider.respond(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        result = await GithubPublisher(
+            store,
+            GithubClient(http),
+            authority=authority,
+            bot_user_id="9002",
+        ).publish(review_job_id=authority.review_job_id)
+
+    assert result["status"] == outcome
+    assert await _integration(publication_engine, repository_id) == "bot_denied"
+    async with publication_engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                select(RepositoryAccess.user_id).where(
+                    RepositoryAccess.repository_id == repository_id
+                )
+            )
+        ) == user_id
+
+
+async def test_publisher_rate_limit_does_not_mark_integration_unhealthy(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """AC6 guard: transient provider failures are not a bot denial."""
+    store, authority = await setup_publication(publication_engine, payload_data)
+    repository_id, _ = await _seed_access(publication_engine, authority.review_job_id)
+    provider = FakeGithub()
+    provider.reject_post = 429
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(provider.respond)
+    ) as http:
+        await GithubPublisher(
+            store,
+            GithubClient(http),
+            authority=authority,
+            bot_user_id="9002",
+        ).publish(review_job_id=authority.review_job_id)
+
+    assert await _integration(publication_engine, repository_id) == "healthy"
+
+
+@pytest.mark.parametrize("loss", ["expired", "wrong_fencing"])
+async def test_mark_bot_denied_requires_live_authority(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+    loss: str,
+) -> None:
+    """AC6: a stale writer cannot flag the repository as bot_denied."""
+    store, authority = await setup_publication(publication_engine, payload_data)
+    repository_id, _ = await _seed_access(publication_engine, authority.review_job_id)
+    claim = await store.begin(
+        authority.review_job_id, authority=authority, marker="m", payload_hash="h"
+    )
+    assert claim is not None
+    values: dict[str, Any] = (
+        {"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
+        if loss == "expired"
+        else {"fencing_token": 2}
+    )
+    async with publication_engine.begin() as connection:
+        await connection.execute(
+            update(TaskLease)
+            .where(TaskLease.review_job_id == authority.review_job_id)
+            .values(**values)
+        )
+
+    with pytest.raises(PublicationAuthorityError):
+        await store.mark_bot_denied(claim)
+
+    assert await _integration(publication_engine, repository_id) == "healthy"

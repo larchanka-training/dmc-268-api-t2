@@ -108,3 +108,26 @@ def test_caddy_deploy_validates_before_replace_and_waits_until_stable() -> None:
     ci_run = "\n".join(step.get("run", "") or "" for step in caddy_job.get("steps", []))
     assert "caddy/Caddyfile:/etc/caddy/Caddyfile:ro" in ci_run
     assert validate in ci_run
+
+
+def test_caddy_https_materializes_remote_script_not_bash_s() -> None:
+    """Ensure Caddy HTTPS must not run the full body via bash -s stdin."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "deploy-staging.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+    run = next(step for step in steps if step.get("name") == "Ensure Caddy HTTPS")[
+        "run"
+    ]
+    script = "/opt/caddy/.ensure-caddy-https.remote.sh"
+    assert f"cat > '{script}'" in run
+    assert f"bash '{script}'" in run
+    assert "status=\\$?" in run
+    assert f"rm -f '{script}'" in run
+    assert "\\$status" in run
+    assert '"bash -s"' not in run
+    remote = run.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
+    assert "caddy validate --config /etc/caddy/Caddyfile" in remote
+    assert "docker run -d --name caddy" in remote

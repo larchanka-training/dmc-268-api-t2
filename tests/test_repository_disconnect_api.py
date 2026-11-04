@@ -18,7 +18,11 @@ from test_postgres_integration import (
     _create_review_job,
 )
 from test_repositories_api import Catalog
-from test_repository_onboarding_api import github_repository, mutation_headers
+from test_repository_onboarding_api import (
+    bot_write_permission_response,
+    github_repository,
+    mutation_headers,
+)
 from test_repository_reader_wiring import browser_cookie
 
 from app.core.config import Settings
@@ -40,7 +44,9 @@ async def test_personal_disconnect_preserves_history_and_reconnect(
     onboarding: Catalog,
 ) -> None:
     payload = github_repository()
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+    onboarding.provider = lambda request: (
+        bot_write_permission_response(request) or httpx.Response(200, json=payload)
+    )
     request_body = {"provider": "github", "external_id": str(payload["id"])}
     connected = await onboarding.client.post(
         "/api/v1/repositories/connect",
@@ -156,6 +162,9 @@ async def test_personal_disconnect_preserves_history_and_reconnect(
     observed: list[str] = []
 
     def provider(request: httpx.Request) -> httpx.Response:
+        bot = bot_write_permission_response(request)
+        if bot is not None:
+            return bot
         observed.append(request.url.path)
         return httpx.Response(200, json=payload)
 

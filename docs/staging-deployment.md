@@ -328,15 +328,15 @@ POSTGRES__DB=dmc
 
 ### Passthrough секретов времени выполнения
 
-Конвенция: секрет приложения живёт в GitHub Encrypted Secrets под тем же именем, под которым его читает контейнер. Деплой-workflow переносит заданные секреты в env-файл окружения; незаданные секреты в файл не попадают вовсе.
+Конвенция: где возможно, секрет Actions совпадает с именем переменной контейнера. Имена Actions Secrets **не могут** начинаться с `GITHUB_` — для bot GitHub credentials Deploy читает `STAGING_GITHUB_*` и пишет в env-файл контейнерные `GITHUB__*`. Незаданные секреты в файл не попадают вовсе (optional passthrough).
 
-| Секрет GitHub | Переменная контейнера | Назначение |
+| Секрет GitHub Actions | Переменная контейнера | Назначение |
 |---|---|---|
 | `STAGING_POSTGRES_PASSWORD` | `POSTGRES__PASSWORD` | Пароль PostgreSQL |
 | `WEBHOOK__SECRET` | `WEBHOOK__SECRET` | HMAC-секрет входящих VCS webhooks |
-| `GITHUB__TOKEN` | `GITHUB__TOKEN` | Read token GitHub API для PR/compare; не Actions `GITHUB_TOKEN` |
-| `GITHUB__WRITE_TOKEN` | `GITHUB__WRITE_TOKEN` | Отдельный токен публикации GitHub с Pull requests write; только для API / будущего publisher |
-| `GITHUB__BOT_USER_ID` | `GITHUB__BOT_USER_ID` | Числовой ID бота для проверки авторства опубликованного ревью |
+| `STAGING_GITHUB_READ_TOKEN` | `GITHUB__TOKEN` | Read token GitHub API для PR/compare / Check access; не путать с built-in Actions `GITHUB_TOKEN` |
+| `STAGING_GITHUB_WRITE_TOKEN` | `GITHUB__WRITE_TOKEN` | Отдельный токен публикации GitHub с Pull requests write |
+| `STAGING_GITHUB_BOT_USER_ID` | `GITHUB__BOT_USER_ID` | Числовой ID бота для проверки авторства опубликованного ревью и Connect identity |
 | `AUTH__GITHUB_CLIENT_SECRET` | `AUTH__GITHUB_CLIENT_SECRET` | Секрет GitHub OAuth App для входа в браузере |
 | `AUTH__JWT_SECRET` | `AUTH__JWT_SECRET` | Секрет сессии, не короче 32 байт |
 | `AUTH__CREDENTIAL_KEY` | `AUTH__CREDENTIAL_KEY` | Ключ Fernet для сохранённых учётных данных |

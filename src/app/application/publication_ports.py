@@ -40,6 +40,7 @@ class PublicationInput:
     coverage: dict[str, Any]
     contexts: tuple[dict[str, Any], ...]
     findings: tuple[PersistedFinding, ...]
+    integration_status: str = "healthy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,8 @@ class PublicationStore(Protocol):
         status: str,
         provider_metadata: dict[str, object] | None,
     ) -> None: ...
+
+    async def mark_bot_denied(self, claim: PublicationClaim) -> None: ...
 
     async def get(self, review_id: UUID) -> PublicationState | None: ...
 

@@ -19,7 +19,11 @@ from sqlalchemy.engine import AdaptedConnection, Connection
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from test_postgres_integration import _create_change_request
 from test_repositories_api import Catalog
-from test_repository_onboarding_api import github_repository, mutation_headers
+from test_repository_onboarding_api import (
+    bot_write_permission_response,
+    github_repository,
+    mutation_headers,
+)
 from test_review_start_api import (
     BASE,
     HEAD,
@@ -88,7 +92,9 @@ async def race(
     onboarding: Catalog, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[RaceScope]:
     payload = github_repository()
-    onboarding.provider = lambda request: httpx.Response(200, json=payload)
+    onboarding.provider = lambda request: (
+        bot_write_permission_response(request) or httpx.Response(200, json=payload)
+    )
     connected = await onboarding.client.post(
         "/api/v1/repositories/connect",
         json={"provider": "github", "external_id": str(payload["id"])},

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from deploy_remote_fakes import install_deploy_remote_fakes
 from test_analysis_deployment import ROOT, workflow_step
 
 
@@ -202,23 +203,14 @@ assert subprocess.run(command).returncode != 0
 
 def deployment_environment(tmp_path: Path) -> tuple[str, dict[str, str], Path]:
     binary = tmp_path / "bin"
-    binary.mkdir()
-    (binary / "docker").write_text(
-        '#!/bin/bash\necho "docker $*" >> "$TRACE"\n'
-        'if [[ "$1" == inspect ]]; then\n'
-        '  if [[ "$*" == *Health* ]]; then echo healthy; else echo running; fi\n'
-        "fi\n"
-        'if [[ "$*" == *"worker python -c"* ]]; then\n'
-        '  exit "${VALIDATION_FAILURE:-0}"; fi\n'
-        'if [[ "$*" == *"worker python -" ]]; then exit "${PREFLIGHT_FAILURE:-0}"; fi\n'
-    )
+    install_deploy_remote_fakes(binary)
     (binary / "sudo").write_text(
         '#!/bin/bash\necho "install $*" >> "$TRACE"\nexit "${INSTALL_FAILURE:-0}"\n'
     )
-    (binary / "curl").write_text("#!/bin/sh\nexit 0\n")
-    for path in binary.iterdir():
-        path.chmod(0o755)
-    (tmp_path / ".env.test").write_text("COMPOSE_PROFILES=analysis\n")
+    (binary / "sudo").chmod(0o755)
+    (tmp_path / ".env.test").write_text(
+        "COMPOSE_PROFILES=analysis\nAPI_IMAGE=api:test\nUI_IMAGE=ui:test\n"
+    )
     backup = tmp_path / "backup-postgres.sh"
     backup.write_text("#!/bin/sh\nexit 0\n")
     backup.chmod(0o755)
@@ -268,7 +260,7 @@ def test_deployment_installs_manifest_after_stop_and_before_preflight(
         )
         assert result.returncode != 0
         assert " up -d webhook-worker" not in trace.read_text()
-        assert " up -d api" not in trace.read_text()
+        assert "--force-recreate --no-deps api" not in trace.read_text()
         if failure == "INSTALL_FAILURE":
             assert "worker python -" not in trace.read_text()
             assert " up -d " not in trace.read_text()

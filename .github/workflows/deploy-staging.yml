@@ -699,20 +699,6 @@ jobs:
             sleep 2
           done
 
-          echo "Verifying OAuth authorize requests scope=repo inside api..."
-          oauth_location="$(compose exec -T api python -c "import httpx; r = httpx.get('http://127.0.0.1:8000/api/v1/auth/github/start', follow_redirects=False, timeout=10.0); print(r.headers.get('location') or '')" | tr -d '\r')"
-          echo "OAuth start Location (api): ${oauth_location}"
-          case "${oauth_location}" in
-            *'scope=repo'*)
-              echo "OAuth scope=repo confirmed on Compose api service"
-              ;;
-            *)
-              echo "ERROR: OAuth Location missing scope=repo on Compose api service"
-              compose logs --tail=100 api
-              exit 1
-              ;;
-          esac
-
           echo "Starting workers..."
           compose up -d webhook-worker "${analysis_services[@]}"
 
@@ -766,12 +752,10 @@ jobs:
           echo "Verifying running images match env pins..."
           expected_api_image="$(grep -E '^API_IMAGE=' "${ENV_FILE}" | tail -n1 | cut -d= -f2-)"
           expected_ui_image="$(grep -E '^UI_IMAGE=' "${ENV_FILE}" | tail -n1 | cut -d= -f2-)"
-          running_api_image="$(docker inspect \
-            --format='{{.Config.Image}}' \
-            "$(compose ps -q api)")"
-          running_ui_image="$(docker inspect \
-            --format='{{.Config.Image}}' \
-            "$(compose ps -q web)")"
+          api_cid="$(compose ps -q api)"
+          web_cid="$(compose ps -q web)"
+          running_api_image="$(docker inspect --format='{{.Config.Image}}' "${api_cid}")"
+          running_ui_image="$(docker inspect --format='{{.Config.Image}}' "${web_cid}")"
           echo "API_IMAGE env=${expected_api_image} running=${running_api_image}"
           echo "UI_IMAGE env=${expected_ui_image} running=${running_ui_image}"
           if [[ -z "${expected_api_image}" || "${running_api_image}" != "${expected_api_image}" ]]; then

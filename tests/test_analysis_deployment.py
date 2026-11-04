@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 import yaml
+from deploy_remote_fakes import install_deploy_remote_fakes
 
 ROOT = Path(__file__).parents[1]
 PREFLIGHT_FAILURE = 42
@@ -254,17 +255,9 @@ def test_deploy_activates_analysis_only_for_explicitly_enabled_staging(
     (tmp_path / ".env.test").write_text(result.stdout)
     # Substitute only OS command boundaries; execute the deployment shell itself.
     binary = tmp_path / "bin"
-    binary.mkdir()
-    (binary / "docker").write_text(
-        '#!/bin/bash\nprintf "%s\\n" "$*" >> "$DEPLOY_TRACE"\n'
-        'if [[ "$1" == inspect ]]; then\n'
-        '  if [[ "$*" == *Health* ]]; then echo healthy; else echo running; fi\n'
-        "fi\n"
-    )
-    (binary / "curl").write_text("#!/bin/sh\nexit 0\n")
+    install_deploy_remote_fakes(binary)
     (binary / "sudo").write_text("#!/bin/sh\nexit 0\n")
-    for executable in binary.iterdir():
-        executable.chmod(0o755)
+    (binary / "sudo").chmod(0o755)
     backup = tmp_path / "backup-postgres.sh"
     backup.write_text("#!/bin/sh\nexit 0\n")
     backup.chmod(0o755)

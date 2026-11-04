@@ -2,12 +2,14 @@
 
 | Field | Value |
 |---|---|
-| Status | **Review** |
+| Status | **Draft for human approval; not an accepted runtime contract** |
 | Version | 0.9.1 |
 | Authors | DMC-268 Team 2 — Tech Lead (owner); drafted with AI assistance (Claude) |
 | Date | 2026-11-03 |
 | Supersedes | Free-form `RepositorySettings.rules.instructions` as the *only* rules carrier (`schemas/settings/v1.json`) |
 | Related | [ADR-0002 rules from base branch](../adr/0002-rules-from-base-branch.md), [PIPELINE_SPEC](../PIPELINE_SPEC.md), [PROMPT_VERSION_CONTRACT](../PROMPT_VERSION_CONTRACT.md), [CONTEXT_AND_VERIFICATION_SPEC](./CONTEXT_AND_VERIFICATION_SPEC.md) (Part B — prompt injection) |
+
+**Scope:** [Sprint 2–3 decision profile](./SPRINT_2_3_DECISIONS.md) separates the current contract, the selected delivery profile, and future design. Selected P1/P2 governs S2/S3; conflicting extended-draft requirements do not apply. The extended design below is a proposal, including its ADR “Decision” paragraphs and implementation checklists. It does not authorize a runtime activation, budget increase, integration migration or additional sprint scope. Human approval has not been recorded.
 
 Normative keywords MUST, MUST NOT, SHOULD, SHOULD NOT, MAY are used as in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174).
 
@@ -85,7 +87,7 @@ Define a machine-parseable, human-friendly file through which repository maintai
 - R-2.4. All rules files MUST be read from the **base repository** at the **base revision** `snapshot.base_sha`, never from the head repository/branch, never by branch name (a branch name races with pushes). This implements ADR-0002.
 - R-2.5. For fork PRs the base repository is the upstream (`snapshot.base_repository_id`); head-repository content MUST NOT be read for rules.
 - R-2.6. If the PR diff modifies any `**/.review/rules.md`, those modifications MUST NOT affect the current review. The summary comment SHOULD state: "Rules file changes in this PR take effect after merge." (diagnostic `RF120`, info).
-- R-2.7. The loader MUST read rules before the first LLM call and freeze the effective ruleset (§6.6) in the same durable step that persists the `ContextPayload` (`adapters/analysis_handler.py:_execute`), so retries and recovery never re-read rules.
+- R-2.7. The loader MUST read rules before the first LLM call and freeze the effective ruleset (§6.6) in the same durable step that persists the `ContextPayload` (`adapters/analysis_handler.py:_execute`), so retries and recovery never re-read rules. Admission MUST resolve the source before freezing its authoritative rules identity; the later context step MUST NOT mutate an admitted settings row, policy or digest (see decision profile).
 
 ### 2.3 Retrieval contract (GitHub, implemented first)
 
@@ -99,7 +101,7 @@ Accept: application/vnd.github+json
 | Check | Requirement | Verified field |
 |---|---|---|
 | Revision | `ref` MUST be the 40/64-hex `base_sha` | `ref` — "The name of the commit/branch/tag" |
-| Absent | HTTP 404 → layer status `absent` (not an error) | 404 "Resource not found" |
+| Absent | HTTP 404 → `absent` only after repository/ref access is independently confirmed; GitHub may mask denied access as 404 | 404 "Resource not found" |
 | Type | `type` MUST equal `file`; `symlink`/`submodule`/`dir` → `RF002`, layer `rejected` | `type`, `target`, `submodule_git_url` |
 | Size | `size` > 65,536 → `RF003`, layer `rejected`, content not decoded | `size` |
 | Encoding | `encoding` MUST be `base64`; decode `content` | `encoding`, `content` |
@@ -126,7 +128,7 @@ GET /projects/:id/repository/files/:file_path?ref={base_sha}
 
 ### 2.6 Absent file
 
-- R-2.12. If no rules file exists at any probed location, the effective ruleset MUST equal: security floor + built-in defaults (current version) + legacy DB layer (§6.1, L2). This is a valid, fully supported state.
+- R-2.12. If no rules file exists at any probed location, the effective ruleset MUST equal: security floor + built-in defaults (current version) + legacy DB layer (§6.1, L2). This is the proposed extended design. For the Sprint 2–3 profile, absence keeps the existing system prompt and verbatim DB instructions; no new defaults bundle is required.
 
 ---
 
@@ -297,7 +299,7 @@ Note added code that cannot be reached or whose result is never used.
 
 Notes on defaults:
 
-- `# Style` is intentionally empty (confirmed decision Phase 0, OQ 4): the product's system prompt excludes formatter/linter-level remarks (`.agents/reviewer/v3/system.md`, "Чего не делать"). Repositories opt in by adding Style rules.
+- `# Style` is intentionally empty (proposed extended-design choice; no recorded approval): the product's system prompt excludes formatter/linter-level remarks (`.agents/reviewer/v3/system.md`, "Чего не делать"). Repositories opt in by adding Style rules.
 - `# Ignore` is empty: product-level file exclusions remain in code (`vcs/diff.py:_default_policy`); see §5.6.
 
 ---
@@ -336,7 +338,7 @@ Content before the first H1 (other than frontmatter) and content in a section th
 | `extends` | `inherit` \| `defaults` \| `none` | `inherit` | Base of this file's layer (§6.2). |
 | `defaults_version` | string `defaults-v<N>` | latest | Pin built-in defaults. Root file only; in nested files → `RF013`, key ignored. |
 | `scope` | list of globs (relative) | `["**"]` | Further narrows which paths under the scope directory this file governs. |
-| `allow_inline_ignores` | boolean | `true` | If `false`, inline directives in source are not honored (`RF071` per occurrence). |
+| `allow_inline_ignores` | boolean | `false` | If `false`, inline directives in source are not honored (`RF071` per occurrence). |
 
 - R-4.1. Frontmatter MUST be parsed with a safe YAML loader (PyYAML `safe_load`; PyYAML is currently only a transitive dependency in `uv.lock` and MUST be added as a direct dependency). Anchors, aliases, tags and multi-document streams MUST be rejected (`RF010`).
 - R-4.2. Unknown keys MUST produce `RF014` (warning) and be discarded.
@@ -374,7 +376,7 @@ Content before the first H1 (other than frontmatter) and content in a section th
 - R-4.9. `text` ends at the next line that starts with `#` outside a fenced code block, or at EOF. Raw HTML, HTML comments and Markdown images MUST be stripped from `text` (`RF063`, info). Fenced code blocks are allowed.
 - R-4.10. H3+ headings inside a rule are treated as literal text lines (no structure).
 
-Severity mapping to the existing finding enum (`src/app/domain/enums.py:FindingSeverity`; confirmed Phase 0, OQ 3):
+Severity mapping to the existing finding enum (`src/app/domain/enums.py:FindingSeverity`; proposed in the original draft; unapproved Phase 0, OQ 3):
 
 | Rules severity | `FindingSeverity` | Publication |
 |---|---|---|
@@ -524,7 +526,7 @@ Two documents. `rules-file/v1` is the per-file parse result (linter output, diag
 
 `rules-file/v1` (linter `--format json`) has the same `rule`/`ignore`/`diagnostic` definitions, except that in a *file* rule every attribute except `id`, `section`, `title` is optional (overrides), plus `frontmatter` (object of §4.3 keys) and `source` `{path, blob_sha}`. Its canonical form MUST be committed as `schemas/rules/file-v1.json` alongside `effective-v2.json`.
 
-- R-4.15. Diagnostic `message` MUST NOT contain rule text or file content beyond the rule id and ≤ 60 chars of the offending token (safe-details rule, PIPELINE_SPEC §8).
+- R-4.15. Diagnostic `message` MUST NOT contain rule text, file content or offending token values; emit only fixed diagnostic codes and structural source coordinates (safe-details rule, PIPELINE_SPEC §8).
 
 ---
 
@@ -553,7 +555,7 @@ The finding `category` for a finding citing a rule MUST be the rule's `category`
 
 ### 5.4 Legacy DB rules (layer L2)
 
-Each string of `RepositorySettings.rules.instructions` becomes one rule: `id` = the `[LABEL]` extracted by the existing `_RULE_LABEL` regex if it matches §4.5, else `LEG-<n>` (1-based position); section `Correctness` (category `correctness`); severity `minor`; paths `**`; title = first 120 chars; text = the instruction minus the label (first 1,000 chars; longer → `RF036`). This keeps existing `rule_ref` values valid.
+Existing DB instructions MUST remain verbatim, including unlabeled strings and labels accepted by the existing validator. They MUST NOT acquire synthetic `LEG-*` labels, forced categories/severities, truncation, or rewritten historical digests. Structured rules are a separately versioned, base-sourced addition. The effective snapshot records both carriers and their provenance. A file label colliding with a DB label is rejected with a diagnostic until explicit override semantics are approved; historical runs keep their original settings and prompt closure.
 
 ### 5.5 `# Ignore` section
 
@@ -586,7 +588,7 @@ Regex (normative, applied per line after the comment leader):
 ```
 
 - R-5.6. A directive without at least one rule id (e.g. `review-ignore-next-line`, `review-ignore-file *`) MUST NOT suppress anything and MUST produce `RF070` (warning; surfaced in the summary).
-- R-5.7. Inline directives come from the **head** revision, i.e. they are **author-controlled**. Therefore: (a) they MUST NOT suppress floor rules (`RF072`); (b) they are honored only if `allow_inline_ignores` is `true` for the governing scope; (c) every honored suppression MUST be listed in the summary comment (count + rule ids + paths); (d) directives on deleted lines are ignored.
+- R-5.7. Inline directives come from the **head** revision, i.e. they are **author-controlled**. Therefore: (a) they MUST NOT suppress floor rules (`RF072`); (b) they are honored only if `allow_inline_ignores` is explicitly `true` in the base-sourced governing scope AND the referenced rule explicitly permits inline suppression; both default to `false`; (c) every honored suppression MUST be listed in the summary comment (count + rule ids + paths); (d) directives on deleted lines are ignored.
 - R-5.8. `review-ignore-next-line` applies to the next non-blank line on the NEW side; `review-ignore-file` applies to the whole file and MUST be located within the first 50 lines of the head-revision file. If the head file content is unavailable, only directives visible in diff lines are honored (`RF073`, info). A reason is RECOMMENDED; missing reason → `RF074` (info).
 - R-5.9. The deterministic secret masking/scan (`src/app/review/validation.py:mask_secrets`, `_SECRET_PATTERNS`) MUST run on all added lines regardless of `# Ignore` and inline directives. Extending it into a standalone `FSEC-1` detector is a SHOULD (OQ-R3).
 
@@ -604,7 +606,7 @@ Regex (normative, applied per line after the comment leader):
 | L3 | Root rules file | `.review/rules.md` @ base_sha | — |
 | L4…L(3+k) | Nested files | outer → inner along the path chain | — |
 
-Confirmed Phase 0 OQ 5: defaults < DB < `rules.md`.
+Proposed in the original draft; unapproved Phase 0 OQ 5: defaults < DB < `rules.md`.
 
 ### 6.2 `extends`
 
@@ -646,8 +648,8 @@ rules   = [r for r in effective.values() if not r.disabled]
 
 - **Context.** Rules are maintainer-controlled (base branch), but inline directives are author-controlled, legacy DB rules are editable via API, and a mis-edited `rules.md` (`extends: none`) could silently remove all security review. The product markets security review as a baseline.
 - **Options.** (A) No floor — repositories fully control rules. (B) Floor of two narrow, high-precision rules (secrets; injection) that cannot be disabled, weakened, narrowed or ignored. (C) Floor = all default Security rules.
-- **Decision.** **(B)** `FSEC-1` (secrets) and `FSEC-2` (injection into interpreters). Floor rules: severity fixed at `blocker`; `paths` fixed at `**`; not disableable; not ignorable by `# Ignore` or inline directives; text not overridable. Path exclusion with `*` still removes files from *LLM* review (maintainer decision, visible in summary), but the deterministic secret scan (R-5.9) still runs.
-- **Consequences.** (+) Guaranteed minimum security coverage, resists author-side suppression. (−) Possible false positives on fixtures; mitigated by verifier passes (CONTEXT_AND_VERIFICATION_SPEC Part D) and by `*` exclusion of fixture paths. (−) Floor changes need security sign-off (R-3.6). Option C rejected: too opinionated (e.g. `BSEC-6` config rules are noisy for some stacks).
+- **Decision.** **(B)** `FSEC-1` (secrets) and `FSEC-2` (injection into interpreters). This is a proposed semantic floor, not a guarantee of finding every defect or of reviewing excluded paths. Floor rules: severity fixed at `blocker`; `paths` fixed at `**`; not disableable; not ignorable by `# Ignore` or inline directives; text not overridable. Path exclusion with `*` still removes files from *LLM* review (maintainer decision, visible in summary), but the deterministic secret scan (R-5.9) still runs.
+- **Consequences.** (+) Minimum coverage on paths actually sent to the model, resists author-side suppression. (−) Possible false positives on fixtures; mitigated by verifier passes (CONTEXT_AND_VERIFICATION_SPEC Part D) and by `*` exclusion of fixture paths. (−) Floor changes need security sign-off (R-3.6). Option C rejected: too opinionated (e.g. `BSEC-6` config rules are noisy for some stacks).
 
 ### 6.5 Conflict-resolution table
 

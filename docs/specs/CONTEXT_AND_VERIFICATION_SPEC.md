@@ -2,11 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | **Review** |
+| Status | **Draft for human approval; not an accepted runtime contract** |
 | Version | 0.9.1 |
 | Authors | DMC-268 Team 2 — Tech Lead (owner); drafted with AI assistance (Claude) |
 | Date | 2026-11-03 |
 | Related | [RULES_FORMAT_SPEC](./RULES_FORMAT_SPEC.md), [PIPELINE_SPEC](../PIPELINE_SPEC.md), [PROMPT_VERSION_CONTRACT](../PROMPT_VERSION_CONTRACT.md), [github-review-publication](../github-review-publication.md), [SECURITY_AND_REGRESSION_REPORT](../SECURITY_AND_REGRESSION_REPORT.md), [ADR-0002](../adr/0002-rules-from-base-branch.md) |
+
+**Scope:** [Sprint 2–3 decision profile](./SPRINT_2_3_DECISIONS.md) separates the current contract, the selected delivery profile, and future design. Selected P1/P2 governs S2/S3; conflicting extended-draft requirements do not apply. The extended design below is a proposal, including its ADR “Decision” paragraphs and implementation checklists. It does not authorize a runtime activation, budget increase, integration migration or additional sprint scope. Human approval has not been recorded.
 
 Normative keywords per [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174).
 
@@ -71,8 +73,8 @@ Specify (A) everything that reaches the model and how it is budgeted, (B) how un
 |---|---|---|
 | Context payload `schema_version: 2` (`schemas/context/v2.json`) | `schemas/context/v1.json` | adds labels, scopes, previous comments, metadata extensions, rules subset |
 | Prompt `v4` / `review-renderer-v4` | `v3` | nonce delimiters, labels, extended context blocks, rules with ids/severity |
-| LLM output `schemas/llm-output/v3.json` | v2 | `start_label`/`end_label`, `rule_id` (renames v2 `rule_ref`; same value space, persisted in the existing `rule_ref` column), `evidence_quote` |
-| Review result `schemas/review-result/v3.json` | v2 | adds `rule_id`, labels, `fp2`, `verification` |
+| LLM output `schemas/llm-output/v3.json` | v2 | `start_label`/`end_label`, `rule_ref` (the existing required nullable field; no rename), `evidence_quote` |
+| Review result `schemas/review-result/v3.json` | v2 | retains `rule_ref`; proposed additions: labels, `fp2`, `verification` |
 | Verifier output `schemas/verifier-output/v1.json` | `ReflectionOutput` | claim/relevance scoring |
 
 Historical identities MUST remain loadable and MUST NOT be re-rendered (PROMPT_VERSION_CONTRACT).
@@ -148,7 +150,7 @@ input: B, sources s in priority order with demand d_s, floor f_s, target t_s (fr
 
 ### A.4.2 Languages and extraction
 
-Phase-1 languages (confirmed Phase 0 OQ 1): Python, TypeScript/TSX, JavaScript, Go, Java. Detection by extension; `FileDiff.language` and `Metadata.languages` MUST be populated (today always empty).
+Phase-1 languages (proposed in the original draft; unapproved Phase 0 OQ 1): Python, TypeScript/TSX, JavaScript and Go. Java is a future proposal outside #23. Detection by extension; `FileDiff.language` and `Metadata.languages` MUST be populated (today always empty).
 
 | Extract | Definition | Used for |
 |---|---|---|
@@ -162,7 +164,7 @@ Queries are per-language `.scm` files under `src/app/context/queries/<lang>/{def
 
 ### A.4.3 Source acquisition
 
-- R-A.11. Full file revisions MUST be fetched via [Get repository content](https://docs.github.com/en/rest/repos/contents?apiVersion=2022-11-28#get-repository-content) with `ref=head_sha` (new side) and `ref=merge_base_sha` (old side) of the base/head repository respectively; files > 1 MB return empty `content` with `encoding: "none"` in object form and MUST be skipped with `unavailable_blob`.
+- R-A.11. Full file revisions MUST be fetched via [Get repository content](https://docs.github.com/en/rest/repos/contents?apiVersion=2022-11-28#get-repository-content) from the head repository with `ref=head_sha` (NEW side), and from the base repository with `ref=merge_base_sha` (OLD side); files > 1 MB return empty `content` with `encoding: "none"` in object form and MUST be skipped with `unavailable_blob`.
 - R-A.12. Limits per review: ≤ 40 blob fetches, ≤ 10 additional (non-PR) files for definitions/callers/related, ≤ 512 KiB parsed per file.
 - R-A.13. The fetched blob SHA MUST equal `new_blob_sha`/`old_blob_sha` from the diff `index` line when present (`vcs/diff.py:_blob_shas`); mismatch → discard and mark `context_error`.
 - R-A.14. Head-repository blobs are untrusted content (they are the PR's code) — allowed as context data, never as instructions or rules.
@@ -208,12 +210,12 @@ flowchart LR
 
 | Cache | Key | Value | Store / TTL |
 |---|---|---|---|
-| Symbol index | `ast:v1:{lang}:{grammar_version}:{blob_sha}` | extracted index JSON (no source text) | Redis, 24 h; process LRU 256 entries |
+| Symbol index | `ast:v1:{provider}:{repo_id}:{path}:{blob_sha}:{lang}:{grammar_version}:{builder_version}:{options_digest}` | extracted index JSON (no source text) | Redis, 24 h; process LRU 256 entries |
 | Blob content | — | not cached outside the review (source code at rest minimization) | — |
 | Rules | frozen per review (RULES_FORMAT_SPEC §6.6) | — | PostgreSQL |
 | Repository conventions | `conv:v1:{repo_id}:{base_sha}` | facts JSON | Redis, 24 h |
 
-Cache misses MUST NOT change results (cache stores only deterministic derivations of content-addressed input).
+Every cache hit MUST revalidate current repository authorization. Tenant/repository boundaries are retained even for identical public blob SHAs. Cache misses MUST NOT change results (cache stores only deterministic derivations of content-addressed input).
 
 ## A.7 Improvements to the existing implementation (from Phase 0)
 
@@ -391,7 +393,7 @@ C42/42        return db.execute(q)
 
 - R-C.1. Labels are unique per file; table `LineTable[path] : label → (kind, old, new, hunk_id, text)`.
 - R-C.2. The model MUST return `path`, `start_label`, `end_label`; it never returns raw line numbers or sides. Code resolves labels.
-- R-C.3. Resolution rules: both labels MUST exist in the file's table (`P2_LABEL_UNRESOLVED`); `start` precedes or equals `end` in diff order (`P2_RANGE_INVALID`); the range MUST contain ≥ 1 `R` or `L` line (`P2_NOT_CHANGED_ANCHOR`); side = NEW if the range contains any `R`/`C` endpoint pair on NEW, OLD if both endpoints are `L`; mixed `L`…`R` ranges collapse to the `end` label single line (logged `C_RANGE_COLLAPSED`).
+- R-C.3. Resolution rules: both labels MUST exist in the file's table (`P2_LABEL_UNRESOLVED`); `start` precedes or equals `end` in diff order (`P2_RANGE_INVALID`); the range MUST contain ≥ 1 `R` or `L` line (`P2_NOT_CHANGED_ANCHOR`); side = NEW if the range contains any `R`/`C` endpoint pair on NEW, OLD if both endpoints are `L`; mixed `L`…`R` or cross-hunk ranges are rejected (`P2_RANGE_INVALID`); code MUST NOT relocate or clamp a finding to another line.
 
 ### C.1.1 ADR-C1 — Labels instead of line numbers
 
@@ -407,7 +409,7 @@ Endpoint used (existing): [Create a review for a pull request](https://docs.gith
 | Field | Value | Notes (verified) |
 |---|---|---|
 | `commit_id` | `snapshot.head_sha` | "Not using the latest commit SHA may render your review comment outdated" |
-| `path` | new path (NEW side) / old path (OLD side) | existing `_github_path` |
+| `path` | new path for renamed files on either side; old path only for deleted files | existing `_github_path`; `test_prepare_review_uses_new_path_for_old_line_in_renamed_file` |
 | `side` | `RIGHT` for NEW (added and context), `LEFT` for OLD (deleted) | "LEFT for deletions and RIGHT for additions or unchanged context lines" |
 | `line` | resolved line of `end_label` | "For a multi-line comment, it is the last line of the range" |
 | `start_line` / `start_side` | resolved line/side of `start_label`, only if ≠ `line` | required for multi-line comments |
@@ -452,14 +454,14 @@ Snapshot mapping: GitLab `base_commit_sha`/`start_commit_sha` correspond to our 
 
 | Case | Handling |
 |---|---|
-| Renamed/moved file | `status=renamed`; NEW-side labels use `new_path`, OLD-side `old_path`; GitLab sends both paths; fingerprint uses `new_path` |
+| Renamed/moved file | `status=renamed`; labels retain their side; GitHub comment path uses `new_path` for both sides (current contract); GitLab sends both paths |
 | Pure rename (no hunks) | no labels; findings impossible → only summary |
 | Deleted file | only `L` labels; GitHub `side=LEFT`, path = old path; GitLab `old_line` only |
 | Binary / policy-skipped | no labels; listed under "Not reviewed" |
 | Label outside hunks / unknown | Pass 2 reject (`P2_LABEL_UNRESOLVED`); never moved to a neighbour line (existing principle) |
 | Finding valid but publication cannot anchor (e.g. GitHub 422 for a specific comment) | demote to file-level comment (`subject_type=file` via [single comment endpoint](https://docs.github.com/en/rest/pulls/comments?apiVersion=2022-11-28#create-a-review-comment-for-a-pull-request)) if file is in the PR, else into summary |
-| Multi-line range crossing hunks | clamp to the hunk containing `end_label` (start := first line of that hunk ≥ original start); log `C_RANGE_CLAMPED` |
-| Range > 50 lines | clamp to last 50 lines ending at `end_label` |
+| Multi-line range crossing hunks | reject `P2_RANGE_INVALID`; never move the anchor |
+| Range > 50 lines | reject the oversized range; never silently change its location |
 | Force-push / new head before publish | existing `check_pull` re-validates `head.sha`/`base.sha` immediately before POST (`_pull_metadata`) → `PR_STALE_OR_CLOSED`, no POST; new cycle reviews the new head |
 | Race: push between check and POST | review is pinned to old `commit_id`; GitHub marks comments outdated — acceptable; next cycle dedups via fp2 |
 | GitHub 422 on review POST | today the whole review fails (`remote_effect="absent"`). New: (1) pre-validate every anchor against the frozen diff; (2) on 422 retry **once** without inline comments, moving them into the summary body with labels → `PARTIAL` publication |
@@ -473,7 +475,7 @@ Snapshot mapping: GitLab `base_commit_sha`/`start_commit_sha` correspond to our 
 
 - **Context.** fp1 = hash(path, side, start, end, category, title) (`analysis_handler.py:_infer`; a second variant exists in `validation.py:fingerprint`). It changes when lines shift or the model rewords the title → duplicates across cycles (CONTEXT.md "Цикл ревью").
 - **Options.** (a) keep fp1; (b) `hash(rule_id, path, normalized_line_content)` (prompt requirement); (c) semantic embedding similarity.
-- **Decision.** (b) as **fp2**, alongside fp1 (confirmed Phase 0 OQ 7):
+- **Decision.** (b) as **fp2**, alongside fp1 (proposed in the original draft; unapproved Phase 0 OQ 7):
 
 ```
 fp2 = sha256("fp2|" + (rule_id or "cat:" + category) + "|" + path_new_or_old + "|" + side + "|" + norm(text of end_label line))
@@ -521,19 +523,19 @@ flowchart LR
   P5 -.drop/defer.-> L
 ```
 
-Every rejection writes a row/event with: `review_id`, `chunk_id`, `pass`, `reason_code`, `rule_id`, `path`, `start_label`, `end_label`, `model_ref` — **no** finding text or code (safe details, PIPELINE_SPEC §8).
+Every rejection writes a row/event with: `review_id`, `chunk_id`, `pass`, `reason_code`, `rule_ref`, `path`, `start_label`, `end_label`, `model_ref` — **no** finding text or code (safe details, PIPELINE_SPEC §8).
 
 ## D.1 Output schema v3 (finding)
 
 ```json
 {
   "type": "object", "additionalProperties": false,
-  "required": ["path","start_label","end_label","rule_id","category","severity","title","explanation","evidence_quote","recommendation","proposed_diff_fix"],
+  "required": ["path","start_label","end_label","rule_ref","category","severity","title","explanation","evidence_quote","recommendation","proposed_diff_fix"],
   "properties": {
     "path": {"type": "string", "maxLength": 1024},
     "start_label": {"type": "string", "pattern": "^(R[1-9][0-9]*|L[1-9][0-9]*|C[1-9][0-9]*/[1-9][0-9]*)$"},
     "end_label":   {"type": "string", "pattern": "^(R[1-9][0-9]*|L[1-9][0-9]*|C[1-9][0-9]*/[1-9][0-9]*)$"},
-    "rule_id": {"type": ["string","null"], "pattern": "^[A-Z][A-Z0-9]{1,9}-[0-9]{1,4}$"},
+    "rule_ref": {"type": ["string","null"], "pattern": "^[A-Z][A-Z0-9]{1,9}-[0-9]{1,4}$"},
     "category": {"enum": ["security","correctness","performance","maintainability"]},
     "severity": {"enum": ["critical","high","medium","low"]},
     "title": {"type": "string", "minLength": 1, "maxLength": 200},
@@ -553,9 +555,9 @@ Every property is required and nullable where optional (OpenAI strict-mode const
 |---|---|
 | Input | raw model text |
 | Output | parsed candidates |
-| Checks | JSON Schema (Draft 2020-12, existing gateway); `rule_id` ∈ effective ruleset of the path's scope; rule applicable to path (RULES_FORMAT_SPEC §5.2) |
+| Checks | JSON Schema (Draft 2020-12, existing gateway); `rule_ref` ∈ effective ruleset of the path's scope; rule applicable to path (RULES_FORMAT_SPEC §5.2) |
 | Reason codes | `P1_SCHEMA_INVALID` (whole response; one repair, existing), `P1_UNKNOWN_RULE`, `P1_RULE_NOT_APPLICABLE`, `P1_RULE_DISABLED` |
-| Normalization | if `rule_id` set: `category` := rule category, `severity` := mapped rule severity (RULES_FORMAT_SPEC R-4.11, §5.3) |
+| Normalization | if `rule_ref` set: `category` := rule category, `severity` := mapped rule severity (RULES_FORMAT_SPEC R-4.11, §5.3) |
 
 ## D.3 Pass 2 — Existence (deterministic)
 
@@ -563,12 +565,12 @@ Every property is required and nullable where optional (OpenAI strict-mode const
 |---|---|
 | `path` is a file of this chunk | `P2_FILE_NOT_IN_CHUNK` |
 | labels resolve (C.1) | `P2_LABEL_UNRESOLVED` |
-| range ordered, single side (else collapse) | `P2_RANGE_INVALID` |
+| range ordered, single side, single hunk (otherwise reject) | `P2_RANGE_INVALID` |
 | range contains ≥ 1 changed line | `P2_NOT_CHANGED_ANCHOR` |
 | `evidence_quote` matches code | `P2_EVIDENCE_MISMATCH` |
 | `evidence_quote` ≠ normalized title (existing `_has_evidence`) | `P2_EVIDENCE_TRIVIAL` |
 
-Evidence matching: `norm(evidence_quote)` (whitespace-collapsed, diff markers removed) MUST be a substring of `norm(text of lines in [start−2, end+2] of the same file side)`; otherwise compute `difflib.SequenceMatcher(None, q, w).ratio()` over sliding windows `w` of equal length; accept if max ratio ≥ **0.85** (stdlib, no new dependency). Quotes < 8 chars MUST match exactly.
+Evidence matching MUST use the cited side and exact anchor range. Whitespace normalization MAY be applied; fuzzy similarity and searching neighboring lines MUST NOT turn evidence at another location into an accepted anchor. Ambiguous or missing evidence is rejected with `P2_EVIDENCE_MISMATCH`.
 
 ## D.4 Pass 3 — Static grounding
 

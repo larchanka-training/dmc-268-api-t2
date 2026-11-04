@@ -590,3 +590,43 @@ __all__ = [
     "RuntimeProfile",
     "build_frozen_gateway",
 ]
+
+
+def validate_admission_configuration(
+    config: FrozenAnalysisConfiguration,
+    *,
+    settings_digest: str,
+    instructions: tuple[str, ...],
+    prompt_root: Path,
+) -> ModelSettings:
+    """Frozen admission identity for a new start; ValueError when unusable.
+
+    Shared by HTTP starts and the system follow-up start."""
+    try:
+        if (
+            not isinstance(config, FrozenAnalysisConfiguration)
+            or type(config.frozen_configuration_version) is not int
+            or config.frozen_configuration_version != 1
+        ):
+            raise ValueError("unsupported admission configuration")
+        policy = ModelSettings.from_stored(config.model_settings)
+        ModelRoute(
+            profile_ref=policy.routing.primary_profile_ref,
+            model_ref=config.model_ref,
+            model_digest=config.model_digest,
+        )
+        if (
+            policy.repository_settings_digest != settings_digest
+            or config.model_digest is not None
+            or any(route.model_digest is not None for route in policy.routing.fallback)
+        ):
+            raise ValueError("unsupported admission identity")
+        PromptBuilder.load(
+            prompt_root,
+            config.prompt_version,
+            expected_digest=config.prompt_digest,
+            repository_instructions=RepositoryInstructions(instructions=instructions),
+        )
+        return policy
+    except ValidationError, ValueError, TypeError, PromptConfigError:
+        raise ValueError("review configuration is unavailable") from None

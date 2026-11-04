@@ -16,9 +16,10 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 
 from app.adapters.redis_queue import RedisQueue
+from app.application.github_ports import GithubPullRequestReader
 from app.application.ports import LeaseLostError
 from app.core.config import Logging, get_settings
-from app.core.github_runtime import github_connection
+from app.core.github_runtime import StoredCredentialAuthorizer, github_connection
 from app.core.logging_config import configure_logging
 from app.core.sentry import configure_sentry
 from app.domain.frozen_configuration import FrozenConfigurationError
@@ -54,6 +55,7 @@ async def run(*, once: bool, poll_interval: float) -> None:  # noqa: PLR0912 -- 
         from app.adapters.analysis_composition import (  # noqa: PLC0415
             prepare_postgres_analysis_worker,
         )
+        from app.review.cache import ReviewResultCache  # noqa: PLC0415
 
         async with (
             Redis.from_url(
@@ -75,6 +77,15 @@ async def run(*, once: bool, poll_interval: float) -> None:  # noqa: PLR0912 -- 
                 prompt_root=Path(".agents/reviewer"),
                 schemas_dir=Path("schemas"),
                 owner=owner,
+                input_guards=settings.input_guards.policy(),
+                incremental=settings.incremental.policy(),
+                pulls=github if isinstance(github, GithubPullRequestReader) else None,
+                authorizer=StoredCredentialAuthorizer(settings, async_session_factory),
+                cache=(
+                    ReviewResultCache(client, cache_policy)
+                    if (cache_policy := settings.review_cache.policy())
+                    else None
+                ),
             )
             cursor = "0-0"
             next_recovery = monotonic() + 30

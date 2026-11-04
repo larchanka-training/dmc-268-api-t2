@@ -54,7 +54,9 @@ async def run_once(
         )
     async with github_publisher_connection(settings, transport=transport) as github:
         publisher = GithubPublisher(
-            PostgresPublicationStore(sessions),
+            PostgresPublicationStore(
+                sessions, suppress_repeats=settings.incremental.enabled
+            ),
             github,
             authority=authority,
             bot_user_id=settings.github.bot_user_id,

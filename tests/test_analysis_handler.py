@@ -61,6 +61,7 @@ from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.domain.frozen_configuration import admission_policy
 from app.domain.settings import compute_rules_digest
 from app.vcs.github import GithubClient
+from app.vcs.input_guards import InputGuardPolicy
 
 pytest_plugins = ("test_postgres_integration", "test_redis_queue")
 SHA256_HEX_LENGTH = 64
@@ -1679,3 +1680,102 @@ async def test_local_authority_loss_before_result_persistence_keeps_delivery_pen
         )
         job = await session.get(ReviewJob, review_id)
         assert job is not None and job.finished_at is None
+
+
+def _added_file(path: str, *lines: str) -> str:
+    body = "".join(f"+{line}\n" for line in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "index 0000000..2222222\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}"
+    )
+
+
+GUARDED_DIFF = "".join(
+    (
+        DIFF,
+        _added_file("data/big.py", *(f"x{n} = {' 1 +' * 500} 1" for n in range(600))),
+        "diff --git a/logo.png b/logo.png\n"
+        "new file mode 100644\n"
+        "index 0000000..2222222\n"
+        "Binary files /dev/null and b/logo.png differ\n",
+        _added_file("package-lock.json", *(f'"d{n}": "1",' for n in range(2500))),
+        _added_file("migrations/versions/0001_init.py", "op.drop_table('t')"),
+        _added_file("api/user.pb.go", "package api"),
+        _added_file("static/app.css", "a{b:c}" * 300),
+        _added_file("web/client.gen.ts", "export const api = 1"),
+    )
+)
+
+
+def guarded_github_http() -> httpx.MockTransport:
+    """github_http plus a base-branch .gitattributes marking *.gen.ts generated."""
+    base = github_http(GUARDED_DIFF)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/contents/.gitattributes"):
+            assert request.url.params["ref"] == BASE
+            return httpx.Response(200, text="*.gen.ts linguist-generated\n")
+        return cast(httpx.Response, base.handler(request))
+
+    return httpx.MockTransport(respond)
+
+
+async def test_input_guards_keep_unusable_files_out_of_llm(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+    """DoD 7: oversized, binary, lock, migration, generated and minified files
+    never reach the LLM; each skip keeps its enumerated reason."""
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(RepositorySettings)
+            .where(
+                RepositorySettings.id.in_(
+                    select(ReviewJob.repository_settings_id).where(
+                        ReviewJob.id == review_id
+                    )
+                )
+            )
+            .values(ignores={"globs": [], "exclude_migrations": True})
+        )
+    llm = DeterministicLlm()
+    async with httpx.AsyncClient(transport=guarded_github_http()) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            input_guards=InputGuardPolicy(),
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+    assert len(llm.payloads) == 1
+    files = cast(list[dict[str, Any]], llm.payloads[0].payload_body["files"])
+    assert [file["diff"]["new_path"] for file in files] == ["src/a.py"]
+    wire = cast(dict[str, Any], llm.payloads[0].to_wire())
+    wire_skipped = wire["coverage"]["skipped"]
+    assert {entry["reason"] for entry in wire_skipped} == {"policy"}
+    assert review is not None and review.status == "COMPLETED"
+    assert {item["path"]: item["detail"] for item in review.coverage["skipped"]} == {
+        "data/big.py": "too_large",
+        "logo.png": "binary",
+        "package-lock.json": "lockfile",
+        "migrations/versions/0001_init.py": "migration",
+        "api/user.pb.go": "generated",
+        "static/app.css": "minified",
+        "web/client.gen.ts": "generated",
+    }

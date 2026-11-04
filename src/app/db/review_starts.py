@@ -16,6 +16,7 @@ from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
     ChangeRequestIdentity,
     IdempotencyConflictError,
+    PullRequestReviewActiveError,
     RepositoryIdentity,
     ReviewAlreadyActiveError,
     ReviewHeadMismatchError,
@@ -154,7 +155,7 @@ async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimisti
     saved.description = live.description
 
 
-async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with optional materialization
+async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- atomic admission with optional materialization
     command: StartReviewCommand,
     *,
     factory: async_sessionmaker[AsyncSession],
@@ -166,6 +167,7 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
     expected_settings: str,
     new_change: GithubPullRequest | None = None,
     saved_change: ChangeRequestIdentity | None = None,
+    one_active_per_pr: bool = False,
 ) -> tuple[UUID, str, bool]:
     repository_id = expected_repository.id
     async with SqlAlchemyUnitOfWork(factory) as uow:
@@ -249,13 +251,15 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
             )
             if parent is None:
                 raise AdmissionResourceNotFoundError
+        # One active analysis per PR needs an exclusive row lock: under a
+        # shared lock two starts for different heads both see no active run.
         change = await uow.session.scalar(
             select(ChangeRequest)
             .where(
                 ChangeRequest.id == command.change_request_id,
                 ChangeRequest.repository_id == repository_id,
             )
-            .with_for_update(read=True)
+            .with_for_update(read=not one_active_per_pr)
         )
         if change is None or change.current_status != "open":
             raise AdmissionResourceNotFoundError
@@ -294,6 +298,13 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
         )
         if equivalent is not None:
             raise ReviewAlreadyActiveError
+        if one_active_per_pr and await uow.session.scalar(
+            select(ReviewJob.id).where(
+                ReviewJob.change_request_id == command.change_request_id,
+                ReviewJob.finished_at.is_(None),
+            )
+        ):
+            raise PullRequestReviewActiveError
         await _check_quotas(
             uow.session, repository_id, command.initiator_user_id, settings, window
         )

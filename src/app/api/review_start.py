@@ -21,6 +21,7 @@ from structlog.contextvars import get_contextvars
 from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identity
 from app.api.errors import ApiError
 from app.api.review_start_dependencies import (
+    get_one_active_per_pr,
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
@@ -36,6 +37,7 @@ from app.application.review_start_ports import (
     ChangeRequestIdentity,
     FrozenAnalysisConfiguration,
     IdempotencyConflictError,
+    PullRequestReviewActiveError,
     RepositoryIdentity,
     ReviewAlreadyActiveError,
     ReviewConfigurationResolver,
@@ -61,17 +63,17 @@ from app.db.review_starts import (
 )
 from app.db.session import get_session
 from app.domain.frozen_configuration import (
-    ModelRoute,
     ModelSettings,
-    RepositoryInstructions,
 )
 from app.domain.settings import (
     compute_repository_settings_digest,
     compute_rules_digest,
     project_historical_empty_settings,
 )
-from app.review.configuration import FrozenConfigurationError
-from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.configuration import (
+    FrozenConfigurationError,
+    validate_admission_configuration,
+)
 
 
 class ReviewStartRoute(APIRoute):
@@ -126,6 +128,11 @@ _ADMISSION_ERRORS: dict[type[Exception], tuple[int, str, str]] = {
         409,
         "REVIEW_ALREADY_ACTIVE",
         "An equivalent review is already active.",
+    ),
+    PullRequestReviewActiveError: (
+        409,
+        "REVIEW_ALREADY_ACTIVE",
+        "A review of this pull request is already active.",
     ),
     SettingsVersionChangedError: (
         409,
@@ -338,32 +345,13 @@ def _validate_configuration(
     instructions: tuple[str, ...],
 ) -> ModelSettings:
     try:
-        if (
-            not isinstance(config, FrozenAnalysisConfiguration)
-            or type(config.frozen_configuration_version) is not int
-            or config.frozen_configuration_version != 1
-        ):
-            raise ValueError("unsupported admission configuration")
-        policy = ModelSettings.from_stored(config.model_settings)
-        ModelRoute(
-            profile_ref=policy.routing.primary_profile_ref,
-            model_ref=config.model_ref,
-            model_digest=config.model_digest,
+        return validate_admission_configuration(
+            config,
+            settings_digest=settings_digest,
+            instructions=instructions,
+            prompt_root=Path(__file__).resolve().parents[3] / ".agents/reviewer",
         )
-        if (
-            policy.repository_settings_digest != settings_digest
-            or config.model_digest is not None
-            or any(route.model_digest is not None for route in policy.routing.fallback)
-        ):
-            raise ValueError("unsupported admission identity")
-        PromptBuilder.load(
-            Path(__file__).resolve().parents[3] / ".agents/reviewer",
-            config.prompt_version,
-            expected_digest=config.prompt_digest,
-            repository_instructions=RepositoryInstructions(instructions=instructions),
-        )
-        return policy
-    except ValidationError, ValueError, TypeError, PromptConfigError:
+    except ValueError:
         raise ApiError(
             503,
             "SERVICE_UNAVAILABLE",
@@ -386,6 +374,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     resolver: Annotated[
         ReviewConfigurationResolver, Depends(get_review_configuration_resolver)
     ],
+    one_active_per_pr: Annotated[bool, Depends(get_one_active_per_pr)],
 ) -> JSONResponse:
     if (
         not isinstance(identity, VerifiedMutationIdentity)
@@ -573,6 +562,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
             expected_settings=expected_settings,
             new_change=new_change,
             saved_change=saved_change,
+            one_active_per_pr=one_active_per_pr,
         )
     except tuple(_ADMISSION_ERRORS) as error:
         raise ApiError(*_ADMISSION_ERRORS[type(error)]) from None

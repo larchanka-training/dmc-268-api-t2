@@ -53,7 +53,9 @@ async def make_publication_handler[T](
     """Compose publication explicitly; the caller owns queue wiring and execution."""
     async with github_publisher_connection(settings, transport=transport) as github:
         yield PublicationTaskHandler(
-            PostgresPublicationStore(sessions),
+            PostgresPublicationStore(
+                sessions, suppress_repeats=settings.incremental.enabled
+            ),
             github,
             bot_user_id=settings.github.bot_user_id,
             completed_outcome=completed_outcome,

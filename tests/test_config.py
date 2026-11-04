@@ -208,3 +208,44 @@ def test_github_token_is_loaded_and_redacted(monkeypatch: pytest.MonkeyPatch) ->
     settings = Settings()
     assert settings.github.token.get_secret_value() == "github-test-token"
     assert "github-test-token" not in repr(settings)
+
+
+def test_input_guards_are_off_by_default() -> None:
+    assert Settings().input_guards.policy() is None
+
+
+def test_input_guards_flag_and_thresholds_come_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INPUT_GUARDS__ENABLED", "true")
+    monkeypatch.setenv("INPUT_GUARDS__MAX_PATCH_BYTES", "4096")
+
+    policy = Settings().input_guards.policy()
+
+    assert policy is not None
+    assert policy.max_patch_bytes == 4096  # noqa: PLR2004 -- env value above
+    assert "package-lock.json" in policy.lockfile_globs
+
+
+def test_incremental_review_and_cache_are_off_by_default() -> None:
+    settings = Settings()
+
+    assert settings.incremental.policy() is None
+    assert settings.review_cache.policy() is None
+
+
+def test_incremental_review_and_cache_flags_come_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INCREMENTAL__ENABLED", "true")
+    monkeypatch.setenv("INCREMENTAL__MAX_PRIOR_REVIEWS", "5")
+    monkeypatch.setenv("REVIEW_CACHE__ENABLED", "true")
+    monkeypatch.setenv("REVIEW_CACHE__TTL_SECONDS", "3600")
+
+    settings = Settings()
+    incremental = settings.incremental.policy()
+    cache = settings.review_cache.policy()
+
+    assert incremental is not None and incremental.max_prior_reviews == 5  # noqa: PLR2004
+    assert cache is not None and cache.ttl_seconds == 3600  # noqa: PLR2004
+    assert cache.key_version == 1

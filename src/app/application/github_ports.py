@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +33,7 @@ class GithubPullRequest:
     description: str
 
 
+@runtime_checkable
 class GithubPullRequestReader(Protocol):
     async def get_pull_request(
         self, owner: str, name: str, repository_external_id: str, number: int
@@ -98,6 +99,22 @@ class GithubWriteFailure(GithubFailure):
 
 class GithubPort(Protocol):
     async def fetch(self, request: GithubRequest) -> GithubSnapshot: ...
+
+
+@runtime_checkable
+class GitattributesReader(Protocol):
+    """Optional adapter capability: base-commit ``.gitattributes`` or None."""
+
+    async def fetch_gitattributes(self, request: GithubRequest) -> str | None: ...
+
+
+@runtime_checkable
+class CompareReader(Protocol):
+    """Optional adapter capability: Compare API status of ``base...head``."""
+
+    async def compare_status(
+        self, request: GithubRequest, base_sha: str
+    ) -> str | None: ...
 
 
 class GithubRepositoryReader(Protocol):

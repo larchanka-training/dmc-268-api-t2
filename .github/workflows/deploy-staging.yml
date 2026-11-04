@@ -826,13 +826,14 @@ jobs:
             caddy/Caddyfile \
             "${SSH_USER}@${SSH_HOST}:/opt/caddy/Caddyfile.new"
 
+          # Materialize remote body so docker cannot drain bash -s stdin.
           sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "bash -s" \
+            "cat > '/opt/caddy/.ensure-caddy-https.remote.sh' && chmod 700 '/opt/caddy/.ensure-caddy-https.remote.sh' && bash '/opt/caddy/.ensure-caddy-https.remote.sh'; status=\$?; rm -f '/opt/caddy/.ensure-caddy-https.remote.sh'; exit \"\$status\"" \
             <<'REMOTE'
           set -euo pipefail
 

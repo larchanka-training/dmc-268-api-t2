@@ -77,6 +77,13 @@ class GithubFailure(Exception):  # noqa: N818 - public gateway contract
         super().__init__(reason_code)
 
 
+class GithubRepositoryMismatch(GithubFailure):
+    """Provider payload names another repository: caller-scoped, not a bot denial."""
+
+    def __init__(self) -> None:
+        super().__init__("VCS_ACCESS_DENIED", False)
+
+
 class GithubWriteFailure(GithubFailure):
     def __init__(
         self,

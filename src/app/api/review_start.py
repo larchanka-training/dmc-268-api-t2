@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.routing import APIRoute
 from jsonschema import Draft202012Validator
 from pydantic import AnyUrl, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import JSONResponse, Response
@@ -25,7 +25,12 @@ from app.api.review_start_dependencies import (
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
-from app.application.github_ports import GithubFailure, GithubPullRequest, GithubRequest
+from app.application.github_ports import (
+    GithubFailure,
+    GithubPullRequest,
+    GithubRepositoryMismatch,
+    GithubRequest,
+)
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
@@ -196,6 +201,16 @@ def _pull_request_number(value: str) -> int:
     return number
 
 
+class _BotDeniedError(Exception):
+    """The bot token was denied by GitHub (not the user's token)."""
+
+
+def _unhealthy_error() -> ApiError:
+    return ApiError(
+        409, "INTEGRATION_UNHEALTHY", "The repository integration is unhealthy."
+    )
+
+
 async def _revalidate_github(
     authorizer: ReviewStartAuthorizer,
     user_id: UUID,
@@ -203,10 +218,12 @@ async def _revalidate_github(
     number: int,
     requested_head_sha: str,
 ) -> tuple[ChangeRequestIdentity, GithubPullRequest]:
+    bot_stage = False
     try:
         await authorizer.authorize_start(
             user_id=user_id, repository=repository_identity
         )
+        bot_stage = True
         # The saved PR row is only a cache: pushes after the first start move the
         # head on GitHub, so every start re-reads the live PR and refreshes the row.
         async with github_runtime.github_pull_request_connection(
@@ -241,6 +258,8 @@ async def _revalidate_github(
             snapshot = await github.fetch(github_request)
     except GithubFailure as error:
         if error.reason_code == "VCS_ACCESS_DENIED":
+            if bot_stage and not isinstance(error, GithubRepositoryMismatch):
+                raise _BotDeniedError from None
             raise ApiError(403, "ACCESS_DENIED", "Access is denied.") from None
         if error.reason_code == "PR_STALE_OR_CLOSED":
             raise ApiError(
@@ -414,6 +433,8 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
                 "resource_url": resource_url,
             },
         )
+    if repository.integration_status != "healthy":
+        raise _unhealthy_error()
     change = await session.scalar(
         select(ChangeRequest).where(
             ChangeRequest.repository_id == repository.id,
@@ -472,13 +493,23 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         ]
     )
     await session.rollback()
-    expected_change, new_change = await _revalidate_github(
-        authorizer,
-        identity.user_id,
-        repository_identity,
-        pr_number,
-        body.requested_head_sha,
-    )
+    try:
+        expected_change, new_change = await _revalidate_github(
+            authorizer,
+            identity.user_id,
+            repository_identity,
+            pr_number,
+            body.requested_head_sha,
+        )
+    except _BotDeniedError:
+        # Keep RepositoryAccess rows: a generic denial is not a confirmed removal.
+        await session.execute(
+            update(Repository)
+            .where(Repository.id == repository_identity.id)
+            .values(integration_status="bot_denied")
+        )
+        await session.commit()
+        raise _unhealthy_error() from None
     try:
         config = await resolver.resolve(
             repository=repository_identity,

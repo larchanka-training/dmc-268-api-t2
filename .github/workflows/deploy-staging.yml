@@ -393,8 +393,8 @@ jobs:
           EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
           GITHUB_API_TOKEN: ${{ secrets.STAGING_GITHUB_READ_TOKEN }}
-          GITHUB_PUBLISH_TOKEN: ${{ secrets.GITHUB__WRITE_TOKEN }}
-          GITHUB_BOT_USER_ID: ${{ secrets.GITHUB__BOT_USER_ID }}
+          GITHUB_PUBLISH_TOKEN: ${{ secrets.STAGING_GITHUB_WRITE_TOKEN }}
+          GITHUB_BOT_USER_ID: ${{ secrets.STAGING_GITHUB_BOT_USER_ID }}
           AUTH_GITHUB_CLIENT_ID: ${{ vars.AUTH__GITHUB_CLIENT_ID }}
           AUTH_GITHUB_CLIENT_SECRET: ${{ secrets.AUTH__GITHUB_CLIENT_SECRET }}
           AUTH_GITHUB_REDIRECT_URI: ${{ vars.AUTH__GITHUB_REDIRECT_URI }}
@@ -665,7 +665,9 @@ jobs:
           fi
 
           echo "Starting API..."
-          compose up -d api
+          # Force recreate so Compose cannot leave a stale api service running
+          # pre-scope OAuth code after env already pins a newer API_IMAGE.
+          compose up -d --force-recreate --no-deps api
 
           echo "Waiting for API healthcheck..."
           for attempt in $(seq 1 30); do
@@ -726,14 +728,15 @@ jobs:
           done
 
           echo "Starting web..."
-          compose up -d web
+          # Host WEB_PORT is the web (nginx) container, which proxies /api/ to
+          # the api service. Recreate so a previous UI image cannot keep :80.
+          compose up -d --force-recreate --no-deps web
 
           echo "Waiting for web..."
           for attempt in $(seq 1 30); do
             if curl -fsS "http://127.0.0.1:${WEB_PORT}/" >/dev/null; then
               echo "${ENV_NAME} web is healthy"
-              compose ps
-              exit 0
+              break
             fi
 
             if [[ "${attempt}" -eq 30 ]]; then
@@ -745,6 +748,54 @@ jobs:
 
             sleep 2
           done
+
+          echo "Verifying running images match env pins..."
+          expected_api_image="$(grep -E '^API_IMAGE=' "${ENV_FILE}" | tail -n1 | cut -d= -f2-)"
+          expected_ui_image="$(grep -E '^UI_IMAGE=' "${ENV_FILE}" | tail -n1 | cut -d= -f2-)"
+          api_cid="$(compose ps -q api)"
+          web_cid="$(compose ps -q web)"
+          running_api_image="$(docker inspect --format='{{.Config.Image}}' "${api_cid}")"
+          running_ui_image="$(docker inspect --format='{{.Config.Image}}' "${web_cid}")"
+          echo "API_IMAGE env=${expected_api_image} running=${running_api_image}"
+          echo "UI_IMAGE env=${expected_ui_image} running=${running_ui_image}"
+          if [[ -z "${expected_api_image}" || "${running_api_image}" != "${expected_api_image}" ]]; then
+            echo "ERROR: running api image does not match API_IMAGE"
+            compose ps
+            exit 1
+          fi
+          if [[ -z "${expected_ui_image}" || "${running_ui_image}" != "${expected_ui_image}" ]]; then
+            echo "ERROR: running web image does not match UI_IMAGE"
+            compose ps
+            exit 1
+          fi
+          echo "Running api/web images match env pins"
+
+          echo "Verifying OAuth authorize requests scope=repo via web..."
+          web_oauth_headers="$(mktemp)"
+          curl -sS --max-redirs 0 \
+            -D "${web_oauth_headers}" \
+            -o /dev/null \
+            "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" \
+            || true
+          web_oauth_location="$(tr -d '\r' < "${web_oauth_headers}" \
+            | grep -i '^location:' \
+            | head -n1 \
+            | sed -E 's/^[Ll]ocation:[[:space:]]*//')"
+          rm -f "${web_oauth_headers}"
+          echo "OAuth start Location (web): ${web_oauth_location}"
+          case "${web_oauth_location}" in
+            *'scope=repo'*)
+              echo "OAuth scope=repo confirmed via web path"
+              ;;
+            *)
+              echo "ERROR: OAuth Location missing scope=repo via web on :${WEB_PORT}"
+              compose logs --tail=100 api web
+              exit 1
+              ;;
+          esac
+
+          compose ps
+          exit 0
           REMOTE
 
       - name: Ensure Caddy HTTPS

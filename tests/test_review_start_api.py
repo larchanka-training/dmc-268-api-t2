@@ -447,7 +447,10 @@ async def test_unavailable_admission_is_retryable_and_atomic(
 
 
 async def test_provider_denial_is_canonical_and_atomic(
-    client: httpx.AsyncClient, scope: StartScope, app: FastAPI
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    app: FastAPI,
+    postgres: PostgresHarness,
 ) -> None:
 
     class Denied:
@@ -463,6 +466,15 @@ async def test_provider_denial_is_canonical_and_atomic(
     assert response.status_code == HTTPStatus.FORBIDDEN
     assert response.json()["code"] == "ACCESS_DENIED"
     assert_schema(response, "Error")
+    # The user's token was denied, not the bot's: the integration stays healthy.
+    async with postgres.engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                select(models.Repository.integration_status).where(
+                    models.Repository.id == scope.repository
+                )
+            )
+        ) == "healthy"
 
 
 async def test_provider_failure_is_safe_retryable_unavailable(
@@ -803,6 +815,98 @@ async def test_new_start_is_durable_and_atomic(
             == quota.window_start.microsecond
             == 0
         )
+
+
+async def test_unhealthy_integration_refuses_new_start_and_keeps_access(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    """AC6: an unhealthy repository admits no new review and keeps access links."""
+    async with postgres.engine.begin() as conn:
+        await conn.execute(
+            update(models.Repository)
+            .where(models.Repository.id == scope.repository)
+            .values(integration_status="bot_denied")
+        )
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "INTEGRATION_UNHEALTHY"
+    assert_schema(response, "Error")
+    assert configured.calls == 0
+    async with postgres.engine.connect() as conn:
+        assert not (
+            await conn.execute(
+                select(models.ReviewJob.id).where(
+                    models.ReviewJob.repository_id == scope.repository
+                )
+            )
+        ).all()
+        assert (
+            await conn.scalar(
+                select(models.RepositoryAccess.user_id).where(
+                    models.RepositoryAccess.repository_id == scope.repository
+                )
+            )
+        ) == scope.user
+
+
+@pytest.mark.parametrize("stage", ["pull_request_read", "diff_fetch"])
+async def test_bot_token_denial_marks_integration_unhealthy_and_keeps_access(  # noqa: PLR0913, PLR0917 -- explicit fixture and parameter boundaries
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    providers: FakeStartGithub,
+    postgres: PostgresHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """AC6: a later bot-token denial flags the repository; access is never removed."""
+
+    async def denied(*args: object, **kwargs: object) -> Any:
+        raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+
+    monkeypatch.setattr(
+        providers,
+        "get_pull_request" if stage == "pull_request_read" else "fetch",
+        denied,
+    )
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "INTEGRATION_UNHEALTHY"
+    assert_schema(response, "Error")
+    async with postgres.engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                select(models.Repository.integration_status).where(
+                    models.Repository.id == scope.repository
+                )
+            )
+        ) == "bot_denied"
+        assert (
+            await conn.scalar(
+                select(models.RepositoryAccess.user_id).where(
+                    models.RepositoryAccess.repository_id == scope.repository
+                )
+            )
+        ) == scope.user
+        assert not (
+            await conn.execute(
+                select(models.ReviewJob.id).where(
+                    models.ReviewJob.repository_id == scope.repository
+                )
+            )
+        ).all()
+    providers.calls = 0
+    again = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert again.status_code == HTTPStatus.CONFLICT
+    assert again.json()["code"] == "INTEGRATION_UNHEALTHY"
 
 
 async def test_replay_keeps_frozen_configuration_and_does_not_revalidate(

@@ -68,9 +68,13 @@ def test_deploy_writes_separate_publication_credentials() -> None:
         step for step in steps if step.get("name") == "Write runtime environment"
     )
     assert (
-        runtime["env"]["GITHUB_PUBLISH_TOKEN"] == "${{ secrets.GITHUB__WRITE_TOKEN }}"
+        runtime["env"]["GITHUB_PUBLISH_TOKEN"]
+        == "${{ secrets.STAGING_GITHUB_WRITE_TOKEN }}"
     )
-    assert runtime["env"]["GITHUB_BOT_USER_ID"] == "${{ secrets.GITHUB__BOT_USER_ID }}"
+    assert (
+        runtime["env"]["GITHUB_BOT_USER_ID"]
+        == "${{ secrets.STAGING_GITHUB_BOT_USER_ID }}"
+    )
     # Execute only the environment writer, before its SSH pipe, with synthetic data.
     writer = runtime["run"].split("} | sshpass -e ssh", 1)[0] + "}\n"
     result = subprocess.run(
@@ -101,6 +105,21 @@ def test_deploy_writes_separate_publication_credentials() -> None:
     assert entries["GITHUB__TOKEN"] == '"read-only-synthetic"'
     assert entries["GITHUB__WRITE_TOKEN"] == '"write-synthetic"'
     assert entries["GITHUB__BOT_USER_ID"] == '"12345"'
+
+
+def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
+    """Deploy recreates api/web; fails if authorize Location lacks scope=repo."""
+    workflow = (ROOT / ".github/workflows/deploy-staging.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "compose up -d --force-recreate --no-deps api" in workflow
+    assert "compose up -d --force-recreate --no-deps web" in workflow
+    assert "Verifying OAuth authorize requests scope=repo via web..." in workflow
+    assert "Verifying running images match env pins..." in workflow
+    assert "running api image does not match API_IMAGE" in workflow
+    assert "running web image does not match UI_IMAGE" in workflow
+    assert "*'scope=repo'*)" in workflow
+    assert "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
 
 
 @pytest.mark.skipif(

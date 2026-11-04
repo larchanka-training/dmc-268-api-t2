@@ -19,6 +19,7 @@ from app.application.github_ports import (
     GithubPullRequest,
     GithubRemoteComment,
     GithubRemoteReview,
+    GithubRepositoryMismatch,
     GithubRequest,
     GithubReviewReference,
     GithubSnapshot,
@@ -145,7 +146,7 @@ def _pull_metadata(response: httpx.Response, request: GithubRequest) -> dict[str
     ):
         raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
     if str(base_repo["id"]) != request.repository_external_id:
-        raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+        raise GithubRepositoryMismatch()
     return pull
 
 
@@ -480,7 +481,7 @@ class GithubClient:
                 head = _listed_ref(pull.get("head"))
                 base = _listed_ref(pull.get("base"))
                 if base["repository_external_id"] != repository_external_id:
-                    raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+                    raise GithubRepositoryMismatch()
                 return GithubPullRequest(
                     head_sha=head["sha"],
                     base_sha=base["sha"],
@@ -553,6 +554,46 @@ class GithubClient:
         ):
             raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
         return str(payload["id"]), login
+
+    async def get_collaborator_permission(
+        self, owner: str, name: str, username: str
+    ) -> str:
+        """Return the collaborator's permission on a repository (bot Check access)."""
+        if (
+            not _OWNER.fullmatch(owner)
+            or not _REPOSITORY.fullmatch(name)
+            or name in {".", ".."}
+            or not _OWNER.fullmatch(username)
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        response = await self._get(
+            f"https://api.github.com/repos/{owner}/{name}/collaborators/"
+            f"{username}/permission",
+            "application/vnd.github+json",
+        )
+        payload = _json_object(response)
+        permission = payload.get("permission")
+        role_name = payload.get("role_name")
+        # role_name carries maintain/triage; permission is the coarse admin/write/read.
+        if isinstance(role_name, str) and role_name in {
+            "admin",
+            "maintain",
+            "write",
+            "triage",
+            "read",
+            "none",
+        }:
+            return role_name
+        if isinstance(permission, str) and permission in {
+            "admin",
+            "maintain",
+            "write",
+            "triage",
+            "read",
+            "none",
+        }:
+            return permission
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
 
     async def list_pull_requests(
         self, external_id: str, owner: str, name: str, *, limit: int, page: int

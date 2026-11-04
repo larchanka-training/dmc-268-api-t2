@@ -20,7 +20,10 @@ if [[ "$1" == inspect ]]; then
   elif [[ "$*" == *Config.Image* ]]; then
     cid="${@: -1}"
     env_file="${ENV_FILE:-.env.test}"
-    if [[ "$cid" == *web* ]]; then
+    if [[ "$cid" == cid-publication-worker &&
+          "${PUBLICATION_IMAGE_MISMATCH:-0}" == 1 ]]; then
+      echo api:unexpected
+    elif [[ "$cid" == *web* ]]; then
       grep -E '^UI_IMAGE=' "${env_file}" | tail -n1 | cut -d= -f2-
     else
       grep -E '^API_IMAGE=' "${env_file}" | tail -n1 | cut -d= -f2-
@@ -29,6 +32,15 @@ if [[ "$1" == inspect ]]; then
     echo running
   fi
   exit 0
+fi
+
+publication_check="publication-worker python -m app.publication_worker --check-config"
+if [[ "$*" == *"${publication_check}"* ]]; then
+  exit "${PUBLICATION_PREFLIGHT_FAILURE:-0}"
+fi
+if [[ "$1" == compose && " $* " == *" up -d "* &&
+      " $* " == *" publication-worker "* ]]; then
+  exit "${PUBLICATION_START_FAILURE:-0}"
 fi
 
 if [[ "$*" == *"worker python -c"* ]]; then

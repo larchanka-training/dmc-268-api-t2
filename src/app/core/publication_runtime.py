@@ -16,18 +16,29 @@ class PublicationConfigError(ValueError):
     """Publication is explicitly disabled until its own credentials are present."""
 
 
-@asynccontextmanager
-async def github_publisher_connection(
-    settings: Settings,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> AsyncIterator[GithubClient]:
+def validate_publication_settings(settings: Settings) -> None:
+    """Check local publication configuration without connecting to any service."""
     token = settings.github.write_token.get_secret_value()
     if not token.strip() or not settings.github.bot_user_id:
         raise PublicationConfigError(
             "GitHub publication credentials require GITHUB__WRITE_TOKEN "
             "and GITHUB__BOT_USER_ID"
         )
+    if not token.isascii() or any(
+        ord(char) <= 32 or ord(char) == 127  # noqa: PLR2004 -- ASCII controls
+        for char in token
+    ):
+        raise PublicationConfigError("GitHub publication write credential is invalid")
+
+
+@asynccontextmanager
+async def github_publisher_connection(
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> AsyncIterator[GithubClient]:
+    validate_publication_settings(settings)
+    token = settings.github.write_token.get_secret_value()
     headers = {
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "dmc-268-api-t2",

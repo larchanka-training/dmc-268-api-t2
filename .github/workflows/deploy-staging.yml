@@ -665,7 +665,9 @@ jobs:
           fi
 
           echo "Starting API..."
-          compose up -d api
+          # Force recreate so a pulled sha-* tag cannot leave an old container
+          # answering /auth/github/start (staging had Location without scope=repo).
+          compose up -d --force-recreate --no-deps api
 
           echo "Waiting for API healthcheck..."
           for attempt in $(seq 1 30); do
@@ -696,6 +698,21 @@ jobs:
 
             sleep 2
           done
+
+          echo "Verifying OAuth authorize requests scope=repo..."
+          compose exec -T api python -c "import inspect; from app.api.github_auth import start_github_oauth; src = inspect.getsource(start_github_oauth); assert '\"scope\": \"repo\"' in src, src; print('start_github_oauth source includes scope=repo')"
+          oauth_location="$(compose exec -T api python -c "import httpx; r = httpx.get('http://127.0.0.1:8000/api/v1/auth/github/start', follow_redirects=False, timeout=10.0); print(r.headers.get('location') or '')" | tr -d '\r')"
+          echo "OAuth start Location: ${oauth_location}"
+          case "${oauth_location}" in
+            *'scope=repo'*)
+              echo "OAuth scope=repo confirmed on running API"
+              ;;
+            *)
+              echo "ERROR: OAuth Location missing scope=repo"
+              compose logs --tail=100 api
+              exit 1
+              ;;
+          esac
 
           echo "Starting workers..."
           compose up -d webhook-worker "${analysis_services[@]}"

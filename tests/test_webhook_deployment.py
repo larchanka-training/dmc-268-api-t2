@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from test_publication_deployment import deploy_remote
 
 ROOT = Path(__file__).parents[1]
 
@@ -229,3 +231,83 @@ def test_runtime_secret_survives_compose_env_file(
             check=True,
             timeout=30,
         )
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose is required")
+def test_rendered_recovery_can_resolve_frozen_admission_and_personal_admin() -> None:
+    """Automatic recovery needs only the trusted manifest and credential key."""
+    rendered = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            str(ROOT / "docker-compose.staging.yml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        env={
+            "PATH": os.environ["PATH"],
+            "API_IMAGE": "api:synthetic",
+            "UI_IMAGE": "ui:synthetic",
+            "POSTGRES__USER": "test",
+            "POSTGRES__PASSWORD": "synthetic-db",
+            "POSTGRES__DB": "test",
+            "ANALYSIS_RUNTIME_DIR": "/opt/dmc-268-t2-runtime/analysis-runtime",
+            "ANALYSIS__CONFIG_PATH": "/app/runtime/analysis-runtime.v1.json",
+            "AUTH__CREDENTIAL_KEY": "synthetic-credential-key",
+            "AUTH__JWT_SECRET": "synthetic-browser-secret",
+            "AUTH__GITHUB_CLIENT_SECRET": "synthetic-client-secret",
+            "GITHUB__WRITE_TOKEN": "synthetic-write-token",
+            "LLM__EUROROUTER__API_KEYS": "synthetic-llm-key",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    recovery = json.loads(rendered.stdout)["services"]["webhook-worker"]
+    environment = recovery["environment"]
+    assert environment.get("AUTH__CREDENTIAL_KEY") == "synthetic-credential-key"
+    assert (
+        environment.get("ANALYSIS__CONFIG_PATH")
+        == "/app/runtime/analysis-runtime.v1.json"
+    )
+    assert any(
+        mount["target"] == "/app/runtime"
+        and mount["read_only"] is True
+        and mount["source"] == "/opt/dmc-268-t2-runtime/analysis-runtime"
+        for mount in recovery["volumes"]
+    )
+    for variable in (
+        "AUTH__JWT_SECRET",
+        "AUTH__GITHUB_CLIENT_SECRET",
+        "GITHUB__WRITE_TOKEN",
+        "LLM__EUROROUTER__API_KEYS",
+    ):
+        assert variable not in environment
+
+
+def test_rollout_quiesces_previous_intake_before_new_api_or_migrations(
+    tmp_path: Path,
+) -> None:
+    result, calls = deploy_remote(tmp_path, analysis="false", publication="false")
+    assert result.returncode == 0, result.stderr
+    stops = [i for i, call in enumerate(calls) if " stop webhook-worker" in call]
+    assert stops, (
+        "The old L1-only consumer must not consume newly selected automatic receipts"
+    )
+    migrated = next(i for i, call in enumerate(calls) if "alembic upgrade head" in call)
+    api_started = next(
+        i
+        for i, call in enumerate(calls)
+        if "up -d --force-recreate --no-deps api" in call
+    )
+    recovery_started = next(
+        i
+        for i, call in enumerate(calls)
+        if " up -d " in call and "webhook-worker" in call
+    )
+    assert stops[0] < migrated < api_started < recovery_started

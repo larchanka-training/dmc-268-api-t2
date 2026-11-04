@@ -166,17 +166,31 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         f"head={review.head_sha} config={review.config_digest} -->"
     )
     files = "\n".join(f"- {item['path']}" for item in review.coverage["included"])
-    risks = "\n".join(f"- {item.severity}: {item.title}" for item in review.findings)
-    if not risks:
+    severity = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    eligible = tuple(
+        item
+        for item in review.findings
+        if severity.get(item.severity, 4) <= severity[review.minimum_severity]
+    )
+    summary = review.summary
+    risks = "\n".join(f"- {item.severity}: {item.title}" for item in eligible)
+    if review.minimum_severity != "low":
+        summary = (
+            "Проверка завершена. Минимальный уровень серьёзности: "
+            f"{review.minimum_severity}. "
+            f"Замечаний на выбранном уровне: {len(eligible)}."
+        )
+        if not risks:
+            risks = "На выбранном уровне серьёзности замечаний нет."
+    elif not risks:
         risks = "Замечаний не обнаружено в проверенной части изменений."
     skipped = "\n".join(
         f"- {item['path']}: {item['reason']}" for item in review.coverage["skipped"]
     )
     unique: dict[str, PersistedFinding] = {}
-    for item in review.findings:
+    for item in eligible:
         if _publishable(item, review):
             unique.setdefault(item.fingerprint, item)
-    severity = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     publishable = sorted(
         unique.values(),
         key=lambda item: (
@@ -210,7 +224,7 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         }
         for item in publishable
     )
-    omitted = len(review.findings) - len(comments)
+    omitted = len(eligible) - len(comments)
     return PreparedGithubReview(
         request=GithubRequest(
             review.owner,
@@ -222,7 +236,7 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         ),
         marker=marker,
         body=mask_secrets(
-            f"{marker}\n## Обзор AI-ревью\n\n{review.summary}\n\n"
+            f"{marker}\n## Обзор AI-ревью\n\n{summary}\n\n"
             f"Проверенные файлы:\n{files}\n\nРиски:\n{risks}"
             f"\n\nНе опубликованы inline: {omitted}"
             f"\n\nНе проверены:\n{skipped or 'Нет пропущенных файлов.'}"

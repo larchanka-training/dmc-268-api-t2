@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 from uuid import UUID
 
+from app.application.webhook_ports import AutomaticReceiptContext
+
 
 class IdempotencyConflictError(Exception):
     """A live scoped key belongs to another request."""
@@ -77,3 +79,39 @@ class ReviewConfigurationResolver(Protocol):
     ) -> FrozenAnalysisConfiguration:
         """Resolve immutable server-owned identities outside DB transactions."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewAdmissionRequest:
+    actor_id: UUID
+    repository_id: UUID
+    number: int
+    requested_head_sha: str
+    rerun_of: str | None
+    idempotency_key: str
+    trace_id: str
+    automatic: AutomaticReceiptContext | None = None
+
+
+class ReviewAdmissionError(Exception):
+    """Safe typed refusal shared by HTTP and durable intake adapters."""
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+class AutomaticReceiptClaimLostError(Exception):
+    """The trusted delivery/intent/fence no longer authorizes new admission."""

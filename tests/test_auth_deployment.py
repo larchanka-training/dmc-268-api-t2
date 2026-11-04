@@ -1,4 +1,4 @@
-"""Browser auth settings reach only the staging API container."""
+"""Browser login secrets stay in API; automatic recovery can decrypt saved OAuth."""
 
 import os
 import subprocess
@@ -25,8 +25,11 @@ def test_deploy_forwards_browser_auth_only_to_api() -> None:
     assert services["api"]["environment"] | _API_AUTH == services["api"]["environment"]
     for name, service in services.items():
         if name != "api":
-            for variable in _API_AUTH:
-                assert variable not in service.get("environment", {})
+            for variable, expected in _API_AUTH.items():
+                if name == "webhook-worker" and variable == "AUTH__CREDENTIAL_KEY":
+                    assert service["environment"][variable] == expected
+                else:
+                    assert variable not in service.get("environment", {})
 
     example = (ROOT / ".env.staging.example").read_text(encoding="utf-8")
     for variable in _API_AUTH:

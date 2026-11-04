@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from app.application.github_ports import GithubFailure, GithubRequest
+from app.domain.repository_policy import AutomaticReviewIntent
 
 
 class InboxUnavailable(Exception):  # noqa: N818 - application boundary failure
@@ -22,6 +23,8 @@ class WebhookDelivery:
     raw_diff: str | None
     reason_code: str | None
     ignore_globs: tuple[str, ...]
+    automatic: AutomaticReviewIntent | None = None
+    review_job_id: UUID | None = None
 
 
 class WebhookInbox(Protocol):
@@ -43,3 +46,14 @@ class WebhookInbox(Protocol):
     async def pending(
         self, *, now: datetime | None = None, limit: int = 100
     ) -> list[UUID]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AutomaticReceiptContext:
+    claim: WebhookDelivery
+    snapshot: dict[str, Any]
+    raw_diff: str
+
+
+class AutomaticWebhookAdmission(Protocol):
+    async def admit(self, context: AutomaticReceiptContext) -> None: ...

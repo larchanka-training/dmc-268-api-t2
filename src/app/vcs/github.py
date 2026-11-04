@@ -28,7 +28,9 @@ from app.application.github_ports import (
     GithubWriteFailure,
     RepositoryFile,
     RepositoryFileRejected,
+    RepositoryRevision,
 )
+from app.domain.repository_policy import MAX_BRANCH_NAME_BYTES
 
 __all__ = ["GithubClient", "GithubFailure", "GithubRequest", "GithubSnapshot"]
 
@@ -615,6 +617,43 @@ class GithubClient:
             raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
         item["role"] = "admin" if payload["permissions"]["admin"] else "reviewer"
         return item
+
+    async def resolve_default_branch(self, external_id: str) -> RepositoryRevision:
+        """Re-resolve the moving default branch before immutable file/cache reads."""
+        if not _EXTERNAL_ID.fullmatch(external_id):
+            raise GithubFailure("VCS_ACCESS_DENIED", False)
+        payload = _json_object(
+            await self._get(
+                f"https://api.github.com/repositories/{external_id}",
+                "application/vnd.github+json",
+            )
+        )
+        item = _available_repository(payload)
+        if item is None or item["external_id"] != external_id:
+            raise GithubFailure("VCS_ACCESS_DENIED", False)
+        branch = payload.get("default_branch")
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or len(branch.encode("utf-8")) > MAX_BRANCH_NAME_BYTES
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        response = _json_object(
+            await self._get(
+                f"https://api.github.com/repos/{item['owner']}/{item['name']}"
+                f"/branches/{quote(branch, safe='')}",
+                "application/vnd.github+json",
+            )
+        )
+        commit = response.get("commit")
+        revision = commit.get("sha") if isinstance(commit, dict) else None
+        if (
+            response.get("name") != branch
+            or not isinstance(revision, str)
+            or not _SHA.fullmatch(revision)
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        return RepositoryRevision(item["owner"], item["name"], branch, revision)
 
     async def get_identity(self, token: str) -> tuple[str, str]:
         """Resolve the authenticated user using only the exchanged user token."""

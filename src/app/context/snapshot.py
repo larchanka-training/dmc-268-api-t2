@@ -25,15 +25,21 @@ _FIELDS = (
 
 
 def capture_settings(settings: RepositorySettings) -> dict[str, Any]:
-    return {
+    values = {
         "id": settings.id,
         **{key: deepcopy(getattr(settings, key)) for key in _FIELDS},
     }
+    if settings.review_policy is not None:
+        values["review_policy"] = deepcopy(settings.review_policy)
+    return values
 
 
 def snapshot_id(values: dict[str, Any]) -> UUID:
+    payload = {key: values[key] for key in (*_FIELDS, "rules_source")}
+    if values.get("review_policy") is not None:
+        payload["review_policy"] = values["review_policy"]
     canonical = json.dumps(
-        {key: values[key] for key in (*_FIELDS, "rules_source")},
+        payload,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),

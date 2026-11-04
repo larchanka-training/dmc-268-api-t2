@@ -23,6 +23,7 @@ from app.application.review_start_ports import (
     SettingsVersionChangedError,
 )
 from app.application.use_cases.start_review import compute_config_digest
+from app.context.snapshot import valid_snapshot
 from app.db.models import (
     ChangeRequest,
     IdempotencyRecord,
@@ -154,6 +155,29 @@ async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimisti
     saved.description = live.description
 
 
+async def _verify_effective_settings(
+    session: AsyncSession,
+    command: StartReviewCommand,
+    source_id: UUID,
+    expected_settings: str,
+    repository_id: UUID,
+) -> None:
+    if source_id != command.repository_settings_id:
+        effective = await session.get(
+            RepositorySettings, command.repository_settings_id
+        )
+        if (
+            effective is None
+            or effective.repository_id != repository_id
+            or not valid_snapshot(effective)
+            or effective.rules_source is None
+            or effective.rules_source.get("source_settings_id") != str(source_id)
+            or effective.rules_source.get("source_settings_identity")
+            != expected_settings
+        ):
+            raise SettingsVersionChangedError
+
+
 async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with optional materialization
     command: StartReviewCommand,
     *,
@@ -166,6 +190,7 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
     expected_settings: str,
     new_change: GithubPullRequest | None = None,
     saved_change: ChangeRequestIdentity | None = None,
+    source_settings_id: UUID | None = None,
 ) -> tuple[UUID, str, bool]:
     repository_id = expected_repository.id
     async with SqlAlchemyUnitOfWork(factory) as uow:
@@ -198,7 +223,9 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
             != expected_repository
         ):
             raise AdmissionResourceNotFoundError
-        if repository.current_settings_id != command.repository_settings_id:
+        if repository.current_settings_id != (
+            source_id := source_settings_id or command.repository_settings_id
+        ):
             raise SettingsVersionChangedError
         if new_change is not None and saved_change is not None:
             await _refresh_saved_change(
@@ -276,13 +303,16 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
         settings = await uow.session.scalar(
             select(RepositorySettings)
             .where(
-                RepositorySettings.id == command.repository_settings_id,
+                RepositorySettings.id == source_id,
                 RepositorySettings.repository_id == repository_id,
             )
             .with_for_update(read=True)
         )
         if settings is None or settings_identity(settings) != expected_settings:
             raise SettingsVersionChangedError
+        await _verify_effective_settings(
+            uow.session, command, source_id, expected_settings, repository_id
+        )
         config_digest = compute_config_digest(command)
         equivalent = await uow.session.scalar(
             select(ReviewJob.id).where(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import re
@@ -11,6 +12,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -24,6 +26,8 @@ from app.application.github_ports import (
     GithubReviewReference,
     GithubSnapshot,
     GithubWriteFailure,
+    RepositoryFile,
+    RepositoryFileRejected,
 )
 
 __all__ = ["GithubClient", "GithubFailure", "GithubRequest", "GithubSnapshot"]
@@ -434,6 +438,98 @@ class GithubClient:
         self._timeout_seconds = timeout_seconds
         self._authorize = authorize
 
+    async def read_file(  # noqa: PLR0913 -- implements RepositoryFileReader identity contract
+        self,
+        owner: str,
+        name: str,
+        external_id: str,
+        revision: str,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> RepositoryFile | None:
+        """Read a file from one immutable revision using the existing transport."""
+        await self.authorize_revision(owner, name, external_id, revision)
+        url = (
+            f"https://api.github.com/repos/{owner}/{name}/contents/"
+            f"{quote(path, safe='/')}"
+        )
+        response = await self._get(
+            f"{url}?ref={revision}",
+            "application/vnd.github+json",
+            missing_file=True,
+            response_limit=max_bytes * 2 + 8192,
+        )
+        if response.status_code == HTTPStatus.NOT_FOUND:
+            return None
+        item = _json_object(response)
+        if not isinstance(item.get("sha"), str) or not _SHA.fullmatch(item["sha"]):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        if item.get("type") != "file":
+            raise RepositoryFileRejected("unsupported_file_type", blob_sha=item["sha"])
+        if item.get("encoding") != "base64":
+            raise RepositoryFileRejected("invalid_encoding", blob_sha=item["sha"])
+        if type(item.get("size")) is not int or item["size"] < 0:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        if item["size"] > max_bytes:
+            raise RepositoryFileRejected("file_too_large", blob_sha=item["sha"])
+        try:
+            raw = base64.b64decode("".join(item["content"].split()), validate=True)
+        except ValueError, TypeError, AttributeError:
+            raise RepositoryFileRejected(
+                "invalid_encoding", blob_sha=item["sha"]
+            ) from None
+        if len(raw) > max_bytes:
+            raise RepositoryFileRejected("file_too_large", blob_sha=item["sha"])
+        try:
+            return RepositoryFile(raw.decode("utf-8"), item["sha"])
+        except UnicodeError:
+            raise RepositoryFileRejected("invalid_utf8", blob_sha=item["sha"]) from None
+
+    async def authorize_revision(
+        self, owner: str, name: str, external_id: str, revision: str
+    ) -> None:
+        root = f"https://api.github.com/repos/{owner}/{name}"
+        repository = _json_object(await self._get(root, "application/vnd.github+json"))
+        if str(repository.get("id")) != external_id:
+            raise GithubRepositoryMismatch()
+        commit = _json_object(
+            await self._get(f"{root}/commits/{revision}", "application/vnd.github+json")
+        )
+        if commit.get("sha") != revision:
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+
+    async def read_file_by_id(
+        self,
+        external_id: str,
+        revision: str,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> RepositoryFile | None:
+        if not _EXTERNAL_ID.fullmatch(external_id):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        repository = _json_object(
+            await self._get(
+                f"https://api.github.com/repositories/{external_id}",
+                "application/vnd.github+json",
+            )
+        )
+        owner = repository.get("owner", {}).get("login")
+        name = repository.get("name")
+        if (
+            str(repository.get("id")) != external_id
+            or not isinstance(owner, str)
+            or not _OWNER.fullmatch(owner)
+            or not isinstance(name, str)
+            or not _REPOSITORY.fullmatch(name)
+            or name in {".", ".."}
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", False)
+        return await self.read_file(
+            owner, name, external_id, revision, path, max_bytes=max_bytes
+        )
+
     async def get_pull_request(
         self, owner: str, name: str, repository_external_id: str, number: int
     ) -> GithubPullRequest:
@@ -808,13 +904,15 @@ class GithubClient:
         except TimeoutError:
             raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
 
-    async def _get(
+    async def _get(  # noqa: PLR0913 -- existing transport with file absence and response bound
         self,
         url: str,
         accept: str,
         *,
         token: str | None = None,
         missing_pull: bool = False,
+        missing_file: bool = False,
+        response_limit: int = _MAX_RESPONSE_BYTES,
     ) -> httpx.Response:
         if self._authorize is not None:
             await self._authorize()
@@ -825,6 +923,8 @@ class GithubClient:
             async with self._client.stream(
                 "GET", url, headers=headers, follow_redirects=False
             ) as response:
+                if missing_file and response.status_code == HTTPStatus.NOT_FOUND:
+                    return httpx.Response(HTTPStatus.NOT_FOUND)
                 if missing_pull and response.status_code == HTTPStatus.NOT_FOUND:
                     raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
                 ambiguous_forbidden = (
@@ -836,10 +936,10 @@ class GithubClient:
                     _check_status(response)
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
-                    limit = (
-                        _MAX_ERROR_BYTES if ambiguous_forbidden else _MAX_RESPONSE_BYTES
-                    )
+                    limit = _MAX_ERROR_BYTES if ambiguous_forbidden else response_limit
                     if len(content) + len(chunk) > limit:
+                        if missing_file and not ambiguous_forbidden:
+                            raise RepositoryFileRejected("file_too_large")
                         reason = (
                             "VCS_ACCESS_DENIED"
                             if ambiguous_forbidden

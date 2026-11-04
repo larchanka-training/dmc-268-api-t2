@@ -55,8 +55,9 @@ reductions fail, and the resulting prompt carries a limitation and reports the
 rules actually sent. The final repaired/overflow prompt owns the `rule_ref`
 whitelist. Unknown labels are rejected by deterministic validation.
 
-`AdmissionSelection` accepts v1/v2/v3, trusted manifests pin a bundle digest, and
-preflight verifies all supported closures and saved active-job configurations.
+`AdmissionSelection` accepts v1/v2/v3/v4, trusted manifests pin a bundle digest, and
+preflight verifies historical closures, the selected bundle and saved active-job
+configurations.
 Historical jobs resolve their saved prompt/policy/settings identity. No default
 switch enables v3: use an explicit trusted admission selection and matching
 verified digest. Existing LLM defaults remain v1; resolver defaults remain v2.
@@ -82,3 +83,15 @@ Migration 0014 adds nullable `finding.rule_ref` after 0013; historical migration
 are unchanged. Retained v1/v2 results can be read and reused without another LLM
 call, including terminal recovery after ContextPayload retention has removed
 its source payload. No stored result, fingerprint, policy or digest is rewritten.
+
+## V4 source context
+
+Bundle digest: `3658c8c09838eff2e09409a295ca8ed685c8fb98104f91378b68e09366590dd1`.
+
+Issue #23 adds an explicitly selected verified `review-renderer-v4` bundle using
+provider/result schema2. It renders persisted source windows and AST symbols as
+untrusted data, neutralizes protected blocks/chat role markers, and drops optional
+AST before diff or rules. Frozen base rules and structured refs/severity/default
+provenance are described in [repository-context.md](repository-context.md).
+Historical artifacts and default activation are unchanged. The durable Reflection
+gap remains owned by #25.

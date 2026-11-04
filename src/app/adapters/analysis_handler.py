@@ -16,7 +16,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_authority import current_analysis_authority
-from app.application.github_ports import GithubFailure, GithubPort, GithubRequest
+from app.application.github_ports import (
+    GithubFailure,
+    GithubPort,
+    GithubRequest,
+    SourceFileReader,
+)
 from app.application.ports import (
     BuiltContextPayload,
     DurableTaskOutcome,
@@ -28,6 +33,7 @@ from app.application.ports import (
     TaskLeaseSnapshot,
     TokenUsage,
 )
+from app.context.enrichment import enrich_context
 from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
     ChangeRequest,
@@ -347,6 +353,7 @@ class PostgresAnalysisHandler:
                 review.base_sha or change.base_sha,
             )
             settings_id = settings.id
+            context_enabled = review.prompt_version == "v4"
             language = settings.output_language
             ignores = list(
                 project_historical_empty_settings(settings.ignores, "globs")["globs"]
@@ -403,6 +410,8 @@ class PostgresAnalysisHandler:
             },
         }
         context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
+        if context_enabled:
+            await enrich_context(body, cast(SourceFileReader, self._github))
         # Use the Gateway's token estimator for the complete wire, including IDs.
         # Iterate until the estimate's own decimal width is accounted for.
         counter = ConservativeTokenCounter()
@@ -412,6 +421,19 @@ class PostgresAnalysisHandler:
             )
         ) > body["budget"]["estimated_input_tokens"]:
             body["budget"]["estimated_input_tokens"] = estimated
+        if estimated > limit and context_enabled:
+            for file in body["files"]:
+                file["source_windows"] = []
+                file["whole_file"] = None
+            body["related_symbols"] = []
+            body["coverage"]["context_quality"] = "degraded"
+            body["budget"]["estimated_input_tokens"] = 0
+            while (
+                estimated := counter.count(
+                    json.dumps(context.to_wire(), ensure_ascii=False)
+                )
+            ) > body["budget"]["estimated_input_tokens"]:
+                body["budget"]["estimated_input_tokens"] = estimated
         if estimated > limit:
             coverage = {
                 "included": [],

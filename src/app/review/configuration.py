@@ -25,6 +25,7 @@ from app.application.review_start_ports import (
     RepositoryIdentity,
 )
 from app.application.use_cases.start_review import compute_config_digest
+from app.context.snapshot import valid_snapshot
 from app.db.models import RepositorySettings, ReviewJob
 from app.domain.frozen_configuration import (
     Digest,
@@ -77,6 +78,10 @@ class ExecutionConfiguration:
     ignores: tuple[str, ...]
     surrounding_lines: int
     service_settings: ExecutionSettings
+    rule_severities: tuple[tuple[str, str], ...] = ()
+    rules_source_state: str | None = None
+    rules_diagnostics: tuple[str, ...] = ()
+    allowed_rule_refs: frozenset[str] | None = None
 
     def validate_context(self, payload: ContextPayload) -> None:
         if (
@@ -155,7 +160,7 @@ class ProfileDescriptor(FrozenDTO):
 class AdmissionSelection(FrozenDTO):
     primary: ModelRoute
     policy: ModelSettings
-    prompt_version: Literal["v1", "v2", "v3"]
+    prompt_version: Literal["v1", "v2", "v3", "v4"]
     prompt_digest: Digest
 
 
@@ -356,6 +361,8 @@ class FrozenConfigurationReader:
             settings = await session.get(RepositorySettings, job.repository_settings_id)
             if settings is None or settings.repository_id != job.repository_id:
                 raise FrozenConfigurationError("repository_settings_mismatch")
+            if not valid_snapshot(settings):
+                raise FrozenConfigurationError("rules_snapshot_mismatch")
             try:
                 policy = ModelSettings.from_stored(job.model_settings)
                 primary = ModelRoute(
@@ -453,6 +460,24 @@ class FrozenConfigurationReader:
                 ),
                 surrounding_lines=settings.surrounding_lines,
                 service_settings=service,
+                allowed_rule_refs=frozenset(
+                    settings.rules_source.get("file", {}).get("allowed_rule_refs", [])
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else None,
+                rules_diagnostics=tuple(
+                    settings.rules_source.get("file", {}).get("diagnostics", [])
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else (),
+                rules_source_state=settings.rules_source.get("file", {}).get("state")
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else None,
+                rule_severities=tuple(
+                    settings.rules_source.get("file", {}).get("severities", {}).items()
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else (),
             )
 
 
@@ -528,6 +553,10 @@ class FrozenAdmissionResolver:
         self._policy = policy
         self._version = prompt_version
         self._digest = prompt_digest
+
+    @property
+    def context_enabled(self) -> bool:
+        return self._version == "v4"
 
     async def resolve(
         self, *, repository: RepositoryIdentity, settings_id: UUID, rules_digest: str

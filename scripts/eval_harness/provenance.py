@@ -7,6 +7,7 @@ from typing import Any
 
 from app.review.prompt import PromptBuilder
 from scripts.eval_harness.dataset import dataset_file, load_manifest
+from scripts.eval_harness.runtime import MODEL_METADATA_POLICY
 
 MATCHING_POLICY = "path-side-category-overlap-greedy-one-to-one-production-anchor/v2"
 
@@ -55,6 +56,7 @@ def replay_provenance(
         "prompt_digest": builder.prompt_digest,
         "schema_sha256": digest(json.loads(builder.output_schema_json)),
         "matching_policy": MATCHING_POLICY,
+        "model_metadata_policy": MODEL_METADATA_POLICY,
     }
     return {
         **config,

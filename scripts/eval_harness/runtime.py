@@ -4,6 +4,7 @@ This is not a worker E2E: admission/fencing/repair/publication are tested by the
 existing application integration suites. Deterministic mode replaces HTTP only.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from app.review.schemas.result import provider_output_model
 from app.vcs.diff import parse_diff
 from scripts.eval_harness.dataset import Fixture
 
+MODEL_METADATA_POLICY = "opaque-case-sha256-title-empty-body/v1"
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -39,6 +42,7 @@ class Observation:
 def fixture_context(fixture: Fixture) -> ContextPayload:
     parsed = parse_diff(fixture.diff_text)
     key = str(uuid5(UUID(int=0), fixture.id))
+    case_digest = hashlib.sha256(fixture.id.encode()).hexdigest()
     return ContextPayload.model_validate(
         {
             "schema_version": 1,
@@ -58,8 +62,8 @@ def fixture_context(fixture: Fixture) -> ContextPayload:
                 },
             },
             "metadata": {
-                "title": fixture.title,
-                "body": fixture.description,
+                "title": f"Benchmark case {case_digest}",
+                "body": "",
                 "base_ref": "main",
                 "head_ref": "benchmark",
                 "commit_messages": [],

@@ -71,6 +71,14 @@ labels, replays and license files; output location is excluded. Fixed content an
 configuration produce identical offline reports. `--filter <category>` selects a
 subset; the report records it and retains the full corpus digest.
 
+Model metadata policy `opaque-case-sha256-title-empty-body/v1`: inference uses a
+stable opaque SHA-256 case title and an empty body. Human fixture titles,
+descriptions, categories, IDs and expected labels are not inserted as PR metadata;
+source paths and diff content remain the actual review input. Original dataset
+metadata/diffs/labels and corpus SHA stay unchanged. The policy is included in
+provenance/config identity; old Gateway replays using descriptive metadata are
+not a comparable model-quality baseline. No live measurement preceded this fix.
+
 Matching policy `path-side-category-overlap-greedy-one-to-one-production-anchor/v2`:
 only schema-valid predictions with a changed start and entire range within the
 same hunk can match (trailing context allowed), using production

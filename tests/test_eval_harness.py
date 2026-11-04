@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -749,3 +750,80 @@ def test_style_only_examples_are_clean_false_positive_controls() -> None:
         assert fixture.category == "clean"
         assert fixture.expected_findings == []
         assert fixture.golden_response["findings"] == []
+
+
+async def test_gateway_messages_do_not_reveal_ground_truth_metadata() -> None:
+    fixture = replace(
+        load_dataset(Path(__file__).parents[1] / "test-prs-dataset")[0],
+        id="ground-truth-case-id-do-not-transmit",
+        title="GROUND_TRUTH_TITLE_c197_sql_injection",
+        description="GROUND_TRUTH_DESCRIPTION_f238_expected_bug_at_line_two",
+    )
+    builder = PromptBuilder.load(Path(__file__).parents[1] / ".agents/reviewer", "v3")
+    sent: list[str] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.extend(message["content"] for message in body["messages"])
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture",
+                "choices": [
+                    {"message": {"content": json.dumps(fixture.golden_response)}}
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
+        gateway = LLMGateway(
+            [
+                ProviderPool(
+                    "mock",
+                    [
+                        Endpoint(
+                            OpenAICompatibleClient(
+                                name="mock",
+                                http=http,
+                                base_url="https://fixture.invalid",
+                                model="fixture",
+                                api_key="fixture",
+                            )
+                        )
+                    ],
+                    timeout_s=120,
+                )
+            ]
+        )
+        observation = await gateway_response(
+            fixture, builder, gateway, RunBudget(BudgetLimits(1, 80000, 16000, 600))
+        )
+    assert observation.requests == 1
+    messages = "\n".join(sent)
+    assert fixture.title not in messages
+    assert fixture.description not in messages
+    assert fixture.id not in messages
+    context = fixture_context(fixture)
+    assert context.metadata.title.startswith("Benchmark case ")
+    assert context.metadata.body == ""
+    assert context.metadata.title == fixture_context(fixture).metadata.title
+
+
+def test_report_identifies_the_metadata_policy_without_changing_corpus(
+    tmp_path: Path,
+) -> None:
+    report = run(["--report-out", str(tmp_path / "report.json")])
+    provenance = report["provenance"]
+    assert (
+        provenance["model_metadata_policy"] == "opaque-case-sha256-title-empty-body/v1"
+    )
+    assert (
+        provenance["dataset_sha256"]
+        == "b7c2ad5a5ff606d4985af74191143fbf106e5aeabcd9b96f209397b1075f5396"
+    )
+    # Independent vector from the actual4363f90 offline CI artifact.
+    assert (
+        provenance["config_sha256"]
+        != "88df9a6f480462de6218938d93bd9c18419d0253c81c9f4b41e2c12943277f88"
+    )

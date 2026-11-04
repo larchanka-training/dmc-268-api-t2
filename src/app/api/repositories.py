@@ -9,8 +9,6 @@ from contextlib import suppress
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-import httpx
-from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import delete, insert, literal, select, tuple_, update
@@ -27,15 +25,18 @@ from app.api.auth import (
 from app.api.errors import ApiError
 from app.application.github_ports import GithubFailure, GithubRepositoryReader
 from app.core.config import Settings, get_settings
+from app.core.github_runtime import (
+    CredentialUnavailableError,
+    stored_github_token,
+    user_github_client,
+)
 from app.db.models import (
-    GithubIdentity,
     Repository,
     RepositoryAccess,
     RepositorySettings,
 )
 from app.db.session import get_session
 from app.domain.settings import compute_rules_digest
-from app.vcs.github import GithubClient
 
 router = APIRouter(prefix="/api/v1/repositories")
 _MAX_LIMIT = 100
@@ -52,36 +53,13 @@ async def get_repository_reader(
 ) -> AsyncIterator[GithubRepositoryReader]:
     """Use only the verified browser user's stored OAuth credential."""
     try:
-        cipher = Fernet(settings.auth.credential_key.get_secret_value())
-        encrypted = await session.scalar(
-            select(GithubIdentity.encrypted_token).where(
-                GithubIdentity.user_id == principal.user_id
-            )
-        )
-        await session.close()
-        if not encrypted:
-            raise ValueError("Missing credential")
-        token = cipher.decrypt(encrypted.encode()).decode()
-        if (
-            not token
-            or not token.isascii()
-            or any(ord(char) <= 32 or ord(char) == 127 for char in token)  # noqa: PLR2004
-        ):
-            raise ValueError("Invalid credential")
-    except InvalidToken, ValueError, UnicodeError, SQLAlchemyError, OSError:
+        token = await stored_github_token(settings, session, principal.user_id)
+    except CredentialUnavailableError:
         raise ApiError(
             503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
         ) from None
-    async with httpx.AsyncClient(
-        headers={
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "dmc-268-api-t2",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        timeout=15,
-        follow_redirects=False,
-    ) as client:
-        yield GithubClient(client)
+    async with user_github_client(token) as client:
+        yield client
 
 
 @router.get("", operation_id="listRepositories")

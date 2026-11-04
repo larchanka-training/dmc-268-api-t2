@@ -9,10 +9,9 @@ Cycle 2 models a real new commit: the PR head moves to a fresh SHA before the
 second cycle publishes, so the cycle semantics are exercised on a new push,
 not a re-delivery of the old head.
 
-Known limitation, not the target contract: a cross-cycle repeat of the same
-finding on an unchanged line is still published (markers are review-scoped).
-Suppressing such repeats is the open sprint-4 acceptance (issue #53,
-dmc-268-ui-t2#28/#33); this test pins today's behavior until it lands.
+Cross-cycle repeats (#53): without incremental review the same finding on an
+unchanged line is published again (markers are review-scoped); with it, a
+fingerprint an earlier cycle posted is suppressed. Both modes are pinned.
 """
 
 # ruff: noqa: PLR2004 -- literal post and review counts
@@ -22,6 +21,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import httpx
+import pytest
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from test_github_publisher_postgres import FakeGithub, setup_publication
@@ -61,9 +61,11 @@ def _publisher(
     )
 
 
+@pytest.mark.parametrize("suppress_repeats", [False, True])
 async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicates(
     publication_engine: AsyncEngine,
     payload_data: dict[str, object],
+    suppress_repeats: bool,
 ) -> None:
     engine = publication_engine
     store, authority = await setup_publication(engine, payload_data)
@@ -119,7 +121,10 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
         **provider.metadata,
         "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
     }
-    publisher_2 = _publisher(store, provider, authority_2)
+    store_2 = PostgresPublicationStore(
+        async_sessionmaker(engine), suppress_repeats=suppress_repeats
+    )
+    publisher_2 = _publisher(store_2, provider, authority_2)
 
     outcome_2 = await publisher_2.publish(review_job_id=review_2)
     assert outcome_2["status"] == "PUBLISHED", f"outcome_2={outcome_2}"
@@ -129,10 +134,14 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
     assert provider.posts[1]["commit_id"] != head_sha
     assert f"review={review_2}" in provider.posts[1]["body"]
     assert review_1 != review_2
-    # Cross-cycle repeat of the unchanged-line finding is the pinned current
-    # limitation: it lands in the new review; the old review is never edited
-    # or merged into.
-    assert provider.posts[1]["comments"] == provider.posts[0]["comments"]
+    if suppress_repeats:
+        # #53 accepted: the unchanged-line finding is not posted again.
+        assert provider.posts[1]["comments"] == []
+        assert "Уже отмечены в предыдущих ревью: " in provider.posts[1]["body"]
+    else:
+        # Without incremental review the cross-cycle repeat still lands in the
+        # new review; the old review is never edited or merged into.
+        assert provider.posts[1]["comments"] == provider.posts[0]["comments"]
     assert provider.reviews[0]["body"] == cycle_1_body
     assert len(provider.reviews) == 2
 

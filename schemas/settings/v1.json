@@ -31,7 +31,21 @@
             "minLength": 1,
             "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$)(?!!).*\\S.*$"
           }
-        }
+        },
+        "include_globs": {
+          "description": "Paths reviewed even when a default input guard pattern matches.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$)(?!!).*\\S.*$"
+          }
+        },
+        "exclude_migrations": { "type": "boolean" },
+        "max_patch_bytes": { "type": "integer", "minimum": 1 },
+        "minified_line_length": { "type": "integer", "minimum": 1 },
+        "minified_avg_line_length": { "type": "integer", "minimum": 1 }
       }
     }
   }

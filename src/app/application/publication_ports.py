@@ -40,6 +40,8 @@ class PublicationInput:
     coverage: dict[str, Any]
     contexts: tuple[dict[str, Any], ...]
     findings: tuple[PersistedFinding, ...]
+    # Fingerprints already posted inline by earlier review cycles of this PR.
+    published_before: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

@@ -39,6 +39,7 @@ _TOTAL_TIMEOUT_SECONDS = 15
 _MAX_READ_PAGES = 20
 _MAX_PAGE = 2_147_483_647
 _SECONDARY_RETRY_AFTER_SECONDS = 60
+_COMPARE_STATUSES = frozenset({"ahead", "behind", "diverged", "identical"})
 
 
 def _secondary_rate_limit(body: bytes) -> bool:
@@ -421,6 +422,24 @@ def _remote_comment(item: dict[str, Any]) -> GithubRemoteComment:
     )
 
 
+class _NotFoundError(Exception):
+    """The requested resource does not exist (HTTP 404) and that is expected."""
+
+
+def _validate_snapshot_request(request: GithubRequest) -> None:
+    if (
+        not _OWNER.fullmatch(request.owner)
+        or not _REPOSITORY.fullmatch(request.name)
+        or request.name in {".", ".."}
+        or not _EXTERNAL_ID.fullmatch(request.repository_external_id)
+        or type(request.number) is not int
+        or request.number < 1
+        or not _SHA.fullmatch(request.head_sha)
+        or not _SHA.fullmatch(request.base_sha)
+    ):
+        raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+
+
 class GithubClient:
     def __init__(
         self,
@@ -760,6 +779,54 @@ class GithubClient:
             raise GithubWriteFailure("VCS_UNAVAILABLE", remote_effect="unknown")
         return GithubReviewReference(remote_review_id=str(remote_id))
 
+    async def fetch_gitattributes(self, request: GithubRequest) -> str | None:
+        """``.gitattributes`` at the pinned base commit (ADR-0002: never the head
+        branch, so a PR author cannot mark their own code as generated)."""
+        _validate_snapshot_request(request)
+        url = (
+            f"https://api.github.com/repos/{request.owner}/{request.name}"
+            f"/contents/.gitattributes?ref={request.base_sha}"
+        )
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                response = await self._get(
+                    url, "application/vnd.github.raw", not_found_ok=True
+                )
+        except _NotFoundError:
+            return None
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+        try:
+            return response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    async def compare_status(self, request: GithubRequest, base_sha: str) -> str | None:
+        """Compare API ``status`` of ``base_sha...head``; None when unknown, e.g.
+        a force-push left the old head unreachable."""
+        _validate_snapshot_request(request)
+        if not _SHA.fullmatch(base_sha):
+            return None
+        url = (
+            f"https://api.github.com/repos/{request.owner}/{request.name}"
+            f"/compare/{base_sha}...{request.head_sha}"
+        )
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                response = await self._get(
+                    url, "application/vnd.github+json", not_found_ok=True
+                )
+            status = _json_object(response).get("status")
+        except _NotFoundError:
+            return None
+        except TimeoutError:
+            raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+        except GithubFailure as failure:
+            if failure.retryable:
+                raise
+            return None
+        return status if status in _COMPARE_STATUSES else None
+
     async def fetch(self, request: GithubRequest) -> GithubSnapshot:
         try:
             async with asyncio.timeout(_TOTAL_TIMEOUT_SECONDS):
@@ -774,6 +841,7 @@ class GithubClient:
         *,
         token: str | None = None,
         missing_pull: bool = False,
+        not_found_ok: bool = False,
     ) -> httpx.Response:
         if self._authorize is not None:
             await self._authorize()
@@ -786,6 +854,8 @@ class GithubClient:
             ) as response:
                 if missing_pull and response.status_code == HTTPStatus.NOT_FOUND:
                     raise GithubFailure("PR_STALE_OR_CLOSED", retryable=False)
+                if not_found_ok and response.status_code == HTTPStatus.NOT_FOUND:
+                    raise _NotFoundError
                 ambiguous_forbidden = (
                     response.status_code == HTTPStatus.FORBIDDEN
                     and response.headers.get("x-ratelimit-remaining") != "0"
@@ -821,17 +891,7 @@ class GithubClient:
         )
 
     async def _fetch(self, request: GithubRequest) -> GithubSnapshot:
-        if (
-            not _OWNER.fullmatch(request.owner)
-            or not _REPOSITORY.fullmatch(request.name)
-            or request.name in {".", ".."}
-            or not _EXTERNAL_ID.fullmatch(request.repository_external_id)
-            or type(request.number) is not int
-            or request.number < 1
-            or not _SHA.fullmatch(request.head_sha)
-            or not _SHA.fullmatch(request.base_sha)
-        ):
-            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        _validate_snapshot_request(request)
         repository = f"https://api.github.com/repos/{request.owner}/{request.name}"
         pull_url = f"{repository}/pulls/{request.number}"
         first = await self._get(pull_url, "application/vnd.github+json")

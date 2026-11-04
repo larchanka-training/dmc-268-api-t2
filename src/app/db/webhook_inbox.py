@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.application.github_ports import GithubFailure, GithubRequest
 from app.application.webhook_ports import InboxUnavailable, WebhookDelivery
 from app.db.models import Repository, RepositorySettings, WebhookReceipt
+from app.vcs.input_guards import REPOSITORY_OVERRIDES
 
 _MAX_ATTEMPTS = 3
 
@@ -84,7 +85,11 @@ class SqlAlchemyWebhookInbox:
             )
             ignore_settings = settings.ignores if settings is not None else {}
             if not isinstance(ignore_settings, dict) or (
-                ignore_settings and set(ignore_settings) != {"globs"}
+                ignore_settings
+                and (
+                    "globs" not in ignore_settings
+                    or not set(ignore_settings) <= {"globs", *REPOSITORY_OVERRIDES}
+                )
             ):
                 raise InboxUnavailable
             ignores = ignore_settings.get("globs", [])

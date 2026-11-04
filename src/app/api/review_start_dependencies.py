@@ -59,6 +59,13 @@ class _GithubReviewStartAuthorizer:
         raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
 
 
+def get_one_active_per_pr(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> bool:
+    """Incremental review (spec PR #42 3.2): no parallel newer-head run."""
+    return settings.incremental.enabled
+
+
 def get_review_start_authorizer(
     settings: Annotated[Settings, Depends(get_settings)],
     session: Annotated[AsyncSession, Depends(get_session)],

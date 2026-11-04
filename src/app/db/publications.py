@@ -30,8 +30,37 @@ from app.db.review_events import append_review_event
 
 
 class PostgresPublicationStore:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        suppress_repeats: bool = False,
+    ) -> None:
         self._sessions = session_factory
+        self._suppress_repeats = suppress_repeats
+
+    async def _published_before(
+        self, session: AsyncSession, review: ReviewJob
+    ) -> frozenset[str]:
+        """Fingerprints confirmed posted inline by earlier cycles of this PR."""
+        if not self._suppress_repeats:
+            return frozenset()
+        metadata = await session.scalars(
+            select(Publication.provider_metadata)
+            .join(ReviewJob, ReviewJob.id == Publication.review_job_id)
+            .where(
+                ReviewJob.change_request_id == review.change_request_id,
+                ReviewJob.id != review.id,
+                ReviewJob.created_at < review.created_at,
+                Publication.status.in_(["PUBLISHED", "PARTIAL"]),
+            )
+        )
+        return frozenset(
+            fingerprint
+            for item in metadata
+            if isinstance(item, dict) and isinstance(item.get("comment_ids"), dict)
+            for fingerprint in item["comment_ids"]
+        )
 
     async def begin(
         self,
@@ -532,4 +561,5 @@ class PostgresPublicationStore:
                     )
                     for finding in findings
                 ),
+                published_before=await self._published_before(session, review),
             )

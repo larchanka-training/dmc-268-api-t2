@@ -24,6 +24,7 @@ from app.application.ports import (
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.domain.settings import compute_rules_digest, render_rules
 from app.main import create_app
+from app.vcs.input_guards import REPOSITORY_OVERRIDES
 
 ROOT = Path(__file__).parents[1]
 SCHEMAS = ROOT / "schemas"
@@ -528,6 +529,52 @@ def test_settings_contract_accepts_canonical_values() -> None:
             "ignores": {"globs": ["vendor/**", "**/*.generated.py"]},
         }
     )
+
+
+_GUARD_OVERRIDES = {
+    "globs": ["docs/**"],
+    "include_globs": ["dist/keep.js"],
+    "exclude_migrations": True,
+    "max_patch_bytes": 2048,
+    "minified_line_length": 800,
+    "minified_avg_line_length": 400,
+}
+
+
+def test_settings_contracts_accept_input_guard_overrides() -> None:
+    _validator(SCHEMAS / "settings" / "v1.json").validate(
+        {"rules": {"instructions": []}, "ignores": _GUARD_OVERRIDES}
+    )
+    _api_validator("Ignores").validate(_GUARD_OVERRIDES)
+
+
+def test_settings_contract_override_keys_match_guard_policy() -> None:
+    schema = json.loads((SCHEMAS / "settings" / "v1.json").read_text("utf-8"))
+    with (ROOT / "openapi.yaml").open(encoding="utf-8") as source:
+        api = yaml.safe_load(source)["components"]["schemas"]["Ignores"]
+
+    expected = {"globs", *REPOSITORY_OVERRIDES}
+    assert set(schema["properties"]["ignores"]["properties"]) == expected
+    assert set(api["properties"]) == expected
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"lockfile_globs": []},
+        {"exclude_migrations": "yes"},
+        {"max_patch_bytes": 0},
+        {"include_globs": ["../secret"]},
+    ],
+)
+def test_settings_contracts_reject_invalid_guard_overrides(
+    override: dict[str, Any],
+) -> None:
+    ignores = {"globs": [], **override}
+    assert not _validator(SCHEMAS / "settings" / "v1.json").is_valid(
+        {"rules": {"instructions": []}, "ignores": ignores}
+    )
+    assert not _api_validator("Ignores").is_valid(ignores)
 
 
 def test_settings_contracts_reject_non_normalized_globs() -> None:

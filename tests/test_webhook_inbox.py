@@ -372,8 +372,15 @@ async def test_crash_recovery_cannot_claim_forever(postgres: PostgresHarness) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ignores",
+    [
+        {"globs": ["tests/**"]},
+        {"globs": ["tests/**"], "exclude_migrations": True, "max_patch_bytes": 9},
+    ],
+)
 async def test_delivery_freezes_current_ignore_settings(
-    postgres: PostgresHarness,
+    postgres: PostgresHarness, ignores: dict[str, object]
 ) -> None:
 
     async with postgres.engine.begin() as connection:
@@ -384,7 +391,7 @@ async def test_delivery_freezes_current_ignore_settings(
         await connection.execute(
             update(models.RepositorySettings)
             .where(models.RepositorySettings.id == settings_id)
-            .values(ignores={"globs": ["tests/**"]})
+            .values(ignores=ignores)
         )
         await connection.execute(
             update(models.Repository)

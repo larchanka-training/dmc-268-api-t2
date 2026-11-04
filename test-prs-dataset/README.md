@@ -1,11 +1,21 @@
 # Gold benchmark corpus and reproducible evaluation (#15)
 
-23 cases: the original 22 synthetic PR diffs (5 security, 4 resource/performance,
-5 correctness, 4 maintainability, 4 clean) and one real public security fix,
-labelled clean for the defect it fixes. Cases are small curated examples, not a
+24 cases: 5 security, 4 resource/performance, 6 correctness (including an actual
+Python parse error checked with `ast.parse`), and 9 clean controls. The original
+22 synthetic diffs are preserved, with labels adapted to verified v3; one new
+synthetic syntax-error case and one real public security fix were added.
+The public fix is labelled clean for the defect it fixes. Cases are small curated examples, not a
 representative model-quality sample. Synthetic examples and labels were
 contributed on `feat/golden-samples` at `12718e24c03904b4efb28f0eb29f687d183c10e4`;
 that history is preserved.
+
+The four original `syn-*` diffs remain byte-identical but now have clean labels.
+Their unreachable print, nested conditions, wrapper and Strategy abstraction do
+not demonstrate a new business bug; rewarding such suggestions would contradict
+`.agents/reviewer/v3/system.md`, which excludes style/formatter/linter findings
+and requires likely bugs for maintainability. Each metadata record explains its
+reclassification. These are intentional false-positive controls, alongside the
+original four clean cases and public fix.
 
 The real case is the production hunk from
 [psf/requests 74ea7cf](https://github.com/psf/requests/commit/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5)

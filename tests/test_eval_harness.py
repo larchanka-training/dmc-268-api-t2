@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 from pathlib import Path
@@ -502,7 +503,9 @@ def test_authorized_live_path_uses_runtime_gateway_with_a_local_transport(
     assert report["fixtures"][0]["provider"] == "eurorouter"
     assert report["provenance"]["mode"] == "live"
     assert report["usage"]["requests"] == len(requests)
-    assert report["usage"]["cost_usd"] == "0.000015"
+    assert (
+        report["usage"]["cost_usd"] == "0.000027"
+    )  # Nine clean controls, 1+2 tokens each.
 
 
 def test_reversed_finding_range_cannot_pass_grounding() -> None:
@@ -705,3 +708,44 @@ def test_dataset_rejects_symlinked_source_outside_approved_corpus(
     meta.symlink_to(outside)
     with pytest.raises(ValueError, match="outside dataset"):
         load_dataset(dataset)
+
+
+def test_corpus_includes_a_real_syntax_error_with_grounded_bug_label() -> None:
+    fixtures = load_dataset(Path(__file__).parents[1] / "test-prs-dataset")
+    syntax = [
+        fixture for fixture in fixtures if fixture.id == "syntax-001-missing-colon"
+    ]
+    assert len(syntax) == 1
+    fixture = syntax[0]
+    code = "\n".join(
+        line[1:]
+        for line in fixture.diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    with pytest.raises(SyntaxError):
+        ast.parse(code)
+    assert fixture.expected_findings[0]["category"] == "correctness"
+    assert is_grounded(
+        fixture.golden_response["findings"][0], parse_diff(fixture.diff_text)
+    )
+    report = evaluate_fixture(fixture, fixture.golden_response, _SCHEMA)
+    assert (report.true_positives, report.false_positives, report.false_negatives) == (
+        1,
+        0,
+        0,
+    )
+
+
+def test_style_only_examples_are_clean_false_positive_controls() -> None:
+    fixtures = load_dataset(Path(__file__).parents[1] / "test-prs-dataset")
+    controls = [fixture for fixture in fixtures if fixture.id.startswith("syn-")]
+    assert {fixture.id for fixture in controls} == {
+        "syn-001-dead-code-branch",
+        "syn-002-redundant-nested-conditionals",
+        "syn-003-unnecessary-wrapper-function",
+        "syn-004-overengineered-trivial-abstraction",
+    }
+    for fixture in controls:
+        assert fixture.category == "clean"
+        assert fixture.expected_findings == []
+        assert fixture.golden_response["findings"] == []

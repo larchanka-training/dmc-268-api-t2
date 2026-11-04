@@ -2,5 +2,6 @@
   "title": "Функция-обёртка без добавленной логики",
   "description": "Получение полного имени пользователя.",
   "language": "python",
-  "category": "maintainability"
+  "category": "clean",
+  "label_rationale": "Delegating through a wrapper preserves full-name behavior; no concrete correctness or maintenance failure is demonstrated. Verified .agents/reviewer/v3/system.md forbids style/formatter/linter findings and requires likely bugs for maintainability."
 }

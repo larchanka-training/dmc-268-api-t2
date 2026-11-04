@@ -1,10 +1,1 @@
-[
-  {
-    "path": "app/pricing/discount.py",
-    "side": "NEW",
-    "start_line": 1,
-    "end_line": 17,
-    "category": "maintainability",
-    "severity": "low"
-  }
-]
+[]

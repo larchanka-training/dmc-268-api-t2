@@ -1,20 +1,5 @@
 {
-  "summary": "Найдено 1 проблем(а).",
-  "findings": [
-    {
-      "path": "app/orders/format_status.py",
-      "side": "NEW",
-      "start_line": 4,
-      "end_line": 4,
-      "category": "maintainability",
-      "severity": "low",
-      "title": "Недостижимый код после return",
-      "explanation": "print(\"logging cancellation\") находится после return и никогда не выполняется. Такой мёртвый код вводит в заблуждение читателя, будто логирование действительно происходит.",
-      "evidence": "print(\"logging cancellation\")",
-      "recommendation": "Удалить недостижимую строку или переместить её перед return, если логирование нужно.",
-      "rule_ref": null,
-      "proposed_diff_fix": null
-    }
-  ],
+  "summary": "No demonstrated new bug; style-only observations are outside verified v3 review scope.",
+  "findings": [],
   "limitations": []
 }

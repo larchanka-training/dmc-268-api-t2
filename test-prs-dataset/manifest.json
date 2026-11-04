@@ -71,22 +71,22 @@
   },
   {
     "id": "syn-001-dead-code-branch",
-    "category": "maintainability",
+    "category": "clean",
     "title": "Недостижимая ветка кода после return"
   },
   {
     "id": "syn-002-redundant-nested-conditionals",
-    "category": "maintainability",
+    "category": "clean",
     "title": "Избыточно вложенные условия вместо единого выражения"
   },
   {
     "id": "syn-003-unnecessary-wrapper-function",
-    "category": "maintainability",
+    "category": "clean",
     "title": "Функция-обёртка без добавленной логики"
   },
   {
     "id": "syn-004-overengineered-trivial-abstraction",
-    "category": "maintainability",
+    "category": "clean",
     "title": "Избыточная абстракция (Strategy) для константного вычисления"
   },
   {
@@ -113,5 +113,10 @@
     "id": "public-001-requests-proxy-auth-fix",
     "category": "clean",
     "title": "Requests: prevent proxy auth disclosure"
+  },
+  {
+    "id": "syntax-001-missing-colon",
+    "category": "correctness",
+    "title": "Python function declaration missing colon"
   }
 ]

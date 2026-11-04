@@ -164,7 +164,7 @@ uv run python -m app.publication_worker --poll-interval 1
 
 ## Gold benchmark / Eval
 
-23 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
+24 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
 [`test-prs-dataset/README.md`](test-prs-dataset/README.md).
 
 ```bash

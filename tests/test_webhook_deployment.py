@@ -122,6 +122,28 @@ def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
     assert "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
 
 
+def test_deploy_application_materializes_remote_script_not_bash_s() -> None:
+    """Deploy application must not run the full body via bash -s stdin."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/deploy-staging.yml").read_text(encoding="utf-8")
+    )
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+    run = next(step for step in steps if step.get("name") == "Deploy application")[
+        "run"
+    ]
+    assert "cat > '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "bash '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "status=\\$?" in run
+    assert "rm -f '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "\\$status" in run
+    # Full body must not be attached to bare bash -s (stdin-eaten-by-compose bug).
+    assert "INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash -s\"" not in run
+    remote = run.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
+    assert 'echo "Waiting for PostgreSQL and Redis..."' in remote
+    assert 'echo "Running database migrations..."' in remote
+    assert "compose up -d --force-recreate --no-deps api" in remote
+
+
 @pytest.mark.skipif(
     shutil.which("docker") is None or os.environ.get("DMC268_RUN_DOCKER_TESTS") != "1",
     reason="set DMC268_RUN_DOCKER_TESTS=1 with Docker running",

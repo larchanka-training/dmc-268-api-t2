@@ -58,6 +58,24 @@ def remote_script() -> str:
     return run.split("<<'REMOTE'\n", 1)[1].rsplit("\nREMOTE", 1)[0]
 
 
+def test_audit_materializes_remote_script_not_bash_s() -> None:
+    """Backlog audit must not run the full body via bash -s stdin."""
+    steps = workflow()["jobs"]["audit"]["steps"]
+    run: str = next(s["run"] for s in steps if s["name"] == "Audit staging backlog")
+    script = "/opt/dmc-268-t2/.staging-backlog-audit.remote.sh"
+    assert "timeout 120s sshpass -e ssh" in run
+    assert f"cat > '{script}'" in run
+    assert f"bash '{script}'" in run
+    assert "status=\\$?" in run
+    assert f"rm -f '{script}'" in run
+    assert "\\$status" in run
+    assert "'bash -s'" not in run
+    remote = remote_script()
+    assert "cd /opt/dmc-268-t2\n" in remote
+    assert "<<'PY'" in remote
+    assert "<<'REDIS_PY'" in remote
+
+
 @pytest.mark.parametrize("state", ["", "exited", "running", "restarting", "error"])
 def test_audit_only_reports_staging_analysis_service_states(
     tmp_path: Path, state: str

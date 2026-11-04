@@ -516,13 +516,17 @@ jobs:
             "${SSH_USER}@${SSH_HOST}" \
             "chmod 755 '${DEPLOY_PATH}/backup-postgres.sh'"
 
+          # Materialize the remote body to a file, then bash that file.
+          # Do not feed the deploy script as `bash -s` stdin: docker compose
+          # can drain stdin and bash then hits EOF (exit 0) mid-script — staging
+          # logs stopped after "Waiting for PostgreSQL and Redis...".
           sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash -s" \
+            "cat > '${DEPLOY_PATH}/.deploy-application.remote.sh' && chmod 700 '${DEPLOY_PATH}/.deploy-application.remote.sh' && DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash '${DEPLOY_PATH}/.deploy-application.remote.sh'; status=\$?; rm -f '${DEPLOY_PATH}/.deploy-application.remote.sh'; exit \"\$status\"" \
             <<'REMOTE'
           set -euo pipefail
 
@@ -822,13 +826,14 @@ jobs:
             caddy/Caddyfile \
             "${SSH_USER}@${SSH_HOST}:/opt/caddy/Caddyfile.new"
 
+          # Materialize remote body so docker cannot drain bash -s stdin.
           sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "bash -s" \
+            "cat > '/opt/caddy/.ensure-caddy-https.remote.sh' && chmod 700 '/opt/caddy/.ensure-caddy-https.remote.sh' && bash '/opt/caddy/.ensure-caddy-https.remote.sh'; status=\$?; rm -f '/opt/caddy/.ensure-caddy-https.remote.sh'; exit \"\$status\"" \
             <<'REMOTE'
           set -euo pipefail
 

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/review-result/v2.json",
+  "title": "ReviewChunkResult v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "summary", "findings", "limitations", "usage", "latency_ms"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "summary": { "type": "string" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "usage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input_tokens", "output_tokens"],
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "latency_ms": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "description": "One concrete issue at one repository-relative location or range. end_line must be greater than or equal to start_line. rule_ref cites the violated repository-rule label, when one exists.",
+      "additionalProperties": false,
+      "required": ["path", "side", "start_line", "end_line", "category", "severity", "title", "explanation", "evidence", "recommendation", "rule_ref", "proposed_diff_fix"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
+        },
+        "side": { "enum": ["OLD", "NEW"] },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "category": { "enum": ["security", "correctness", "performance", "maintainability"] },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "title": { "type": "string", "minLength": 1 },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 },
+        "rule_ref": {
+          "type": ["string", "null"],
+          "maxLength": 32,
+          "description": "Label of the violated repository rule (for example SEC-1) or null when no rule applies. Validators reject labels absent from the rules passed to the review."
+        },
+        "proposed_diff_fix": { "type": ["string", "null"], "description": "Suggestion only; never automatically applied." }
+      }
+    }
+  }
+}

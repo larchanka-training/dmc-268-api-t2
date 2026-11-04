@@ -11,7 +11,13 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.application.use_cases.start_review as start_review_module
-from app.application.ports import ReviewJobRepositoryPort, StartReviewCommand
+from app.application.ports import (
+    PublicationRepositoryPort,
+    ReviewJobRepositoryPort,
+    ReviewJobSnapshot,
+    StartReviewCommand,
+    TaskLeaseSnapshot,
+)
 from app.application.use_cases.start_review import (
     compute_config_digest,
     start_review,
@@ -19,6 +25,7 @@ from app.application.use_cases.start_review import (
 from app.db.models import OutboxEvent, Publication, ReviewJob
 from app.db.repositories import SqlAlchemyReviewJobRepository
 from app.db.uow import SqlAlchemyUnitOfWork
+from app.domain.enums import ReviewStatus
 
 
 def make_command() -> StartReviewCommand:
@@ -117,7 +124,12 @@ class FakeReviewJobRepository:
         self.review_id = review_id
         self.calls: list[tuple[StartReviewCommand, str]] = []
 
-    async def get(self, review_job_id: uuid.UUID) -> object | None:
+    async def update_status(
+        self, lease: TaskLeaseSnapshot, *, status: ReviewStatus
+    ) -> None:
+        raise NotImplementedError("Start-review tests do not perform worker writes")
+
+    async def get(self, review_job_id: uuid.UUID) -> ReviewJobSnapshot | None:
         return None
 
     async def add_start_review(
@@ -129,6 +141,7 @@ class FakeReviewJobRepository:
 
 class FakeUnitOfWork:
     review_jobs: ReviewJobRepositoryPort
+    publications: PublicationRepositoryPort
 
     def __init__(self, repository: FakeReviewJobRepository) -> None:
         self.review_jobs = repository

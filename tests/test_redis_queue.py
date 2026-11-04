@@ -1,0 +1,824 @@
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import asdict, replace
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+import pytest_asyncio
+from jsonschema import Draft202012Validator, FormatChecker
+from redis.asyncio import Redis
+from redis.asyncio.connection import Connection, ConnectionPool
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.exceptions import NoPermissionError, TimeoutError
+from redis.typing import EncodableT, FieldT
+
+from app.adapters.redis_queue import InvalidQueueMessageError, RedisQueue
+from app.application.ports import (
+    QueueEnvelopeValidationError,
+    QueueTaskEnvelope,
+    TaskKind,
+)
+
+_REDIS_URL = os.environ.get("DMC268_TEST_REDIS_URL")
+if not _REDIS_URL:
+    pytest.skip(
+        "set DMC268_TEST_REDIS_URL to run Redis queue integration tests",
+        allow_module_level=True,
+    )
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator[Redis]:
+    assert _REDIS_URL is not None
+    async with Redis.from_url(_REDIS_URL, decode_responses=True) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def stream_prefix(redis_client: Redis) -> AsyncIterator[str]:
+    prefix = f"dmc268:test:{uuid.uuid4().hex}"
+    try:
+        yield prefix
+    finally:
+        await redis_client.delete(
+            f"{prefix}:analyze",
+            f"{prefix}:publish",
+            f"{prefix}:unknown",
+            f"{prefix}:dead",
+        )
+
+
+def envelope(task_kind: TaskKind = "analyze") -> QueueTaskEnvelope:
+    return QueueTaskEnvelope(
+        schema_version=1,
+        event_id="event_123",
+        review_id="rev_123",
+        task_kind=task_kind,
+        attempt=1,
+        trace_id="trace_123",
+    )
+
+
+async def test_crashed_consumer_pending_delivery_is_reclaimed_with_original_id(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    first = await queue.receive(task_kind="analyze", consumer_name="consumer-a")
+    assert first is not None and first.message_id == message_id
+    assert await queue.receive(task_kind="analyze", consumer_name="consumer-b") is None
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [(row["message_id"], row["consumer"]) for row in pending] == [
+        (message_id, "consumer-a")
+    ]
+
+    claimed = await queue.reclaim(
+        consumer_name="consumer-b", cursor="0-0", min_idle_time=0
+    )
+    assert claimed.delivery == first
+    assert claimed.cursor == "0-0"
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "consumer-b", 2)]
+
+
+async def test_reclaim_preserves_cursor_across_empty_idle_scan(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    ids = [await queue.enqueue(envelope()) for _ in range(12)]
+    for _ in ids:
+        assert await queue.receive(task_kind="analyze", consumer_name="a")
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0", min_idle_time=90_000)
+    assert claimed.delivery is None
+    # Redis scans at most COUNT * 10 PEL entries, even when none is idle enough.
+    assert claimed.cursor == ids[10]
+    end = await queue.reclaim(
+        consumer_name="b", cursor=claimed.cursor, min_idle_time=90_000
+    )
+    assert end.cursor == "0-0" and end.delivery is None
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == len(ids)
+
+
+async def test_reclaim_reports_deleted_pel_ids_without_delivery_or_ack(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    await redis_client.xdel(f"{stream_prefix}:analyze", message_id)
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 1
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0", min_idle_time=0)
+    assert claimed.delivery is None and claimed.cursor == "0-0"
+    assert claimed.deleted_ids == (message_id,)
+    assert (await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers"))[
+        "pending"
+    ] == 0
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+
+async def test_reclaim_recreates_missing_group_without_resetting_existing_group(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0")
+    assert claimed.delivery is None and claimed.cursor == "0-0"
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    await redis_client.xgroup_destroy(f"{stream_prefix}:analyze", "review-workers")
+    claimed = await queue.reclaim(consumer_name="b", cursor="0-0")
+    assert claimed.delivery is None
+    fresh = await queue.receive(task_kind="analyze", consumer_name="b")
+    assert fresh is not None and fresh.message_id == message_id
+
+
+@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
+async def test_enqueue_confirms_canonical_envelope_in_separate_task_channels(
+    redis_client: Redis, stream_prefix: str, task_kind: TaskKind
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    message_id = await queue.enqueue(envelope(task_kind))
+
+    messages = await redis_client.xrange(f"{stream_prefix}:{task_kind}")
+    assert messages is not None
+    assert len(messages) == 1
+    assert messages[0][0] == message_id
+    fields = messages[0][1]
+    assert fields is not None
+    payload = json.loads(fields["envelope"])
+    assert payload == {
+        "schema_version": 1,
+        "event_id": "event_123",
+        "review_id": "rev_123",
+        "task_kind": task_kind,
+        "attempt": 1,
+        "trace_id": "trace_123",
+    }
+    schema_path = Path(__file__).parents[1] / "schemas/queue/task-envelope.v1.json"
+    Draft202012Validator(json.loads(schema_path.read_text())).validate(payload)
+
+
+@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
+async def test_received_task_stays_pending_without_ack_and_is_not_given_as_new_work(
+    redis_client: Redis, stream_prefix: str, task_kind: TaskKind
+) -> None:
+    queue = RedisQueue(
+        redis_client, stream_prefix=stream_prefix, group_name="review-workers"
+    )
+    task = envelope(task_kind)
+    message_id = await queue.enqueue(task)
+
+    delivery = await queue.receive(task_kind=task_kind, consumer_name="worker-1")
+
+    assert delivery is not None
+    assert delivery.message_id == message_id
+    assert delivery.envelope == task
+    # A new adapter/consumer must neither ACK nor silently reclaim this task.
+    next_consumer = RedisQueue(
+        redis_client, stream_prefix=stream_prefix, group_name="review-workers"
+    )
+    assert (
+        await next_consumer.receive(task_kind=task_kind, consumer_name="worker-2")
+        is None
+    )
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:{task_kind}", "review-workers", "-", "+", 10
+    )
+    assert len(pending) == 1
+    assert pending[0]["message_id"] == message_id
+    assert pending[0]["consumer"] == "worker-1"
+
+
+@pytest.mark.parametrize(
+    "stream_fields",
+    [
+        {"envelope": "private-source: not JSON"},
+        {"envelope": "[]"},
+        {"envelope": "{}"},
+        {"other": "missing envelope"},
+    ],
+)
+async def test_malformed_transport_payload_is_rejected_with_safe_error(
+    redis_client: Redis, stream_prefix: str, stream_fields: dict[str, str]
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze",
+        cast(dict[FieldT, EncodableT], stream_fields),
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(ValueError, match=r"^Invalid queue task envelope$"):
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [entry["message_id"] for entry in pending] == [message_id]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("schema_version", 2),
+        ("schema_version", True),
+        ("task_kind", "unknown"),
+        ("attempt", 0),
+        ("attempt", True),
+        ("attempt", "1"),
+        ("event_id", ""),
+        ("review_id", None),
+        ("trace_id", 123),
+    ],
+)
+async def test_consumer_rejects_invalid_envelopes_and_keeps_them_unacknowledged(
+    redis_client: Redis, stream_prefix: str, field: str, invalid_value: object
+) -> None:
+    payload = {**asdict(envelope()), field: invalid_value, "source": "private-source"}
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": json.dumps(payload)}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(ValueError, match=r"^Invalid queue task envelope$"):
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [entry["message_id"] for entry in pending] == [message_id]
+
+
+async def test_explicit_ack_removes_pending_work_and_repeated_ack_returns_false(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await queue.enqueue(envelope())
+    delivery = await queue.receive(task_kind="analyze", consumer_name="worker-1")
+    assert delivery is not None
+
+    assert await queue.ack(delivery) is True
+
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == 0
+    assert await queue.ack(delivery) is False
+
+
+async def test_consumer_ignores_unknown_optional_v1_fields(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    task = envelope()
+    payload = {**asdict(task), "future_optional_field": {"value": "ignored"}}
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": json.dumps(payload)}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    delivery = await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert delivery is not None
+    assert delivery.envelope == task
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [("schema_version", 2), ("task_kind", "unknown"), ("attempt", 0)],
+)
+async def test_producer_rejects_invalid_envelope_before_enqueue(
+    redis_client: Redis, stream_prefix: str, field: str, invalid_value: object
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    task = replace(envelope(), **{field: cast(Any, invalid_value)})
+
+    with pytest.raises(ValueError, match=r"^Invalid queue task envelope$"):
+        await queue.enqueue(task)
+
+    assert (
+        await redis_client.exists(
+            f"{stream_prefix}:analyze", f"{stream_prefix}:unknown"
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "receive"])
+async def test_envelope_size_limit_is_16_kib_of_utf8_on_both_boundaries(
+    redis_client: Redis, stream_prefix: str, operation: str
+) -> None:
+    empty = replace(envelope(), trace_id="")
+    overhead = len(json.dumps(asdict(empty), separators=(",", ":")).encode())
+    available = 16_384 - overhead
+    task = replace(empty, trace_id="я" * (available // 2) + "x" * (available % 2))
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    await queue.enqueue(task)
+    delivery = await queue.receive(task_kind="analyze", consumer_name="worker-1")
+    assert delivery is not None
+    assert delivery.envelope == task
+
+    oversized = replace(task, trace_id=task.trace_id + "x")
+    with pytest.raises(ValueError, match=r"^Queue task envelope exceeds 16 KiB$"):
+        if operation == "enqueue":
+            await queue.enqueue(oversized)
+        else:
+            await redis_client.xadd(
+                f"{stream_prefix}:analyze",
+                {
+                    "envelope": json.dumps(
+                        asdict(oversized), ensure_ascii=False, separators=(",", ":")
+                    )
+                },
+            )
+            await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == (1 if operation == "enqueue" else 2)
+
+
+async def test_queue_supports_default_redis_client_byte_responses(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    assert _REDIS_URL is not None
+    async with Redis.from_url(_REDIS_URL) as raw_client:
+        queue = RedisQueue(raw_client, stream_prefix=stream_prefix)
+        message_id = await queue.enqueue(envelope())
+
+        delivery = await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+        assert delivery is not None
+        assert delivery.message_id == message_id
+        assert delivery.envelope == envelope()
+        assert await queue.ack(delivery) is True
+    pending = await redis_client.xpending(f"{stream_prefix}:analyze", "review-workers")
+    assert pending["pending"] == 0
+
+
+async def test_consumer_rejects_task_kind_that_does_not_match_its_channel(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze",
+        {"envelope": json.dumps(asdict(envelope("publish")))},
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(ValueError, match=r"^Queue task kind does not match channel$"):
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [entry["message_id"] for entry in pending] == [message_id]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(
+            b'{"schema_version":1,"event_id":"event_123","review_id":"rev_123",'
+            b'"task_kind":"analyze","attempt":'
+            + b"9" * 5000
+            + b',"trace_id":"trace_123"}',
+            id="overlong-json-integer",
+        ),
+    ],
+)
+async def test_decode_errors_are_safe_and_leave_message_pending_with_byte_client(
+    stream_prefix: str, payload: bytes
+) -> None:
+    assert _REDIS_URL is not None
+    async with Redis.from_url(_REDIS_URL, decode_responses=False) as raw_client:
+        message_id = await raw_client.xadd(
+            f"{stream_prefix}:analyze", {"envelope": payload}
+        )
+        queue = RedisQueue(raw_client, stream_prefix=stream_prefix)
+
+        with pytest.raises(ValueError, match=r"^Invalid queue task envelope$"):
+            await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+        pending = await raw_client.xpending_range(
+            f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+        )
+        assert [entry["message_id"] for entry in pending] == [message_id]
+        assert pending[0]["consumer"] == b"worker-1"
+
+
+async def test_rejection_exposes_transport_identity_without_raw_payload(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": "private-source: not JSON"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(ValueError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert getattr(rejected.value, "message_id", None) == message_id
+    assert getattr(rejected.value, "source_routing_key", None) == "analyze"
+    assert getattr(rejected.value, "reason_code", None) == "INVALID_ENVELOPE"
+    assert "private-source" not in str(rejected.value)
+
+
+@pytest.mark.parametrize("task_kind", ["analyze", "publish"])
+async def test_quarantine_writes_only_canonical_diagnostic_dead_v1(
+    redis_client: Redis, stream_prefix: str, task_kind: TaskKind
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:{task_kind}",
+        {"envelope": "private-source: not JSON", "prompt": "private-prompt"},
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind=task_kind, consumer_name="worker-1")
+
+    dead_id = await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and len(messages) == 1
+    assert messages[0][0] == dead_id
+    fields = messages[0][1]
+    assert fields is not None and set(fields) == {"envelope"}
+    payload = json.loads(fields["envelope"])
+    assert set(payload) == {
+        "schema_version",
+        "quarantine_id",
+        "reason_code",
+        "quarantined_at",
+        "source_routing_key",
+    }
+    assert payload["schema_version"] == 1
+    assert payload["reason_code"] == "INVALID_ENVELOPE"
+    assert payload["source_routing_key"] == task_kind
+    assert "private-" not in fields["envelope"]
+    schema_path = Path(__file__).parents[1] / "schemas/queue/dead/v1.json"
+    Draft202012Validator(
+        json.loads(schema_path.read_text()), format_checker=FormatChecker()
+    ).validate(payload)
+
+
+async def test_quarantine_acks_source_only_after_successful_dead_write(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:publish", {"envelope": "not JSON"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="publish", consumer_name="worker-1")
+    # Permit cleanup and ACK but make the actual DLQ write fail in real Redis.
+    username, password = uuid.uuid4().hex, uuid.uuid4().hex
+    await redis_client.acl_setuser(
+        username,
+        enabled=True,
+        passwords=[f"+{password}"],
+        commands=["+@all", "-xadd"],
+        keys=[f"{stream_prefix}:*"],
+    )
+    assert _REDIS_URL is not None
+    try:
+        async with Redis.from_url(
+            _REDIS_URL, username=username, password=password, decode_responses=True
+        ) as denied_client:
+            denied_queue = RedisQueue(denied_client, stream_prefix=stream_prefix)
+            with pytest.raises(NoPermissionError, match="xadd"):
+                await denied_queue.quarantine(rejected.value)
+    finally:
+        await redis_client.acl_deluser(username)
+
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:publish", "review-workers", "-", "+", 10
+    )
+    assert [entry["message_id"] for entry in pending] == [message_id]
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+    await queue.quarantine(rejected.value)
+
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 1
+    pending_summary = await redis_client.xpending(
+        f"{stream_prefix}:publish", "review-workers"
+    )
+    assert pending_summary["pending"] == 0
+
+
+@pytest.mark.parametrize("version", [2, 2.0])
+async def test_quarantine_classifies_unsupported_source_schema_version(
+    redis_client: Redis, stream_prefix: str, version: int | float
+) -> None:
+    payload = {**asdict(envelope()), "schema_version": version, "task_kind": "unknown"}
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": json.dumps(payload)}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert rejected.value.reason_code == "UNSUPPORTED_SCHEMA_VERSION"
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    assert json.loads(messages[0][1]["envelope"])["reason_code"] == (
+        "UNSUPPORTED_SCHEMA_VERSION"
+    )
+
+
+async def test_quarantine_classifies_unknown_task_kind(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:publish",
+        {"envelope": json.dumps({**asdict(envelope()), "task_kind": "future"})},
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="publish", consumer_name="worker-1")
+
+    assert rejected.value.reason_code == "UNKNOWN_TASK_KIND"
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    assert payload["reason_code"] == "UNKNOWN_TASK_KIND"
+    assert payload["source_routing_key"] == "publish"
+
+
+async def test_quarantine_copies_only_valid_allowlisted_source_identities(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    await redis_client.xadd(
+        f"{stream_prefix}:analyze",
+        {
+            "envelope": json.dumps(
+                {
+                    **asdict(envelope()),
+                    "schema_version": 2.0,
+                    "source": "private-source",
+                    "prompt": "private-prompt",
+                    "stack_trace": "private-stack",
+                    "payload": {"secret": "private-secret"},
+                    "source_event_id": "forged-id",
+                    "exception": "private-exception",
+                }
+            )
+        },
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    for field in ("quarantine_id", "quarantined_at"):
+        assert payload.pop(field)
+    assert payload == {
+        "schema_version": 1,
+        "reason_code": "UNSUPPORTED_SCHEMA_VERSION",
+        "source_routing_key": "analyze",
+        "source_event_id": "event_123",
+        "review_id": "rev_123",
+        "trace_id": "trace_123",
+        "attempt": 1,
+        "source_schema_version": 2,
+    }
+
+
+async def test_quarantine_retains_id_with_corrupt_utf8_on_decoding_client(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:analyze", {"envelope": b"\xff", b"\xfe": b"\xfd"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    assert rejected.value.message_id == message_id
+    await queue.quarantine(rejected.value)
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None and messages[0][1] is not None
+    payload = json.loads(messages[0][1]["envelope"])
+    assert "source_event_id" not in payload
+    assert payload["reason_code"] == "INVALID_ENVELOPE"
+
+
+@pytest.mark.parametrize("operation", ["receive", "quarantine"])
+async def test_unknown_dead_schema_is_never_recursively_quarantined(
+    redis_client: Redis, stream_prefix: str, operation: str
+) -> None:
+    message_id = await redis_client.xadd(
+        f"{stream_prefix}:dead", {"envelope": '{"schema_version":2}'}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(ValueError, match=r"^Unsupported source task channel$"):
+        if operation == "receive":
+            await queue.receive(
+                task_kind=cast(TaskKind, "dead"), consumer_name="operator"
+            )
+        else:
+            await queue.quarantine(
+                InvalidQueueMessageError(
+                    "Invalid queue task envelope",
+                    message_id=cast(str, message_id),
+                    source_routing_key=cast(TaskKind, "dead"),
+                )
+            )
+
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 1
+    assert await redis_client.xinfo_groups(f"{stream_prefix}:dead") == []
+
+
+async def test_dead_retention_removes_individually_expired_entries_only(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    seconds, _ = await redis_client.time()
+    old_id = f"{(seconds - 8 * 86_400) * 1000}-0"
+    recent_id = f"{(seconds - 6 * 86_400) * 1000}-0"
+    for message_id in (old_id, recent_id):
+        await redis_client.xadd(
+            f"{stream_prefix}:dead", {"envelope": "safe-metadata"}, id=message_id
+        )
+    newest_id = await redis_client.xadd(
+        f"{stream_prefix}:dead", {"envelope": "safe-metadata"}
+    )
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+
+    assert await queue.trim_dead_letters() == 1
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None
+    assert [message[0] for message in messages] == [recent_id, newest_id]
+    assert await redis_client.ttl(f"{stream_prefix}:dead") == -1
+    assert await queue.trim_dead_letters() == 0
+
+
+async def test_new_quarantine_does_not_extend_older_dead_entry_retention(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    seconds, _ = await redis_client.time()
+    old_id = f"{(seconds - 8 * 86_400) * 1000}-0"
+    recent_id = f"{(seconds - 6 * 86_400) * 1000}-0"
+    for message_id in (old_id, recent_id):
+        await redis_client.xadd(
+            f"{stream_prefix}:dead", {"envelope": "safe-metadata"}, id=message_id
+        )
+    await redis_client.xadd(f"{stream_prefix}:analyze", {"envelope": "not JSON"})
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(InvalidQueueMessageError) as rejected:
+        await queue.receive(task_kind="analyze", consumer_name="worker-1")
+
+    newest_id = await queue.quarantine(rejected.value)
+
+    messages = await redis_client.xrange(f"{stream_prefix}:dead")
+    assert messages is not None
+    assert [message[0] for message in messages] == [recent_id, newest_id]
+    assert await redis_client.ttl(f"{stream_prefix}:dead") == -1
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"schema_version": 2}, "UNSUPPORTED_SCHEMA_VERSION"),
+        ({"task_kind": "unknown"}, "UNKNOWN_TASK_KIND"),
+        ({"trace_id": ""}, "INVALID_ENVELOPE"),
+        ({"trace_id": "x" * (16 * 1024)}, "INVALID_ENVELOPE"),
+    ],
+)
+async def test_producer_validation_exposes_only_typed_safe_rejection(
+    redis_client: Redis,
+    stream_prefix: str,
+    changes: dict[str, Any],
+    reason: str,
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    with pytest.raises(QueueEnvelopeValidationError) as rejected:
+        await queue.enqueue(replace(envelope(), **changes))
+
+    assert rejected.value.reason_code == reason
+    assert "x" * 100 not in str(rejected.value)
+    assert await redis_client.xlen(f"{stream_prefix}:analyze") == 0
+    assert await redis_client.xlen(f"{stream_prefix}:dead") == 0
+
+
+async def test_reclaim_supports_real_byte_client_and_preserves_message_identity(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    assert _REDIS_URL is not None
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    async with Redis.from_url(_REDIS_URL, decode_responses=False) as raw:
+        claimed = await RedisQueue(raw, stream_prefix=stream_prefix).reclaim(
+            consumer_name="b", cursor="0-0", min_idle_time=0
+        )
+    assert claimed.delivery is not None
+    assert claimed.delivery.message_id == message_id
+    assert claimed.delivery.envelope == envelope()
+    assert claimed.cursor == "0-0" and claimed.deleted_ids == ()
+
+
+async def test_reclaim_real_redis_error_never_acknowledges_pending_delivery(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    username, password = uuid.uuid4().hex, uuid.uuid4().hex
+    await redis_client.acl_setuser(
+        username,
+        enabled=True,
+        passwords=[f"+{password}"],
+        commands=["+@all", "-xautoclaim"],
+        keys=[f"{stream_prefix}:*"],
+    )
+    assert _REDIS_URL is not None
+    try:
+        async with Redis.from_url(
+            _REDIS_URL, username=username, password=password
+        ) as denied:
+            with pytest.raises(NoPermissionError):
+                await RedisQueue(denied, stream_prefix=stream_prefix).reclaim(
+                    consumer_name="b", cursor="0-0", min_idle_time=0
+                )
+    finally:
+        await redis_client.acl_deluser(username)
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "a", 1)]
+
+
+async def test_reclaim_response_timeout_is_never_retried_by_redis_sdk(
+    redis_client: Redis, stream_prefix: str
+) -> None:
+    sent = []
+    dropped = False
+
+    class DropClaimResponse(Connection):
+        claim_response = False
+
+        async def send_command(self, *args: Any, **kwargs: Any) -> None:
+            await super().send_command(*args, **kwargs)
+            self.claim_response = args[0] == "XAUTOCLAIM"
+            if self.claim_response:
+                sent.append(args)
+
+        async def read_response(self, *args: Any, **kwargs: Any) -> Any:
+            nonlocal dropped
+            response = await super().read_response(*args, **kwargs)
+            if self.claim_response:
+                self.claim_response = False
+                if not dropped:
+                    dropped = True
+                    # Server has executed the command; client loses the response.
+                    raise TimeoutError("lost XAUTOCLAIM response")
+            return response
+
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    message_id = await queue.enqueue(envelope())
+    assert await queue.receive(task_kind="analyze", consumer_name="a")
+    assert _REDIS_URL is not None
+    pool = ConnectionPool.from_url(
+        _REDIS_URL,
+        connection_class=DropClaimResponse,
+        retry=Retry(NoBackoff(), 1),
+        max_connections=1,
+    )
+    async with Redis.from_pool(pool) as client:
+        try:
+            await RedisQueue(client, stream_prefix=stream_prefix).reclaim(
+                consumer_name="b", cursor="0-0", min_idle_time=0
+            )
+        except TimeoutError:
+            pass
+        else:
+            pytest.fail(f"response timeout hidden; XAUTOCLAIM sent {len(sent)} times")
+        assert len(sent) == 1
+        # The borrowed connection must be safe for the next independent command.
+        assert await client.ping()
+    pending = await redis_client.xpending_range(
+        f"{stream_prefix}:analyze", "review-workers", "-", "+", 10
+    )
+    assert [
+        (row["message_id"], row["consumer"], row["times_delivered"]) for row in pending
+    ] == [(message_id, "b", 2)]

@@ -1,3 +1,7 @@
+# Default project name for ad-hoc local runs of this file; the deploy
+# workflow overrides it per environment with `-p` (staging:
+# dmc-268-t2-staging, develop: dmc-268-t2-develop), so the two environments
+# never share containers, network or volumes.
 name: dmc-268-t2-staging
 
 services:
@@ -5,7 +9,9 @@ services:
     image: ${UI_IMAGE:?UI_IMAGE is required}
     restart: unless-stopped
     ports:
-      - "80:80"
+      # Хостовый порт задаёт окружение (staging 80, develop 8080);
+      # деплой-workflow прокидывает WEB_PORT в env-файл.
+      - "${WEB_PORT:-80}:80"
     depends_on:
       api:
         condition: service_healthy
@@ -25,6 +31,31 @@ services:
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
+      ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
+      # Legacy gateway settings remain available. Frozen analysis selects its
+      # model/policy from ANALYSIS__CONFIG_PATH; deployment checks consistency.
+      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
+      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
+      LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
+      LLM__EUROROUTER__MODEL: ${LLM__EUROROUTER__MODEL:-}
+      LLM__EUROROUTER__API_KEYS: ${LLM__EUROROUTER__API_KEYS:-}
+      LLM__OLLAMA__BASE_URL: ${LLM__OLLAMA__BASE_URL:-http://ollama:11434}
+      LLM__OLLAMA__MODEL: ${LLM__OLLAMA__MODEL:-}
+      # Секреты времени выполнения: деплой-workflow прокидывает их в env-файл,
+      # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
+      WEBHOOK__SECRET: ${WEBHOOK__SECRET:-}
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+      AUTH__GITHUB_CLIENT_ID: ${AUTH__GITHUB_CLIENT_ID:-}
+      AUTH__GITHUB_CLIENT_SECRET: ${AUTH__GITHUB_CLIENT_SECRET:-}
+      AUTH__GITHUB_REDIRECT_URI: ${AUTH__GITHUB_REDIRECT_URI:-}
+      AUTH__JWT_SECRET: ${AUTH__JWT_SECRET:-}
+      AUTH__CREDENTIAL_KEY: ${AUTH__CREDENTIAL_KEY:-}
+      AUTH__FRONTEND_ORIGINS: ${AUTH__FRONTEND_ORIGINS:-}
+      GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
+      GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
+    volumes:
+      - ${ANALYSIS_RUNTIME_DIR:-./analysis-runtime}:/app/runtime:ro
     depends_on:
       db:
         condition: service_healthy
@@ -42,6 +73,89 @@ services:
       timeout: 3s
       retries: 12
       start_period: 10s
+    networks:
+      - backend
+
+  worker:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    profiles: [analysis]
+    restart: "on-failure:3"
+    command: ["python", "-m", "app.analysis_worker"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
+      ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
+      # Execution uses the trusted manifest, plus credentials from environment.
+      LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
+      LLM__FALLBACK_ENABLED: ${LLM__FALLBACK_ENABLED:-false}
+      LLM__EUROROUTER__BASE_URL: ${LLM__EUROROUTER__BASE_URL:-}
+      LLM__EUROROUTER__MODEL: ${LLM__EUROROUTER__MODEL:-}
+      LLM__EUROROUTER__API_KEYS: ${LLM__EUROROUTER__API_KEYS:-}
+      LLM__OLLAMA__BASE_URL: ${LLM__OLLAMA__BASE_URL:-http://ollama:11434}
+      LLM__OLLAMA__MODEL: ${LLM__OLLAMA__MODEL:-}
+      # Секреты времени выполнения: деплой-workflow прокидывает их в env-файл,
+      # если соответствующие GitHub secrets заданы (docs/staging-deployment.md).
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+    volumes:
+      - ${ANALYSIS_RUNTIME_DIR:-./analysis-runtime}:/app/runtime:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  outbox-dispatcher:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    profiles: [analysis]
+    restart: unless-stopped
+    command: ["python", "-m", "app.outbox_dispatcher"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  webhook-worker:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    restart: unless-stopped
+    command: ["python", "-m", "app.webhook_worker"]
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
+    depends_on:
+      db:
+        condition: service_healthy
     networks:
       - backend
 

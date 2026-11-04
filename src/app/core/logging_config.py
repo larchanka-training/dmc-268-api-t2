@@ -7,17 +7,31 @@ a rotating file (see docs/adr/0001-structlog-unified-logging.md).
 
 import logging
 import logging.handlers
+import re
 import sys
 
 import structlog
-from structlog.typing import Processor
+from structlog.typing import EventDict, Processor, WrappedLogger
 
 from app.core.config import Logging
 
 _FILE_MAX_BYTES = 10 * 1024 * 1024
 _FILE_BACKUP_COUNT = 5
 
+_OAUTH_CALLBACK_QUERY = re.compile(r"(/api/v1/auth/github/callback/?)\?[^\s\"']*")
+
+
+def _redact_oauth_query(
+    logger: WrappedLogger, method_name: str, event_dict: EventDict
+) -> EventDict:
+    event = event_dict.get("event")
+    if isinstance(event, str):
+        event_dict["event"] = _OAUTH_CALLBACK_QUERY.sub(r"\1?[redacted]", event)
+    return event_dict
+
+
 _SHARED_PROCESSORS: tuple[Processor, ...] = (
+    _redact_oauth_query,
     structlog.contextvars.merge_contextvars,
     structlog.stdlib.add_log_level,
     structlog.stdlib.add_logger_name,

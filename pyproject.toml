@@ -7,10 +7,17 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.19.2",
     "asyncpg>=0.31.0",
+    "cryptography>=46,<51",
     "fastapi>=0.141.1",
+    "httpx>=0.28.1,<1",
+    "jsonschema>=4.25,<5",
     "pydantic-settings>=2.15.0",
+    "pyjwt>=2.10,<3",
+    "redis>=5,<9",
+    "sentry-sdk>=2.72.0",
     "sqlalchemy[asyncio]>=2.0.52",
     "structlog>=26.1.0",
+    "unidiff>=0.7.5,<0.8",
     "uvicorn[standard]>=0.52.4",
 ]
 
@@ -25,7 +32,7 @@ packages = ["src/app"]
 line-length = 88
 target-version = "py314"
 src = ["src"]
-extend-exclude = ["migrations"]
+extend-exclude = ["migrations", "docs"]
 
 [tool.ruff.lint]
 select = [
@@ -44,26 +51,25 @@ select = [
     "PL",  # pylint (subset via ruff)
 ]
 
-[tool.ruff.lint.per-file-ignores]
-# Russian-language LLM prompt text, not a comment/identifier.
-"scripts/eval_harness/prompt.py" = ["RUF001"]
-
 [tool.mypy]
 strict = true
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 exclude = ["migrations/"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "."]
+pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "chaos: fault-injection scenarios (LLM/API outages, worker crashes); run as the dedicated chaos CI job",
+]
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
-    "jsonschema>=4.26.0",
     "mypy>=2.3.1",
+    "openapi-spec-validator>=0.7,<0.8",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.6",
     "types-jsonschema>=4.26.0.20260518",
+    "types-pyyaml>=6.0.12.20260906",
 ]

@@ -1,0 +1,106 @@
+{
+  "additionalProperties": false,
+  "description": "Model-generated fields only. The gateway bundles the local Finding reference before sending a structured-output schema to a provider.",
+  "properties": {
+    "findings": {
+      "items": {
+        "additionalProperties": false,
+        "description": "One concrete issue at one repository-relative location or range. end_line must be greater than or equal to start_line.",
+        "properties": {
+          "category": {
+            "enum": [
+              "security",
+              "correctness",
+              "performance",
+              "maintainability"
+            ]
+          },
+          "end_line": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "evidence": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$",
+            "type": "string"
+          },
+          "proposed_diff_fix": {
+            "description": "Suggestion only; never automatically applied.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recommendation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "side": {
+            "enum": [
+              "OLD",
+              "NEW"
+            ]
+          },
+          "start_line": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "side",
+          "start_line",
+          "end_line",
+          "category",
+          "severity",
+          "title",
+          "explanation",
+          "evidence",
+          "recommendation",
+          "proposed_diff_fix"
+        ],
+        "type": "object"
+      },
+      "maxItems": 50,
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 10,
+      "type": "array"
+    },
+    "summary": {
+      "maxLength": 2000,
+      "type": "string"
+    }
+  },
+  "required": [
+    "summary",
+    "findings",
+    "limitations"
+  ],
+  "title": "LLMReviewOutput v1",
+  "type": "object"
+}

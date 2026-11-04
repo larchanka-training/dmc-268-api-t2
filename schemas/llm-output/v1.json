@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmc-268.local/schemas/llm-output/v1.json",
+  "title": "LLMReviewOutput v1",
+  "description": "Model-generated fields only. The gateway bundles the local Finding reference before sending a structured-output schema to a provider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "limitations"],
+  "properties": {
+    "summary": { "type": "string", "maxLength": 2000 },
+    "findings": { "type": "array", "maxItems": 50, "items": { "$ref": "../review-result/v1.json#/$defs/finding" } },
+    "limitations": { "type": "array", "maxItems": 10, "items": { "type": "string" } }
+  }
+}

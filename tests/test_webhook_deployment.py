@@ -114,9 +114,15 @@ def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
     )
     assert "compose up -d --force-recreate --no-deps api" in workflow
     assert "compose up -d --force-recreate --no-deps web" in workflow
-    assert "Verifying OAuth authorize requests scope=repo..." in workflow
+    assert "Verifying OAuth authorize requests scope=repo inside api..." in workflow
+    assert "Verifying OAuth authorize requests scope=repo via web..." in workflow
+    assert "Verifying running images match env pins..." in workflow
+    assert "running api image does not match API_IMAGE" in workflow
+    assert "running web image does not match UI_IMAGE" in workflow
     assert "*'scope=repo'*)" in workflow
-    assert "start_github_oauth source includes scope=repo" in workflow
+    assert (
+        "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
+    )
 
 
 @pytest.mark.skipif(

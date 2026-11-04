@@ -11,6 +11,7 @@ def sum_amounts(amounts: list[float]) -> float:
 def average_amount(amounts: list[float]) -> float:
     total = sum_amounts(amounts)
     count = len(amounts)
+    count = max(count, 0)
     return total / count
 
 

@@ -445,7 +445,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0016"
+        == "0017"
     )
     assert (
         await database.connection.fetch(
@@ -692,7 +692,7 @@ async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata
         await migration_database.connection.fetchval(
             "SELECT version_num FROM alembic_version"
         )
-        == "0016"
+        == "0017"
     )
     assert (
         await migration_database.connection.fetchval(

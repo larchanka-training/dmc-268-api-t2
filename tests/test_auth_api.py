@@ -159,7 +159,7 @@ async def test_start_redirects_to_github_with_browser_bound_state(
     assert query["client_id"] == ["test-client"]
     assert query["redirect_uri"] == ["https://test/api/v1/auth/github/callback"]
     assert len(query["state"][0]) >= 32  # noqa: PLR2004
-    assert "scope" not in query
+    assert query["scope"] == ["repo"]
     cookie = response.headers["set-cookie"]
     assert "Secure" in cookie and "HttpOnly" in cookie and "SameSite=lax" in cookie
     assert "Max-Age=600" in cookie

@@ -68,9 +68,13 @@ def test_deploy_writes_separate_publication_credentials() -> None:
         step for step in steps if step.get("name") == "Write runtime environment"
     )
     assert (
-        runtime["env"]["GITHUB_PUBLISH_TOKEN"] == "${{ secrets.GITHUB__WRITE_TOKEN }}"
+        runtime["env"]["GITHUB_PUBLISH_TOKEN"]
+        == "${{ secrets.STAGING_GITHUB_WRITE_TOKEN }}"
     )
-    assert runtime["env"]["GITHUB_BOT_USER_ID"] == "${{ secrets.GITHUB__BOT_USER_ID }}"
+    assert (
+        runtime["env"]["GITHUB_BOT_USER_ID"]
+        == "${{ secrets.STAGING_GITHUB_BOT_USER_ID }}"
+    )
     # Execute only the environment writer, before its SSH pipe, with synthetic data.
     writer = runtime["run"].split("} | sshpass -e ssh", 1)[0] + "}\n"
     result = subprocess.run(

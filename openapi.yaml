@@ -211,6 +211,14 @@ paths:
               schema: { $ref: '#/components/schemas/Repository' }
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
+        '409':
+          description: BOT_ACCESS_REQUIRED or INTEGRATION_UNHEALTHY
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                bot_access_required: { value: { code: BOT_ACCESS_REQUIRED, message: 'Grant the bot Write access on this repository, then try again.', request_id: req_123, retryable: false, retry_after: null, bot_login: dmc-bot, access_url: 'https://github.com/octocat/project/settings/access' } }
+                integration_unhealthy: { value: { code: INTEGRATION_UNHEALTHY, message: The repository integration is unhealthy., request_id: req_123, retryable: false, retry_after: null } }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/repositories/{id}/connection:
@@ -377,6 +385,7 @@ paths:
                 head: { value: { code: PR_HEAD_MISMATCH, message: Pull request head does not match., request_id: req_123, retryable: false, retry_after: null } }
                 active: { value: { code: REVIEW_ALREADY_ACTIVE, message: An equivalent review is already active., request_id: req_123, retryable: false, retry_after: null } }
                 legacy_settings: { value: { code: LEGACY_SETTINGS_UNSUPPORTED, message: Create a new supported settings version before starting a review., request_id: req_123, retryable: false, retry_after: null } }
+                integration_unhealthy: { value: { code: INTEGRATION_UNHEALTHY, message: The repository integration is unhealthy., request_id: req_123, retryable: false, retry_after: null } }
         '422': { $ref: '#/components/responses/ValidationFailed' }
         '429': { $ref: '#/components/responses/QuotaExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -789,7 +798,7 @@ components:
       enum: [NOT_READY, PENDING, PUBLISHED, PARTIAL, FAILED, UNKNOWN, SKIPPED]
     ErrorCode:
       type: string
-      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE, EVENT_REPLAY_UNAVAILABLE]
+      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, BOT_ACCESS_REQUIRED, INTEGRATION_UNHEALTHY, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE, EVENT_REPLAY_UNAVAILABLE]
     Error:
       type: object
       additionalProperties: false
@@ -800,6 +809,8 @@ components:
         request_id: { type: string }
         retryable: { type: boolean }
         retry_after: { type: [integer, 'null'], minimum: 0, description: 'Seconds until retry, or null' }
+        bot_login: { type: string, description: 'GitHub login of the bot (BOT_ACCESS_REQUIRED)' }
+        access_url: { type: string, description: 'GitHub repository access settings URL (BOT_ACCESS_REQUIRED)' }
     Me:
       type: object
       additionalProperties: false
@@ -1330,6 +1341,21 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example: { code: ACCESS_DENIED, message: Access is denied., request_id: req_123, retryable: false, retry_after: null }
+    BotAccessRequired:
+      description: BOT_ACCESS_REQUIRED — repository admin must grant the bot Write access
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            {
+              code: BOT_ACCESS_REQUIRED,
+              message: Grant the bot Write access on this repository, then try again.,
+              request_id: req_123,
+              retryable: false,
+              retry_after: null,
+              bot_login: dmc-bot,
+              access_url: https://github.com/octocat/project/settings/access,
+            }
     ResourceNotFound:
       description: RESOURCE_NOT_FOUND
       content:

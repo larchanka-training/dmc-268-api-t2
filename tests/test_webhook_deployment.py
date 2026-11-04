@@ -120,9 +120,7 @@ def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
     assert "running api image does not match API_IMAGE" in workflow
     assert "running web image does not match UI_IMAGE" in workflow
     assert "*'scope=repo'*)" in workflow
-    assert (
-        "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
-    )
+    assert "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
 
 
 @pytest.mark.skipif(

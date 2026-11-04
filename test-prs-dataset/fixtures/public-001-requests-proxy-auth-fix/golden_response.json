@@ -1,0 +1,7 @@
+{
+  "summary": "The changed condition prevents proxy credential disclosure on HTTPS.",
+  "findings": [],
+  "limitations": [
+    "Curated clean label applies to this fix excerpt only."
+  ]
+}

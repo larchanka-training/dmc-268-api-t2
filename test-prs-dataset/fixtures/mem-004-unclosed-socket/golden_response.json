@@ -11,7 +11,9 @@
       "title": "Сокет никогда не закрывается",
       "explanation": "sock создаётся через socket.socket(...), но close() не вызывается ни при успешном, ни при неуспешном подключении. При частых healthcheck-вызовах накапливаются открытые файловые дескрипторы.",
       "evidence": "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
-      "recommendation": "Использовать 'with socket.socket(...) as sock:' или явный sock.close() в блоке finally."
+      "recommendation": "Использовать 'with socket.socket(...) as sock:' или явный sock.close() в блоке finally.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

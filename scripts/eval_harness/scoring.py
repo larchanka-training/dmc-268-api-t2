@@ -1,7 +1,7 @@
 """Precision/recall scoring of predicted findings against hand-labeled ones.
 
 A predicted finding matches an expected one when they share the same
-``path`` and ``category`` and their line ranges overlap. Free-text fields and
+``path``, ``side`` and ``category`` and their line ranges overlap. Free-text fields and
 ``severity`` are ignored. Matching is greedy one-to-one: each expected
 finding can be consumed by at most one predicted finding, so duplicate
 predictions are not double-counted as extra true positives.
@@ -27,6 +27,7 @@ def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
 def _is_match(predicted: dict[str, Any], expected: dict[str, Any]) -> bool:
     return (
         predicted["path"] == expected["path"]
+        and predicted["side"] == expected["side"]
         and predicted["category"] == expected["category"]
         and _ranges_overlap(
             predicted["start_line"],

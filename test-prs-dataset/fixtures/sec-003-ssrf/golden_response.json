@@ -11,7 +11,9 @@
       "title": "SSRF: запрос выполняется на произвольный URL без валидации",
       "explanation": "image_url приходит от пользователя и напрямую передаётся в httpx.get без проверки схемы/хоста, что позволяет обращаться к внутренним сервисам (например, 169.254.169.254 или localhost).",
       "evidence": "response = httpx.get(image_url, timeout=5.0)",
-      "recommendation": "Валидировать схему (только http/https) и резолвить хост, запрещая приватные/loopback-адреса, либо использовать allowlist доменов."
+      "recommendation": "Валидировать схему (только http/https) и резолвить хост, запрещая приватные/loopback-адреса, либо использовать allowlist доменов.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

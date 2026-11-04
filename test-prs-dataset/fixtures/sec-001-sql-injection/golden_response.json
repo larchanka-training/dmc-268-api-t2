@@ -11,7 +11,9 @@
       "title": "SQL-инъекция через конкатенацию пользовательского ввода",
       "explanation": "Параметр name подставляется в текст запроса конкатенацией строк, что позволяет злоумышленнику внедрить произвольный SQL (например, завершить строку и добавить UNION SELECT).",
       "evidence": "query = \"SELECT id, email FROM users WHERE name = '\" + name + \"'\"",
-      "recommendation": "Использовать параметризованный запрос: cursor.execute(\"SELECT id, email FROM users WHERE name = %s\", (name,))."
+      "recommendation": "Использовать параметризованный запрос: cursor.execute(\"SELECT id, email FROM users WHERE name = %s\", (name,)).",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

@@ -11,7 +11,9 @@
       "title": "'and' вместо 'or' запрещает редактирование владельцам-не-админам",
       "explanation": "Функция должна разрешать редактирование либо владельцу, либо администратору, но 'and' требует выполнения ОБОИХ условий одновременно, из-за чего обычный владелец ресурса теряет доступ к редактированию собственного ресурса.",
       "evidence": "return is_owner and is_admin",
-      "recommendation": "Заменить на 'return is_owner or is_admin'."
+      "recommendation": "Заменить на 'return is_owner or is_admin'.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

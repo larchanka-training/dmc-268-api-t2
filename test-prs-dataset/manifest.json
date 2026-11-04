@@ -108,5 +108,10 @@
     "id": "clean-004-resource-managed-with-context-manager",
     "category": "clean",
     "title": "Корректное закрытие файла через контекстный менеджер"
+  },
+  {
+    "id": "public-001-requests-proxy-auth-fix",
+    "category": "clean",
+    "title": "Requests: prevent proxy auth disclosure"
   }
 ]

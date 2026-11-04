@@ -3,44 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
+import httpx
+
+from app.review.prompt import PromptBuilder
 from scripts.eval_harness.dataset import Fixture, load_dataset
-from scripts.eval_harness.llm_client import LlmConfig, call_llm
-from scripts.eval_harness.prompt import SYSTEM_PROMPT, build_user_message
+from scripts.eval_harness.llm_client import LlmConfig, LlmConfigurationError, call_llm
+from scripts.eval_harness.provenance import digest, replay_provenance
 from scripts.eval_harness.report import (
     build_report,
     evaluate_fixture,
     print_console_summary,
 )
+from scripts.eval_harness.runtime import deterministic_response
 
-_SCHEMA_PATH = Path(__file__).parent / "schema" / "review_result.schema.json"
-
-
-def _load_schema() -> dict[str, Any]:
-    return cast("dict[str, Any]", json.loads(_SCHEMA_PATH.read_text(encoding="utf-8")))
+ROOT = Path(__file__).resolve().parents[2]
+PROMPTS = ROOT / ".agents/reviewer"
 
 
 def _offline_response(fixture: Fixture) -> Any:
     return fixture.golden_response
-
-
-def _live_response(fixture: Fixture, config: LlmConfig) -> Any:
-    raw_text = call_llm(
-        config,
-        system_prompt=SYSTEM_PROMPT,
-        user_message=build_user_message(
-            title=fixture.title,
-            description=fixture.description,
-            diff_text=fixture.diff_text,
-        ),
-    )
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        return raw_text
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -50,10 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["offline", "live"],
+        choices=["offline", "deterministic", "live"],
         default="offline",
         help="offline (default): replay golden_response.json, no network/API key. "
-        "live: call a real LLM configured via EVAL_LLM_* env vars.",
+        "deterministic: verified prompt/Gateway with local HTTP replay. "
+        "live: explicitly approved runtime manifest and spend ceilings.",
     )
     parser.add_argument(
         "--dataset-dir",
@@ -72,26 +59,132 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Only evaluate fixtures whose category equals this value.",
     )
+    parser.add_argument("--runtime-manifest", type=Path)
+    parser.add_argument("--allow-live", action="store_true")
+    parser.add_argument("--max-cost-usd")
+    parser.add_argument("--input-usd-per-million")
+    parser.add_argument("--output-usd-per-million")
     return parser.parse_args(argv)
 
 
-def run(argv: list[str] | None = None) -> dict[str, Any]:
+def run(
+    argv: list[str] | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+) -> dict[str, Any]:
     args = parse_args(argv)
-    schema = _load_schema()
-    fixtures = load_dataset(args.dataset_dir, category_filter=args.filter)
-
-    llm_config = LlmConfig.from_env() if args.mode == "live" else None
-
-    reports = []
-    for fixture in fixtures:
-        response = (
-            _offline_response(fixture)
-            if llm_config is None
-            else _live_response(fixture, llm_config)
+    if args.mode == "live" and not all(
+        (
+            args.allow_live,
+            args.runtime_manifest,
+            args.max_cost_usd,
+            args.input_usd_per_million,
+            args.output_usd_per_million,
         )
+    ):
+        raise LlmConfigurationError(
+            "Live mode requires an explicit manifest, approval, cost cap "
+            "and input/output price ceilings"
+        )
+    fixtures = load_dataset(args.dataset_dir, category_filter=args.filter)
+    if not fixtures:
+        raise ValueError("No fixtures selected; check the manifest and category filter")
+
+    llm_config = (
+        LlmConfig.approved(
+            args.runtime_manifest,
+            args.max_cost_usd,
+            args.input_usd_per_million,
+            args.output_usd_per_million,
+            len(fixtures),
+        )
+        if args.mode == "live"
+        else None
+    )
+    builder = (
+        PromptBuilder.load(
+            PROMPTS,
+            llm_config.runtime.admission.prompt_version,
+            expected_digest=llm_config.runtime.admission.prompt_digest,
+        )
+        if llm_config
+        else PromptBuilder.load(PROMPTS, "v3")
+    )
+    schema = json.loads(builder.output_schema_json)
+    requests = input_tokens = output_tokens = 0
+    reports = []
+    receipts: list[dict[str, Any]] = []
+    for fixture in fixtures:
+        response = _offline_response(fixture)
+        receipt: dict[str, Any] = {
+            "provider": None,
+            "model": None,
+            "error_code": None,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+        if args.mode != "offline":
+            observation = (
+                asyncio.run(call_llm(fixture, builder, llm_config, transport=transport))
+                if llm_config
+                else asyncio.run(deterministic_response(fixture, builder))
+            )
+            response = observation.response
+            requests += observation.requests
+            input_tokens += observation.input_tokens
+            output_tokens += observation.output_tokens
+            receipt = {
+                "provider": observation.provider,
+                "model": observation.model,
+                "error_code": observation.error_code,
+                "requests": observation.requests,
+                "input_tokens": observation.input_tokens,
+                "output_tokens": observation.output_tokens,
+            }
+        receipts.append(receipt)
         reports.append(evaluate_fixture(fixture, response, schema))
 
     report = build_report(reports)
+    for row, receipt in zip(report["fixtures"], receipts, strict=True):
+        row.update(receipt)
+    report["provenance"] = replay_provenance(args.dataset_dir, builder, args.filter)
+    if args.mode == "deterministic":
+        report["provenance"].update(
+            mode="deterministic",
+            provider="mock",
+            model="gold-replay",
+            scope="verified-initial-prompt/Gateway with HTTP replay; no model quality",
+        )
+    if llm_config:
+        report["provenance"].update(
+            mode="live",
+            provider=llm_config.runtime.admission.primary.profile_ref,
+            model=llm_config.runtime.admission.primary.model_ref,
+            runtime_manifest_sha256=llm_config.runtime.identity,
+            quality_measurement=True,
+            scope="verified initial prompt/Gateway; no worker admission or repair",
+            cost_basis=(
+                "price ceilings times charged token receipts/reservations; "
+                "estimate, not invoice"
+            ),
+            max_cost_usd=str(llm_config.cap),
+            input_usd_per_million=str(llm_config.input_price),
+            output_usd_per_million=str(llm_config.output_price),
+        )
+    report["provenance"]["config_sha256"] = digest(
+        {
+            key: value
+            for key, value in report["provenance"].items()
+            if key not in {"config_sha256", "dataset_sha256"}
+        }
+    )
+    report["usage"] = {
+        "requests": requests,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": str(llm_config.cost(input_tokens, output_tokens))
+        if llm_config
+        else "0",
+    }
     print_console_summary(report)
 
     args.report_out.write_text(
@@ -101,5 +194,13 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    run(argv)
-    return 0
+    report = run(argv)
+    summary = report["aggregate"]
+    return int(
+        summary["shape_valid_count"] != summary["fixtures_total"]
+        or (
+            report["provenance"]["mode"] != "live"
+            and (summary["false_positives"] or summary["false_negatives"])
+        )
+        or summary["findings_grounded"] != summary["findings_predicted"]
+    )

@@ -11,7 +11,9 @@
       "title": "Кэш в памяти процесса растёт без ограничения",
       "explanation": "_GEOCODE_CACHE — обычный dict без верхней границы размера и TTL. При большом количестве уникальных адресов процесс со временем исчерпает память (утечка в рамках времени жизни процесса).",
       "evidence": "_GEOCODE_CACHE[address] = result",
-      "recommendation": "Использовать ограниченный по размеру кэш с вытеснением (например, functools.lru_cache(maxsize=...) или cachetools.LRUCache)."
+      "recommendation": "Использовать ограниченный по размеру кэш с вытеснением (например, functools.lru_cache(maxsize=...) или cachetools.LRUCache).",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

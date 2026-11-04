@@ -11,7 +11,9 @@
       "title": "Соединение из пула не освобождается",
       "explanation": "connection получено из pool.acquire(), но нигде не вызывается pool.release(connection)/connection.close(). При частых вызовах функция исчерпает пул соединений с базой данных.",
       "evidence": "connection = pool.acquire()",
-      "recommendation": "Оборачивать использование соединения в try/finally или контекстный менеджер пула, гарантирующий release() при любом исходе."
+      "recommendation": "Оборачивать использование соединения в try/finally или контекстный менеджер пула, гарантирующий release() при любом исходе.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

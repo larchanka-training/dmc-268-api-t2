@@ -11,7 +11,9 @@
       "title": "Срез теряет последний элемент страницы (off-by-one)",
       "explanation": "end вычисляется как start + page_size - 1, а Python-срез items[start:end] уже не включает правую границу. В результате каждая страница содержит на один элемент меньше page_size.",
       "evidence": "end = start + page_size - 1",
-      "recommendation": "Использовать end = start + page_size (без вычитания единицы)."
+      "recommendation": "Использовать end = start + page_size (без вычитания единицы).",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

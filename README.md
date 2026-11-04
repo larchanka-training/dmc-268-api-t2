@@ -161,3 +161,17 @@ uv run python -m app.publication_worker --poll-interval 1
 не запускают публикацию автоматически. Контракты, SSE, recovery и интеграция
 с объединёнными зависимостями:
 [`docs/github-review-publication.md`](docs/github-review-publication.md).
+
+## Gold benchmark / Eval
+
+23 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
+[`test-prs-dataset/README.md`](test-prs-dataset/README.md).
+
+```bash
+uv run python -m scripts.eval_harness --mode offline --report-out eval-offline.json
+uv run python -m scripts.eval_harness --mode deterministic --report-out eval-deterministic.json
+```
+
+CI загружает оба отчёта как `gold-benchmark-reports`. Replay и deterministic
+проверяют регрессию; они не измеряют качество LLM. Live запускается отдельно
+только с явным runtime manifest, разрешением и лимитом расходов.

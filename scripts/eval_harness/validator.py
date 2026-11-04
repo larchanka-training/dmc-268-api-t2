@@ -7,66 +7,53 @@ hallucinated. This module checks both, independently.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
-_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-_NEW_FILE_HEADER = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
-_OLD_FILE_HEADER = re.compile(r"^--- (?:a/)?(.+)$")
+from app.review.schemas.context import FileDiff
+from app.review.schemas.finding import LLMFindingV1
+from app.review.validation import has_changed_anchor
+from app.vcs.diff import parse_diff as parse_canonical_diff
 
 
 @dataclass(slots=True)
 class ChangedLines:
     new_lines: set[int] = field(default_factory=set)
     old_lines: set[int] = field(default_factory=set)
+    diff: FileDiff | None = None
 
 
 def validate_shape(response: Any, schema: dict[str, Any]) -> list[str]:
     """Return JSON-schema validation error messages (empty if valid)."""
 
     validator = Draft202012Validator(schema)
-    return [error.message for error in validator.iter_errors(response)]
+    return [f"schema:{error.validator}" for error in validator.iter_errors(response)]
 
 
 def parse_diff(diff_text: str) -> dict[str, ChangedLines]:
     """Return, per file path, the set of changed OLD/NEW line numbers."""
 
     changed: dict[str, ChangedLines] = {}
-    current_path: str | None = None
-    old_line = new_line = 0
-
-    for line in diff_text.splitlines():
-        new_file_match = _NEW_FILE_HEADER.match(line)
-        if new_file_match:
-            path = new_file_match.group(1)
-            current_path = None if path == "/dev/null" else path
-            if current_path is not None:
-                changed.setdefault(current_path, ChangedLines())
-            continue
-        if _OLD_FILE_HEADER.match(line):
-            continue
-
-        hunk_match = _HUNK_HEADER.match(line)
-        if hunk_match:
-            old_line = int(hunk_match.group(1))
-            new_line = int(hunk_match.group(2))
-            continue
-
-        if current_path is None:
-            continue
-
-        if line.startswith("+"):
-            changed[current_path].new_lines.add(new_line)
-            new_line += 1
-        elif line.startswith("-"):
-            changed[current_path].old_lines.add(old_line)
-            old_line += 1
-        elif line.startswith(" "):
-            old_line += 1
-            new_line += 1
+    for file in parse_canonical_diff(diff_text).files:
+        diff = file["diff"]
+        for side, path_key, kind, number in (
+            ("old_lines", "old_path", "deleted", "old_line"),
+            ("new_lines", "new_path", "added", "new_line"),
+        ):
+            path = diff[path_key]
+            if path is None:
+                continue
+            entry = changed.setdefault(
+                path, ChangedLines(diff=FileDiff.model_validate(diff))
+            )
+            target = getattr(entry, side)
+            for hunk in diff["hunks"]:
+                target.update(
+                    line[number] for line in hunk["lines"] if line["kind"] == kind
+                )
 
     return changed
 
@@ -74,12 +61,15 @@ def parse_diff(diff_text: str) -> dict[str, ChangedLines]:
 def is_grounded(
     finding: dict[str, Any], changed_lines: dict[str, ChangedLines]
 ) -> bool:
-    """Whether a finding's location lands entirely on changed lines of the diff."""
+    """Whether the production same-hunk changed-anchor policy accepts a finding."""
 
     lines = changed_lines.get(finding["path"])
-    if lines is None:
+    if lines is None or lines.diff is None:
         return False
-    target = lines.new_lines if finding["side"] == "NEW" else lines.old_lines
-    return all(
-        line in target for line in range(finding["start_line"], finding["end_line"] + 1)
-    )
+    try:
+        location = LLMFindingV1.model_validate(
+            {name: finding[name] for name in LLMFindingV1.model_fields}
+        )
+    except KeyError, ValidationError:
+        return False
+    return has_changed_anchor(location, [lines.diff])

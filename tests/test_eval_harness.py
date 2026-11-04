@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
+import httpx
 import pytest
-from scripts.eval_harness.cli import run
+from scripts.eval_harness.cli import main, run
+from scripts.eval_harness.dataset import Fixture, load_dataset
 from scripts.eval_harness.llm_client import LlmConfigurationError
+from scripts.eval_harness.report import aggregate, evaluate_fixture
+from scripts.eval_harness.runtime import fixture_context, gateway_response
 from scripts.eval_harness.scoring import MatchCounts, match_findings
 from scripts.eval_harness.validator import is_grounded, parse_diff, validate_shape
+
+from app.llm.budget import BudgetLimits, RunBudget
+from app.llm.gateway import Endpoint, LLMGateway, ProviderPool
+from app.llm.openai_compatible import OpenAICompatibleClient
+from app.review.prompt import PromptBuilder
 
 _DIFF = (
     "diff --git a/app/example.py b/app/example.py\n"
@@ -23,11 +33,14 @@ _DIFF = (
     "+line three\n"
 )
 
-_SCHEMA_PATH = (
-    Path(__file__).parents[1] / "scripts/eval_harness/schema/review_result.schema.json"
+
+_SCHEMA = json.loads(
+    PromptBuilder.load(
+        Path(__file__).parents[1] / ".agents/reviewer", "v3"
+    ).output_schema_json
 )
-_SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
 _FULL_PERCENT = 100.0
+_SHA256_LENGTH = 64
 
 
 def _counts(result: MatchCounts) -> tuple[int, int, int]:
@@ -46,6 +59,8 @@ def _finding(**overrides: object) -> dict[str, object]:
         "explanation": "e",
         "evidence": "ev",
         "recommendation": "r",
+        "rule_ref": None,
+        "proposed_diff_fix": None,
     }
     base.update(overrides)
     return base
@@ -260,3 +275,433 @@ class TestCliEndToEnd:
 
         with pytest.raises(LlmConfigurationError):
             run(["--mode", "live", "--dataset-dir", str(dataset_dir)])
+
+
+def test_matching_does_not_credit_an_old_side_finding_on_the_new_side() -> None:
+    counts = match_findings([_finding(side="OLD")], [_finding(side="NEW")])
+    assert _counts(counts) == (0, 1, 1)
+
+
+def test_clean_corpus_grounding_is_a_percentage() -> None:
+
+    assert aggregate([])["grounding_valid_percent"] == _FULL_PERCENT
+
+
+def test_ungrounded_prediction_cannot_be_a_true_positive() -> None:
+
+    fixture = Fixture(
+        id="demo",
+        category="security",
+        title="Demo",
+        description="",
+        language="python",
+        diff_text=_DIFF,
+        expected_findings=[_finding()],
+        golden_response={},
+    )
+    report = evaluate_fixture(
+        fixture,
+        {
+            "summary": "ok",
+            "findings": [_finding(start_line=2, end_line=20)],
+            "limitations": [],
+        },
+        _SCHEMA,
+    )
+    assert (report.true_positives, report.false_positives, report.false_negatives) == (
+        0,
+        1,
+        1,
+    )
+
+
+def test_cli_exit_status_rejects_invalid_schema(tmp_path: Path) -> None:
+
+    dataset = tmp_path / "dataset"
+    shutil.copytree(Path(__file__).parents[1] / "test-prs-dataset", dataset)
+    first = json.loads((dataset / "manifest.json").read_text())[0]["id"]
+    (dataset / "fixtures" / first / "golden_response.json").write_text("{}")
+    assert (
+        main(
+            [
+                "--dataset-dir",
+                str(dataset),
+                "--report-out",
+                str(tmp_path / "report.json"),
+            ]
+        )
+        == 1
+    )
+
+
+def test_cli_validates_the_canonical_schema_required_nullable_fields(
+    tmp_path: Path,
+) -> None:
+
+    dataset = tmp_path / "dataset"
+    shutil.copytree(Path(__file__).parents[1] / "test-prs-dataset", dataset)
+    response = dataset / "fixtures" / "sec-001-sql-injection" / "golden_response.json"
+    data = json.loads(response.read_text())
+    del data["findings"][0]["proposed_diff_fix"]
+    response.write_text(json.dumps(data))
+    report = run(
+        ["--dataset-dir", str(dataset), "--report-out", str(tmp_path / "report.json")]
+    )
+    assert report["fixtures"][0]["shape_valid"] is False
+
+
+def test_deleted_file_findings_are_grounded_on_the_old_path() -> None:
+    diff = (
+        "diff --git a/app/example.py b/app/example.py\n"
+        "deleted file mode 100644\n--- a/app/example.py\n+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-line one\n-line two\n"
+    )
+    assert is_grounded(_finding(side="OLD"), parse_diff(diff))
+
+
+def test_report_pins_replay_provenance_without_claiming_model_quality(
+    tmp_path: Path,
+) -> None:
+    args = ["--report-out", str(tmp_path / "report.json")]
+    report = run(args)
+    second = run(args)
+    provenance = report["provenance"]
+    assert provenance == second["provenance"]
+    assert provenance["mode"] == "offline"
+    assert provenance["quality_measurement"] is False
+    assert provenance["model"] is None
+    assert len(provenance["dataset_sha256"]) == _SHA256_LENGTH
+    assert provenance["prompt_version"] == "v3"
+    assert len(provenance["prompt_digest"]) == _SHA256_LENGTH
+    assert len(provenance["schema_sha256"]) == _SHA256_LENGTH
+    assert len(provenance["config_sha256"]) == _SHA256_LENGTH
+    assert report["usage"] == {
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": "0",
+    }
+
+
+def test_deterministic_mode_exercises_verified_prompt_and_gateway(
+    tmp_path: Path,
+) -> None:
+    report = run(
+        [
+            "--mode",
+            "deterministic",
+            "--filter",
+            "clean",
+            "--report-out",
+            str(tmp_path / "report.json"),
+        ]
+    )
+    assert report["aggregate"]["shape_valid_percent"] == _FULL_PERCENT
+    assert report["usage"]["requests"] == report["aggregate"]["fixtures_total"]
+    assert report["provenance"]["quality_measurement"] is False
+    assert report["provenance"]["provider"] == "mock"
+
+
+def test_live_mode_requires_explicit_manifest_and_spend_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    for key, value in {
+        "EVAL_LLM_BASE_URL": "https://unapproved.invalid",
+        "EVAL_LLM_API_KEY": "fixture-key",
+        "EVAL_LLM_MODEL": "unapproved",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("An unapproved live HTTP call was attempted")
+
+    monkeypatch.setattr(httpx, "post", forbidden)
+    with pytest.raises(LlmConfigurationError):
+        run(
+            [
+                "--mode",
+                "live",
+                "--filter",
+                "clean",
+                "--report-out",
+                str(tmp_path / "report.json"),
+            ]
+        )
+
+
+def test_authorized_live_path_uses_runtime_gateway_with_a_local_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    root = Path(__file__).parents[1]
+    manifest = json.loads((root / "deploy/analysis-runtime.staging.json").read_text())
+    manifest["profiles"]["eurorouter/review-v1"]["base_url"] = "https://llm.invalid/v1"
+    manifest["profiles"]["eurorouter/review-v1"]["allowed_models"] = ["fixture-model"]
+    manifest["admission"]["primary"]["model_ref"] = "fixture-model"
+    manifest["admission"]["prompt_version"] = "v3"
+    manifest["admission"]["prompt_digest"] = PromptBuilder.load(
+        root / ".agents/reviewer", "v3"
+    ).prompt_digest
+    config = tmp_path / "runtime.json"
+    config.write_text(json.dumps(manifest))
+    monkeypatch.setenv("LLM__EUROROUTER__API_KEYS", "fixture-key")
+    requests: list[httpx.Request] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = json.loads(request.content)
+        assert body["model"] == "fixture-model"
+        assert body["response_format"]["json_schema"]["schema"]["properties"][
+            "findings"
+        ]["items"]["required"][-2:] == ["rule_ref", "proposed_diff_fix"]
+        assert (
+            body["messages"][0]["content"]
+            == (root / ".agents/reviewer/v3/system.md").read_text()
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"summary": "ok", "findings": [], "limitations": []}
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+        )
+
+    report = run(
+        [
+            "--mode",
+            "live",
+            "--allow-live",
+            "--runtime-manifest",
+            str(config),
+            "--max-cost-usd",
+            "100",
+            "--input-usd-per-million",
+            "1",
+            "--output-usd-per-million",
+            "1",
+            "--filter",
+            "clean",
+            "--report-out",
+            str(tmp_path / "report.json"),
+        ],
+        transport=httpx.MockTransport(provider),
+    )
+    assert len(requests) == report["aggregate"]["fixtures_total"]
+    assert report["provenance"]["model"] == "fixture-model"
+    assert report["fixtures"][0]["model"] == "fixture-model"
+    assert report["fixtures"][0]["provider"] == "eurorouter"
+    assert report["provenance"]["mode"] == "live"
+    assert report["usage"]["requests"] == len(requests)
+    assert report["usage"]["cost_usd"] == "0.000015"
+
+
+def test_reversed_finding_range_cannot_pass_grounding() -> None:
+    assert not is_grounded(_finding(start_line=3, end_line=2), parse_diff(_DIFF))
+
+
+def test_dataset_rejects_fixture_paths_outside_its_directory(tmp_path: Path) -> None:
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "manifest.json").write_text(
+        json.dumps([{"id": "../../outside", "category": "clean", "title": "bad"}])
+    )
+    with pytest.raises(ValueError, match="fixture id"):
+        load_dataset(dataset)
+
+
+def test_schema_diagnostics_do_not_echo_provider_output() -> None:
+    errors = validate_shape(
+        {
+            "summary": {"text": "fixture-sensitive-output"},
+            "findings": [],
+            "limitations": [],
+        },
+        _SCHEMA,
+    )
+    assert errors
+    assert "fixture-sensitive-output" not in json.dumps(errors)
+
+
+def test_cli_exit_status_rejects_ungrounded_replay(tmp_path: Path) -> None:
+
+    dataset = tmp_path / "dataset"
+    shutil.copytree(Path(__file__).parents[1] / "test-prs-dataset", dataset)
+    response = dataset / "fixtures" / "sec-001-sql-injection" / "golden_response.json"
+    data = json.loads(response.read_text())
+    data["findings"][0]["end_line"] = 200
+    response.write_text(json.dumps(data))
+    assert (
+        main(
+            [
+                "--dataset-dir",
+                str(dataset),
+                "--report-out",
+                str(tmp_path / "report.json"),
+            ]
+        )
+        == 1
+    )
+
+
+def test_cli_catches_replay_missing_an_expected_bug(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    shutil.copytree(Path(__file__).parents[1] / "test-prs-dataset", dataset)
+    response = dataset / "fixtures" / "sec-001-sql-injection" / "golden_response.json"
+    response.write_text(
+        json.dumps({"summary": "miss", "findings": [], "limitations": []})
+    )
+    assert (
+        main(
+            [
+                "--dataset-dir",
+                str(dataset),
+                "--report-out",
+                str(tmp_path / "report.json"),
+            ]
+        )
+        == 1
+    )
+
+
+async def test_gateway_benchmark_accounts_for_schema_in_per_call_input_limit() -> None:
+
+    fixture = load_dataset(
+        Path(__file__).parents[1] / "test-prs-dataset", category_filter="clean"
+    )[0]
+    builder = PromptBuilder.load(Path(__file__).parents[1] / ".agents/reviewer", "v3")
+    message_tokens = builder.build(
+        fixture_context(fixture), max_input_tokens=10000
+    ).estimated_tokens
+    calls: list[httpx.Request] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture",
+                "choices": [
+                    {"message": {"content": json.dumps(fixture.golden_response)}}
+                ],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
+        client = OpenAICompatibleClient(
+            name="mock",
+            http=http,
+            base_url="https://fixture.invalid",
+            model="fixture",
+            api_key="fixture",
+        )
+        gateway = LLMGateway([ProviderPool("mock", [Endpoint(client)], timeout_s=120)])
+        outcome = await gateway_response(
+            fixture,
+            builder,
+            gateway,
+            RunBudget(BudgetLimits(1, 80000, 16000, 600)),
+            max_input_tokens=message_tokens,
+        )
+    assert calls == []
+    assert outcome.error_code == "prompt_too_large"
+
+
+def test_eval_accepts_a_changed_anchor_with_trailing_context_in_the_same_hunk() -> None:
+    diff = (
+        "diff --git a/app/example.py b/app/example.py\n"
+        "--- a/app/example.py\n+++ b/app/example.py\n"
+        "@@ -1,3 +1,3 @@\n-old\n+new\n context\n tail\n"
+    )
+    fixture = Fixture(
+        id="changed-context",
+        category="security",
+        title="Demo",
+        description="",
+        language="python",
+        diff_text=diff,
+        expected_findings=[_finding(start_line=1, end_line=2)],
+        golden_response={},
+    )
+    report = evaluate_fixture(
+        fixture,
+        {
+            "summary": "ok",
+            "findings": [_finding(start_line=1, end_line=2)],
+            "limitations": [],
+        },
+        _SCHEMA,
+    )
+    assert (report.true_positives, report.false_positives, report.false_negatives) == (
+        1,
+        0,
+        0,
+    )
+
+
+def test_eval_rejects_a_range_spanning_two_adjacent_hunks() -> None:
+    diff = (
+        "diff --git a/app/example.py b/app/example.py\n"
+        "--- a/app/example.py\n+++ b/app/example.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n@@ -2 +2 @@\n-other\n+changed\n"
+    )
+    fixture = Fixture(
+        id="two-hunks",
+        category="security",
+        title="Demo",
+        description="",
+        language="python",
+        diff_text=diff,
+        expected_findings=[_finding(start_line=1, end_line=1)],
+        golden_response={},
+    )
+    report = evaluate_fixture(
+        fixture,
+        {
+            "summary": "ok",
+            "findings": [_finding(start_line=1, end_line=2)],
+            "limitations": [],
+        },
+        _SCHEMA,
+    )
+    assert (report.true_positives, report.false_positives, report.false_negatives) == (
+        0,
+        1,
+        1,
+    )
+
+
+def test_cli_rejects_an_empty_selected_dataset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="No fixtures"):
+        run(
+            [
+                "--filter",
+                "category-does-not-exist",
+                "--report-out",
+                str(tmp_path / "report.json"),
+            ]
+        )
+
+
+def test_dataset_rejects_symlinked_source_outside_approved_corpus(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    shutil.copytree(Path(__file__).parents[1] / "test-prs-dataset", dataset)
+    meta = dataset / "fixtures" / "sec-001-sql-injection" / "meta.json"
+    outside = tmp_path / "outside.json"
+    outside.write_text(meta.read_text())
+    meta.unlink()
+    meta.symlink_to(outside)
+    with pytest.raises(ValueError, match="outside dataset"):
+        load_dataset(dataset)

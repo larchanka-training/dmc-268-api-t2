@@ -63,7 +63,8 @@ def evaluate_fixture(
         1 for finding in findings if is_grounded(finding, changed_lines)
     )
 
-    counts = match_findings(findings, fixture.expected_findings)
+    grounded = [finding for finding in findings if is_grounded(finding, changed_lines)]
+    counts = match_findings(grounded, fixture.expected_findings)
 
     return FixtureReport(
         fixture_id=fixture.id,
@@ -73,7 +74,7 @@ def evaluate_fixture(
         findings_predicted=len(findings),
         findings_grounded=grounded_count,
         true_positives=counts.true_positives,
-        false_positives=counts.false_positives,
+        false_positives=counts.false_positives + len(findings) - len(grounded),
         false_negatives=counts.false_negatives,
     )
 
@@ -109,7 +110,7 @@ def aggregate(reports: list[FixtureReport]) -> dict[str, Any]:
         "findings_predicted": findings_predicted,
         "findings_grounded": findings_grounded,
         "grounding_valid_percent": round(
-            100 * _safe_ratio(findings_grounded, findings_predicted, default=100.0), 1
+            100 * _safe_ratio(findings_grounded, findings_predicted, default=1.0), 1
         ),
         "true_positives": true_positives,
         "false_positives": false_positives,

@@ -11,7 +11,9 @@
       "title": "Недостижимый код после return",
       "explanation": "print(\"logging cancellation\") находится после return и никогда не выполняется. Такой мёртвый код вводит в заблуждение читателя, будто логирование действительно происходит.",
       "evidence": "print(\"logging cancellation\")",
-      "recommendation": "Удалить недостижимую строку или переместить её перед return, если логирование нужно."
+      "recommendation": "Удалить недостижимую строку или переместить её перед return, если логирование нужно.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
     }
   ],
   "limitations": []

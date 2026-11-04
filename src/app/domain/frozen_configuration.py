@@ -1,4 +1,4 @@
-"""Strict persisted policy v1. Defaults are materialized only at new admission."""
+"""Strict persisted policies. Defaults are materialized only at new admission."""
 
 import json
 from typing import Annotated, Any, Literal, Self
@@ -30,6 +30,7 @@ class FrozenDTO(BaseModel):
         "max_transient_per_provider",
         "max_format_repairs",
         "max_overflow_rebuilds_per_chunk",
+        "max_reflections_per_chunk",
         mode="before",
         check_fields=False,
     )
@@ -83,8 +84,8 @@ class RetryPolicy(FrozenDTO):
     backoff_policy: Literal["review-exponential-v1"]
 
 
-class ModelSettings(FrozenDTO):
-    schema_version: Literal[1]
+class _PolicyFields(FrozenDTO):
+    schema_version: int
     generation: Generation
     routing: Routing
     limits: Limits
@@ -92,11 +93,38 @@ class ModelSettings(FrozenDTO):
     token_estimator_version: Literal["review-conservative-v1"]
     repository_settings_digest: Digest
 
+
+class ModelSettings(_PolicyFields):
+    schema_version: Literal[1]
+
     @classmethod
-    def from_stored(cls, values: dict[str, object]) -> Self:
-        # JSON lists become immutable tuples. Python strict mode would reject the
-        # canonical persisted array. No defaults exist on the persisted DTO.
-        return cls.model_validate_json(json.dumps(values, allow_nan=False))
+    def from_stored(cls, values: dict[str, object]) -> ModelPolicy:
+        encoded = json.dumps(values, allow_nan=False)
+        if type(values.get("schema_version")) is int and values["schema_version"] == 2:  # noqa: PLR2004 -- explicit saved policy version
+            return ModelSettingsV2.model_validate_json(encoded)
+        return cls.model_validate_json(encoded)
+
+
+class ReflectionPolicy(FrozenDTO):
+    max_reflections_per_run: Annotated[int, Field(ge=0)]
+    max_reflections_per_chunk: Literal[1]
+    failure_mode: Literal["fail_open"]
+    verifier_version: Literal["v1"]
+    verifier_digest: Digest
+
+
+class ModelSettingsV2(_PolicyFields):
+    schema_version: Literal[2]
+    reflection: ReflectionPolicy
+
+    @model_validator(mode="after")
+    def bounded_reflection(self) -> Self:
+        if self.reflection.max_reflections_per_run > self.limits.max_chunks:
+            raise ValueError("reflection allowance exceeds frozen chunk count")
+        return self
+
+
+type ModelPolicy = ModelSettings | ModelSettingsV2
 
 
 def admission_policy(

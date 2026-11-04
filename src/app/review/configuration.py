@@ -33,6 +33,7 @@ from app.domain.frozen_configuration import (
     ExecutionSettings,
     FrozenConfigurationError,
     FrozenDTO,
+    ModelPolicy,
     ModelRoute,
     ModelSettings,
     ProfileRef,
@@ -49,7 +50,12 @@ from app.llm.gateway import Endpoint, LLMGateway, ProviderPool
 from app.llm.ollama import OllamaClient
 from app.llm.openai_compatible import OpenAICompatibleClient
 from app.review.preflight import PreflightIssue, PreflightReport, offline_preflight
-from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.prompt import (
+    PromptBuilder,
+    PromptConfigError,
+    ReflectionBundle,
+    reflection_bundle,
+)
 from app.review.schemas.context import ContextPayload
 
 
@@ -72,7 +78,7 @@ class ExecutionConfiguration:
     model_digest: str | None
     prompt_version: str
     prompt_digest: str
-    policy: ModelSettings
+    policy: ModelPolicy
     instructions: tuple[str, ...]
     output_language: str
     ignores: tuple[str, ...]
@@ -82,6 +88,7 @@ class ExecutionConfiguration:
     rules_source_state: str | None = None
     rules_diagnostics: tuple[str, ...] = ()
     allowed_rule_refs: frozenset[str] | None = None
+    verifier: ReflectionBundle | None = None
 
     def validate_context(self, payload: ContextPayload) -> None:
         if (
@@ -159,7 +166,7 @@ class ProfileDescriptor(FrozenDTO):
 
 class AdmissionSelection(FrozenDTO):
     primary: ModelRoute
-    policy: ModelSettings
+    policy: ModelPolicy
     prompt_version: Literal["v1", "v2", "v3", "v4"]
     prompt_digest: Digest
 
@@ -419,6 +426,7 @@ class FrozenConfigurationReader:
                     expected_digest=job.prompt_digest,
                     repository_instructions=instructions,
                 )
+                verifier = reflection_bundle(self._prompts, policy, job.prompt_version)
             except PromptConfigError, ValidationError, KeyError, TypeError:
                 raise FrozenConfigurationError("unsupported_prompt_bundle") from None
             for route in (primary, *policy.routing.fallback):
@@ -451,6 +459,7 @@ class FrozenConfigurationReader:
                 prompt_version=job.prompt_version,
                 prompt_digest=job.prompt_digest,
                 policy=policy,
+                verifier=verifier,
                 instructions=instructions.instructions,
                 output_language=settings.output_language,
                 ignores=tuple(
@@ -542,7 +551,7 @@ class FrozenAdmissionResolver:
         profiles: Mapping[str, RuntimeProfile],
         *,
         primary: ModelRoute,
-        policy: ModelSettings,
+        policy: ModelPolicy,
         prompt_version: str = "v2",
         prompt_digest: str | None = None,
     ) -> None:
@@ -596,6 +605,7 @@ class FrozenAdmissionResolver:
                     expected_digest=self._digest,
                     repository_instructions=instructions,
                 )
+                reflection_bundle(self._prompts, self._policy, self._version)
             except PromptConfigError, ValidationError, KeyError, TypeError:
                 raise FrozenConfigurationError("unsupported_prompt_bundle") from None
             policy_values = self._policy.model_dump(mode="json")

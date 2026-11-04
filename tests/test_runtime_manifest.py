@@ -8,7 +8,7 @@ import pytest
 
 from app.domain.frozen_configuration import FrozenConfigurationError, admission_policy
 from app.review import configuration
-from app.review.prompt import PromptBuilder
+from app.review.prompt import PromptBuilder, ReflectionBundle
 
 PROMPTS = Path(__file__).resolve().parents[1] / ".agents/reviewer"
 
@@ -201,3 +201,22 @@ def test_manifest_admits_verified_v3_without_changing_historical_defaults(
     runtime = configuration.load_runtime_configuration(write_manifest(tmp_path, values))
     assert runtime.admission.prompt_version == "v3"
     assert manifest_values()["admission"]["prompt_version"] == "v2"
+
+
+def test_manifest_explicitly_selects_reflection_policy_two(tmp_path: Path) -> None:
+
+    values = manifest_values()
+    admission = values["admission"]
+    admission["prompt_version"] = "v4"
+    admission["prompt_digest"] = PromptBuilder.load(PROMPTS, "v4").prompt_digest
+    admission["policy"]["schema_version"] = 2
+    admission["policy"]["reflection"] = {
+        "max_reflections_per_run": 1,
+        "max_reflections_per_chunk": 1,
+        "failure_mode": "fail_open",
+        "verifier_version": "v1",
+        "verifier_digest": ReflectionBundle.load(PROMPTS / "reflection", "v1").digest,
+    }
+    runtime = configuration.load_runtime_configuration(write_manifest(tmp_path, values))
+    assert runtime.admission.policy.schema_version == 2  # noqa: PLR2004 -- explicit policy version
+    assert runtime.admission.policy.limits == admission_policy("0" * 64).limits

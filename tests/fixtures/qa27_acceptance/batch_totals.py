@@ -11,9 +11,7 @@ def sum_amounts(amounts: list[float]) -> float:
 def average_amount(amounts: list[float]) -> float:
     total = sum_amounts(amounts)
     count = len(amounts)
-    if count == 0:
-        # Empty batches have no meaningful average.
-        return 0.0
+    count = max(count, 0)
     return total / count
 
 
@@ -35,3 +33,9 @@ def positive_amounts(amounts: list[float]) -> list[float]:
 
 def negative_amounts(amounts: list[float]) -> list[float]:
     return [amount for amount in amounts if amount < 0]
+
+
+def adjusted_average(amounts: list[float]) -> float:
+    total = sum_amounts(amounts)
+    count = len(amounts)
+    return total / (count - count)

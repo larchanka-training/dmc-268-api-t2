@@ -113,6 +113,7 @@ def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
         encoding="utf-8"
     )
     assert "compose up -d --force-recreate --no-deps api" in workflow
+    assert "compose up -d --force-recreate --no-deps web" in workflow
     assert "Verifying OAuth authorize requests scope=repo..." in workflow
     assert "*'scope=repo'*)" in workflow
     assert "start_github_oauth source includes scope=repo" in workflow

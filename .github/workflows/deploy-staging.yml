@@ -743,7 +743,8 @@ jobs:
           done
 
           echo "Starting web..."
-          compose up -d web
+          # Same sticky-container risk as api: host :80 can keep an old UI image.
+          compose up -d --force-recreate --no-deps web
 
           echo "Waiting for web..."
           for attempt in $(seq 1 30); do

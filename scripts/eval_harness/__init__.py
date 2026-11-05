@@ -1,6 +1,5 @@
-"""Standalone LLM-eval harness for the test-prs-dataset gold benchmark.
+"""Gold-benchmark harness reusing application schemas, prompts and Gateway.
 
-Independent of ``src/app``: it defines its own JSON schema, prompt, and
-scoring so it can validate any reviewer's output format without depending on
-the backend's internal contracts.
+Offline replay and scoring need no external services. Deterministic and live
+Gateway runs use the backend's verified contracts.
 """

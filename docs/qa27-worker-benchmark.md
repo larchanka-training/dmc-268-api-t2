@@ -48,10 +48,74 @@ means scripted transport: those receipts are not a provider invoice.
 
 `quality_measurement=false` is mandatory for these reports. Golden answers are
 scripted provider responses and must never be presented as quality measurements.
-Worker scope currently rejects live mode; the existing explicitly gated Gateway
-live command still measures only its documented initial-Gateway scope. Actual
-approved worker/provider measurements and bot publication require their reviewed
-authorized runner; neither was executed by this change.
+The default Gateway live command still measures only its documented initial
+Gateway scope. The separately gated worker live command below exercises the same
+worker, AST and three-pass comparison with real provider HTTP. Neither actual
+provider measurement nor bot publication was executed by this change.
+
+## Prepared live worker command
+
+Use the same disposable migrated PostgreSQL/Redis setup described above. Prepare
+an explicit nonsecret v4/schema2 manifest from this pinned checkout; this does not
+edit the historical staging manifest or deploy anything:
+
+```bash
+uv run python - <<'PY'
+import json
+from pathlib import Path
+from scripts.eval_harness.worker import runtime_values
+Path('.scratch/qa27-live-v4.json').write_text(json.dumps(runtime_values(), indent=2) + '\n')
+PY
+```
+
+Before an actual run, verify current provider prices are at or below the declared
+positive input/output price ceilings. The existing approved destination is
+Eurorouter `https://api.eurouter.ai/api/v1`, model `mistral-small-4`; credentials
+come only through the existing `LLM__EUROROUTER__API_KEYS` mechanism. Do not copy
+keys into commands, manifests, journals or reports.
+
+```bash
+uv run python -m scripts.eval_harness --scope worker --mode live --allow-live \
+  --runtime-manifest .scratch/qa27-live-v4.json \
+  --max-cost-usd 1 --input-usd-per-million 0.25 --output-usd-per-million 1 \
+  --campaign-journal .scratch/qa27-live-once.json \
+  --report-out .scratch/qa27-live-report.json
+```
+
+In worker scope `--max-cost-usd` is the **per-pass** ceiling (at most$1); the
+three-pass campaign must reserve at most$3. The unchanged full run allowances at
+these price ceilings reserve$0.864/pass,$2.592total. This is a conservative ceiling
+estimate, not an invoice or a statement of current prices. Gateway scope keeps
+its original single-invocation cap semantics.
+
+Live worker requires all24 approved cases/all3 passes, the original corpus digest,
+attested source bundle, exact approved v4 runtime/model/routing/limits and verifier.
+It rejects altered/partial selections before resolving provider credentials.
+Only approved provider HTTP uses the network; GitHub reads remain local public
+fixtures and GitHub publication is absent. Golden responses are never dispatched
+by the live provider path.
+
+The private execution journal is created exclusively before provider HTTP, reserves
+all three passes, and records actor/repository/job identities durably before each
+worker invocation. Any existing journal refuses another run, including completed,
+interrupted or uncertain campaigns. Do not delete it or choose a different path
+to repeat this authorization. There is no automatic campaign recovery/fourth pass;
+existing bounded Gateway retries stay inside each job's existing allowance.
+
+Live mode retains durable database results/attempt receipts on success or error.
+The journal/report contain identities, aggregate receipts and safe states, never
+keys, headers, raw prompts/responses or exception strings. Known terminal invalid
+model results contribute invalid-case/FN measurements; every stored canonical v2
+result is validated before projection. Shape-validity percentages describe final
+canonical-result projection validity, not a raw HTTP JSON-parsing denominator.
+Unknown usage stays charged at its retained
+reservation, and uncertain execution cannot be replayed. Inspect retained receipts
+before making any later decision about an incomplete run.
+
+Only real provider execution can set `quality_measurement=true`. Public CLI tests
+inject provider HTTP, label `provider_transport=injected-test`, keep quality false,
+and clean only their own synthetic UUID graphs afterward. Both real measurements
+and real bot acceptance remain unexecuted:0real calls/$0.
 
 ## Source identity
 

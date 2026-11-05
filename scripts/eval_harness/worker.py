@@ -35,6 +35,7 @@ from app.review.configuration import (
 from app.review.prompt import PromptBuilder, ReflectionBundle
 from app.vcs.github import GithubClient
 from scripts.eval_harness.dataset import Fixture, dataset_file
+from scripts.eval_harness.llm_client import LlmConfig, LlmConfigurationError
 from scripts.eval_harness.provenance import MATCHING_POLICY, dataset_digest, digest
 from scripts.eval_harness.report import build_report, evaluate_fixture
 from scripts.eval_harness.runtime import MODEL_METADATA_POLICY
@@ -57,6 +58,47 @@ RECEIPT_FIELDS = (
     "reserved_input_tokens",
     "reserved_output_tokens",
 )
+APPROVED_CORPUS = "b7c2ad5a5ff606d4985af74191143fbf106e5aeabcd9b96f209397b1075f5396"
+APPROVED_SOURCES = "c840440689e9ace778bafcf0d5faa02bc49247be78d16a506512f507330a294b"
+APPROVED_CASES = 24
+MAX_CAMPAIGN_USD = 3
+
+
+def write_journal(path: Path, body: dict[str, Any], *, create: bool = False) -> None:
+    flags = os.O_WRONLY | (os.O_CREAT | os.O_EXCL if create else os.O_TRUNC)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raise LlmConfigurationError(
+            "Campaign journal exists; live rerun is refused"
+        ) from None
+    with os.fdopen(descriptor, "w") as output:
+        json.dump(body, output, indent=2)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def live_runtime_values(config: LlmConfig) -> dict[str, Any]:
+    runtime = config.runtime
+    values: dict[str, Any] = {
+        "schema_version": 1,
+        "profiles": {
+            ref: {
+                "provider": profile.provider,
+                "base_url": profile.base_url,
+                "allowed_models": list(profile.allowed_models),
+                "credential_env": runtime.credential_env[ref],
+            }
+            for ref, profile in runtime.profiles.items()
+        },
+        "admission": runtime.admission.model_dump(mode="json"),
+    }
+    if digest(values) != digest(runtime_values()):
+        raise LlmConfigurationError(
+            "Live worker manifest must pin the approved v4 runtime "
+            "without changing limits, routing or verifier"
+        )
+    return values
 
 
 def semantic_context(body: dict[str, Any]) -> str:
@@ -326,7 +368,9 @@ async def process_review(
     queue: RedisQueue,
     runtime: TrustedRuntimeConfiguration,
     transport: httpx.AsyncBaseTransport,
-) -> None:
+    *,
+    provider_http: httpx.AsyncClient | None = None,
+) -> bool:
     """Reuse the prepared production worker; no alternate processing lifecycle."""
     await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
     async with httpx.AsyncClient(transport=transport) as http:
@@ -335,16 +379,20 @@ async def process_review(
             queue,
             runtime=runtime,
             github=GithubClient(http),
-            http=http,
+            http=provider_http or http,
             prompt_root=PROMPTS,
             schemas_dir=ROOT / "schemas",
             owner="qa27",
-            environ={"LLM__EUROROUTER__API_KEYS": "synthetic-only"},
+            environ=None
+            if provider_http
+            else {"LLM__EUROROUTER__API_KEYS": "synthetic-only"},
         )
-        if not await worker.run_once():
+        acknowledged = await worker.run_once()
+        if not acknowledged and provider_http is None:
             raise AssertionError(
                 "Scripted worker did not acknowledge its durable decision"
             )
+        return acknowledged
 
 
 async def cleanup_campaign(
@@ -408,12 +456,15 @@ async def cleanup_campaign(
         await session.execute(delete(models.User).where(models.User.id.in_(actors)))
 
 
-async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
+async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resources for one bounded campaign
     fixtures: list[Fixture],
     dataset: Path,
     source_root: Path,
     *,
     passes: tuple[str, ...] = ("baseline",),
+    live_config: LlmConfig | None = None,
+    journal_path: Path | None = None,
+    provider_transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     """Controlled scripted passes; original runtime budgets and corpus stay fixed."""
     manifest, bundle_digest = load_sources(source_root, dataset)
@@ -423,12 +474,82 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
         raise ValueError(
             "Worker scope requires disposable PostgreSQL and Redis test URLs"
         )
+    common_values = (
+        live_runtime_values(live_config) if live_config else runtime_values()
+    )
+    journal: dict[str, Any] = {}
+    if live_config:
+        if (
+            journal_path is None
+            or len(fixtures) != APPROVED_CASES
+            or passes != ("baseline", "rules", "reflection")
+            or dataset_digest(dataset) != APPROVED_CORPUS
+            or hashlib.sha256((source_root / "manifest.json").read_bytes()).hexdigest()
+            != APPROVED_SOURCES
+        ):
+            raise LlmConfigurationError(
+                "Live worker requires the approved complete public corpus "
+                "and attested sources"
+            )
+        limits = live_config.runtime.admission.policy.limits
+        worst = live_config.cost(
+            limits.run_max_input_tokens * len(fixtures),
+            limits.run_max_output_tokens * len(fixtures),
+        )
+        if (
+            live_config.cap > 1
+            or worst * len(passes) > MAX_CAMPAIGN_USD
+            or min(live_config.input_price, live_config.output_price) <= 0
+        ):
+            raise LlmConfigurationError(
+                "Live worker approval ceilings require positive known prices, "
+                "at most $1/pass and $3/campaign"
+            )
+        journal = {
+            "state": "running",
+            "runtime_manifest_sha256": live_config.runtime.identity,
+            "dataset_sha256": APPROVED_CORPUS,
+            "source_bundle_sha256": bundle_digest,
+            "reserved_upper_bound_usd": str(worst * len(passes)),
+            "price_ceilings": {
+                "input": str(live_config.input_price),
+                "output": str(live_config.output_price),
+            },
+            "passes": {
+                name: {"reserved_upper_bound_usd": str(worst), "completed_cases": 0}
+                for name in passes
+            },
+            "jobs": [],
+            "repositories": [],
+            "actors": [],
+        }
+        write_journal(journal_path, journal, create=True)
     engine = create_async_engine(db_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     repositories: list[UUID] = []
     actors: list[UUID] = []
     scores, rows = [], []
-    common_values = runtime_values()
+    current_scenario: CaseTransport | None = None
+
+    async def observe_provider(request: httpx.Request) -> None:
+        if (
+            str(request.url) != "https://api.eurouter.ai/api/v1/chat/completions"
+            or request.method != "POST"
+            or current_scenario is None
+        ):
+            raise LlmConfigurationError("Unapproved live provider destination")
+        current_scenario.calls.append(json.loads(request.content))
+
+    provider_http = (
+        httpx.AsyncClient(
+            transport=provider_transport,
+            follow_redirects=False,
+            event_hooks={"request": [observe_provider]},
+        )
+        if live_config
+        else None
+    )
+    complete = False
     try:
         async with Redis.from_url(redis_url, decode_responses=True) as redis:
             prefix = "dmc268:qa27:" + uuid4().hex
@@ -438,6 +559,9 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                     actor, repository_id, settings_id = uuid4(), uuid4(), uuid4()
                     repositories.append(repository_id)
                     actors.append(actor)
+                    if live_config:
+                        journal["repositories"].append(str(repository_id))
+                        journal["actors"].append(str(actor))
                     external_id = str(uuid4().int % (10**15) + 1)
                     key = Fernet.generate_key()
                     settings = Settings(  # type: ignore[call-arg]  # BaseSettings runtime option
@@ -506,7 +630,11 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                             factory,
                             rules=None if pass_name == "baseline" else GENERIC_RULES,
                         )
-                        values = runtime_values(int(pass_name == "reflection"))
+                        current_scenario = scenario
+                        values = json.loads(json.dumps(common_values))
+                        values["admission"]["policy"]["reflection"][
+                            "max_reflections_per_run"
+                        ] = int(pass_name == "reflection")
                         with TemporaryDirectory() as temporary:
                             runtime_path = Path(temporary) / "runtime.json"
                             runtime_path.write_text(json.dumps(values))
@@ -543,11 +671,22 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                                         ),
                                     )
                                     assert created
+                                if live_config:
+                                    journal["jobs"].append(
+                                        {
+                                            "pass": pass_name,
+                                            "fixture_id": fixture.id,
+                                            "review_id": str(review_id),
+                                        }
+                                    )
+                                    assert journal_path is not None
+                                    write_journal(journal_path, journal)
                                 await process_review(
                                     factory,
                                     queue,
                                     runtime,
                                     httpx.MockTransport(scenario.respond),
+                                    provider_http=provider_http,
                                 )
                         async with factory() as session:
                             chunk = (
@@ -556,17 +695,25 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                                         models.ChunkResult.review_job_id == review_id
                                     )
                                 )
-                            ).one()
-                            findings = list(
-                                await session.scalars(
-                                    select(models.Finding).where(
-                                        models.Finding.chunk_result_id == chunk.id
+                            ).one_or_none()
+                            findings = (
+                                list(
+                                    await session.scalars(
+                                        select(models.Finding).where(
+                                            models.Finding.chunk_result_id == chunk.id
+                                        )
                                     )
                                 )
+                                if chunk is not None
+                                else []
                             )
-                            context = await session.get(
-                                models.ContextPayload, chunk.context_payload_id
-                            )
+                            context = (
+                                await session.scalars(
+                                    select(models.ContextPayload).where(
+                                        models.ContextPayload.review_job_id == review_id
+                                    )
+                                )
+                            ).one()
                             job = await session.get(models.ReviewJob, review_id)
                             assert context is not None and job is not None
                             effective = await session.get(
@@ -586,33 +733,57 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                                     .order_by(models.ReviewLlmAttempt.reserved_at)
                                 )
                             )
+                            if live_config and any(
+                                attempt.actual_input_tokens is None
+                                or attempt.actual_output_tokens is None
+                                for attempt in attempts
+                            ):
+                                journal["uncertain_usage_receipts"] = [
+                                    {
+                                        name: getattr(attempt, name)
+                                        for name in RECEIPT_FIELDS
+                                    }
+                                    for attempt in attempts
+                                ]
+                                raise LlmConfigurationError(
+                                    "Live worker usage is uncertain; durable receipts "
+                                    "retained and campaign replay refused"
+                                )
                             canonical_schema = json.loads(
                                 (ROOT / "schemas/review-result/v2.json").read_text()
                             )
-                            canonical = {
-                                "schema_version": chunk.schema_version,
-                                "summary": chunk.summary,
-                                "limitations": chunk.limitations,
-                                "usage": chunk.usage,
-                                "latency_ms": chunk.latency_ms,
-                                "findings": [
-                                    {
-                                        name: getattr(finding, name)
-                                        for name in canonical_schema["$defs"][
-                                            "finding"
-                                        ]["properties"]
-                                    }
-                                    for finding in findings
-                                ],
-                            }
-                            if validate_shape(canonical, canonical_schema):
-                                raise ValueError(
-                                    "Persisted canonical v2 result invalid"
-                                )
-                            projected = {
-                                name: canonical[name]
-                                for name in ("summary", "findings", "limitations")
-                            }
+                            canonical = (
+                                {
+                                    "schema_version": chunk.schema_version,
+                                    "summary": chunk.summary,
+                                    "limitations": chunk.limitations,
+                                    "usage": chunk.usage,
+                                    "latency_ms": chunk.latency_ms,
+                                    "findings": [
+                                        {
+                                            name: getattr(finding, name)
+                                            for name in canonical_schema["$defs"][
+                                                "finding"
+                                            ]["properties"]
+                                        }
+                                        for finding in findings
+                                    ],
+                                }
+                                if chunk is not None
+                                else None
+                            )
+                            canonical_valid = (
+                                canonical is not None
+                                and not validate_shape(canonical, canonical_schema)
+                            )
+                            projected = (
+                                {
+                                    name: canonical[name]
+                                    for name in ("summary", "findings", "limitations")
+                                }
+                                if canonical_valid and canonical is not None
+                                else None
+                            )
                             score = evaluate_fixture(
                                 fixture,
                                 projected,
@@ -650,8 +821,9 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                                 {
                                     **score.to_dict(),
                                     "pass": pass_name,
-                                    "canonical_result_valid": True,
+                                    "canonical_result_valid": canonical_valid,
                                     "canonical_result": canonical,
+                                    "worker_status": job.status,
                                     "requests": len(scenario.calls),
                                     "ast": {
                                         "source_window_count": sum(
@@ -691,12 +863,22 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
                                     ],
                                 }
                             )
+                            if live_config:
+                                journal["passes"][pass_name]["completed_cases"] += 1
             finally:
                 await redis.delete(prefix + ":analyze", prefix + ":publish")
+        complete = True
     finally:
         try:
-            await cleanup_campaign(factory, repositories, actors)
+            if live_config:
+                journal["state"] = "complete" if complete else "uncertain"
+                assert journal_path is not None
+                write_journal(journal_path, journal)
+            else:
+                await cleanup_campaign(factory, repositories, actors)
         finally:
+            if provider_http:
+                await provider_http.aclose()
             await engine.dispose()
     report = build_report(scores)
     report["fixtures"] = rows
@@ -721,8 +903,12 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
     }
     report["provenance"] = {
         "scope": "worker-integration",
-        "mode": "deterministic",
-        "quality_measurement": False,
+        "mode": "live" if live_config else "deterministic",
+        "quality_measurement": bool(
+            live_config
+            and provider_transport is None
+            and any(row["requests"] for row in rows)
+        ),
         "dataset_sha256": dataset_digest(dataset),
         "source_bundle_sha256": bundle_digest,
         "model_metadata_policy": MODEL_METADATA_POLICY,
@@ -747,6 +933,19 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
         selected_fixture_ids=[fixture.id for fixture in fixtures],
         passes=list(passes),
     )
+    if live_config:
+        report["provenance"].update(
+            runtime_manifest_sha256=live_config.runtime.identity,
+            provider_transport="injected-test"
+            if provider_transport is not None
+            else "real-provider",
+            cost_basis=(
+                "price ceilings times charged actual tokens or unknown reservations; "
+                "estimate, not invoice"
+            ),
+            max_cost_usd_per_pass=str(live_config.cap),
+            reserved_upper_bound_usd=journal["reserved_upper_bound_usd"],
+        )
     report["provenance"]["config_sha256"] = digest(report["provenance"])
     receipts = [receipt for row in rows for receipt in row["usage_receipts"]]
     report["usage"] = {
@@ -773,4 +972,14 @@ async def run_worker(  # noqa: PLR0915 -- one controlled fixture campaign
             for side in ("input", "output")
         },
     }
+    if live_config:
+        report["usage"]["cost_usd"] = str(
+            live_config.cost(
+                report["usage"]["charged_input_tokens"],
+                report["usage"]["charged_output_tokens"],
+            )
+        )
+        journal["usage"] = report["usage"]
+        assert journal_path is not None
+        write_journal(journal_path, journal)
     return report

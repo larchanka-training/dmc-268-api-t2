@@ -64,9 +64,21 @@ findings and partial coverage is visible. No independent verifier format repair
 is performed. Lease loss, cancellation and configuration/programming errors still
 propagate through existing authority checks.
 
-Per-chunk result usage comes from the authoritative ledger, including paid invalid
-responses and previous attempts. Unknown input/output usage is not reported as a
-partial known total. Primary generation provenance remains primary; verifier
+The pinned JSON Schema constrains the verdict/reason enums independently; typed
+`ReflectionVerdict` validation then requires `confirmed` + `verified`, or
+`rejected` + one of `no_real_consequence`, `pre_existing`, `overflagged_style`.
+`ReflectionOutput` also rejects duplicate indexes. A mismatched pair fails typed
+validation before findings are filtered and follows the existing fail-open path;
+the JSON Schema alone does not enforce that semantic pairing. No schema identity
+or verifier digest changes are needed for this existing validation.
+
+For **all durable chunks**, including policy1 and policy2 with Reflection off,
+per-chunk result usage comes from the authoritative ledger, including paid invalid
+responses and previous attempts. This replaces the partial sum of successful
+in-process calls for durable execution. If any input or output usage remains
+unknown, that dimension is `None` (wire `null`), not a partial known total;
+requests count all recorded attempts. In-memory `RunBudget` keeps its existing
+call-based usage calculation. Primary generation provenance remains primary; verifier
 provider/model/operation/fence/state/known-or-reserved usage remain in the existing
 ledger, with verifier identity in the immutable job policy. Logs use safe codes
 and counts, never raw verifier answers, prompts, source or credentials.
@@ -85,3 +97,12 @@ retain a compatible reader/worker for policy2 jobs and keep the forward schema.
 Draining active jobs is insufficient for a schema downgrade: completed policy2
 jobs and historical `reflection` attempt rows also violate the old CHECKs. Do not
 delete accounting history or rewrite frozen policies to force a downgrade.
+
+`alembic downgrade 0018` performs the ordinary CHECK narrowing; it is not a
+no-op. It succeeds only when all retained rows satisfy the old constraints:
+frozen jobs use policy1 and attempt kinds exclude `reflection`. Empty accounting
+is sufficient for the attempt-kind constraint, but retained policy2 jobs still
+prevent downgrade; nonempty accounting with only old attempt kinds is compatible.
+Incompatible retained rows make constraint creation fail. Keep the forward schema
+and a compatible reader/worker in that case; disabling new Reflection or draining
+active jobs does not make historical rows compatible.

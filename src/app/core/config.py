@@ -110,6 +110,14 @@ class Sentry(BaseModel):
     dsn: SecretStr = SecretStr("")
 
 
+class Metrics(BaseModel):
+    """Opt-in internal Prometheus listener (METRICS__*)."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=9100, ge=1, le=65535)
+
+
 class Logging(BaseModel):
     """Logging settings (LOGGING__* env variables)."""
 
@@ -248,6 +256,7 @@ class Settings(BaseSettings):
     auth: Auth = Field(default_factory=Auth)
     logging: Logging = Field(default_factory=Logging)
     sentry: Sentry = Field(default_factory=Sentry)
+    metrics: Metrics = Field(default_factory=Metrics)
     llm: LLM = Field(default_factory=LLM)
 
 

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
+import sentry_sdk
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from referencing import Registry, Resource
 from sqlalchemy import select
@@ -372,17 +373,24 @@ class PostgresAnalysisHandler:
                 validate_hunks(file["diff"]["hunks"])
             return await self._infer(task, lease, saved, llm)
         await self._ensure_call_authority(task, lease)
-        try:
-            captured = await self._github.fetch(request)
-        except GithubFailure as failure:
-            if failure.retryable:
-                raise
-            raise _AnalysisFailureError(ReviewReasonCode(failure.reason_code)) from None
-        self._check_snapshot(captured.metadata["snapshot"], request, expected_source)
-        try:
-            parsed = parse_diff(captured.raw_diff, ignore_globs=ignores)
-        except InvalidDiff:
-            raise _AnalysisFailureError(ReviewReasonCode.DIFF_UNTRUSTWORTHY) from None
+        with sentry_sdk.start_span(op="review.diff", name="Diff"):
+            try:
+                captured = await self._github.fetch(request)
+            except GithubFailure as failure:
+                if failure.retryable:
+                    raise
+                raise _AnalysisFailureError(
+                    ReviewReasonCode(failure.reason_code)
+                ) from None
+            self._check_snapshot(
+                captured.metadata["snapshot"], request, expected_source
+            )
+            try:
+                parsed = parse_diff(captured.raw_diff, ignore_globs=ignores)
+            except InvalidDiff:
+                raise _AnalysisFailureError(
+                    ReviewReasonCode.DIFF_UNTRUSTWORTHY
+                ) from None
         if not parsed.files:
             async with self._factory.begin() as session:
                 await self._transition(session, task, lease, ReviewStatus.SKIPPED)
@@ -393,79 +401,89 @@ class PostgresAnalysisHandler:
                     parsed.coverage,
                 )
             return DurableTaskOutcome.COMPLETED
-        body: dict[str, Any] = {
-            **captured.metadata,
-            "metadata": {
-                **captured.metadata["metadata"],
-                "rules_version": str(settings_id),
-                "output_language": language,
-            },
-            "files": parsed.files,
-            "related_symbols": [],
-            "coverage": parsed.coverage,
-            "budget": {
-                "estimated_input_tokens": 0,
-                "reserved_output_tokens": reserved,
-                "limit_input_tokens": limit,
-            },
-        }
-        context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
-        if context_enabled:
-            await enrich_context(body, cast(SourceFileReader, self._github))
-        # Use the Gateway's token estimator for the complete wire, including IDs.
-        # Iterate until the estimate's own decimal width is accounted for.
-        counter = ConservativeTokenCounter()
-        while (
-            estimated := counter.count(
-                json.dumps(context.to_wire(), ensure_ascii=False)
-            )
-        ) > body["budget"]["estimated_input_tokens"]:
-            body["budget"]["estimated_input_tokens"] = estimated
-        if estimated > limit and context_enabled:
-            for file in body["files"]:
-                file["source_windows"] = []
-                file["whole_file"] = None
-            body["related_symbols"] = []
-            body["coverage"]["context_quality"] = "degraded"
-            body["budget"]["estimated_input_tokens"] = 0
+        with sentry_sdk.start_span(op="review.context", name="Context"):
+            body: dict[str, Any] = {
+                **captured.metadata,
+                "metadata": {
+                    **captured.metadata["metadata"],
+                    "rules_version": str(settings_id),
+                    "output_language": language,
+                },
+                "files": parsed.files,
+                "related_symbols": [],
+                "coverage": parsed.coverage,
+                "budget": {
+                    "estimated_input_tokens": 0,
+                    "reserved_output_tokens": reserved,
+                    "limit_input_tokens": limit,
+                },
+            }
+            context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
+            if context_enabled:
+                await enrich_context(body, cast(SourceFileReader, self._github))
+            # Use the Gateway's token estimator for the complete wire, including IDs.
+            # Iterate until the estimate's own decimal width is accounted for.
+            counter = ConservativeTokenCounter()
             while (
                 estimated := counter.count(
                     json.dumps(context.to_wire(), ensure_ascii=False)
                 )
             ) > body["budget"]["estimated_input_tokens"]:
                 body["budget"]["estimated_input_tokens"] = estimated
-        if estimated > limit:
-            coverage = {
-                "included": [],
-                "skipped": [
-                    *parsed.skipped,
-                    *[
-                        {**entry, "reason": "token_budget"}
-                        for entry in parsed.coverage["included"]
+            if estimated > limit and context_enabled:
+                for file in body["files"]:
+                    file["source_windows"] = []
+                    file["whole_file"] = None
+                body["related_symbols"] = []
+                body["coverage"]["context_quality"] = "degraded"
+                body["budget"]["estimated_input_tokens"] = 0
+                while (
+                    estimated := counter.count(
+                        json.dumps(context.to_wire(), ensure_ascii=False)
+                    )
+                ) > body["budget"]["estimated_input_tokens"]:
+                    body["budget"]["estimated_input_tokens"] = estimated
+            if estimated > limit:
+                coverage = {
+                    "included": [],
+                    "skipped": [
+                        *parsed.skipped,
+                        *[
+                            {**entry, "reason": "token_budget"}
+                            for entry in parsed.coverage["included"]
+                        ],
                     ],
-                ],
-                "context_quality": "diff_only",
-            }
+                    "context_quality": "diff_only",
+                }
+                async with self._factory.begin() as session:
+                    await self._transition(session, task, lease, ReviewStatus.SKIPPED)
+                    await self._save_snapshot(
+                        session, lease, body["snapshot"], coverage
+                    )
+                return DurableTaskOutcome.COMPLETED
+            self._context_validator.validate(context.to_wire())
+            validate_ranges(context.to_wire())
+            for file in parsed.files:
+                validate_hunks(file["diff"]["hunks"])
+        with sentry_sdk.start_span(op="review.db", name="Context commit"):
             async with self._factory.begin() as session:
-                await self._transition(session, task, lease, ReviewStatus.SKIPPED)
-                await self._save_snapshot(session, lease, body["snapshot"], coverage)
-            return DurableTaskOutcome.COMPLETED
-        self._context_validator.validate(context.to_wire())
-        validate_ranges(context.to_wire())
-        for file in parsed.files:
-            validate_hunks(file["diff"]["hunks"])
-        async with self._factory.begin() as session:
-            await self._transition(session, task, lease, ReviewStatus.PARSING_CONTEXT)
-            await self._save_snapshot(session, lease, body["snapshot"], parsed.coverage)
-            session.add(
-                ContextPayload(
-                    id=context.chunk_id,
-                    review_job_id=context.review_id,
-                    schema_version=context.schema_version,
-                    payload_body=context.payload_body,
+                await self._transition(
+                    session, task, lease, ReviewStatus.PARSING_CONTEXT
                 )
-            )
-            await self._transition(session, task, lease, ReviewStatus.LLM_PROCESSING)
+                await self._save_snapshot(
+                    session, lease, body["snapshot"], parsed.coverage
+                )
+                session.add(
+                    ContextPayload(
+                        id=context.chunk_id,
+                        review_job_id=context.review_id,
+                        schema_version=context.schema_version,
+                        payload_body=context.payload_body,
+                    )
+                )
+                await self._transition(
+                    session, task, lease, ReviewStatus.LLM_PROCESSING
+                )
 
         return await self._infer(task, lease, context, llm)
 
@@ -497,7 +515,8 @@ class PostgresAnalysisHandler:
     ) -> DurableTaskOutcome:
         files = cast(list[dict[str, Any]], context.payload_body["files"])
         await self._ensure_call_authority(task, lease)
-        result = await llm.review(context)
+        with sentry_sdk.start_span(op="review.llm", name="LLM"):
+            result = await llm.review(context)
         authority = current_analysis_authority.get()
         if authority is not None:
             authority.check()
@@ -514,70 +533,75 @@ class PostgresAnalysisHandler:
                     error_code="backend_result_invalid",
                 )
             return DurableTaskOutcome.COMPLETED
-        async with self._factory.begin() as session:
-            locked = await lock_owned_lease(session, lease)
-            if locked is None:
-                raise LeaseLostError("Analysis lease is no longer current")
-            if authority is not None:
-                authority.check()
-            deadline = locked[0].analysis_deadline_at
-            late = deadline is not None and deadline <= locked[2]
-            await self._transition(
-                session,
-                task,
-                lease,
-                ReviewStatus.PARTIAL
-                if late or result.limitations
-                else ReviewStatus.COMPLETED,
-                ReviewReasonCode.ANALYSIS_DEADLINE_EXCEEDED if late else None,
-            )
-            review = await session.get(ReviewJob, lease.review_job_id)
-            assert review is not None
-            review.final_summary = result.summary
-            chunk_id = uuid.uuid4()
-            session.add(
-                ChunkResult(
-                    id=chunk_id,
-                    review_job_id=context.review_id,
-                    context_payload_id=context.chunk_id,
-                    schema_version=result.schema_version,
-                    summary=result.summary,
-                    limitations=result.limitations,
-                    usage=asdict(result.usage) if result.usage is not None else None,
-                    latency_ms=result.latency_ms,
+        with sentry_sdk.start_span(op="review.db", name="Result commit"):
+            async with self._factory.begin() as session:
+                locked = await lock_owned_lease(session, lease)
+                if locked is None:
+                    raise LeaseLostError("Analysis lease is no longer current")
+                if authority is not None:
+                    authority.check()
+                deadline = locked[0].analysis_deadline_at
+                late = deadline is not None and deadline <= locked[2]
+                await self._transition(
+                    session,
+                    task,
+                    lease,
+                    ReviewStatus.PARTIAL
+                    if late or result.limitations
+                    else ReviewStatus.COMPLETED,
+                    ReviewReasonCode.ANALYSIS_DEADLINE_EXCEEDED if late else None,
                 )
-            )
-            await session.flush()
-            seen_fingerprints: set[str] = set()
-            for finding in result.findings:
-                values = asdict(finding)
-                # Backend fingerprint v1: canonical location/category/title identity.
-                identity = {
-                    key: values[key]
-                    for key in (
-                        "path",
-                        "side",
-                        "start_line",
-                        "end_line",
-                        "category",
-                        "title",
-                    )
-                }
-                fingerprint = hashlib.sha256(
-                    json.dumps(
-                        identity,
-                        sort_keys=True,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
-                if fingerprint in seen_fingerprints:
-                    continue
-                seen_fingerprints.add(fingerprint)
+                review = await session.get(ReviewJob, lease.review_job_id)
+                assert review is not None
+                review.final_summary = result.summary
+                chunk_id = uuid.uuid4()
                 session.add(
-                    Finding(chunk_result_id=chunk_id, fingerprint=fingerprint, **values)
+                    ChunkResult(
+                        id=chunk_id,
+                        review_job_id=context.review_id,
+                        context_payload_id=context.chunk_id,
+                        schema_version=result.schema_version,
+                        summary=result.summary,
+                        limitations=result.limitations,
+                        usage=asdict(result.usage)
+                        if result.usage is not None
+                        else None,
+                        latency_ms=result.latency_ms,
+                    )
                 )
-            await self._prepare_publication(session, task, lease)
+                await session.flush()
+                seen_fingerprints: set[str] = set()
+                for finding in result.findings:
+                    values = asdict(finding)
+                    # Backend fingerprint v1: canonical location/category/title.
+                    identity = {
+                        key: values[key]
+                        for key in (
+                            "path",
+                            "side",
+                            "start_line",
+                            "end_line",
+                            "category",
+                            "title",
+                        )
+                    }
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            identity,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if fingerprint in seen_fingerprints:
+                        continue
+                    seen_fingerprints.add(fingerprint)
+                    session.add(
+                        Finding(
+                            chunk_result_id=chunk_id, fingerprint=fingerprint, **values
+                        )
+                    )
+                await self._prepare_publication(session, task, lease)
         return DurableTaskOutcome.COMPLETED
 
     async def _usable_saved_results(

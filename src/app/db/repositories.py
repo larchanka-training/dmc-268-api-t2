@@ -58,16 +58,19 @@ class SqlAlchemyReviewJobRepository:
                 ModelSettings.from_stored(command.model_settings)
             except ValidationError, TypeError, ValueError:
                 raise FrozenConfigurationError("unsupported_model_settings") from None
-        repository_id = await self._session.scalar(
-            select(ChangeRequest.repository_id).where(
-                ChangeRequest.id == command.change_request_id
+        change = (
+            await self._session.execute(
+                select(ChangeRequest.repository_id, ChangeRequest.base_sha).where(
+                    ChangeRequest.id == command.change_request_id
+                )
             )
-        )
-        if repository_id is None:
+        ).one_or_none()
+        if change is None:
             raise LookupError(
                 f"ChangeRequest {command.change_request_id} was not found"
             )
 
+        repository_id, base_sha = change
         now = datetime.now(UTC)
         review_id = uuid.uuid4()
         self._session.add_all(
@@ -82,6 +85,7 @@ class SqlAlchemyReviewJobRepository:
                     trigger_type=command.trigger_type,
                     initiator_user_id=command.initiator_user_id,
                     requested_head_sha=command.requested_head_sha,
+                    base_sha=base_sha,
                     rerun_of=command.rerun_of,
                     model_ref=command.model_ref,
                     model_digest=command.model_digest,

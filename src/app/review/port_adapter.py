@@ -43,6 +43,11 @@ class LlmGatewayAdapter:
         self._budget = budget
         self._review_id: uuid.UUID | None = None
 
+    def prompt_fits(self, payload: BuiltContextPayload) -> bool:
+        return self._service.prompt_fits(
+            ContextPayload.model_validate(payload.to_wire())
+        )
+
     async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
         context = ContextPayload.model_validate(payload.to_wire())
         if self._review_id is None:

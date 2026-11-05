@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/search.py",
+    "side": "NEW",
+    "start_line": 3,
+    "end_line": 4,
+    "category": "security",
+    "severity": "critical"
+  }
+]

@@ -285,7 +285,7 @@ async def test_catalog_deadline_fails_without_partial_page_and_closes_http(
 
     class SlowBody(httpx.AsyncByteStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
-            await asyncio.sleep(0.5)
+            await asyncio.Event().wait()
             yield b"{}"
 
         async def aclose(self) -> None:
@@ -309,7 +309,7 @@ async def test_catalog_deadline_fails_without_partial_page_and_closes_http(
         catalog.client.get(
             "/api/v1/repositories", headers=browser_cookie(catalog.user)
         ),
-        timeout=1,
+        timeout=5,
     )
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
     assert response.json()["code"] == "UPSTREAM_UNAVAILABLE"

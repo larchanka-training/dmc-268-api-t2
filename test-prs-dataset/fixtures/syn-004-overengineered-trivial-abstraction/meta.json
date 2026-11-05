@@ -1,0 +1,7 @@
+{
+  "title": "Избыточная абстракция (Strategy) для константного вычисления",
+  "description": "Применение фиксированной скидки 10% к сумме заказа.",
+  "language": "python",
+  "category": "clean",
+  "label_rationale": "Strategy abstraction still applies the intended ten-percent discount; no concrete failure is demonstrated by the selected diff. Verified .agents/reviewer/v3/system.md forbids style/formatter/linter findings and requires likely bugs for maintainability."
+}

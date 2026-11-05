@@ -1,0 +1,14 @@
+diff --git a/app/validation/range_check.py b/app/validation/range_check.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/validation/range_check.py
+@@ -0,0 +1,8 @@
++def is_in_range(value, low, high):
++    if value >= low:
++        if value <= high:
++            return True
++        else:
++            return False
++    else:
++        return False

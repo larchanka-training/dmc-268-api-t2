@@ -1,0 +1,10 @@
+diff --git a/app/authz/checks.py b/app/authz/checks.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/authz/checks.py
+@@ -0,0 +1,4 @@
++def can_edit(user, resource):
++    is_owner = resource.owner_id == user.id
++    is_admin = user.role == "admin"
++    return is_owner and is_admin

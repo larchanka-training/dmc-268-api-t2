@@ -1,0 +1,20 @@
+{
+  "summary": "The new module cannot be parsed.",
+  "findings": [
+    {
+      "path": "app/validation.py",
+      "side": "NEW",
+      "start_line": 1,
+      "end_line": 1,
+      "category": "correctness",
+      "severity": "high",
+      "title": "Function definition is missing its colon",
+      "explanation": "Python raises SyntaxError while parsing this module, so importing the helper and starting any handler that imports it fails.",
+      "evidence": "def validate(payload)",
+      "recommendation": "Terminate the function header with a colon.",
+      "rule_ref": null,
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

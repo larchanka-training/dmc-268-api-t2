@@ -1,0 +1,19 @@
+{
+  "title": "Requests: do not leak proxy authorization into TLS tunnel",
+  "description": "Actual fix excerpt; the added condition prevents the known credential leak. Clean target for this defect, not proof that the whole upstream project is bug free.",
+  "language": "python",
+  "category": "clean",
+  "source": {
+    "kind": "public_fix",
+    "repository": "psf/requests",
+    "commit": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+    "url": "https://github.com/psf/requests/commit/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+    "path": "requests/sessions.py",
+    "license": "Apache-2.0",
+    "license_file": "licenses/requests-Apache-2.0.txt",
+    "modifications": "Selected the production changed block and one context line; added file headers and trimmed surrounding hunk context. Source code lines unchanged.",
+    "label_rationale": "This change fixes CVE-2023-32681; do not report the removed insecure condition as a newly introduced defect.",
+    "advisory": "https://github.com/psf/requests/security/advisories/GHSA-j8r2-6x86-q33q",
+    "notice_file": "licenses/requests-NOTICE.txt"
+  }
+}

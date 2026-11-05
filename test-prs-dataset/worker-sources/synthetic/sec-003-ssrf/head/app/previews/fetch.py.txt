@@ -1,0 +1,6 @@
+import httpx
+
+def fetch_preview_image(image_url: str) -> bytes:
+    response = httpx.get(image_url, timeout=5.0)
+    response.raise_for_status()
+    return response.content

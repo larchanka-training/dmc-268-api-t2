@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import platform
 import time
 import uuid
@@ -15,9 +16,11 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import pytest_asyncio
 from pydantic import SecretStr
 from sqlalchemy import or_, select
@@ -214,32 +217,33 @@ def _metrics(
         for outcome in burst.outcomes
         if isinstance(outcome, httpx.Response)
     )
-    print(
-        "QA03A "
-        + json.dumps(
-            {
-                "requests": len(burst.outcomes),
-                "concurrency": burst.concurrency,
-                "unique_deliveries": len(scenario.manifest),
-                "github_reads": len(scenario.reads),
-                "elapsed_s": burst.elapsed,
-                "completed_requests_per_second": sum(statuses.values()) / burst.elapsed,
-                "p50_ms": durations[math.ceil(len(durations) * 0.50) - 1] * 1000,
-                "p95_ms": durations[math.ceil(len(durations) * 0.95) - 1] * 1000,
-                "http_statuses": dict(statuses),
-                "exceptions": sum(
-                    isinstance(outcome, BaseException) for outcome in burst.outcomes
-                ),
-                "receipts": len(receipts),
-                "ready": sum(row.processing_status == "READY" for row in receipts),
-                "python": platform.python_version(),
-                "platform": platform.system(),
-                "transport": "ASGITransport (includes BackgroundTasks)",
-                "db_pool": type(scenario.postgres.engine.pool).__name__,
-            },
-            sort_keys=True,
-        )
-    )
+    record = {
+        "requests": len(burst.outcomes),
+        "concurrency": burst.concurrency,
+        "unique_deliveries": len(scenario.manifest),
+        "github_reads": len(scenario.reads),
+        "elapsed_s": burst.elapsed,
+        "completed_requests_per_second": sum(statuses.values()) / burst.elapsed,
+        "p50_ms": durations[math.ceil(len(durations) * 0.50) - 1] * 1000,
+        "p95_ms": durations[math.ceil(len(durations) * 0.95) - 1] * 1000,
+        "http_statuses": dict(statuses),
+        "exceptions": sum(
+            isinstance(outcome, BaseException) for outcome in burst.outcomes
+        ),
+        "receipts": len(receipts),
+        "ready": sum(row.processing_status == "READY" for row in receipts),
+        "python": platform.python_version(),
+        "platform": platform.system(),
+        "transport": "ASGITransport (includes BackgroundTasks)",
+        "db_pool": type(scenario.postgres.engine.pool).__name__,
+    }
+    record["quality_measurement"] = False
+    record["scope"] = "Level1 intake characterization; no analysis capacity/SLA claim"
+    serialized = json.dumps(record, sort_keys=True)
+    print("QA03A " + serialized)
+    if destination := os.environ.get("DMC268_LOAD_REPORT"):
+        with Path(destination).open("a", encoding="utf-8") as output:
+            output.write(serialized + "\n")
 
 
 def _assert_capture(row: models.WebhookReceipt, scenario: LoadScenario) -> None:
@@ -348,7 +352,13 @@ async def _assert_no_review_work(scenario: LoadScenario) -> None:
         )
 
 
-async def test_concurrent_unique_deliveries(load_scenario: LoadScenario) -> None:
+async def test_concurrent_unique_deliveries(
+    load_scenario: LoadScenario, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_path = Path(
+        os.environ.get("DMC268_LOAD_REPORT", str(tmp_path / "load.jsonl"))
+    )
+    monkeypatch.setenv("DMC268_LOAD_REPORT", str(report_path))
     scenario = load_scenario
     expected_ids = {str(uuid.uuid4()) for _ in range(_UNIQUE_REQUESTS)}
     deliveries = [
@@ -372,6 +382,10 @@ async def test_concurrent_unique_deliveries(load_scenario: LoadScenario) -> None
         _assert_capture(row, scenario)
     assert len(scenario.reads) == _UNIQUE_READS
     await _assert_no_review_work(scenario)
+    assert (
+        json.loads(report_path.read_text().splitlines()[-1])["requests"]
+        == _UNIQUE_REQUESTS
+    )
 
 
 async def test_concurrent_duplicate_deliveries(load_scenario: LoadScenario) -> None:

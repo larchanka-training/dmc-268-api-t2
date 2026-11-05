@@ -184,6 +184,9 @@ preflight не подходит. API и локальная Compose-заглуш�
 
 ## Gold benchmark / Eval
 
+Controlled scripted worker passes, signed full-chain coverage and interpretation:
+[`docs/qa27-worker-benchmark.md`](docs/qa27-worker-benchmark.md).
+
 24 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
 [`test-prs-dataset/README.md`](test-prs-dataset/README.md).
 

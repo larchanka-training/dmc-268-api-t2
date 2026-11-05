@@ -102,6 +102,7 @@ async def start_github_oauth(
             "client_id": settings.auth.github_client_id,
             "redirect_uri": settings.auth.github_redirect_uri,
             "state": state,
+            "scope": "repo",
         }
     )
     response = RedirectResponse(

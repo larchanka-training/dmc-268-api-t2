@@ -234,6 +234,12 @@ class LLM(BaseModel):
 class Settings(BaseSettings):
     """Runtime configuration for the application."""
 
+    @field_validator("git_sha")
+    @classmethod
+    def _blank_git_sha_is_unknown(cls, value: str) -> str:
+        """A blank build arg is the same as a missing commit."""
+        return value.strip() or "unknown"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -241,6 +247,7 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    git_sha: str = "unknown"
     postgres: Postgres = Field(default_factory=Postgres)
     redis: Redis = Field(default_factory=Redis)
     webhook: Webhook = Field(default_factory=Webhook)

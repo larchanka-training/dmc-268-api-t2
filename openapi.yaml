@@ -1299,8 +1299,10 @@ components:
     Health:
       type: object
       additionalProperties: false
-      required: [status]
-      properties: { status: { const: ok } }
+      required: [status, commit]
+      properties:
+        status: { const: ok }
+        commit: { type: string, minLength: 1 }
     Readiness:
       type: object
       additionalProperties: false

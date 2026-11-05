@@ -28,6 +28,7 @@ from app.adapters.analysis_handler import PostgresAnalysisHandler
 from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
 from app.adapters.redis_queue import RedisQueue
 from app.adapters.review_worker import PostgresReviewWorker
+from app.api.review_diff import project_diff
 from app.application.analysis_authority import (
     LiveAnalysisAuthority,
     current_analysis_authority,
@@ -747,6 +748,276 @@ async def test_context_budget_does_not_send_over_limit_payload(
         ],
         "context_quality": "diff_only",
     }
+
+
+def _added_file(name: str, lines: int) -> str:
+    body = "".join(f"+value_{i} = compute_{i}(argument)\n" for i in range(1, lines + 1))
+    return (
+        f"diff --git a/src/{name}.py b/src/{name}.py\n"
+        "new file mode 100644\n"
+        "index 0000000..456abcd\n"
+        "--- /dev/null\n"
+        f"+++ b/src/{name}.py\n"
+        f"@@ -0,0 +1,{lines} @@\n{body}"
+    )
+
+
+# The whole three-file wire estimates ~3 900 tokens; every single file fits 2 500.
+MULTI_FILE_DIFF = DIFF + _added_file("b", 30) + _added_file("c", 30)
+CHUNK_LIMIT = 2500
+MULTI_FILE_PATHS = ["src/a.py", "src/b.py", "src/c.py"]
+
+
+def _paths(payload: BuiltContextPayload) -> list[str]:
+    files = cast(list[dict[str, Any]], payload.payload_body["files"])
+    return [file["diff"]["new_path"] for file in files]
+
+
+class ChunkAwareLlm(DeterministicLlm):
+    """Reports the division finding only for the chunk that carries src/a.py."""
+
+    async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+        self.payloads.append(payload)
+        paths = _paths(payload)
+        return replace(
+            self.result,
+            summary=f"Reviewed {', '.join(paths)}.",
+            findings=self.result.findings if "src/a.py" in paths else [],
+        )
+
+
+async def test_over_budget_diff_is_reviewed_in_bounded_chunks(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) > 1
+    assert all(
+        cast(dict[str, Any], payload.payload_body["budget"])["estimated_input_tokens"]
+        <= CHUNK_LIMIT
+        for payload in llm.payloads
+    )
+    sent = [path for payload in llm.payloads for path in _paths(payload)]
+    assert sorted(sent) == MULTI_FILE_PATHS
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+        chunks = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).all()
+        findings = (
+            await session.scalars(
+                select(Finding).where(
+                    Finding.chunk_result_id.in_([chunk.id for chunk in chunks])
+                )
+            )
+        ).all()
+        publish = await session.scalar(
+            select(func.count())
+            .select_from(OutboxEvent)
+            .where(
+                OutboxEvent.review_job_id == review_id,
+                OutboxEvent.task_kind == "publish",
+            )
+        )
+    assert review is not None and review.status == "COMPLETED"
+    assert {context.id for context in contexts} == {
+        payload.chunk_id for payload in llm.payloads
+    }
+    assert {chunk.context_payload_id for chunk in chunks} == {
+        context.id for context in contexts
+    }
+    assert len(findings) == 1 and findings[0].path == "src/a.py"
+    assert review.coverage is not None and review.coverage["skipped"] == []
+    assert sorted(item["path"] for item in review.coverage["included"]) == (
+        MULTI_FILE_PATHS
+    )
+    assert review.final_summary is not None and all(
+        f"Reviewed {', '.join(_paths(payload))}." in review.final_summary
+        for payload in llm.payloads
+    )
+    assert publish == 1
+
+
+async def test_chunks_beyond_max_chunks_are_visible_token_budget_skips(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+            max_chunks=1,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) == 1
+    reviewed = _paths(llm.payloads[0])
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+    assert review is not None and review.status == "PARTIAL"
+    assert len(contexts) == 1
+    assert review.coverage is not None
+    assert [item["path"] for item in review.coverage["included"]] == reviewed
+    assert sorted(item["path"] for item in review.coverage["skipped"]) == sorted(
+        set(MULTI_FILE_PATHS) - set(reviewed)
+    )
+    assert all(
+        item["reason"] == "token_budget" and item["ranges"]
+        for item in review.coverage["skipped"]
+    )
+
+
+async def test_redelivery_resumes_only_unfinished_chunks(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    class InterruptedLlm(ChunkAwareLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            if len(self.payloads) == 2:  # noqa: PLR2004 -- the second chunk call
+                raise RuntimeError("provider private data")
+            return result
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", event.attempt, event.trace_id
+        )
+    llm = InterruptedLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        with pytest.raises(RuntimeError):
+            await worker.run_once()
+        await queue.enqueue(task)
+        assert await worker.run_once() is True
+    first, interrupted, *resumed = llm.payloads
+    assert resumed[0] == interrupted
+    assert first.chunk_id not in {payload.chunk_id for payload in resumed}
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+        chunks = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).all()
+    assert review is not None and review.status == "COMPLETED"
+    assert len(contexts) == len(chunks) == 1 + len(resumed)
+
+
+async def test_file_over_budget_is_split_into_valid_line_ranges(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    lines = 90  # one hunk that alone estimates well over CHUNK_LIMIT
+    async with httpx.AsyncClient(
+        transport=github_http(_added_file("big", lines))
+    ) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) > 1
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload)
+                .where(ContextPayload.review_job_id == review_id)
+                .order_by(ContextPayload.created_at, ContextPayload.id)
+            )
+        ).all()
+    assert review is not None and review.status == "COMPLETED"
+    assert review.coverage is not None and review.coverage["skipped"] == []
+    assert review.coverage["included"] == [
+        {
+            "path": "src/big.py",
+            "ranges": [{"start_line": n, "end_line": n} for n in range(1, lines + 1)],
+        }
+    ]
+    diff = project_diff(contexts)
+    [file] = diff["files"]
+    numbers = [line["new_line"] for hunk in file["hunks"] for line in hunk["lines"]]
+    assert numbers == list(range(1, lines + 1))
 
 
 async def test_github_access_denied_is_safe_terminal_failure(

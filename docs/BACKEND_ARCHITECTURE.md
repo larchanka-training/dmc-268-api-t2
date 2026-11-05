@@ -382,8 +382,11 @@ terminal rows остаются читаемыми через REST без пер�
 
 Builder лишь возвращает bounded worker; фонового сервиса он не запускает.
 CLI Stage 8C-04-01 описан в [analysis-runtime.md](examples/analysis-runtime.md).
+Over-budget diff разбивается на ≤ `max_chunks` чанков (llm-gateway-review-pipeline.md §5.2):
+каждый чанк сохраняется отдельно, при повторной доставке обрабатываются только незавершённые,
+а то, что не влезло, видно в `coverage.skipped` (`token_budget`, статус PARTIAL).
 Activation, transport retention/cleanup, полный in-flight shutdown,
-полный chunk planner, real publisher/reconciliation и OAuth/session integration
+real publisher/reconciliation и OAuth/session integration
 остаются до production activation. Automatic Redis pending recovery и PostgreSQL transport recovery реализованы;
 их наличие не заменяет остальные activation gates. Issue #13 и deployment readiness не объявлены
 завершёнными. Детали — PIPELINE_SPEC.md §2–3, §6 и §8.

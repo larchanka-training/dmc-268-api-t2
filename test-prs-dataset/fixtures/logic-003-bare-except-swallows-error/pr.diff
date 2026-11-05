@@ -1,0 +1,13 @@
+diff --git a/app/billing/charge.py b/app/billing/charge.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/billing/charge.py
+@@ -0,0 +1,7 @@
++def charge_balance(account, amount):
++    try:
++        account.balance -= amount
++        account.save()
++    except:
++        pass
++    return account.balance

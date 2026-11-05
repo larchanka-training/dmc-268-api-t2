@@ -1,0 +1,11 @@
+diff --git a/app/users/display_name.py b/app/users/display_name.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/users/display_name.py
+@@ -0,0 +1,5 @@
++def _build_full_name(first_name, last_name):
++    return f"{first_name} {last_name}"
++
++def get_full_name(first_name, last_name):
++    return _build_full_name(first_name, last_name)

@@ -44,8 +44,22 @@ def test_staging_routes_publication_credentials_only_to_api() -> None:
         services["api"]["environment"]["GITHUB__BOT_USER_ID"]
         == "${GITHUB__BOT_USER_ID:-}"
     )
+    assert (
+        services["publication-worker"]["environment"]["GITHUB__WRITE_TOKEN"]
+        == "${GITHUB__WRITE_TOKEN:-}"
+    )
+    assert (
+        services["publication-worker"]["environment"]["GITHUB__BOT_USER_ID"]
+        == "${GITHUB__BOT_USER_ID:-}"
+    )
+    assert services["publication-worker"]["command"] == [
+        "python",
+        "-m",
+        "app.publication_worker",
+    ]
+    assert services["publication-worker"]["profiles"] == ["analysis"]
     for name, service in services.items():
-        if name != "api":
+        if name not in {"api", "publication-worker"}:
             assert "GITHUB__WRITE_TOKEN" not in service.get("environment", {})
             assert "GITHUB__BOT_USER_ID" not in service.get("environment", {})
 

@@ -247,9 +247,20 @@ def test_deployment_installs_manifest_after_stop_and_before_preflight(
     assert "install -n /usr/bin/python3 -I" in calls, (
         "root installation must be mandatory"
     )
-    assert calls.index("stop worker outbox-dispatcher") < calls.index("install -n")
+    assert calls.index(
+        "stop worker outbox-dispatcher publication-worker"
+    ) < calls.index("install -n")
     assert calls.index("install -n") < calls.index("worker python -")
-    for failure in ("INSTALL_FAILURE", "VALIDATION_FAILURE", "PREFLIGHT_FAILURE"):
+    assert calls.index("worker python -") < calls.index("publication-worker python -c")
+    assert calls.index("publication-worker python -c") < calls.index(
+        "--force-recreate --no-deps api"
+    )
+    for failure in (
+        "INSTALL_FAILURE",
+        "VALIDATION_FAILURE",
+        "PREFLIGHT_FAILURE",
+        "PUBLICATION_CHECK_FAILURE",
+    ):
         trace.write_text("")
         result = subprocess.run(
             ["bash", "-euc", remote],

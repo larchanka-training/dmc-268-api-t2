@@ -549,7 +549,7 @@ jobs:
 
           # Stop the previous image's analysis processes before migrations or
           # activation changes. This also retires the old sleep placeholder.
-          compose --profile analysis stop worker outbox-dispatcher
+          compose --profile analysis stop worker outbox-dispatcher publication-worker
 
           if [[ "${ENV_NAME}" == staging ]]; then
             # The uploaded installer is writable by the SSH user. Anchor its
@@ -611,7 +611,7 @@ jobs:
 
           analysis_services=()
           if grep -qx 'COMPOSE_PROFILES=analysis' "${ENV_FILE}"; then
-            analysis_services=(outbox-dispatcher worker)
+            analysis_services=(outbox-dispatcher worker publication-worker)
             echo "Checking analysis configuration without provider requests..."
             compose run --rm --no-deps -T worker python - <<'PREFLIGHT'
           import asyncio
@@ -666,6 +666,7 @@ jobs:
               raise SystemExit("Analysis preflight failed") from None
           print("Analysis preflight passed")
           PREFLIGHT
+            compose run --rm --no-deps --interactive=false -T publication-worker python -c 'import sys; from app.core.config import get_settings; exec("try:\n g=get_settings().github\n ok=bool(g.write_token.get_secret_value().strip()) and bool(g.bot_user_id)\nexcept Exception:\n ok=False\nsys.exit(0 if ok else 1)")' </dev/null
           fi
 
           echo "Starting API..."

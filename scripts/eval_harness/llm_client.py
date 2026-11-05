@@ -37,10 +37,7 @@ class LlmConfig:
     ) -> LlmConfig:
         try:
             values = [Decimal(value) for value in (cap, input_price, output_price)]
-            if (
-                not all(value.is_finite() and value >= 0 for value in values)
-                or values[0] <= 0
-            ):
+            if not all(value.is_finite() and value > 0 for value in values):
                 raise ValueError
             runtime = load_runtime_configuration(path)
             config = cls(runtime, *values)

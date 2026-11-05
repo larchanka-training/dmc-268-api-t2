@@ -160,7 +160,7 @@ def run(
             provider=llm_config.runtime.admission.primary.profile_ref,
             model=llm_config.runtime.admission.primary.model_ref,
             runtime_manifest_sha256=llm_config.runtime.identity,
-            quality_measurement=True,
+            quality_measurement=transport is None,
             scope="verified initial prompt/Gateway; no worker admission or repair",
             cost_basis=(
                 "price ceilings times charged token receipts/reservations; "

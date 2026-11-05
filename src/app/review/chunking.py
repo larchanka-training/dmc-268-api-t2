@@ -4,6 +4,7 @@ Hidden truncation is forbidden: whatever does not fit ends up in ``skipped``
 with a reason.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import PurePosixPath
@@ -64,17 +65,28 @@ class ChunkLimits:
     max_changed_lines: int = 2000
 
 
+Measure = Callable[[FileDiff], int]
+
+
 def plan_chunks(
-    files: list[FileDiff], counter: TokenCounter, limits: ChunkLimits
+    files: list[FileDiff],
+    counter: TokenCounter,
+    limits: ChunkLimits,
+    *,
+    measure: Measure | None = None,
 ) -> ChunkPlan:
-    """Plan chunks within per-chunk tokens and run admission limits (SD §14)."""
+    """Plan chunks within per-chunk tokens and run admission limits (SD §14).
+
+    ``measure`` sizes one file piece; by default its rendered prompt diff.
+    """
+    size = measure or (lambda diff: counter.count(render_file_diff(diff)))
     max_chunk_tokens, max_chunks = limits.max_chunk_tokens, limits.max_chunks
     ordered = sorted(files, key=lambda f: (priority_of(file_path(f)), file_path(f)))
     admitted, skipped = _admit(ordered, limits.max_files, limits.max_changed_lines)
     units = [
         piece
         for diff in admitted
-        for piece in _fit_file(diff, counter=counter, limit=max_chunk_tokens)
+        for piece in _fit_file(diff, size=size, limit=max_chunk_tokens)
     ]
     too_big = [diff for diff, tokens in units if tokens > max_chunk_tokens]
     units = [(diff, tokens) for diff, tokens in units if tokens <= max_chunk_tokens]
@@ -148,10 +160,10 @@ def _skip(files: list[FileDiff], reason: SkipReason) -> list[SkippedItem]:
 
 
 def _fit_file(
-    diff: FileDiff, *, counter: TokenCounter, limit: int
+    diff: FileDiff, *, size: Measure, limit: int
 ) -> list[tuple[FileDiff, int]]:
     """Split a file that exceeds ``limit`` into pieces of consecutive hunks."""
-    tokens = counter.count(render_file_diff(diff))
+    tokens = size(diff)
     if tokens <= limit:
         return [(diff, tokens)]
     pieces: list[tuple[FileDiff, int]] = []
@@ -159,41 +171,37 @@ def _fit_file(
     fitted = [
         part
         for hunk in diff.hunks
-        for part in _fit_hunk(diff, hunk, counter=counter, limit=limit)
+        for part in _fit_hunk(diff, hunk, size=size, limit=limit)
     ]
     for hunk in fitted:
         candidate = diff.model_copy(update={"hunks": [*hunks, hunk]})
-        if hunks and counter.count(render_file_diff(candidate)) > limit:
+        if hunks and size(candidate) > limit:
             piece = diff.model_copy(update={"hunks": hunks})
-            pieces.append((piece, counter.count(render_file_diff(piece))))
+            pieces.append((piece, size(piece)))
             hunks = []
         hunks.append(hunk)
     if hunks:
         piece = diff.model_copy(update={"hunks": hunks})
-        pieces.append((piece, counter.count(render_file_diff(piece))))
+        pieces.append((piece, size(piece)))
     return pieces
 
 
-def _fit_hunk(
-    diff: FileDiff, hunk: Hunk, *, counter: TokenCounter, limit: int
-) -> list[Hunk]:
+def _fit_hunk(diff: FileDiff, hunk: Hunk, *, size: Measure, limit: int) -> list[Hunk]:
     """Split a hunk that alone exceeds ``limit`` into consecutive line ranges.
 
     Original line numbers are kept; starts and counts are recomputed so every
     part is a valid ``Hunk``.
     """
 
-    def size(lines: list[HunkLine]) -> int:
+    def lines_size(lines: list[HunkLine]) -> int:
         part = _sub_hunk(hunk, lines, part_no=1)
-        return counter.count(
-            render_file_diff(diff.model_copy(update={"hunks": [part]}))
-        )
+        return size(diff.model_copy(update={"hunks": [part]}))
 
-    if size(list(hunk.lines)) <= limit:
+    if lines_size(list(hunk.lines)) <= limit:
         return [hunk]
     groups: list[list[HunkLine]] = [[]]
     for line in hunk.lines:
-        if groups[-1] and size([*groups[-1], line]) > limit:
+        if groups[-1] and lines_size([*groups[-1], line]) > limit:
             groups.append([])
         groups[-1].append(line)
     parts: list[Hunk] = []

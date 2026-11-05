@@ -127,6 +127,23 @@ class ReviewService:
         self._settings = settings
         self._frozen = frozen_configuration
 
+    def prompt_fits(self, payload: ContextPayload) -> bool:
+        """Whether the chunk's first call fits the per-call input limit.
+
+        Mirrors ``_send``: the reservation is the rendered prompt plus the
+        output schema, which the provider receives separately. No provider call.
+        """
+        self._prompts.ensure_verified()
+        counter = ConservativeTokenCounter() if self._frozen else self._counter
+        schema = counter.count(self._prompts.output_schema_json)
+        try:
+            self._prompts.build(
+                payload, max_input_tokens=self._settings.max_input_tokens - schema
+            )
+        except PromptTooLargeError:
+            return False
+        return True
+
     async def review_chunk(
         self,
         payload: ContextPayload,

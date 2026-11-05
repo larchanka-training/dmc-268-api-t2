@@ -17,7 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_authority import current_analysis_authority
-from app.application.github_ports import GithubFailure, GithubPort, GithubRequest
+from app.application.github_ports import (
+    GithubFailure,
+    GithubPort,
+    GithubRequest,
+    SourceFileReader,
+)
 from app.application.ports import (
     BuiltContextPayload,
     DurableTaskOutcome,
@@ -29,6 +34,7 @@ from app.application.ports import (
     TaskLeaseSnapshot,
     TokenUsage,
 )
+from app.context.enrichment import enrich_context
 from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
     ChangeRequest,
@@ -369,6 +375,7 @@ class PostgresAnalysisHandler:
                 review.base_sha or change.base_sha,
             )
             settings_id = settings.id
+            context_enabled = review.prompt_version == "v4"
             language = settings.output_language
             ignores = list(
                 project_historical_empty_settings(settings.ignores, "globs")["globs"]
@@ -423,7 +430,17 @@ class PostgresAnalysisHandler:
             },
         }
         context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
-        contexts, coverage = [context], parsed.coverage
+        if context_enabled:
+            await enrich_context(body, cast(SourceFileReader, self._github))
+        if _estimate(context) > limit and context_enabled:
+            # Optional source context has the same bounded fallback as before.
+            for file in body["files"]:
+                file["source_windows"] = []
+                file["whole_file"] = None
+            body["related_symbols"] = []
+            body["coverage"]["context_quality"] = "degraded"
+            body["budget"]["estimated_input_tokens"] = 0
+        contexts, coverage = [context], body["coverage"]
         # The real gateway also knows the rendered prompt: system prompt and
         # few-shots come on top of the diff, so the wire estimate alone is not enough.
         prompt_fits = llm.prompt_fits if isinstance(llm, LlmGatewayAdapter) else None
@@ -441,7 +458,7 @@ class PostgresAnalysisHandler:
             if not contexts and _estimate(context) <= limit:
                 # The diff fits; only the fixed prompt does not. That is a
                 # configuration failure for the gateway (prompt_too_large).
-                contexts, coverage = [context], parsed.coverage
+                contexts, coverage = [context], body["coverage"]
         if not contexts:
             coverage = {
                 "included": [],
@@ -838,10 +855,14 @@ def _wire_file(diff: FileDiff) -> dict[str, Any]:
 def _chunk_body(
     body: dict[str, Any], files: list[dict[str, Any]], skipped: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    coverage = ParsedDiff(files, skipped, 0).coverage
+    if body["coverage"]["context_quality"] != "diff_only":
+        coverage["context_quality"] = "degraded"
     return {
         **body,
         "files": files,
-        "coverage": ParsedDiff(files, skipped, 0).coverage,
+        "related_symbols": [],
+        "coverage": coverage,
         "budget": {**body["budget"], "estimated_input_tokens": 0},
     }
 
@@ -922,6 +943,8 @@ def _chunk_contexts(  # noqa: PLR0913 -- explicit plan inputs and limits
                 for entry in ParsedDiff(overflow, [], 0).coverage["included"]
             ],
         ],
-        "context_quality": "diff_only",
+        "context_quality": cast(dict[str, Any], shell.payload_body["coverage"])[
+            "context_quality"
+        ],
     }
     return contexts, coverage

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.application.github_ports import (
     GithubPullRequest,
     GithubRepositoryMismatch,
     GithubRequest,
+    RepositoryFile,
 )
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
@@ -44,6 +46,8 @@ from app.application.review_start_ports import (
     ReviewStartAuthorizer,
     SettingsVersionChangedError,
 )
+from app.context.loader import RepoConfigLoader
+from app.context.snapshot import capture_settings, materialize_settings
 from app.core import github_runtime
 from app.core.config import get_settings
 from app.db.models import (
@@ -110,6 +114,7 @@ class ReviewStartRoute(APIRoute):
 
 
 router = APIRouter(prefix="/api/v1/repositories", route_class=ReviewStartRoute)
+_RULES_CACHE: OrderedDict[tuple[str, ...], RepositoryFile] = OrderedDict()
 _SETTINGS_VALIDATOR = Draft202012Validator(
     json.loads(Path("schemas/settings/v1.json").read_text(encoding="utf-8"))
 )
@@ -487,6 +492,8 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         repository.repo_name,
     )
     settings_id, rules_digest = settings.id, settings.rules_digest
+    source_settings_id = settings.id
+    source_values = capture_settings(settings)
     change_id = change.id if change is not None else uuid4()
     saved_change = change_identity(change) if change is not None else None
     expected_settings = settings_identity(settings)
@@ -521,6 +528,38 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
         )
         await session.commit()
         raise _unhealthy_error() from None
+    if getattr(resolver, "context_enabled", False) is True:
+        try:
+            async with github_runtime.github_file_connection(get_settings()) as files:
+                loaded = await RepoConfigLoader(files, _RULES_CACHE).load(
+                    tenant=str(repository_identity.id),
+                    owner=repository_identity.owner,
+                    name=repository_identity.name,
+                    external_id=repository_identity.external_id,
+                    revision=expected_change.base_sha,
+                    instructions=raw_instructions,
+                )
+            effective = await materialize_settings(
+                session, source_values, expected_settings, loaded
+            )
+        except GithubFailure as failure:
+            raise ApiError(
+                503,
+                "SERVICE_UNAVAILABLE",
+                "Repository context is unavailable.",
+                retryable=failure.retryable,
+                retry_after=failure.retry_after,
+            ) from None
+        settings_id, rules_digest = effective["id"], effective["rules_digest"]
+        raw_instructions = tuple(effective["rules"]["instructions"])
+        raw_settings_digest = compute_repository_settings_digest(
+            id=settings_id,
+            repository_id=effective["repository_id"],
+            rules=effective["rules"],
+            ignores=effective["ignores"],
+            output_language=effective["output_language"],
+            surrounding_lines=effective["surrounding_lines"],
+        )
     try:
         config = await resolver.resolve(
             repository=repository_identity,
@@ -530,7 +569,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     except FrozenConfigurationError:
         await _refuse_configuration(
             session,
-            settings_id=settings_id,
+            settings_id=source_settings_id,
             expected_settings=expected_settings,
         )
     try:
@@ -542,7 +581,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     except ApiError:
         await _refuse_configuration(
             session,
-            settings_id=settings_id,
+            settings_id=source_settings_id,
             expected_settings=expected_settings,
         )
     command = StartReviewCommand(
@@ -573,6 +612,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
             expected_settings=expected_settings,
             new_change=new_change,
             saved_change=saved_change,
+            source_settings_id=source_settings_id,
         )
     except tuple(_ADMISSION_ERRORS) as error:
         raise ApiError(*_ADMISSION_ERRORS[type(error)]) from None

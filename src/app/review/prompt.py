@@ -381,6 +381,7 @@ _RENDERERS = {
     "review-renderer-v1": ("app.review.renderers.v1", "src/app/review/renderers/v1.py"),
     "review-renderer-v2": ("app.review.renderers.v2", "src/app/review/renderers/v2.py"),
     "review-renderer-v3": ("app.review.renderers.v3", "src/app/review/renderers/v3.py"),
+    "review-renderer-v4": ("app.review.renderers.v4", "src/app/review/renderers/v4.py"),
 }
 
 
@@ -388,6 +389,7 @@ _PROMPT_IDENTITIES: dict[str, tuple[str, str, Literal[1, 2]]] = {
     "v1": ("review-renderer-v1", "schemas/llm-output/v1.json", 1),
     "v2": ("review-renderer-v2", "schemas/llm-output/v1.json", 1),
     "v3": ("review-renderer-v3", "schemas/llm-output/v2.json", 2),
+    "v4": ("review-renderer-v4", "schemas/llm-output/v2.json", 2),
 }
 
 

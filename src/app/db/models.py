@@ -150,6 +150,7 @@ class RepositorySettings(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
     rules_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_source: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     repository: Mapped[Repository] = relationship(
         back_populates="settings",

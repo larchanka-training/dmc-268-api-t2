@@ -71,6 +71,12 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 
 Каждый запрос получает Request ID: он попадает во все записи журнала этого запроса и в заголовок ответа `X-Request-Id`.
 
+## Правила и контекст репозитория
+
+Загрузка правил из base SHA, Tree-sitter и явно выбранный prompt v4 описаны в
+[`repository-context.md`](docs/repository-context.md). Текущая runtime-конфигурация
+и исторические задания автоматически не переключаются.
+
 ## Проверки качества
 
 ```bash

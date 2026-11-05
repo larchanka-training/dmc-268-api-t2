@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from app.application.analysis_ports import ReviewRunBudgetPort
 from app.core.config import LLM
+from app.domain.enums import FindingSeverity
 from app.domain.frozen_configuration import ExecutionSettings, RepositoryInstructions
 from app.domain.settings import rule_instructions
 from app.llm.budget import RunBudget
@@ -199,7 +200,7 @@ class ReviewService:
                     budget,
                     call_kind="overflow_rebuild",
                     repair_input_limit=smaller
-                    if self._prompts.prompt_version == "v3"
+                    if self._prompts.prompt_version in {"v3", "v4"}
                     else None,
                 )
         except LLMGatewayError as exc:
@@ -221,11 +222,7 @@ class ReviewService:
             limitations.append(
                 f"Чанк обработан резервным провайдером ({call.provider}/{call.model})."
             )
-        outcome = self._validator.validate(
-            call.parsed.findings,
-            payload,
-            rule_refs=rule_refs_from_text(prompt.included_rules),
-        )
+        outcome = self._validate_findings(call.parsed, payload, prompt)
         # Historical renderers do not neutralize every Reflection delimiter.
         if (
             self._prompts.prompt_version == "v3"
@@ -233,15 +230,67 @@ class ReviewService:
             and isinstance(budget, RunBudget)
         ):
             outcome = await self._reflect(payload, prompt, outcome, budget, attempt)
+        summary = self._rules_notes(call.parsed.summary, limitations)
         return await self._result(
             payload,
             budget,
             attempt,
             prompt.prompt_version,
-            summary=call.parsed.summary,
+            summary=summary,
             outcome=outcome,
             limitations=limitations,
         )
+
+    def _validate_findings(
+        self,
+        parsed: LLMReviewOutputV1 | LLMReviewOutput,
+        payload: ContextPayload,
+        prompt: BuiltPrompt,
+    ) -> ValidationOutcome:
+        rule_refs = rule_refs_from_text(prompt.included_rules)
+        if self._frozen is not None and self._frozen.allowed_rule_refs is not None:
+            rule_refs &= self._frozen.allowed_rule_refs
+        outcome = self._validator.validate(
+            parsed.findings,
+            payload,
+            rule_refs=rule_refs,
+        )
+        if self._frozen is not None and prompt.prompt_version == "v4":
+            severities = dict(self._frozen.rule_severities)
+            outcome = ValidationOutcome(
+                accepted=[
+                    finding.model_copy(
+                        update={
+                            "severity": FindingSeverity(severities[finding.rule_ref])
+                        }
+                    )
+                    if finding.rule_ref in severities
+                    else finding
+                    for finding in outcome.accepted
+                ],
+                rejected_count=outcome.rejected_count,
+            )
+        return outcome
+
+    def _rules_notes(self, summary: str, limitations: list[str]) -> str:
+        if self._frozen is not None and self._frozen.rules_diagnostics:
+            note = "Правила репозитория применены не полностью: " + ", ".join(
+                self._frozen.rules_diagnostics[:10]
+            )
+            limitations.append(note)
+            summary += "\n\n" + note
+        if self._frozen is not None and self._frozen.rules_source_state in {
+            "absent",
+            "empty",
+        }:
+            state = (
+                "отсутствует" if self._frozen.rules_source_state == "absent" else "пуст"
+            )
+            summary += (
+                f"\n\nФайл правил {state}; применены стандартные правила "  # noqa: RUF001 -- Russian product text
+                "и настройки репозитория."
+            )
+        return summary
 
     async def _generate(
         self,

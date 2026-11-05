@@ -2,7 +2,7 @@
 
 Status: **P1/P2 selected under explicit user delegation**, 2026-11-04. AC source: API [#22](https://github.com/larchanka-training/dmc-268-api-t2/issues/22), [#23](https://github.com/larchanka-training/dmc-268-api-t2/issues/23), [#25](https://github.com/larchanka-training/dmc-268-api-t2/issues/25), [#27](https://github.com/larchanka-training/dmc-268-api-t2/issues/27), UI [#20](https://github.com/larchanka-training/dmc-268-ui-t2/issues/20).
 
-Selected P1/P2 governs S2/S3. Conflicting extended-draft requirements do not apply to this delivery. This profile distinguishes existing decisions from selected product semantics. It does not record an approval on behalf of a person. An unchecked implementation checklist in either extended spec is a future verification plan, not evidence of delivered behavior.
+Selected P1/P2 is the binding implementation scope for S2/S3. The extended designs in [RULES_FORMAT_SPEC](./RULES_FORMAT_SPEC.md) and [CONTEXT_AND_VERIFICATION_SPEC](./CONTEXT_AND_VERIFICATION_SPEC.md) remain proposals, not additional mandatory S3 requirements. Conflicting extended-draft requirements do not apply to this delivery. This profile distinguishes existing decisions from selected product semantics. It does not record an approval on behalf of a person. An unchecked implementation checklist in either extended spec is a future verification plan, not evidence of delivered behavior.
 
 ## Existing authority retained
 
@@ -51,7 +51,7 @@ Exact parser grammar/schema/ignore syntax will be committed with #23 tests again
 ## Selected automation/settings semantics (decision P2)
 
 - Persist `auto_review_enabled=false` by default; it affects only newly accepted webhook events, and never bypasses repository/bot authorization, limits or idempotency.
-- Base-branch allowlist: empty means all base branches; otherwise exact names or bounded globs, evaluated against the PR base branch. Manual StartReview remains available even when auto review is disabled or filtered.
+- Base-branch allowlist: empty means all base branches; otherwise exact Git branch names only, evaluated against the PR base branch. Glob patterns are rejected in the selected S3 profile; glob support is a possible future proposal. Manual StartReview remains available even when auto review is disabled or filtered.
 - Minimum severity controls **publication**, retaining all validated findings in the UI/audit. It does not hide stored findings or alter the model's schema. Default `low` preserves current publication behavior.
 - Rules preview is read-only, fetched from an explicitly identified base revision, with provenance/default/error states. Settings writes require the already declared admin permission, canonical immutable version and If-Match contract.
 - QA covers both default manual and opt-in automatic paths, including replay, access revocation, branch filtering and rules source provenance. No manual StartReview may be presented as proof of automatic webhook processing.
@@ -73,6 +73,6 @@ Useful #57 invariants retained: verbatim historical rules, default-off author di
 | Decision | Proposed choice | State / evidence |
 |---|---|---|
 | P1 bounded base-rules profile | Root sections + canonical refs, additive DB compatibility, system priority, explicit safe ignores; limits unchanged | Selected by the implementation owner under user instruction “Выбери сам как правильнее и сделай”, 2026-11-04 |
-| P2 settings/automatic review | Off by default; base-branch allowlist; minimum severity gates publication | Selected by the implementation owner under user instruction “Выбери сам как правильнее и сделай”, 2026-11-04 |
+| P2 settings/automatic review | Off by default; exact-name base-branch allowlist; minimum severity gates publication | Selected by the implementation owner under user instruction “Выбери сам как правильнее и сделай”, 2026-11-04 |
 | Full #22 specification approval | This profile plus corrected applicable sections of both specs | **Awaiting human review; not approved by the agent** |
 | Other PR disposition | Keep #57 open as reference until team agrees | No closure performed |

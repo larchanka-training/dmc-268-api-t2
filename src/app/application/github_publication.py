@@ -451,10 +451,26 @@ class GithubPublisher:
         review = await self._store.load(review_job_id)
         if review is None:
             raise LookupError("Frozen publication input is unavailable")
-        noted = await self._already_noted_fingerprints(
-            review,
-            self._github.with_authority(self._require_lease),
-        )
+        denial_reason: str | None = None
+        noted: frozenset[str]
+        if review.integration_status != "healthy":
+            # AC6: no new provider attempts for an unhealthy repository —
+            # the claim-free suppression read included.
+            noted = frozenset()
+        else:
+            try:
+                noted = await self._already_noted_fingerprints(
+                    review,
+                    self._github.with_authority(self._require_lease),
+                )
+            except GithubFailure as error:
+                # The claim-free read precedes begin(): transient failures stay
+                # retryable claim-free, but a bot denial (AC6) must not loop —
+                # it parks durably once the claim exists below.
+                if error.reason_code != "VCS_ACCESS_DENIED":
+                    raise
+                denial_reason = error.reason_code
+                noted = frozenset()
         prepared = prepare_github_review(review, published=noted)
         payload_hash = self._payload_hash(prepared)
         claim = await self._store.begin(
@@ -471,6 +487,12 @@ class GithubPublisher:
             blocked: dict[str, object] = {"reason_code": "INTEGRATION_UNHEALTHY"}
             await self._store.save(claim, status="SKIPPED", provider_metadata=blocked)
             return {"status": "SKIPPED", **blocked}
+        if denial_reason is not None:
+            return await self._unknown_overview(
+                claim,
+                None,
+                reason_code=denial_reason,
+            )
         try:
             await github.check_pull(prepared.request)
         except GithubFailure as error:

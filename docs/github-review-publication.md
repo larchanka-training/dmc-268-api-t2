@@ -60,6 +60,14 @@ publish and reconciliation (for example a comment was deleted manually), the
 set no longer matches and reconciliation refuses with «Reconciliation payload is
 unavailable»; the outcome stays `UNKNOWN` until resolved manually.
 
+If the claim-free suppression read itself is denied by the provider (bot lost
+access, `VCS_ACCESS_DENIED`), the publisher still takes the claim, then parks a
+durable `UNKNOWN` and flags the repository `bot_denied` — the same AC6 posture
+as a post-claim denial; no review or comment is posted. Transient read failures
+stay claim-free: the task fails for a retry with no durable decision. An
+unhealthy repository skips the suppression read entirely — no provider request
+at all.
+
 `GithubPublisher.reconcile(review_job_id=...)` is a **read-only GitHub operation**
 under a fresh publish lease with a higher fencing token. It can confirm presence
 by reading complete review/comment lists. An empty read leaves `UNKNOWN`

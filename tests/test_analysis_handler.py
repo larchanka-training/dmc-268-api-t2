@@ -15,7 +15,7 @@ import pytest_asyncio
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from test_contracts import SCHEMAS, _validator
 from test_postgres_integration import (
     PostgresHarness,
@@ -33,8 +33,10 @@ from app.application.analysis_authority import (
     LiveAnalysisAuthority,
     current_analysis_authority,
 )
+from app.application.github_ports import GithubRequest, GithubSnapshot
 from app.application.ports import (
     BuiltContextPayload,
+    DurableTaskOutcome,
     LeaseLostError,
     QueueTaskEnvelope,
     ReviewChunkResult,
@@ -61,6 +63,8 @@ from app.db.uow import SqlAlchemyUnitOfWork
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.domain.frozen_configuration import admission_policy
 from app.domain.settings import compute_rules_digest
+from app.review.port_adapter import ChunkReviewFailedError
+from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome, Usage
 from app.vcs.github import GithubClient
 
 pytest_plugins = ("test_postgres_integration", "test_redis_queue")
@@ -1904,6 +1908,60 @@ async def test_failure_audit_uses_durable_execution_attempt(
         assert [event.attempt for event in events] == [1, 2]
 
 
+async def test_chunk_failure_after_cancel_completes_without_lease_lost(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class FailingLlm(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            await super().review(payload)
+            await _mark_cancelled(factory, review_id)
+            raise ChunkReviewFailedError(
+                ReviewChunkOutcome(
+                    schema_version=1,
+                    review_id=str(payload.review_id),
+                    chunk_id=str(payload.chunk_id),
+                    status=ChunkStatus.FAILED,
+                    summary=None,
+                    findings=[],
+                    rejected_findings_count=0,
+                    limitations=[],
+                    usage=Usage(
+                        input_tokens=None,
+                        output_tokens=None,
+                        requests=1,
+                        latency_ms=1,
+                    ),
+                    model="test",
+                    model_digest=None,
+                    provider="test",
+                    prompt_version="v1",
+                    error_code="llm_error",
+                    retryable=False,
+                )
+            )
+
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", 1, event.trace_id
+        )
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-then-chunk-fail", task_kind="analyze"
+    )
+    assert lease is not None
+    async with httpx.AsyncClient(transport=github_http()) as http:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(http), FailingLlm(), schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+
+
 async def test_local_authority_loss_before_result_persistence_keeps_delivery_pending(
     postgres: PostgresHarness,
     review_id: uuid.UUID,
@@ -1950,3 +2008,175 @@ async def test_local_authority_loss_before_result_persistence_keeps_delivery_pen
         )
         job = await session.get(ReviewJob, review_id)
         assert job is not None and job.finished_at is None
+
+
+async def _analyze_task(
+    factory: async_sessionmaker[AsyncSession], review_id: uuid.UUID
+) -> QueueTaskEnvelope:
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+    return QueueTaskEnvelope(
+        1, str(event.id), str(review_id), "analyze", event.attempt, event.trace_id
+    )
+
+
+async def _mark_cancelled(
+    factory: async_sessionmaker[AsyncSession], review_id: uuid.UUID
+) -> None:
+    async with factory.begin() as session:
+        updated = await session.scalar(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_id, ReviewJob.finished_at.is_(None))
+            .values(status="FAILED", finished_at=func.clock_timestamp())
+            .returning(ReviewJob.id)
+        )
+    assert updated is not None
+
+
+async def test_saved_chunk_then_cancel_skips_the_next_model_call(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    class InterruptedLlm(ChunkAwareLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            if len(self.payloads) == 2:  # noqa: PLR2004 -- second chunk call
+                raise RuntimeError("provider stopped")
+            return result
+
+    factory = async_sessionmaker(postgres.engine)
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-next", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = InterruptedLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        with pytest.raises(RuntimeError, match="provider stopped"):
+            await handler.handle(task, lease)
+        async with factory() as session:
+            saved = await session.scalar(
+                select(func.count())
+                .select_from(ChunkResult)
+                .where(ChunkResult.review_job_id == review_id)
+            )
+        assert saved == 1
+        await _mark_cancelled(factory, review_id)
+        calls = len(llm.payloads)
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+        assert len(llm.payloads) == calls
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        chunks = await session.scalar(
+            select(func.count())
+            .select_from(ChunkResult)
+            .where(ChunkResult.review_job_id == review_id)
+        )
+    assert review is not None and review.status == "FAILED"
+    assert review.finished_at is not None
+    assert publication.status == "NOT_READY"
+    assert chunks == 1
+
+
+async def test_model_result_after_cancel_is_not_inserted(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class CancelDuringReview(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            await _mark_cancelled(factory, review_id)
+            return result
+
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-during-review", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = CancelDuringReview()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(client), llm, schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+    assert len(llm.payloads) == 1
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        chunk = await session.scalar(
+            select(ChunkResult.id).where(ChunkResult.review_job_id == review_id)
+        )
+        publish = await session.scalar(
+            select(OutboxEvent.id).where(
+                OutboxEvent.review_job_id == review_id,
+                OutboxEvent.task_kind == "publish",
+            )
+        )
+    assert review is not None and review.status == "FAILED"
+    assert publication.status == "NOT_READY"
+    assert chunk is None
+    assert publish is None
+
+
+async def test_cancel_during_fetch_inserts_nothing(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class CancelAfterFetch:
+        def __init__(self, inner: GithubClient) -> None:
+            self._inner = inner
+
+        async def fetch(self, request: GithubRequest) -> GithubSnapshot:
+            snapshot = await self._inner.fetch(request)
+            await _mark_cancelled(factory, review_id)
+            return snapshot
+
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-during-fetch", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = DeterministicLlm()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            CancelAfterFetch(GithubClient(client)),
+            llm,
+            schemas_dir=SCHEMAS,
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+    assert llm.payloads == []
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        context = await session.scalar(
+            select(ContextPayload.id).where(ContextPayload.review_job_id == review_id)
+        )
+    assert review is not None and review.status == "FAILED"
+    assert publication.status == "NOT_READY"
+    assert context is None

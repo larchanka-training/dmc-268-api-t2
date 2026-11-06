@@ -131,11 +131,10 @@ class PostgresAnalysisAttemptStore:
             assert now is not None
             policy = ModelSettings.from_stored(job.model_settings)
             validate_config_identity(job)
-            if (
-                job.finished_at is not None
-                or job.analysis_attempt_fence != lease.fencing_token
-            ):
+            if job.analysis_attempt_fence != lease.fencing_token:
                 raise LeaseLostError("Analysis execution is no longer current")
+            if job.finished_at is not None:
+                return False
             retry_at = now + timedelta(seconds=min(20.0, max(1.0, delay_s)))
             if (
                 job.analysis_attempts >= policy.retry.worker_max_attempts

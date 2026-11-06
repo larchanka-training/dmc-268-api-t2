@@ -1,0 +1,4 @@
+# Prompt bundles are hashed byte-for-byte. Keep the Unix line endings the manifest records.
+.agents/reviewer/** text eol=lf
+schemas/** text eol=lf
+src/app/review/renderers/** text eol=lf

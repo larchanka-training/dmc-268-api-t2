@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -26,6 +26,7 @@ from app.api.review_start_dependencies import get_review_start_authorizer
 from app.application.review_start_ports import ReviewAdmissionRequest
 from app.core.config import Auth, Github, Settings
 from app.db import models
+from app.db.publication_models import PublicationOperation
 from app.domain.repository_policy import StoredReviewPolicy
 from app.domain.settings import compute_rules_digest
 from app.review.configuration import (
@@ -65,17 +66,31 @@ MAX_CAMPAIGN_USD = 3
 
 
 def write_journal(path: Path, body: dict[str, Any], *, create: bool = False) -> None:
-    flags = os.O_WRONLY | (os.O_CREAT | os.O_EXCL if create else os.O_TRUNC)
+    temporary: Path | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
+        with NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(body, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        if create:
+            os.link(temporary, path)  # Atomic no-overwrite campaign creation.
+        else:
+            temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except FileExistsError:
         raise LlmConfigurationError(
             "Campaign journal exists; live rerun is refused"
         ) from None
-    with os.fdopen(descriptor, "w") as output:
-        json.dump(body, output, indent=2)
-        output.flush()
-        os.fsync(output.fileno())
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def live_runtime_values(config: LlmConfig) -> dict[str, Any]:
@@ -209,6 +224,7 @@ class CaseTransport:
     owner: str = "qa27"
     repository_name: str | None = None
     number: int = 1
+    review_id: UUID | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     reads: list[dict[str, str]] = field(default_factory=list)
     base_files: dict[str, bytes] = field(init=False)
@@ -276,6 +292,17 @@ class CaseTransport:
             },
         }
 
+    async def ensure_committed_debit(self) -> None:
+        async with self.factory() as session:
+            attempt = await session.scalar(
+                select(models.ReviewLlmAttempt.id).where(
+                    models.ReviewLlmAttempt.review_job_id == self.review_id,
+                    models.ReviewLlmAttempt.state == "RESERVED",
+                )
+            )
+            if attempt is None:
+                raise AssertionError("Provider dispatch without committed debit")
+
     async def respond(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911 -- fixed fixture HTTP routes
         if (
             request.url.host == "api.eurouter.ai"
@@ -283,16 +310,7 @@ class CaseTransport:
             and request.url.path == "/api/v1/chat/completions"
         ):
             body = json.loads(request.content)
-            async with self.factory() as session:
-                attempts = list(
-                    await session.scalars(
-                        select(models.ReviewLlmAttempt).where(
-                            models.ReviewLlmAttempt.state == "RESERVED"
-                        )
-                    )
-                )
-                if not attempts:
-                    raise AssertionError("Provider dispatch without committed debit")
+            await self.ensure_committed_debit()
             self.calls.append(body)
             reflection = (
                 "verdicts"
@@ -363,16 +381,17 @@ class CaseTransport:
         raise AssertionError(f"Unscripted public fixture path: {path}")
 
 
-async def process_review(
+async def process_review(  # noqa: PLR0913 -- worker ports and exact campaign identity
     factory: async_sessionmaker[AsyncSession],
     queue: RedisQueue,
     runtime: TrustedRuntimeConfiguration,
     transport: httpx.AsyncBaseTransport,
     *,
+    review_id: UUID,
     provider_http: httpx.AsyncClient | None = None,
 ) -> bool:
     """Reuse the prepared production worker; no alternate processing lifecycle."""
-    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch(review_id=review_id)
     async with httpx.AsyncClient(transport=transport) as http:
         worker = await prepare_postgres_analysis_worker(
             factory,
@@ -414,6 +433,7 @@ async def cleanup_campaign(
             delete(models.Finding).where(models.Finding.chunk_result_id.in_(chunks))
         )
         for table in (
+            PublicationOperation,
             models.ReviewLlmAttempt,
             models.ReviewEvent,
             models.IdempotencyRecord,
@@ -447,6 +467,9 @@ async def cleanup_campaign(
         )
         await session.execute(
             delete(models.Repository).where(models.Repository.id.in_(repositories))
+        )
+        await session.execute(
+            delete(models.AuthSession).where(models.AuthSession.user_id.in_(actors))
         )
         await session.execute(
             delete(models.GithubIdentity).where(
@@ -538,6 +561,7 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
             or current_scenario is None
         ):
             raise LlmConfigurationError("Unapproved live provider destination")
+        await current_scenario.ensure_committed_debit()
         current_scenario.calls.append(json.loads(request.content))
 
     provider_http = (
@@ -671,6 +695,7 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                         ),
                                     )
                                     assert created
+                                scenario.review_id = review_id
                                 if live_config:
                                     journal["jobs"].append(
                                         {
@@ -686,36 +711,54 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                     queue,
                                     runtime,
                                     httpx.MockTransport(scenario.respond),
+                                    review_id=review_id,
                                     provider_http=provider_http,
                                 )
                         async with factory() as session:
-                            chunk = (
+                            chunks = list(
                                 await session.scalars(
-                                    select(models.ChunkResult).where(
+                                    select(models.ChunkResult)
+                                    .where(
                                         models.ChunkResult.review_job_id == review_id
                                     )
+                                    .order_by(
+                                        models.ChunkResult.summary,
+                                        models.ChunkResult.id,
+                                    )
                                 )
-                            ).one_or_none()
+                            )
                             findings = (
                                 list(
                                     await session.scalars(
-                                        select(models.Finding).where(
-                                            models.Finding.chunk_result_id == chunk.id
+                                        select(models.Finding)
+                                        .where(
+                                            models.Finding.chunk_result_id.in_(
+                                                [chunk.id for chunk in chunks]
+                                            )
+                                        )
+                                        .order_by(
+                                            models.Finding.path,
+                                            models.Finding.side,
+                                            models.Finding.start_line,
+                                            models.Finding.end_line,
+                                            models.Finding.category,
+                                            models.Finding.title,
+                                            models.Finding.fingerprint,
                                         )
                                     )
                                 )
-                                if chunk is not None
+                                if chunks
                                 else []
                             )
-                            context = (
+                            contexts = list(
                                 await session.scalars(
                                     select(models.ContextPayload).where(
                                         models.ContextPayload.review_job_id == review_id
                                     )
                                 )
-                            ).one()
+                            )
                             job = await session.get(models.ReviewJob, review_id)
-                            assert context is not None and job is not None
+                            assert job is not None
                             effective = await session.get(
                                 models.RepositorySettings, job.repository_settings_id
                             )
@@ -752,13 +795,40 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                             canonical_schema = json.loads(
                                 (ROOT / "schemas/review-result/v2.json").read_text()
                             )
+                            known_usages = [
+                                chunk.usage
+                                for chunk in chunks
+                                if chunk.usage is not None
+                            ]
                             canonical = (
                                 {
-                                    "schema_version": chunk.schema_version,
-                                    "summary": chunk.summary,
-                                    "limitations": chunk.limitations,
-                                    "usage": chunk.usage,
-                                    "latency_ms": chunk.latency_ms,
+                                    "schema_version": chunks[0].schema_version,
+                                    "summary": "\n\n".join(
+                                        chunk.summary for chunk in chunks
+                                    ),
+                                    "limitations": chunks[0].limitations
+                                    if len(chunks) == 1
+                                    else sorted(
+                                        {
+                                            item
+                                            for chunk in chunks
+                                            for item in chunk.limitations
+                                        }
+                                    ),
+                                    "usage": {
+                                        key: sum(usage[key] for usage in known_usages)
+                                        if all(
+                                            usage[key] is not None
+                                            for usage in known_usages
+                                        )
+                                        else None
+                                        for key in ("input_tokens", "output_tokens")
+                                    }
+                                    if len(known_usages) == len(chunks)
+                                    else None,
+                                    "latency_ms": sum(
+                                        chunk.latency_ms for chunk in chunks
+                                    ),
                                     "findings": [
                                         {
                                             name: getattr(finding, name)
@@ -769,7 +839,7 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                         for finding in findings
                                     ],
                                 }
-                                if chunk is not None
+                                if chunks
                                 else None
                             )
                             canonical_valid = (
@@ -792,27 +862,45 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                 ),
                             )
                             scores.append(score)
-                            files = context.payload_body["files"]
-                            ast_digest = semantic_context(context.payload_body)
+                            files = [
+                                file
+                                for context in contexts
+                                for file in context.payload_body["files"]
+                            ]
+                            context_digests = sorted(
+                                semantic_context(context.payload_body)
+                                for context in contexts
+                            )
+                            ast_digest = (
+                                context_digests[0]
+                                if len(context_digests) == 1
+                                else digest(context_digests)
+                                if context_digests
+                                else None
+                            )
                             if (
                                 comparison_ast is not None
+                                and ast_digest is not None
                                 and comparison_ast != ast_digest
                             ):
                                 raise ValueError(
                                     "Controlled comparison changed code/AST semantics"
                                 )
-                            comparison_ast = ast_digest
+                            if ast_digest is not None:
+                                comparison_ast = ast_digest
                             messages = json.dumps(
                                 [call["messages"] for call in scenario.calls],
                                 ensure_ascii=False,
                             )
-                            if (
-                                fixture.id in messages
-                                or fixture.title in messages
-                                or (
-                                    fixture.description
-                                    and fixture.description in messages
+                            if any(
+                                value and value in message["content"]
+                                for value in (
+                                    fixture.id,
+                                    fixture.title,
+                                    fixture.description,
                                 )
+                                for call in scenario.calls
+                                for message in call["messages"]
                             ):
                                 raise ValueError(
                                     "Ground-truth metadata leaked into model input"
@@ -824,6 +912,7 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                     "canonical_result_valid": canonical_valid,
                                     "canonical_result": canonical,
                                     "worker_status": job.status,
+                                    "chunk_count": len(chunks),
                                     "requests": len(scenario.calls),
                                     "ast": {
                                         "source_window_count": sum(
@@ -836,6 +925,7 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
                                         ),
                                         "semantic_sha256": ast_digest,
                                         "normalization_policy": AST_POLICY,
+                                        "aggregation_policy": "sorted-chunk-digests/v1",
                                     },
                                     "review_id": str(review_id),
                                     "source": {
@@ -893,13 +983,15 @@ async def run_worker(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit modes/resou
         for name in passes
     }
     report["controlled_comparison"] = {
-        "valid": True,
+        "valid": all(row["ast"]["semantic_sha256"] is not None for row in rows),
         "passes": list(passes),
         "varied_fields": [
             "root base rules and wrapper commit identity",
             "Reflection run allowance 0/1",
         ],
-        "code_and_ast_fixed": True,
+        "code_and_ast_fixed": all(
+            row["ast"]["semantic_sha256"] is not None for row in rows
+        ),
     }
     report["provenance"] = {
         "scope": "worker-integration",

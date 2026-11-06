@@ -168,7 +168,9 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
         assert frozen_settings.review_policy["minimum_severity"] == "medium"
     queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
     runtime = load_runtime_configuration(Path(os.environ["ANALYSIS__CONFIG_PATH"]))
-    await process_review(factory, queue, runtime, httpx.MockTransport(transport))
+    await process_review(
+        factory, queue, runtime, httpx.MockTransport(transport), review_id=review_id
+    )
     assert len(calls) == 2
     async with factory() as session:
         chunk = (

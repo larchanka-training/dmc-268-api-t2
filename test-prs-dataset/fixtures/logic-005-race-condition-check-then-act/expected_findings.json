@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/inventory/reserve.py",
+    "side": "NEW",
+    "start_line": 2,
+    "end_line": 5,
+    "category": "correctness",
+    "severity": "high"
+  }
+]

@@ -82,9 +82,9 @@ explicitly prepare any permitted retry; retained analysis is reused.
 
 Set `GITHUB__WRITE_TOKEN` and the numeric `GITHUB__BOT_USER_ID`. The read credential
 `GITHUB__TOKEN` is never used as a fallback. The token must grant access to the
-target repository and Pull requests write permission. An installation-token
-provider and refresh lifecycle are deployment responsibilities; this module
-accepts an already provisioned credential and does not mint tokens.
+target repository and Pull requests write permission. The accepted deployment
+uses a bot user; GitHub App/installation-token lifecycle is outside this scope.
+This module accepts an already provisioned credential and does not mint tokens.
 
 `make_publication_handler(settings, sessions, completed_outcome)` owns the HTTP
 client and creates the real store, publisher and handler. Supply the worker's
@@ -102,12 +102,19 @@ Run the publisher explicitly against the same PostgreSQL and Redis as the
 analysis worker, after applying migrations and supplying the write credentials:
 
 ```bash
+uv run python -m app.publication_worker --check-config
 uv run python -m app.publication_worker --once
 uv run python -m app.publication_worker --poll-interval 1
 ```
 
-`--once` performs one bounded dispatch/receive pass. Continuous mode polls new
-publish deliveries and stops cleanly on SIGTERM/SIGINT. No analysis runtime
+`--check-config` validates local write-credential presence, canonical bot ID and
+safe ASCII token syntax. It opens no HTTP/DB/Redis connection, acquires no lease,
+dispatches nothing and does not initialize Sentry. Success does not establish
+the remote bot identity or write permission. `--once` performs a real bounded
+dispatch/receive pass and can POST; it is not a preflight command.
+
+Continuous mode polls new publish deliveries and finishes the current pass on
+SIGTERM/SIGINT, then exits without draining the whole backlog. No analysis runtime
 manifest or LLM credential is required by this process. It uses the persisted
 canonical result; the analysis worker and its dispatcher are separate processes
 described in `docs/examples/analysis-runtime.md`.
@@ -127,10 +134,28 @@ permission for another POST. `--once` exits unsuccessfully for these errors.
 Reconciliation still requires a separately granted live read-only authority;
 this CLI does not allocate it or expose a retry API.
 
-The default Compose `worker` service remains the existing sleep placeholder.
-Starting the API or updating its image does not activate either review worker.
-Enable the dedicated processes in the target environment as an explicit deploy
-step; browser OAuth also requires its own runtime auth settings.
+The local `docker-compose.yml` worker remains a sleep placeholder. Staging has a
+dedicated `publication-worker` in the default-off `publication` profile, using
+the selected API image and only DB/Redis/logging/Sentry/write identity settings.
+It receives no OAuth/read token, LLM credential or analysis manifest. The
+independent `STAGING_PUBLICATION_ENABLED` flag selects it for staging; develop
+stays off. Analysis may be enabled separately or remain off while retained useful
+results are published. The existing staging API manifest validation is separate
+and remains mandatory even when analysis is off.
+
+Deployment stops the previous Compose publisher before migrations, including
+enabled-to-disabled transitions. An enabled new publisher runs offline preflight
+after migration and before startup, is checked for running state, and must match
+the selected API image. The configured stop grace is 120s; it is not a guarantee
+that every possible pass/backlog will drain. Forced termination may leave an
+ambiguous retained operation: use the existing UNKNOWN reconciliation, never
+reset state or infer permission for another POST.
+
+Before first activation, the operator must establish who owns any manually
+managed publisher and the intended pending backlog. Missing repository-managed
+composition did not prove no manual VPS process existed. This source change
+does not enable a variable, deploy, change credentials or perform live review
+acceptance. See [staging deployment](staging-deployment.md).
 
 ## Integrated dependencies (18 October 2026)
 

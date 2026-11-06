@@ -138,6 +138,33 @@ services:
     networks:
       - backend
 
+  publication-worker:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    profiles: [publication]
+    restart: unless-stopped
+    command: ["python", "-m", "app.publication_worker"]
+    stop_grace_period: 120s
+    environment:
+      POSTGRES__HOST: db
+      POSTGRES__PORT: "5432"
+      POSTGRES__USER: ${POSTGRES__USER:?POSTGRES__USER is required}
+      POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
+      POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: INFO
+      LOGGING__FORMAT: json
+      LOGGING__FILE_ENABLED: "false"
+      SENTRY__DSN: ${SENTRY__DSN:-}
+      GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
+      GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
   webhook-worker:
     image: ${API_IMAGE:?API_IMAGE is required}
     restart: unless-stopped

@@ -420,7 +420,7 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
     migration_database: MigrationDatabase,
 ) -> None:
     database = migration_database
-    _, job_id = await _seed_legacy(database)
+    legacy, job_id = await _seed_legacy(database)
     database.migrate("upgrade", "0006")
     unpublished_id, published_id = uuid.uuid4(), uuid.uuid4()
     await database.connection.execute(
@@ -445,7 +445,14 @@ async def test_outbox_quarantine_upgrade_downgrade_preserves_existing_events(
 
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0017"
+        == "0019"
+    )
+    assert (
+        await database.connection.fetchval(
+            "SELECT rules_source FROM repository_settings WHERE id=$1",
+            legacy.repository_settings_id,
+        )
+        is None
     )
     assert (
         await database.connection.fetch(
@@ -692,7 +699,7 @@ async def test_github_auth_migration_preserves_legacy_users_and_matches_metadata
         await migration_database.connection.fetchval(
             "SELECT version_num FROM alembic_version"
         )
-        == "0017"
+        == "0019"
     )
     assert (
         await migration_database.connection.fetchval(

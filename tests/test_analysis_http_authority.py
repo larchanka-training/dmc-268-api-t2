@@ -33,11 +33,10 @@ async def test_healthy_heartbeat_extends_lease_but_never_http_deadline(
     monkeypatch: pytest.MonkeyPatch,
     deadline_expires: bool,
 ) -> None:
-    # Scale only the lease for an integration barrier crossing; HTTP keeps its
-    # actual frozen 120s setting. The numeric 90/120 clock case is also tested.
-    monkeypatch.setattr(
-        "app.db.task_leases.LEASE_DURATION", timedelta(milliseconds=500)
-    )
+    # Allow real PG claim/setup before testing renewal across the actual expiry.
+    # HTTP keeps its frozen 120s cap; the numeric 90/120 clock case is separate.
+    window = timedelta(seconds=2)
+    monkeypatch.setattr("app.db.task_leases.LEASE_DURATION", window)
     assert await PostgresTaskLeaseStore(execution.factory).release(execution.lease)
     entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = []
@@ -81,8 +80,7 @@ async def test_healthy_heartbeat_extends_lease_but_never_http_deadline(
                             update(ReviewJob)
                             .where(ReviewJob.id == lease.review_job_id)
                             .values(
-                                analysis_deadline_at=func.clock_timestamp()
-                                + timedelta(milliseconds=500)
+                                analysis_deadline_at=func.clock_timestamp() + window
                             )
                         )
                 config = await FrozenConfigurationReader(

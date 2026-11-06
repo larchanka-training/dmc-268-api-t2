@@ -63,6 +63,7 @@ def writer_environment() -> dict[str, str]:
 def compose_config(
     *,
     enabled: bool = False,
+    profiles: str | None = None,
     runtime_directory: str = "/opt/dmc-268-t2-runtime/analysis-runtime",
 ) -> dict[str, Any]:
     result = subprocess.run(
@@ -82,7 +83,11 @@ def compose_config(
             "POSTGRES__USER": "test",
             "POSTGRES__PASSWORD": "synthetic-test-password",
             "POSTGRES__DB": "test",
-            "COMPOSE_PROFILES": "analysis" if enabled else "",
+            "COMPOSE_PROFILES": profiles
+            if profiles is not None
+            else "analysis"
+            if enabled
+            else "",
             "ANALYSIS_RUNTIME_DIR": runtime_directory,
             "ANALYSIS__CONFIG_PATH": "/app/runtime/analysis-runtime.v1.json"
             if enabled
@@ -336,6 +341,7 @@ def test_llm_secret_survives_runtime_writer_and_compose(tmp_path: Path) -> None:
                 "--entrypoint",
                 "/usr/bin/env",
                 "worker",
+                "/usr/bin/env",
             ],
             env={"PATH": os.environ["PATH"]},
             capture_output=True,

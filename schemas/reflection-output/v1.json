@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "ReflectionVerdict": {
+      "additionalProperties": false,
+      "description": "One finding's fate; ``index`` points into the findings list sent for\nverification (deterministic checks have already filtered the rest).",
+      "properties": {
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "verdict": {
+          "enum": [
+            "confirmed",
+            "rejected"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "verified",
+            "no_real_consequence",
+            "pre_existing",
+            "overflagged_style"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "verdict",
+        "reason"
+      ],
+      "title": "ReflectionVerdict",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The only schema passed to the verifier as structured-output format.",
+  "properties": {
+    "verdicts": {
+      "items": {
+        "$ref": "#/$defs/ReflectionVerdict"
+      },
+      "maxItems": 50,
+      "title": "Verdicts",
+      "type": "array"
+    }
+  },
+  "required": [
+    "verdicts"
+  ],
+  "title": "ReflectionOutput",
+  "type": "object"
+}

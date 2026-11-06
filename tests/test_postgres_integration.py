@@ -736,7 +736,16 @@ async def test_postgres_catalog_contains_exact_constraints_and_index(
     async with postgres.engine.connect() as connection:
         assert (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0017"
+        ).scalar_one() == "0019"
+        assert (
+            await connection.execute(
+                text(
+                    "SELECT is_nullable, data_type FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='repository_settings' "
+                    "AND column_name='rules_source'"
+                )
+            )
+        ).one() == ("YES", "jsonb")
 
         result = await connection.execute(
             text(

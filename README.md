@@ -71,6 +71,15 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 
 Каждый запрос получает Request ID: он попадает во все записи журнала этого запроса и в заголовок ответа `X-Request-Id`.
 
+## Правила и контекст репозитория
+
+Загрузка правил из base SHA, Tree-sitter и явно выбранный prompt v4 описаны в
+[`repository-context.md`](docs/repository-context.md). Текущая runtime-конфигурация
+и исторические задания автоматически не переключаются.
+
+Явная frozen policy2 включает durable Reflection в пределах существующего
+ledger; контракт, ограничения и rollback: [`durable-reflection.md`](docs/durable-reflection.md).
+
 ## Проверки качества
 
 ```bash
@@ -152,12 +161,38 @@ analysis handler и API запуска/чтения ревью. Полный pro
 GitHub Publisher использует сохранённый результат анализа и запускается отдельно:
 
 ```bash
+uv run python -m app.publication_worker --check-config
 uv run python -m app.publication_worker --once
 uv run python -m app.publication_worker --poll-interval 1
 ```
 
 Нужны миграции, общие с analysis worker PostgreSQL/Redis и отдельные
-`GITHUB__WRITE_TOKEN` / `GITHUB__BOT_USER_ID`. API и Compose-заглушка `worker`
-не запускают публикацию автоматически. Контракты, SSE, recovery и интеграция
+`GITHUB__WRITE_TOKEN` / `GITHUB__BOT_USER_ID`. `--check-config` проверяет локальные
+настройки без HTTP, БД, Redis и Sentry; `--once` может публиковать review и для
+preflight не подходит. API и локальная Compose-заглушка `worker` публикацию
+не запускают. Staging содержит отдельный opt-in `publication-worker`, включаемый
+только через `STAGING_PUBLICATION_ENABLED=true`; по умолчанию он выключен и от
+флага analysis не зависит. Это подготовленная конфигурация, не факт rollout.
+Порядок включения и остановки: [staging deployment](docs/staging-deployment.md).
+Контракты, SSE, recovery и интеграция
 с объединёнными зависимостями:
 [`docs/github-review-publication.md`](docs/github-review-publication.md).
+
+## Gold benchmark / Eval
+
+24 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
+[`test-prs-dataset/README.md`](test-prs-dataset/README.md).
+
+```bash
+uv run python -m scripts.eval_harness --mode offline --report-out eval-offline.json
+uv run python -m scripts.eval_harness --mode deterministic --report-out eval-deterministic.json
+```
+
+CI загружает оба отчёта как `gold-benchmark-reports`. Replay и deterministic
+проверяют регрессию; они не измеряют качество LLM. Live запускается отдельно
+только с явным runtime manifest, разрешением и лимитом расходов.
+
+Inference metadata использует непрозрачный SHA-256 case title и пустой body:
+названия дефектов, description, категории и labels датасета не подсказывают ответ
+через PR metadata. Исходные человекочитаемые данные сохраняются для отчёта и
+scoring; версия metadata policy входит в provenance/config identity.

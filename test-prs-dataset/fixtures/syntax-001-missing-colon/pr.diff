@@ -1,0 +1,7 @@
+diff --git a/app/validation.py b/app/validation.py
+new file mode 100644
+--- /dev/null
++++ b/app/validation.py
+@@ -0,0 +1,2 @@
++def validate(payload)
++    return payload["id"]

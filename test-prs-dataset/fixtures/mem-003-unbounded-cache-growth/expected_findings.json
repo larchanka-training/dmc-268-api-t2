@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/geo/cache.py",
+    "side": "NEW",
+    "start_line": 7,
+    "end_line": 7,
+    "category": "performance",
+    "severity": "medium"
+  }
+]

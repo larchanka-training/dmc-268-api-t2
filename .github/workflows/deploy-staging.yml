@@ -68,6 +68,7 @@ jobs:
       SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
       UI_SHA: ${{ inputs.ui_sha }}
       ANALYSIS_ENABLED: ${{ vars.STAGING_ANALYSIS_ENABLED || 'false' }}
+      PUBLICATION_ENABLED: ${{ vars.STAGING_PUBLICATION_ENABLED || 'false' }}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6a). Until Ollama is
       # deployed to staging, the chain is Eurorouter only.
       LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
@@ -161,6 +162,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          case "${PUBLICATION_ENABLED:-false}" in
+            true|false) ;;
+            *)
+              echo "::error::STAGING_PUBLICATION_ENABLED must be true or false" >&2
+              exit 1
+              ;;
+          esac
 
           if [[ -z "${SSH_HOST:-}" ]]; then
             echo "::error::VPS_DMC268_IP_T2 is not available"
@@ -406,6 +415,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          case "${PUBLICATION_ENABLED:-false}" in
+            true|false) ;;
+            *)
+              echo "::error::STAGING_PUBLICATION_ENABLED must be true or false" >&2
+              exit 1
+              ;;
+          esac
+
           append_optional() {
             local name="$1" value="$2"
             if [[ -n "${value}" ]]; then
@@ -425,12 +442,17 @@ jobs:
             else
               printf 'ANALYSIS_RUNTIME_DIR=./analysis-runtime\n'
             fi
+            enabled_profiles=""
+            analysis_config=""
             if [[ "${ENV_NAME:-}" == staging && "${ANALYSIS_ENABLED:-false}" == true ]]; then
-              printf 'COMPOSE_PROFILES=analysis\n'
-              printf 'ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json\n'
-            else
-              printf 'COMPOSE_PROFILES=\nANALYSIS__CONFIG_PATH=\n'
+              enabled_profiles=analysis
+              analysis_config=/app/runtime/analysis-runtime.v1.json
             fi
+            if [[ "${ENV_NAME:-}" == staging && "${PUBLICATION_ENABLED:-false}" == true ]]; then
+              enabled_profiles="${enabled_profiles:+${enabled_profiles},}publication"
+            fi
+            printf 'COMPOSE_PROFILES=%s\n' "${enabled_profiles}"
+            printf 'ANALYSIS__CONFIG_PATH=%s\n' "${analysis_config}"
             printf 'POSTGRES__USER=dmc\n'
             append_optional 'POSTGRES__PASSWORD' "${POSTGRES_PASSWORD}"
             printf 'POSTGRES__DB=dmc\n'
@@ -550,6 +572,7 @@ jobs:
           # Stop the previous image's analysis processes before migrations or
           # activation changes. This also retires the old sleep placeholder.
           compose --profile analysis stop worker outbox-dispatcher
+          compose --profile publication stop publication-worker
 
           if [[ "${ENV_NAME}" == staging ]]; then
             # The uploaded installer is writable by the SSH user. Anchor its
@@ -609,9 +632,13 @@ jobs:
           echo "Running database migrations..."
           compose run --rm --no-deps --interactive=false -T api alembic upgrade head </dev/null
 
-          analysis_services=()
-          if grep -qx 'COMPOSE_PROFILES=analysis' "${ENV_FILE}"; then
-            analysis_services=(outbox-dispatcher worker)
+          runtime_profiles="$(sed -n 's/^COMPOSE_PROFILES=//p' "${ENV_FILE}" | tail -n1)"
+          profile_enabled() {
+            [[ ",${runtime_profiles}," == *",$1,"* ]]
+          }
+          worker_services=(webhook-worker)
+          if profile_enabled analysis; then
+            worker_services+=(outbox-dispatcher worker)
             echo "Checking analysis configuration without provider requests..."
             compose run --rm --no-deps -T worker python - <<'PREFLIGHT'
           import asyncio
@@ -668,6 +695,13 @@ jobs:
           PREFLIGHT
           fi
 
+          if profile_enabled publication; then
+            echo "Checking publication configuration without external requests..."
+            compose run --rm --no-deps --interactive=false -T publication-worker \
+              python -m app.publication_worker --check-config </dev/null
+            worker_services+=(publication-worker)
+          fi
+
           echo "Starting API..."
           # Force recreate so Compose cannot leave a stale api service running
           # pre-scope OAuth code after env already pins a newer API_IMAGE.
@@ -704,9 +738,9 @@ jobs:
           done
 
           echo "Starting workers..."
-          compose up -d webhook-worker "${analysis_services[@]}"
+          compose up -d "${worker_services[@]}"
 
-          for service in webhook-worker "${analysis_services[@]}"; do
+          for service in "${worker_services[@]}"; do
             echo "Waiting for ${service}..."
             for attempt in $(seq 1 30); do
               worker_id="$(compose ps -q "${service}")"
@@ -773,6 +807,23 @@ jobs:
             exit 1
           fi
           echo "Running api/web images match env pins"
+
+          if profile_enabled publication; then
+            publication_cid="$(compose ps -q publication-worker)"
+            if [[ -z "${publication_cid}" ]]; then
+              echo "ERROR: publication-worker is not running"
+              compose ps
+              compose logs --tail=100 publication-worker
+              exit 1
+            fi
+            running_publication_image="$(docker inspect --format='{{.Config.Image}}' "${publication_cid}")"
+            if [[ "${running_publication_image}" != "${expected_api_image}" ]]; then
+              echo "ERROR: running publication-worker image does not match API_IMAGE"
+              compose ps
+              exit 1
+            fi
+            echo "Running publication-worker image matches API_IMAGE"
+          fi
 
           echo "Verifying OAuth authorize requests scope=repo via web..."
           web_oauth_headers="$(mktemp)"

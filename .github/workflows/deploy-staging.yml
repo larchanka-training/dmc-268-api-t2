@@ -810,6 +810,12 @@ jobs:
 
           if profile_enabled publication; then
             publication_cid="$(compose ps -q publication-worker)"
+            if [[ -z "${publication_cid}" ]]; then
+              echo "ERROR: publication-worker is not running"
+              compose ps
+              compose logs --tail=100 publication-worker
+              exit 1
+            fi
             running_publication_image="$(docker inspect --format='{{.Config.Image}}' "${publication_cid}")"
             if [[ "${running_publication_image}" != "${expected_api_image}" ]]; then
               echo "ERROR: running publication-worker image does not match API_IMAGE"

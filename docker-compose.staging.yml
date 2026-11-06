@@ -141,7 +141,7 @@ services:
   publication-worker:
     image: ${API_IMAGE:?API_IMAGE is required}
     profiles: [publication]
-    restart: "on-failure:3"
+    restart: unless-stopped
     command: ["python", "-m", "app.publication_worker"]
     stop_grace_period: 120s
     environment:

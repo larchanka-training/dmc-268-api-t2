@@ -1,0 +1,148 @@
+{
+  "origin_head": "7e1b3501b1460737ff55e32f511d09362a9df698",
+  "capture_scope": "FULL_FROZEN_SETTINGS_AND_POLICY_1_2_JOB_IDENTITIES_FROM_OLD_SOURCE; seeded on schema0019 before policy column",
+  "source_settings": {
+    "id": "10000000-0000-0000-0000-000000000020",
+    "repository_id": "20000000-0000-0000-0000-000000000020",
+    "rules": {
+      "instructions": [
+        "Сохраняйте проверку нулевого знаменателя."
+      ]
+    },
+    "ignores": {
+      "globs": [
+        "vendor/**"
+      ]
+    },
+    "max_starts_per_hour": 10,
+    "max_active_jobs": 4,
+    "output_language": "ru",
+    "surrounding_lines": 5,
+    "rules_digest": "e992da2fdc38df1022bcbb8cafb0b7ef23a4d4a66b9f79b8569dc582a6620bc5"
+  },
+  "effective_settings": {
+    "id": "4075bf47-7e68-52ac-a0b9-681234057b33",
+    "repository_id": "20000000-0000-0000-0000-000000000020",
+    "rules": {
+      "instructions": [
+        "Сохраняйте проверку нулевого знаменателя."
+      ]
+    },
+    "ignores": {
+      "globs": [
+        "vendor/**"
+      ]
+    },
+    "max_starts_per_hour": 10,
+    "max_active_jobs": 4,
+    "output_language": "ru",
+    "surrounding_lines": 5,
+    "rules_source": {
+      "source_settings_id": "10000000-0000-0000-0000-000000000020",
+      "source_settings_identity": "671ea4c57bb35efd1de499b0b3545595817c9be2392704ef7c745a82583ccde2",
+      "file": {
+        "parser_version": "rules-md/1",
+        "path": ".review/rules.md",
+        "tenant": "20000000-0000-0000-0000-000000000020",
+        "repository_external_id": "123456",
+        "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "blob_sha": null,
+        "content_digest": null,
+        "state": "absent",
+        "diagnostics": [],
+        "severities": {},
+        "allowed_rule_refs": []
+      }
+    },
+    "rules_digest": "e992da2fdc38df1022bcbb8cafb0b7ef23a4d4a66b9f79b8569dc582a6620bc5"
+  },
+  "repository_settings_digest": "8d18f15ecf3cb83e2634574c29c5499e6ebdd04a9f091e8c38fe71fea140845d",
+  "actor_id": "50000000-0000-0000-0000-000000000020",
+  "change_id": "30000000-0000-0000-0000-000000000020",
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "prompt_version": "v4",
+  "prompt_digest": "3658c8c09838eff2e09409a295ca8ed685c8fb98104f91378b68e09366590dd1",
+  "model_ref": "test-model",
+  "records": [
+    {
+      "id": "40000000-0000-0000-0000-000000000001",
+      "model_settings": {
+        "schema_version": 1,
+        "generation": {
+          "temperature": 0.0
+        },
+        "routing": {
+          "primary_profile_ref": "eurorouter/review-v1",
+          "fallback": []
+        },
+        "limits": {
+          "context_window": 16384,
+          "max_input_tokens": 10000,
+          "max_output_tokens": 2000,
+          "request_timeout_ms": 120000,
+          "run_max_requests": 8,
+          "run_max_input_tokens": 80000,
+          "run_max_output_tokens": 16000,
+          "max_chunks": 5,
+          "analysis_duration_ms": 600000
+        },
+        "retry": {
+          "worker_max_attempts": 3,
+          "provider_max_attempts_per_operation": 3,
+          "max_transient_per_provider": 2,
+          "max_format_repairs": 1,
+          "max_overflow_rebuilds_per_chunk": 1,
+          "backoff_policy": "review-exponential-v1"
+        },
+        "token_estimator_version": "review-conservative-v1",
+        "repository_settings_digest": "8d18f15ecf3cb83e2634574c29c5499e6ebdd04a9f091e8c38fe71fea140845d"
+      },
+      "config_digest": "b6cc5af7e11419830914def67913d96bfbec9f0a2adf6b125440ea5e64c4b32b",
+      "idempotency_key": "legacy-policy-1"
+    },
+    {
+      "id": "40000000-0000-0000-0000-000000000002",
+      "model_settings": {
+        "schema_version": 2,
+        "generation": {
+          "temperature": 0.0
+        },
+        "routing": {
+          "primary_profile_ref": "eurorouter/review-v1",
+          "fallback": []
+        },
+        "limits": {
+          "context_window": 16384,
+          "max_input_tokens": 10000,
+          "max_output_tokens": 2000,
+          "request_timeout_ms": 120000,
+          "run_max_requests": 8,
+          "run_max_input_tokens": 80000,
+          "run_max_output_tokens": 16000,
+          "max_chunks": 5,
+          "analysis_duration_ms": 600000
+        },
+        "retry": {
+          "worker_max_attempts": 3,
+          "provider_max_attempts_per_operation": 3,
+          "max_transient_per_provider": 2,
+          "max_format_repairs": 1,
+          "max_overflow_rebuilds_per_chunk": 1,
+          "backoff_policy": "review-exponential-v1"
+        },
+        "token_estimator_version": "review-conservative-v1",
+        "repository_settings_digest": "8d18f15ecf3cb83e2634574c29c5499e6ebdd04a9f091e8c38fe71fea140845d",
+        "reflection": {
+          "max_reflections_per_run": 1,
+          "max_reflections_per_chunk": 1,
+          "failure_mode": "fail_open",
+          "verifier_version": "v1",
+          "verifier_digest": "e583048928ca98e39db959b710a5b0506682159e14412a826814804b2007d690"
+        }
+      },
+      "config_digest": "1d544eeae89976cd40e7c2149cde5fd1346a23c216fba0d91d625da76d426398",
+      "idempotency_key": "legacy-policy-2"
+    }
+  ]
+}

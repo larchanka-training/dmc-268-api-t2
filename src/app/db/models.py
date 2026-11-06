@@ -151,6 +151,7 @@ class RepositorySettings(Base):
     )
     rules_digest: Mapped[str] = mapped_column(Text, nullable=False)
     rules_source: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    review_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     repository: Mapped[Repository] = relationship(
         back_populates="settings",
@@ -782,6 +783,10 @@ class QuotaUsage(Base):
 
 class WebhookReceipt(Base):
     __tablename__ = "webhook_receipt"
+
+    review_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=True
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

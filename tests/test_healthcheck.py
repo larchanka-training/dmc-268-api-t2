@@ -8,7 +8,7 @@ import pytest
 import yaml
 from httpx import ASGITransport, AsyncClient
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.main import create_app
 
 
@@ -36,8 +36,10 @@ async def test_healthcheck_returns_commit_from_git_sha(
 
 async def test_healthcheck_commit_is_unknown_when_git_sha_unset(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("GIT_SHA", raising=False)
+    monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
     app = create_app()
     async with AsyncClient(
@@ -48,6 +50,19 @@ async def test_healthcheck_commit_is_unknown_when_git_sha_unset(
 
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {"status": "ok", "commit": "unknown"}
+
+
+async def test_healthcheck_honors_settings_override() -> None:
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(git_sha="override-sha")
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/healthcheck")
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"status": "ok", "commit": "override-sha"}
 
 
 async def test_healthcheck_commit_is_unknown_when_git_sha_is_blank(
@@ -95,3 +110,8 @@ def test_ci_docker_builds_pass_git_sha() -> None:
     ]
     assert "--build-arg GIT_SHA=" in image_build
     assert "--build-arg GIT_SHA=" in publish_build
+    assert (
+        "--build-arg GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}"
+        in image_build
+    )
+    assert "--build-arg GIT_SHA=${{ github.sha }}" in publish_build

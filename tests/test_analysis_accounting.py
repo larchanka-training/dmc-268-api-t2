@@ -1160,6 +1160,7 @@ async def test_handler_discards_paid_answer_after_lease_changes(
         job = await session.get(ReviewJob, execution.lease.review_job_id)
         assert job is not None
         job.requested_head_sha = HEAD
+        job.base_sha = BASE
         job.config_digest = compute_config_digest(
             StartReviewCommand(
                 job.change_request_id,

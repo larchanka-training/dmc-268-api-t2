@@ -1,0 +1,11 @@
+diff --git a/app/search.py b/app/search.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/search.py
+@@ -0,0 +1,5 @@
++def find_users_by_name(connection, name):
++    cursor = connection.cursor()
++    query = "SELECT id, email FROM users WHERE name = '" + name + "'"
++    cursor.execute(query)
++    return cursor.fetchall()

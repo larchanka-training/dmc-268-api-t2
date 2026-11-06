@@ -1,0 +1,6 @@
+{
+  "title": "Небезопасная десериализация pickle из внешнего источника",
+  "description": "Восстановление кэшированного объекта из Redis.",
+  "language": "python",
+  "category": "security"
+}

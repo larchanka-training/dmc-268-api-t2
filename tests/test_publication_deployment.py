@@ -24,7 +24,7 @@ def test_publication_worker_is_opt_in_and_uses_only_publication_credentials() ->
     worker = services["publication-worker"]
     assert worker["image"] == services["api"]["image"]
     assert worker["command"] == ["python", "-m", "app.publication_worker"]
-    assert worker["restart"] == "on-failure:3"
+    assert worker["restart"] == "unless-stopped"
     assert worker["depends_on"]["db"]["condition"] == "service_healthy"
     assert worker["depends_on"]["redis"]["condition"] == "service_healthy"
     assert worker["networks"] == services["api"]["networks"]
@@ -196,6 +196,20 @@ def test_publication_image_must_match_selected_api_pin(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "running publication-worker image does not match API_IMAGE" in result.stdout
+
+
+def test_missing_publisher_at_image_check_has_explicit_diagnostics(
+    tmp_path: Path,
+) -> None:
+    result, calls = deploy_remote(
+        tmp_path,
+        analysis="false",
+        publication="true",
+        overrides={"PUBLICATION_DISAPPEARS": "1"},
+    )
+    assert result.returncode != 0
+    assert "publication-worker is not running" in result.stdout
+    assert any(" logs --tail=100 publication-worker" in line for line in calls)
 
 
 def test_failed_offline_preflight_never_starts_publisher(tmp_path: Path) -> None:

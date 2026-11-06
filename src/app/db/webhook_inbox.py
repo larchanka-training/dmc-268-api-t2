@@ -239,6 +239,24 @@ class SqlAlchemyWebhookInbox:
         )
         return receipt_id is not None
 
+    async def renew(self, claim: WebhookDelivery) -> bool:
+        """Extend only this still-live attempt; never resurrect a lost claim."""
+        async with self._session() as session:
+            if not await self._lock_claim(session, claim):
+                return False
+            result = await session.scalar(
+                update(WebhookReceipt)
+                .where(
+                    WebhookReceipt.id == claim.id,
+                    WebhookReceipt.processing_status == "PROCESSING",
+                    WebhookReceipt.attempts == claim.attempts,
+                    WebhookReceipt.lease_until > func.clock_timestamp(),
+                )
+                .values(lease_until=func.clock_timestamp() + timedelta(seconds=90))
+                .returning(WebhookReceipt.id)
+            )
+            return result is not None
+
     async def complete(
         self,
         claim: WebhookDelivery,

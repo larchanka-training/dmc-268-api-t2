@@ -501,6 +501,13 @@ async def admit_review(  # noqa: PLR0912, PLR0915 -- captured read/provider/lock
             effective = await materialize_settings(
                 session, source_values, expected_settings, loaded
             )
+        except FrozenConfigurationError:
+            raise ReviewAdmissionError(
+                503,
+                "SERVICE_UNAVAILABLE",
+                "Repository context is unavailable.",
+                retryable=True,
+            ) from None
         except GithubFailure as failure:
             raise ReviewAdmissionError(
                 503,

@@ -36,6 +36,7 @@ from app.domain.frozen_configuration import (
     ModelPolicy,
     ModelRoute,
     ModelSettings,
+    ModelSettingsV2,
     ProfileRef,
     RepositoryInstructions,
     Selector,
@@ -91,6 +92,14 @@ class ExecutionConfiguration:
     rules_diagnostics: tuple[str, ...] = ()
     allowed_rule_refs: frozenset[str] | None = None
     verifier: ReflectionBundle | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.policy, ModelSettingsV2)
+            and self.policy.reflection.max_reflections_per_run > 0
+            and self.verifier is None
+        ):
+            raise FrozenConfigurationError("unsupported_verifier_bundle")
 
     def validate_context(self, payload: ContextPayload) -> None:
         if (

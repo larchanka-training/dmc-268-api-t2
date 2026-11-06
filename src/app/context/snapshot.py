@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context.loader import LoadedRules
 from app.db.models import RepositorySettings
+from app.domain.frozen_configuration import FrozenConfigurationError
 from app.domain.settings import compute_rules_digest
 
 _FIELDS = (
@@ -87,5 +88,5 @@ async def materialize_settings(
     await session.commit()
     stored = await session.get(RepositorySettings, values["id"], populate_existing=True)
     if stored is None or not valid_snapshot(stored):
-        raise ValueError("invalid_rules_snapshot")
+        raise FrozenConfigurationError("invalid_rules_snapshot")
     return values

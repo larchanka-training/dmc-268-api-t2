@@ -82,6 +82,13 @@ no job. Losing the attempt/lease rolls back all admission writes. Level1
 artifacts remain separate from the analysis worker's own frozen context; this
 adds no cross-run cache or review lifecycle.
 
+During live automatic preparation, its owner renews the same 90-second lease
+every 30 seconds with the database clock and attempt fence. A lost renewal
+cancels admission and provider work; expired claims cannot be revived. A typed
+inbox failure defers only that receipt for durable recovery and logs a fixed
+safe code, so other receipts in the batch continue. Explicitly permanent
+admission failures are not retried merely because their HTTP status is 503.
+
 ## Publication and compatibility
 
 The admitted immutable settings freeze the publication threshold. Every

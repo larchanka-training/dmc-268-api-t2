@@ -1,0 +1,24 @@
+diff --git a/app/pricing/discount.py b/app/pricing/discount.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/pricing/discount.py
+@@ -0,0 +1,18 @@
++class DiscountStrategy:
++    def apply(self, amount):
++        raise NotImplementedError
++
++class TenPercentDiscountStrategy(DiscountStrategy):
++    def apply(self, amount):
++        return amount * 0.9
++
++class DiscountCalculator:
++    def __init__(self, strategy: DiscountStrategy):
++        self._strategy = strategy
++
++    def calculate(self, amount):
++        return self._strategy.apply(amount)
++
++def apply_order_discount(amount):
++    calculator = DiscountCalculator(TenPercentDiscountStrategy())
++    return calculator.calculate(amount)

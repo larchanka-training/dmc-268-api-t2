@@ -1,0 +1,11 @@
+diff --git a/app/orders/format_status.py b/app/orders/format_status.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/orders/format_status.py
+@@ -0,0 +1,5 @@
++def format_status(order):
++    if order.is_cancelled:
++        return "Отменён"
++        print("logging cancellation")
++    return "Активен"

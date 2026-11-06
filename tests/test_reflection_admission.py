@@ -1,7 +1,10 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
+
+import pytest
 
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import RepositoryIdentity
@@ -133,6 +136,8 @@ async def test_admission_and_reader_enforce_pinned_verifier_before_inference() -
     valid = await reader.resolve(review_id)
     assert valid.verifier is not None
     assert valid.verifier.digest == verifier_digest
+    with pytest.raises(FrozenConfigurationError, match="unsupported_verifier_bundle"):
+        replace(valid, verifier=None)
 
     valid_resolver = FrozenAdmissionResolver(
         factory,

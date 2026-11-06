@@ -1,0 +1,12 @@
+diff --git a/app/orders/repository.py b/app/orders/repository.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/orders/repository.py
+@@ -0,0 +1,6 @@
++def count_orders(pool, user_id):
++    connection = pool.acquire()
++    cursor = connection.cursor()
++    cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id = %s", (user_id,))
++    (count,) = cursor.fetchone()
++    return count

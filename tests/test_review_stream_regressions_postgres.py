@@ -81,9 +81,10 @@ async def test_failed_analysis_with_not_ready_publication_finishes_stream(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
+        # Allow initial database startup; this watchdog verifies finite closure.
         response = await asyncio.wait_for(
             client.get(f"/api/v1/reviews/{review_id}/events/stream"),
-            timeout=1,
+            timeout=5,
         )
 
     assert response.status_code == HTTPStatus.OK

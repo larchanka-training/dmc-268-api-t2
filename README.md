@@ -63,6 +63,10 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 
 ## Логирование
 
+Optional metrics, dashboard, Sentry stage timing and operational gates:
+[`docs/observability.md`](docs/observability.md). PostgreSQL/Redis backup and
+isolated restore: [`docs/backup-restore.md`](docs/backup-restore.md).
+
 Логи пишутся одновременно в stdout и в файл `logs/app.log` (ротация: 10 МБ × 5 копий). Настройки — в `.env`:
 
 - `LOGGING__LEVEL` — уровень журнала (по умолчанию `INFO`);

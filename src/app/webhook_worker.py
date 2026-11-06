@@ -12,6 +12,7 @@ from app.application.webhook_ports import AutomaticWebhookAdmission, WebhookInbo
 from app.core.config import get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
+from app.core.metrics import metrics_server
 from app.core.sentry import configure_sentry
 from app.db.session import async_session_factory, engine
 from app.db.webhook_inbox import SqlAlchemyWebhookInbox
@@ -54,7 +55,8 @@ def main() -> None:
         "--once", action="store_true", help="Process one due batch and exit."
     )
     args = parser.parse_args()
-    asyncio.run(_run(once=args.once))
+    with metrics_server(get_settings().metrics):
+        asyncio.run(_run(once=args.once))
 
 
 if __name__ == "__main__":

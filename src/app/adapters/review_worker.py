@@ -4,6 +4,7 @@ import asyncio
 import time
 import uuid
 
+import sentry_sdk
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -110,7 +111,22 @@ class PostgresReviewWorker:
         authority = LiveAnalysisAuthority(lease, started=claim_started)
         token = current_analysis_authority.set(authority)
         try:
-            return await self._run_claimed(delivery, lease)
+            with sentry_sdk.isolation_scope() as scope:
+                scope.set_tag("review_id", str(lease.review_job_id))
+                with (
+                    structlog.contextvars.bound_contextvars(
+                        review_id=str(lease.review_job_id)
+                    ),
+                    sentry_sdk.start_transaction(
+                        name=f"review.{self._task_kind}", op="review.worker"
+                    ) as transaction,
+                ):
+                    acknowledged = await self._run_claimed(delivery, lease)
+                    transaction.set_tag(
+                        "delivery_outcome",
+                        "acknowledged" if acknowledged else "deferred",
+                    )
+                    return acknowledged
         finally:
             authority.cancel()
             current_analysis_authority.reset(token)

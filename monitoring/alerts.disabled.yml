@@ -1,0 +1,20 @@
+# Valid Prometheus rules, deliberately NOT included by prometheus.yml.
+# Configure an authorized Alertmanager/Sentry team destination before enabling.
+groups:
+  - name: dmc-mvp
+    rules:
+      - alert: DmcApiErrors
+        expr: sum(rate(dmc_http_requests_total{status_class="5xx"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "API is returning server errors"}
+      - alert: DmcLlmErrors
+        expr: sum(rate(dmc_llm_attempt_seconds_count{outcome="error"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "LLM provider attempts are failing"}
+      - alert: DmcQueueUnavailable
+        expr: dmc_queue_sample_success == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Queue metadata is unavailable"}

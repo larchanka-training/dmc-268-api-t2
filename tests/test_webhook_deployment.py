@@ -31,21 +31,20 @@ def test_staging_runs_intake_recovery_and_forwards_read_token() -> None:
     assert "append_optional 'GITHUB__TOKEN'" in runtime["run"]
 
 
-def test_staging_routes_publication_credentials_only_to_api() -> None:
-    """AC-DEPLOY-01: explicit publication configuration reaches only its API host."""
+def test_staging_routes_write_identity_only_to_api_and_publisher() -> None:
+    """AC-DEPLOY-01: write identity is confined to API and opt-in publisher."""
     services = yaml.safe_load((ROOT / "docker-compose.staging.yml").read_text())[
         "services"
     ]
-    assert (
-        services["api"]["environment"]["GITHUB__WRITE_TOKEN"]
-        == "${GITHUB__WRITE_TOKEN:-}"
-    )
-    assert (
-        services["api"]["environment"]["GITHUB__BOT_USER_ID"]
-        == "${GITHUB__BOT_USER_ID:-}"
-    )
+    publisher = services["publication-worker"]
+    assert publisher["profiles"] == ["publication"]
+    assert publisher["command"] == ["python", "-m", "app.publication_worker"]
+    for name in ("api", "publication-worker"):
+        environment = services[name]["environment"]
+        assert environment["GITHUB__WRITE_TOKEN"] == "${GITHUB__WRITE_TOKEN:-}"
+        assert environment["GITHUB__BOT_USER_ID"] == "${GITHUB__BOT_USER_ID:-}"
     for name, service in services.items():
-        if name != "api":
+        if name not in {"api", "publication-worker"}:
             assert "GITHUB__WRITE_TOKEN" not in service.get("environment", {})
             assert "GITHUB__BOT_USER_ID" not in service.get("environment", {})
 

@@ -161,13 +161,20 @@ analysis handler и API запуска/чтения ревью. Полный pro
 GitHub Publisher использует сохранённый результат анализа и запускается отдельно:
 
 ```bash
+uv run python -m app.publication_worker --check-config
 uv run python -m app.publication_worker --once
 uv run python -m app.publication_worker --poll-interval 1
 ```
 
 Нужны миграции, общие с analysis worker PostgreSQL/Redis и отдельные
-`GITHUB__WRITE_TOKEN` / `GITHUB__BOT_USER_ID`. API и Compose-заглушка `worker`
-не запускают публикацию автоматически. Контракты, SSE, recovery и интеграция
+`GITHUB__WRITE_TOKEN` / `GITHUB__BOT_USER_ID`. `--check-config` проверяет локальные
+настройки без HTTP, БД, Redis и Sentry; `--once` может публиковать review и для
+preflight не подходит. API и локальная Compose-заглушка `worker` публикацию
+не запускают. Staging содержит отдельный opt-in `publication-worker`, включаемый
+только через `STAGING_PUBLICATION_ENABLED=true`; по умолчанию он выключен и от
+флага analysis не зависит. Это подготовленная конфигурация, не факт rollout.
+Порядок включения и остановки: [staging deployment](docs/staging-deployment.md).
+Контракты, SSE, recovery и интеграция
 с объединёнными зависимостями:
 [`docs/github-review-publication.md`](docs/github-review-publication.md).
 

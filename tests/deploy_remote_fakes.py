@@ -31,10 +31,13 @@ if [[ "$1" == inspect ]]; then
   exit 0
 fi
 
-if [[ "$*" == *"worker python -c"* ]]; then
+if [[ "$*" == *"publication-worker python -c"* ]]; then
+  exit "${PUBLICATION_CHECK_FAILURE:-0}"
+fi
+if [[ "$*" == *" worker python -c"* ]]; then
   exit "${VALIDATION_FAILURE:-0}"
 fi
-if [[ "$*" == *"worker python -"* ]]; then
+if [[ "$*" == *" worker python -"* ]]; then
   exit "${PREFLIGHT_FAILURE:-0}"
 fi
 exit 0

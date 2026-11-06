@@ -567,6 +567,217 @@ async def test_transient_personal_failure_recovers_one_admission(
         )
 
 
+async def test_permanent_admission_provider_failure_is_not_retried(
+    automatic_scope: AutomaticScope,
+) -> None:
+    scope = automatic_scope
+    original = scope.provider
+    diffs = 0
+
+    def invalid_revalidation(
+        request: httpx.Request,
+    ) -> httpx.Response | Awaitable[httpx.Response]:
+        nonlocal diffs
+        if request.headers.get("accept") == "application/vnd.github.diff":
+            diffs += 1
+            if diffs == 2:
+                return httpx.Response(200, text="not a trustworthy diff")
+        return original(request)
+
+    scope.provider = invalid_revalidation
+    delivery = str(uuid4())
+    assert (await scope.send(delivery)).status_code == HTTPStatus.ACCEPTED
+    receipt = await scope.inbox.get_by_delivery(delivery)
+    assert receipt is not None and receipt.status == "READY"
+    assert receipt.reason_code == "AUTO_ADMISSION_REFUSED"
+    assert receipt.review_job_id is None
+    assert await scope.inbox.pending() == []
+
+
+async def test_invalid_materialized_snapshot_is_a_safe_admission_retry(
+    automatic_scope: AutomaticScope,
+) -> None:
+    scope = automatic_scope
+    engine = scope.settings.catalog.postgres.engine.sync_engine
+
+    def corrupt_saved_snapshot(
+        connection: Any, cursor: Any, statement: str, parameters: Any, *args: Any
+    ) -> None:
+        if statement.startswith("INSERT INTO repository_settings"):
+            connection.execute(
+                update(models.RepositorySettings)
+                .where(
+                    models.RepositorySettings.repository_id
+                    == scope.settings.repository,
+                    models.RepositorySettings.rules_source.is_not(None),
+                )
+                .values(rules_source={})
+            )
+
+    event.listen(engine, "after_cursor_execute", corrupt_saved_snapshot)
+    delivery = str(uuid4())
+    try:
+        response = await scope.send(delivery)
+    finally:
+        event.remove(engine, "after_cursor_execute", corrupt_saved_snapshot)
+    assert response.status_code == HTTPStatus.ACCEPTED
+    receipt = await scope.inbox.get_by_delivery(delivery)
+    assert receipt is not None and receipt.status == "PENDING"
+    assert receipt.reason_code == "AUTO_ADMISSION_UNAVAILABLE"
+    assert receipt.review_job_id is None
+
+
+async def test_inbox_write_failure_does_not_abort_the_recovery_batch(
+    automatic_scope: AutomaticScope,
+) -> None:
+    scope = automatic_scope
+    request = GithubRequest(
+        "team", "settings", str(scope.pull["base"]["repo"]["id"]), 7, HEAD, BASE
+    )
+    receipts = [await scope.inbox.accept(str(uuid4()), request) for _ in range(2)]
+    assert all(receipt is not None for receipt in receipts)
+    original = scope.provider
+
+    def denied(request: httpx.Request) -> httpx.Response | Awaitable[httpx.Response]:
+        if request.headers.get("Authorization") == "Bearer synthetic-personal-token":
+            return httpx.Response(403)
+        return original(request)
+
+    scope.provider = denied
+    engine = scope.settings.catalog.postgres.engine
+    failed = False
+
+    def reject_first_completion(
+        connection: Any, cursor: Any, statement: str, parameters: Any, *args: Any
+    ) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and statement.startswith("UPDATE webhook_receipt SET")
+            and "snapshot_data" in statement.split(" WHERE ", 1)[0]
+        ):
+            failed = True
+            raise OSError("synthetic inbox write unavailable")
+
+    event.listen(engine.sync_engine, "before_cursor_execute", reject_first_completion)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(scope.dispatch)
+        ) as http:
+            assert (
+                await run_once(
+                    scope.inbox, GithubClient(http), AutomaticReviewAdmission(factory)
+                )
+                == 2
+            )
+    finally:
+        event.remove(
+            engine.sync_engine, "before_cursor_execute", reject_first_completion
+        )
+    assert failed
+    first, second = [await scope.inbox.get(receipt) for receipt in receipts if receipt]
+    assert first is not None and first.status == "PROCESSING"
+    assert first.review_job_id is None
+    assert second is not None and second.status == "READY"
+    assert second.reason_code == "AUTO_ACTOR_DENIED"
+    assert second.review_job_id is None
+
+
+async def test_live_automatic_admission_renews_its_receipt_lease(
+    automatic_scope: AutomaticScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = automatic_scope
+    monkeypatch.setattr(
+        "app.adapters.automatic_review_admission._RENEW_INTERVAL_SECONDS",
+        0.02,
+        raising=False,
+    )
+    original = scope.provider
+    renewed = asyncio.Event()
+    watching = False
+    engine = scope.settings.catalog.postgres.engine
+
+    def observe_renewal(
+        connection: Any, cursor: Any, statement: str, parameters: Any, *args: Any
+    ) -> None:
+        if watching and statement.startswith("UPDATE webhook_receipt SET lease_until="):
+            renewed.set()
+
+    async def slow_admin(request: httpx.Request) -> httpx.Response:
+        nonlocal watching
+        if request.headers.get("Authorization") == "Bearer synthetic-personal-token":
+            statement = select(models.WebhookReceipt.lease_until).where(
+                models.WebhookReceipt.request_data["request"][
+                    "repository_external_id"
+                ].astext
+                == str(scope.pull["base"]["repo"]["id"])
+            )
+            async with engine.connect() as connection:
+                before = await connection.scalar(statement)
+            watching = True
+            await asyncio.wait_for(renewed.wait(), timeout=5)
+            async with engine.begin() as connection:
+                after = await connection.scalar(statement.with_for_update())
+                assert before is not None and after is not None and after > before
+        value = original(request)
+        return await value if inspect.isawaitable(value) else value
+
+    scope.provider = slow_admin
+    delivery = str(uuid4())
+    event.listen(engine.sync_engine, "after_cursor_execute", observe_renewal)
+    try:
+        assert (await scope.send(delivery)).status_code == HTTPStatus.ACCEPTED
+    finally:
+        event.remove(engine.sync_engine, "after_cursor_execute", observe_renewal)
+    receipt = await scope.inbox.get_by_delivery(delivery)
+    assert receipt is not None and receipt.status == "READY"
+    assert receipt.review_job_id is not None and receipt.attempts == 1
+
+
+async def test_receipt_heartbeat_cancels_provider_work_after_fence_loss(
+    automatic_scope: AutomaticScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = automatic_scope
+    monkeypatch.setattr(
+        "app.adapters.automatic_review_admission._RENEW_INTERVAL_SECONDS", 0.02
+    )
+    original = scope.provider
+    cancelled = asyncio.Event()
+
+    async def lose_claim(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("Authorization") == "Bearer synthetic-personal-token":
+            async with scope.settings.catalog.postgres.engine.begin() as connection:
+                await connection.execute(
+                    update(models.WebhookReceipt)
+                    .where(
+                        models.WebhookReceipt.request_data["request"][
+                            "repository_external_id"
+                        ].astext
+                        == str(scope.pull["base"]["repo"]["id"])
+                    )
+                    .values(attempts=models.WebhookReceipt.attempts + 1)
+                )
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        value = original(request)
+        return await value if inspect.isawaitable(value) else value
+
+    scope.provider = lose_claim
+    delivery = str(uuid4())
+    response = await asyncio.wait_for(scope.send(delivery), timeout=5)
+    assert response.status_code == HTTPStatus.ACCEPTED
+    assert cancelled.is_set()
+    receipt = await scope.inbox.get_by_delivery(delivery)
+    assert receipt is not None and receipt.status == "PROCESSING"
+    assert receipt.attempts == 2 and receipt.review_job_id is None
+
+
 async def test_durable_receipt_replays_terminal_job_after_key_expiry_and_revoked_actor(
     automatic_scope: AutomaticScope,
     monkeypatch: pytest.MonkeyPatch,

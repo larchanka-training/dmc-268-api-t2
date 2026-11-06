@@ -2,7 +2,6 @@
 
 import asyncio
 from dataclasses import dataclass
-from http import HTTPStatus
 from pathlib import Path
 from uuid import UUID
 
@@ -29,6 +28,8 @@ from app.review.configuration import (
     FrozenConfigurationError,
     load_runtime_configuration,
 )
+
+_RENEW_INTERVAL_SECONDS = 30
 
 
 @dataclass
@@ -60,6 +61,29 @@ class AutomaticReviewAdmission:
         self._factory = factory
 
     async def admit(self, context: AutomaticReceiptContext) -> None:
+        admission = asyncio.create_task(self._admit(context))
+        heartbeat = asyncio.create_task(self._renew(context))
+        try:
+            done, _ = await asyncio.wait(
+                (admission, heartbeat), return_when=asyncio.FIRST_COMPLETED
+            )
+            if admission in done:
+                await admission
+            else:
+                await heartbeat
+        finally:
+            admission.cancel()
+            heartbeat.cancel()
+            await asyncio.gather(admission, heartbeat, return_exceptions=True)
+
+    async def _renew(self, context: AutomaticReceiptContext) -> None:
+        inbox = SqlAlchemyWebhookInbox(self._factory)
+        while True:
+            await asyncio.sleep(_RENEW_INTERVAL_SECONDS)
+            if not await inbox.renew(context.claim):
+                return
+
+    async def _admit(self, context: AutomaticReceiptContext) -> None:
         intent = context.claim.automatic
         if intent is None:
             raise AutomaticReceiptClaimLostError
@@ -92,11 +116,7 @@ class AutomaticReviewAdmission:
         except AutomaticReceiptClaimLostError:
             return
         except ReviewAdmissionError as error:
-            if (
-                error.retryable
-                or error.status >= HTTPStatus.INTERNAL_SERVER_ERROR
-                or error.code == "QUOTA_EXCEEDED"
-            ):
+            if error.retryable or error.code == "QUOTA_EXCEEDED":
                 raise GithubFailure(
                     "AUTO_ADMISSION_UNAVAILABLE", True, error.retry_after
                 ) from None

@@ -224,6 +224,9 @@ def test_historical_settings_and_context_retain_their_actual_language() -> None:
         "output_language": "en",
         "surrounding_lines": 5,
         "created_at": "2026-09-24T10:00:00Z",
+        "auto_review_enabled": False,
+        "base_branches": [],
+        "minimum_severity": "low",
     }
     _api_validator("RepositorySettings").validate(settings)
     replacement = {
@@ -645,6 +648,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories/{id}/pull-requests", "get"),
         ("/api/v1/repositories/{id}/settings", "get"),
         ("/api/v1/repositories/{id}/settings", "put"),
+        ("/api/v1/repositories/{id}/rules-preview", "get"),
         ("/api/v1/repositories/{id}/pull-requests/{number}/reviews", "post"),
         ("/api/v1/repositories/{id}/reviews", "get"),
         ("/api/v1/repositories/{id}/analytics", "get"),

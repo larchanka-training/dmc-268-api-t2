@@ -1,0 +1,327 @@
+{
+  "format": "qa27-worker-sources/v1",
+  "original_corpus_sha256": "b7c2ad5a5ff606d4985af74191143fbf106e5aeabcd9b96f209397b1075f5396",
+  "public_provenance_path": "provenance.json",
+  "synthetic_mapping_path": "synthetic-mapping.json",
+  "source_urls": [
+    "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/LICENSE",
+    "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/NOTICE",
+    "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/requests/sessions.py",
+    "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/LICENSE",
+    "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/NOTICE",
+    "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/requests/sessions.py"
+  ],
+  "original_to_stored": {
+    "provenance.json": "provenance.json",
+    "synthetic-mapping.json": "synthetic-mapping.json",
+    "licenses/LICENSE": "licenses/LICENSE",
+    "licenses/NOTICE": "licenses/NOTICE",
+    "upstream/parent/requests/sessions.py": "upstream/parent/requests/sessions.py.txt",
+    "upstream/head/requests/sessions.py": "upstream/head/requests/sessions.py.txt",
+    "fixtures/sec-001-sql-injection/pr.diff::NEW::app/search.py": "synthetic/sec-001-sql-injection/head/app/search.py.txt",
+    "fixtures/sec-002-hardcoded-secret/pr.diff::NEW::app/payments/client.py": "synthetic/sec-002-hardcoded-secret/head/app/payments/client.py.txt",
+    "fixtures/sec-003-ssrf/pr.diff::NEW::app/previews/fetch.py": "synthetic/sec-003-ssrf/head/app/previews/fetch.py.txt",
+    "fixtures/sec-004-insecure-deserialization/pr.diff::NEW::app/cache/session_store.py": "synthetic/sec-004-insecure-deserialization/head/app/cache/session_store.py.txt",
+    "fixtures/sec-005-path-traversal/pr.diff::NEW::app/attachments/download.py": "synthetic/sec-005-path-traversal/head/app/attachments/download.py.txt",
+    "fixtures/mem-001-unclosed-file-handle/pr.diff::NEW::app/logs/count_errors.py": "synthetic/mem-001-unclosed-file-handle/head/app/logs/count_errors.py.txt",
+    "fixtures/mem-002-unclosed-db-connection/pr.diff::NEW::app/orders/repository.py": "synthetic/mem-002-unclosed-db-connection/head/app/orders/repository.py.txt",
+    "fixtures/mem-003-unbounded-cache-growth/pr.diff::NEW::app/geo/cache.py": "synthetic/mem-003-unbounded-cache-growth/head/app/geo/cache.py.txt",
+    "fixtures/mem-004-unclosed-socket/pr.diff::NEW::app/healthchecks/tcp_probe.py": "synthetic/mem-004-unclosed-socket/head/app/healthchecks/tcp_probe.py.txt",
+    "fixtures/logic-001-off-by-one/pr.diff::NEW::app/pagination/slice.py": "synthetic/logic-001-off-by-one/head/app/pagination/slice.py.txt",
+    "fixtures/logic-002-wrong-boolean-operator/pr.diff::NEW::app/authz/checks.py": "synthetic/logic-002-wrong-boolean-operator/head/app/authz/checks.py.txt",
+    "fixtures/logic-003-bare-except-swallows-error/pr.diff::NEW::app/billing/charge.py": "synthetic/logic-003-bare-except-swallows-error/head/app/billing/charge.py.txt",
+    "fixtures/logic-004-mutable-default-argument/pr.diff::NEW::app/events/tags.py": "synthetic/logic-004-mutable-default-argument/head/app/events/tags.py.txt",
+    "fixtures/logic-005-race-condition-check-then-act/pr.diff::NEW::app/inventory/reserve.py": "synthetic/logic-005-race-condition-check-then-act/head/app/inventory/reserve.py.txt",
+    "fixtures/syn-001-dead-code-branch/pr.diff::NEW::app/orders/format_status.py": "synthetic/syn-001-dead-code-branch/head/app/orders/format_status.py.txt",
+    "fixtures/syn-002-redundant-nested-conditionals/pr.diff::NEW::app/validation/range_check.py": "synthetic/syn-002-redundant-nested-conditionals/head/app/validation/range_check.py.txt",
+    "fixtures/syn-003-unnecessary-wrapper-function/pr.diff::NEW::app/users/display_name.py": "synthetic/syn-003-unnecessary-wrapper-function/head/app/users/display_name.py.txt",
+    "fixtures/syn-004-overengineered-trivial-abstraction/pr.diff::NEW::app/pricing/discount.py": "synthetic/syn-004-overengineered-trivial-abstraction/head/app/pricing/discount.py.txt",
+    "fixtures/clean-001-well-factored-handler/pr.diff::NEW::app/users/lookup.py": "synthetic/clean-001-well-factored-handler/head/app/users/lookup.py.txt",
+    "fixtures/clean-002-simple-validation-function/pr.diff::NEW::app/validation/bounds.py": "synthetic/clean-002-simple-validation-function/head/app/validation/bounds.py.txt",
+    "fixtures/clean-003-straightforward-data-transform/pr.diff::NEW::app/pagination/slice_fixed.py": "synthetic/clean-003-straightforward-data-transform/head/app/pagination/slice_fixed.py.txt",
+    "fixtures/clean-004-resource-managed-with-context-manager/pr.diff::NEW::app/logs/count_errors_fixed.py": "synthetic/clean-004-resource-managed-with-context-manager/head/app/logs/count_errors_fixed.py.txt",
+    "fixtures/syntax-001-missing-colon/pr.diff::NEW::app/validation.py": "synthetic/syntax-001-missing-colon/head/app/validation.py.txt"
+  },
+  "fixtures": {
+    "public-001-requests-proxy-auth-fix": {
+      "old": {
+        "path": "requests/sessions.py",
+        "stored_path": "upstream/parent/requests/sessions.py.txt",
+        "git_blob_sha1": "6cb3b4dae397930fba60e4c08b25b9444783b6f7",
+        "sha256": "294a8971144ba2f35e7d4b3b49c39749454271f49ac93156b5b889ee03929532",
+        "byte_count": 30180,
+        "upstream_ref": "302225334678490ec66b3614a9dddb8a02c5f4fe"
+      },
+      "new": {
+        "path": "requests/sessions.py",
+        "stored_path": "upstream/head/requests/sessions.py.txt",
+        "git_blob_sha1": "dbcf2a7b0ee2898b72714b756e4b27fbbad4beab",
+        "sha256": "f8bbd3ceb3ed7ad493ad1ddbbb1bb85e176032b2452c1d6ae43ecffbe2f65e1c",
+        "byte_count": 30373,
+        "upstream_ref": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5"
+      }
+    },
+    "sec-001-sql-injection": {
+      "old": null,
+      "new": {
+        "path": "app/search.py",
+        "stored_path": "synthetic/sec-001-sql-injection/head/app/search.py.txt",
+        "git_blob_sha1": "e99e7405f4d329543b29cedb6734426def907d2b",
+        "sha256": "a614c9bf3d73c5584022d5520e4c72a34814d8515203755ff9686b60026021c8",
+        "byte_count": 200
+      }
+    },
+    "sec-002-hardcoded-secret": {
+      "old": null,
+      "new": {
+        "path": "app/payments/client.py",
+        "stored_path": "synthetic/sec-002-hardcoded-secret/head/app/payments/client.py.txt",
+        "git_blob_sha1": "f0f83f702750f060249f49b3ecb76f20fcc3b658",
+        "sha256": "fd95669aaed4eef3a218517c7942440b1a32869750e4112892935c74a48743f7",
+        "byte_count": 376
+      }
+    },
+    "sec-003-ssrf": {
+      "old": null,
+      "new": {
+        "path": "app/previews/fetch.py",
+        "stored_path": "synthetic/sec-003-ssrf/head/app/previews/fetch.py.txt",
+        "git_blob_sha1": "a773e5ba7a0c69e20142b9265bc0077a2c481444",
+        "sha256": "ef362094d2e4cc7c652b44aa32d92b2f264eba1475d067c7e6f9cefdcb8a1de3",
+        "byte_count": 173
+      }
+    },
+    "sec-004-insecure-deserialization": {
+      "old": null,
+      "new": {
+        "path": "app/cache/session_store.py",
+        "stored_path": "synthetic/sec-004-insecure-deserialization/head/app/cache/session_store.py.txt",
+        "git_blob_sha1": "14c1fc4c6448b868dc7a88bc50648caf56c39acf",
+        "sha256": "d3b7029fcecbd5a09afd73f5f09b8d187259c1ba7467230d64ce5fe45062c313",
+        "byte_count": 180
+      }
+    },
+    "sec-005-path-traversal": {
+      "old": null,
+      "new": {
+        "path": "app/attachments/download.py",
+        "stored_path": "synthetic/sec-005-path-traversal/head/app/attachments/download.py.txt",
+        "git_blob_sha1": "f5cc631047a4195b3fcc6d88ff150cbe99eddce0",
+        "sha256": "f98dbf90ef0e74a702c6425c71df7276daee9a6596c406ca1a51e91fe6b34f07",
+        "byte_count": 199
+      }
+    },
+    "mem-001-unclosed-file-handle": {
+      "old": null,
+      "new": {
+        "path": "app/logs/count_errors.py",
+        "stored_path": "synthetic/mem-001-unclosed-file-handle/head/app/logs/count_errors.py.txt",
+        "git_blob_sha1": "ce3143e3f9ead964559944cf06ecd9396042f13d",
+        "sha256": "ad2aced533df56edb6d45a698bb71ab593a975b11d3f1c0a0b41e88d2decc385",
+        "byte_count": 184
+      }
+    },
+    "mem-002-unclosed-db-connection": {
+      "old": null,
+      "new": {
+        "path": "app/orders/repository.py",
+        "stored_path": "synthetic/mem-002-unclosed-db-connection/head/app/orders/repository.py.txt",
+        "git_blob_sha1": "50f48205b11d6396a42f1248c26f8908943a06c7",
+        "sha256": "4a4d51a46ec7729cb3802abe0977510f1af8fb413cc664439f277e7a9369a475",
+        "byte_count": 229
+      }
+    },
+    "mem-003-unbounded-cache-growth": {
+      "old": null,
+      "new": {
+        "path": "app/geo/cache.py",
+        "stored_path": "synthetic/mem-003-unbounded-cache-growth/head/app/geo/cache.py.txt",
+        "git_blob_sha1": "57b3347f2c34026e02c3300e9defda1aed906ed2",
+        "sha256": "3f2b4050ad390abf8f7c948f51e88a56f76076b02fe877b4bf877a19ef9094f3",
+        "byte_count": 219
+      }
+    },
+    "mem-004-unclosed-socket": {
+      "old": null,
+      "new": {
+        "path": "app/healthchecks/tcp_probe.py",
+        "stored_path": "synthetic/mem-004-unclosed-socket/head/app/healthchecks/tcp_probe.py.txt",
+        "git_blob_sha1": "2ef2ccd21d03455446daee96f403a2d6358b70ce",
+        "sha256": "6eff0773b49fd77b64d6fbab284125b0ddd24d425410c7a40cdbfbe5558db0a4",
+        "byte_count": 214
+      }
+    },
+    "logic-001-off-by-one": {
+      "old": null,
+      "new": {
+        "path": "app/pagination/slice.py",
+        "stored_path": "synthetic/logic-001-off-by-one/head/app/pagination/slice.py.txt",
+        "git_blob_sha1": "4c77dd4b871ef858220b3d96457445f7619de726",
+        "sha256": "26170d36329369950c7abc2c52079d164f6f89a77a288c0d547a0a2856420ec3",
+        "byte_count": 149
+      }
+    },
+    "logic-002-wrong-boolean-operator": {
+      "old": null,
+      "new": {
+        "path": "app/authz/checks.py",
+        "stored_path": "synthetic/logic-002-wrong-boolean-operator/head/app/authz/checks.py.txt",
+        "git_blob_sha1": "c4e419366c26baac33ec581a0f1bde738b04602e",
+        "sha256": "818b4dc740fa4f26f8c59cf1efd1b6c5aa174da22c12f0439e8b387f7f0ceb00",
+        "byte_count": 143
+      }
+    },
+    "logic-003-bare-except-swallows-error": {
+      "old": null,
+      "new": {
+        "path": "app/billing/charge.py",
+        "stored_path": "synthetic/logic-003-bare-except-swallows-error/head/app/billing/charge.py.txt",
+        "git_blob_sha1": "4a9285a84e709f47aa728c1e636b75d1949774b1",
+        "sha256": "5f4719a8eec9aaff812d95e77ede50f22adc73b476c50ae7ebb9c6f3de97b25e",
+        "byte_count": 155
+      }
+    },
+    "logic-004-mutable-default-argument": {
+      "old": null,
+      "new": {
+        "path": "app/events/tags.py",
+        "stored_path": "synthetic/logic-004-mutable-default-argument/head/app/events/tags.py.txt",
+        "git_blob_sha1": "1b096d3bf3f630572462a4a2a62a1b2c28154ac2",
+        "sha256": "fabd26ec0cc8360fa30478abf3b5120ce21ce717c9795dcd6a7c5cf025e2abd3",
+        "byte_count": 64
+      }
+    },
+    "logic-005-race-condition-check-then-act": {
+      "old": null,
+      "new": {
+        "path": "app/inventory/reserve.py",
+        "stored_path": "synthetic/logic-005-race-condition-check-then-act/head/app/inventory/reserve.py.txt",
+        "git_blob_sha1": "7284f6126cd0156ae7a7b5f61d96aa899d79c44a",
+        "sha256": "b65766bfae7d80420ac39c1226b0abde5ebcb18d2898d51387c0c70c95d94649",
+        "byte_count": 216
+      }
+    },
+    "syn-001-dead-code-branch": {
+      "old": null,
+      "new": {
+        "path": "app/orders/format_status.py",
+        "stored_path": "synthetic/syn-001-dead-code-branch/head/app/orders/format_status.py.txt",
+        "git_blob_sha1": "96496fec33e069b594c5c75eaa15275cce72e669",
+        "sha256": "6b62df39c85832dfaceba53270dfd889e5376f9091673133a6e0bc0bd2f17e77",
+        "byte_count": 151
+      }
+    },
+    "syn-002-redundant-nested-conditionals": {
+      "old": null,
+      "new": {
+        "path": "app/validation/range_check.py",
+        "stored_path": "synthetic/syn-002-redundant-nested-conditionals/head/app/validation/range_check.py.txt",
+        "git_blob_sha1": "b5970a2e6d7662f45c35e716cd216a1a9f3734ca",
+        "sha256": "97c84e9942672e857f988d0a194483cefdbbffe51f3a1b6911794acb26c29669",
+        "byte_count": 176
+      }
+    },
+    "syn-003-unnecessary-wrapper-function": {
+      "old": null,
+      "new": {
+        "path": "app/users/display_name.py",
+        "stored_path": "synthetic/syn-003-unnecessary-wrapper-function/head/app/users/display_name.py.txt",
+        "git_blob_sha1": "53727c81f74cdb58688963dea7ef2aa35c4f1d74",
+        "sha256": "bfdcd1d6ccf3422b215e8e9562f87394af1d836a6934b7330084ae799a5097d0",
+        "byte_count": 178
+      }
+    },
+    "syn-004-overengineered-trivial-abstraction": {
+      "old": null,
+      "new": {
+        "path": "app/pricing/discount.py",
+        "stored_path": "synthetic/syn-004-overengineered-trivial-abstraction/head/app/pricing/discount.py.txt",
+        "git_blob_sha1": "d68901fbbf374e20a4c5ee54e2fc708ab2e3f594",
+        "sha256": "8fb67ecd4c8aebec87498db76571d4a2f32c8aa80cfd1d89f43020bda09f5600",
+        "byte_count": 529
+      }
+    },
+    "clean-001-well-factored-handler": {
+      "old": null,
+      "new": {
+        "path": "app/users/lookup.py",
+        "stored_path": "synthetic/clean-001-well-factored-handler/head/app/users/lookup.py.txt",
+        "git_blob_sha1": "db7b9b4d820839644cf95290279aa96644d568c0",
+        "sha256": "6f8957b6fcc8e38fe33e8374e46b137817162cc188b33251184b2ecb7570ec94",
+        "byte_count": 248
+      }
+    },
+    "clean-002-simple-validation-function": {
+      "old": null,
+      "new": {
+        "path": "app/validation/bounds.py",
+        "stored_path": "synthetic/clean-002-simple-validation-function/head/app/validation/bounds.py.txt",
+        "git_blob_sha1": "4ee4e9a20c4e00f8d98dfaf345ff75b0fabf88c6",
+        "sha256": "520c0daaf2fcad13591131db498eea2d048ff0ce943e165faa906946707254ae",
+        "byte_count": 67
+      }
+    },
+    "clean-003-straightforward-data-transform": {
+      "old": null,
+      "new": {
+        "path": "app/pagination/slice_fixed.py",
+        "stored_path": "synthetic/clean-003-straightforward-data-transform/head/app/pagination/slice_fixed.py.txt",
+        "git_blob_sha1": "e375746294be39e1a5aa28dbe06ba36d654329cc",
+        "sha256": "92f5bd8cc5a83614a7a636baec872a1bd32c961cfe1cd36ff3dbf38c42316fc3",
+        "byte_count": 145
+      }
+    },
+    "clean-004-resource-managed-with-context-manager": {
+      "old": null,
+      "new": {
+        "path": "app/logs/count_errors_fixed.py",
+        "stored_path": "synthetic/clean-004-resource-managed-with-context-manager/head/app/logs/count_errors_fixed.py.txt",
+        "git_blob_sha1": "760eed351ffdacdf9728053d2892520d5adab8f2",
+        "sha256": "fe75b031f06ee94e915a06277773bfd9023c82133ca5cfd497c4efdcb2dc37e4",
+        "byte_count": 203
+      }
+    },
+    "syntax-001-missing-colon": {
+      "old": null,
+      "new": {
+        "path": "app/validation.py",
+        "stored_path": "synthetic/syntax-001-missing-colon/head/app/validation.py.txt",
+        "git_blob_sha1": "5a701e8efe4f38fe3756b0a7f3326e1ea9e6fa1d",
+        "sha256": "aab6b9f334b4eeb0a4ecc3544b0e999a871fe1c3d661034ffe349906496d6a0e",
+        "byte_count": 47
+      }
+    }
+  },
+  "files": {
+    "README.md": "cecc60e3fcba48f2def40f42991d425f58f7b86263fb9ff164fcdf08a8d8b50a",
+    "licenses/LICENSE": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+    "licenses/NOTICE": "f5110972dedad2b4e9d314518daf3b7d72d6e02e499acd802181de6f74571dcc",
+    "provenance.json": "f9e340dbe778eb603d8039c5b075ee9769b263395859414f86646137bcfb1d7c",
+    "synthetic-mapping.json": "b0e324bcec7f2563e092e4a2244bc04d32f7bb6d857bb9e18f1eae3fd87ec564",
+    "synthetic/clean-001-well-factored-handler/head/app/users/lookup.py.txt": "6f8957b6fcc8e38fe33e8374e46b137817162cc188b33251184b2ecb7570ec94",
+    "synthetic/clean-002-simple-validation-function/head/app/validation/bounds.py.txt": "520c0daaf2fcad13591131db498eea2d048ff0ce943e165faa906946707254ae",
+    "synthetic/clean-003-straightforward-data-transform/head/app/pagination/slice_fixed.py.txt": "92f5bd8cc5a83614a7a636baec872a1bd32c961cfe1cd36ff3dbf38c42316fc3",
+    "synthetic/clean-004-resource-managed-with-context-manager/head/app/logs/count_errors_fixed.py.txt": "fe75b031f06ee94e915a06277773bfd9023c82133ca5cfd497c4efdcb2dc37e4",
+    "synthetic/logic-001-off-by-one/head/app/pagination/slice.py.txt": "26170d36329369950c7abc2c52079d164f6f89a77a288c0d547a0a2856420ec3",
+    "synthetic/logic-002-wrong-boolean-operator/head/app/authz/checks.py.txt": "818b4dc740fa4f26f8c59cf1efd1b6c5aa174da22c12f0439e8b387f7f0ceb00",
+    "synthetic/logic-003-bare-except-swallows-error/head/app/billing/charge.py.txt": "5f4719a8eec9aaff812d95e77ede50f22adc73b476c50ae7ebb9c6f3de97b25e",
+    "synthetic/logic-004-mutable-default-argument/head/app/events/tags.py.txt": "fabd26ec0cc8360fa30478abf3b5120ce21ce717c9795dcd6a7c5cf025e2abd3",
+    "synthetic/logic-005-race-condition-check-then-act/head/app/inventory/reserve.py.txt": "b65766bfae7d80420ac39c1226b0abde5ebcb18d2898d51387c0c70c95d94649",
+    "synthetic/mem-001-unclosed-file-handle/head/app/logs/count_errors.py.txt": "ad2aced533df56edb6d45a698bb71ab593a975b11d3f1c0a0b41e88d2decc385",
+    "synthetic/mem-002-unclosed-db-connection/head/app/orders/repository.py.txt": "4a4d51a46ec7729cb3802abe0977510f1af8fb413cc664439f277e7a9369a475",
+    "synthetic/mem-003-unbounded-cache-growth/head/app/geo/cache.py.txt": "3f2b4050ad390abf8f7c948f51e88a56f76076b02fe877b4bf877a19ef9094f3",
+    "synthetic/mem-004-unclosed-socket/head/app/healthchecks/tcp_probe.py.txt": "6eff0773b49fd77b64d6fbab284125b0ddd24d425410c7a40cdbfbe5558db0a4",
+    "synthetic/sec-001-sql-injection/head/app/search.py.txt": "a614c9bf3d73c5584022d5520e4c72a34814d8515203755ff9686b60026021c8",
+    "synthetic/sec-002-hardcoded-secret/head/app/payments/client.py.txt": "fd95669aaed4eef3a218517c7942440b1a32869750e4112892935c74a48743f7",
+    "synthetic/sec-003-ssrf/head/app/previews/fetch.py.txt": "ef362094d2e4cc7c652b44aa32d92b2f264eba1475d067c7e6f9cefdcb8a1de3",
+    "synthetic/sec-004-insecure-deserialization/head/app/cache/session_store.py.txt": "d3b7029fcecbd5a09afd73f5f09b8d187259c1ba7467230d64ce5fe45062c313",
+    "synthetic/sec-005-path-traversal/head/app/attachments/download.py.txt": "f98dbf90ef0e74a702c6425c71df7276daee9a6596c406ca1a51e91fe6b34f07",
+    "synthetic/syn-001-dead-code-branch/head/app/orders/format_status.py.txt": "6b62df39c85832dfaceba53270dfd889e5376f9091673133a6e0bc0bd2f17e77",
+    "synthetic/syn-002-redundant-nested-conditionals/head/app/validation/range_check.py.txt": "97c84e9942672e857f988d0a194483cefdbbffe51f3a1b6911794acb26c29669",
+    "synthetic/syn-003-unnecessary-wrapper-function/head/app/users/display_name.py.txt": "bfdcd1d6ccf3422b215e8e9562f87394af1d836a6934b7330084ae799a5097d0",
+    "synthetic/syn-004-overengineered-trivial-abstraction/head/app/pricing/discount.py.txt": "8fb67ecd4c8aebec87498db76571d4a2f32c8aa80cfd1d89f43020bda09f5600",
+    "synthetic/syntax-001-missing-colon/head/app/validation.py.txt": "aab6b9f334b4eeb0a4ecc3544b0e999a871fe1c3d661034ffe349906496d6a0e",
+    "upstream/head/requests/sessions.py.txt": "f8bbd3ceb3ed7ad493ad1ddbbb1bb85e176032b2452c1d6ae43ecffbe2f65e1c",
+    "upstream/parent/requests/sessions.py.txt": "294a8971144ba2f35e7d4b3b49c39749454271f49ac93156b5b889ee03929532"
+  }
+}

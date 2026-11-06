@@ -34,6 +34,7 @@ GitHub
                          |     +-- FastAPI :8000
                          |     +-- worker / outbox-dispatcher (opt-in analysis, тот же API-образ)
                          |     +-- webhook-worker (GitHub intake, тот же API-образ)
+                         |     +-- publication-worker (opt-in publication, тот же API-образ)
                          |     +-- PostgreSQL, Redis
                          |
                          +-- develop: /opt/dmc-268-t2-develop  :8080
@@ -241,7 +242,7 @@ web -> api:8000
 
 ### Worker
 
-Фоновые процессы запускаются из того же immutable API-образа, что и FastAPI, и обновляются тем же деплоем: `api`, `worker`, `outbox-dispatcher` и `webhook-worker`.
+Фоновые процессы запускаются из того же immutable API-образа, что и FastAPI, и обновляются тем же деплоем: `api`, `worker`, `outbox-dispatcher`, `webhook-worker` и опциональный `publication-worker`.
 
 `worker` выполняет `python -m app.analysis_worker`, `outbox-dispatcher` — `python -m app.outbox_dispatcher`. Обе команды работают постоянно, без `--once`, и включены в Compose profile `analysis`. По умолчанию профиль выключен. `webhook-worker` постоянно выполняет восстановление GitHub intake независимо от анализа.
 
@@ -261,7 +262,7 @@ web -> api:8000
 6. **Доверенность исполняемого кода и права:** на VPS требуется системный `/usr/bin/python3` (только stdlib, без зависимостей приложения). Workflow запускает встроенный в SSH script verifier через `/usr/bin/python3 -I` от root либо через уже разрешённый `sudo -n`; `-I` исключает cwd, `PYTHONPATH` и пользовательский site-packages до импорта stdlib. Verifier открывает загруженный installer с `O_NOFOLLOW`, проверяет regular file и SHA-256 по digest runner, затем компилирует и исполняет **те же прочитанные байты**, не открывая путь повторно. Подмена installer или symlink блокирует установку до исполнения его кода; запускать напрямую `sudo python3` для файла из deployment directory нельзя. Terraform bootstrap требует root, но не доказывает sudo-права пользователя из `VPS_DMC268_U`; без VPS они не подтверждены. При `sudo: a password is required`, `Installer integrity mismatch` или `untrusted manifest directory` deployment блокируется; проверки доверенности и права manifest не ослаблять. Не выдавайте широкое sudo разрешение ради deployment: если существующая политика не разрешает этот вызов, администратору нужен root-owned helper с узким правилом и соответствующий вызов вместо встроенного verifier. Для `SSH_USER=root` прежнего конфликта владельцев нет, однако новая схема работает и с отдельным SSH-пользователем при существующих правах на установку. Terraform для доставки менять не требуется.
 7. Установите repository Variable `STAGING_ANALYSIS_ENABLED=true`. Запустите `Deploy` из `main` с `environment=staging` после успешного API CI с T3. При обычном API-deploy `ui_sha` оставьте пустым. UI-only deploy сохраняет прежний API image; не используйте его для первого включения T3.
 
-Workflow записывает `COMPOSE_PROFILES=analysis` и `ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json` только для включённого staging. Для staging, в том числе при выключенном analysis, env-файл задаёт `ANALYSIS_RUNTIME_DIR=/opt/dmc-268-t2-runtime/analysis-runtime`; API и worker используют этот каталог как `:ro`. На develop сохраняются собственные deployment directory и `ANALYSIS_RUNTIME_DIR=./analysis-runtime`, пустой config path и выключенный analysis. Общий Compose-файл по умолчанию также использует локальный `./analysis-runtime`; staging получает защищённый путь из своего env-файла, а не из Secrets/Variables.
+Workflow записывает профиль `analysis` и `ANALYSIS__CONFIG_PATH=/app/runtime/analysis-runtime.v1.json` только для включённого staging. Профиль `publication` выбирается независимо; при обоих флагах `COMPOSE_PROFILES=analysis,publication`. Для staging, в том числе при выключенном analysis, env-файл задаёт `ANALYSIS_RUNTIME_DIR=/opt/dmc-268-t2-runtime/analysis-runtime`; API и worker используют этот каталог как `:ro`. На develop сохраняются собственные deployment directory и `ANALYSIS_RUNTIME_DIR=./analysis-runtime`, пустой config path и выключенные opt-in профили. Общий Compose-файл по умолчанию также использует локальный `./analysis-runtime`; staging получает защищённый путь из своего env-файла, а не из Secrets/Variables.
 
 После миграций и до запуска новых API/worker workflow выполняет `load_runtime_configuration()` и существующий `deployment_preflight()` внутри выбранного worker image. Gate проверяет read token, выбранный Eurorouter profile, отсутствие fallback, совпадение model/endpoint с утверждёнными Variables, prompt closure, полноту scan pending jobs и локальную готовность LLM credentials. Он не читает Redis, не получает leases, не резервирует budget и не обращается к GitHub/LLM. Ошибка выводит только `Analysis preflight failed` и завершает deployment до старта analysis. Pending jobs с сохранённым fallback также блокируют MVP-включение, даже внутри одного провайдера. Pending job, чья frozen-конфигурация несовместима с текущим manifest (например, модель убрана из `allowed_models` после создания ревью), запуск не блокирует: preflight отмечает её неблокирующим issue, а worker переводит её в `FAILED` с `error_code` причины до любых внешних запросов. Незавершённый ограниченный scan pending jobs (`backlog_scan_incomplete`) по-прежнему блокирует запуск; сохранённые jobs для обхода gate не изменяйте.
 
@@ -270,6 +271,65 @@ Workflow записывает `COMPOSE_PROFILES=analysis` и `ANALYSIS__CONFIG_P
 Dispatcher и analysis worker запускаются вместе с webhook-worker и проверяются на состояние running. Для worker задано `restart: on-failure:3`: прямой ручной запуск с ошибочной конфигурацией не создаёт бесконечный crash-loop. После устранения причины выполните deployment заново. Чтобы выключить анализ, установите `STAGING_ANALYSIS_ENABLED=false` и повторите deployment: оба analysis-сервиса останавливаются, config path API очищается. Уже принятые jobs сохраняются в БД до следующего включения.
 
 Воркеры не публикуют порты наружу и доступны только внутри Docker network.
+
+### Включение publisher на staging
+
+Публикация использует отдельный `publication-worker` с командой
+`python -m app.publication_worker`. Repository Variable
+`STAGING_PUBLICATION_ENABLED` отсутствует или равна `false` по умолчанию;
+включение анализа или наличие write token само по себе publisher не запускает.
+Допустимы только значения `true` и `false`. На develop оба opt-in профиля
+остаются выключенными независимо от staging-флагов.
+
+| Analysis | Publication | COMPOSE_PROFILES на staging |
+| --- | --- | --- |
+| false | false | пусто |
+| true | false | analysis |
+| false | true | publication |
+| true | true | analysis,publication |
+
+Нужны штатные `STAGING_GITHUB_WRITE_TOKEN` и `STAGING_GITHUB_BOT_USER_ID`, которые
+workflow передаёт как `GITHUB__WRITE_TOKEN` и `GITHUB__BOT_USER_ID`. Read/OAuth/LLM
+credentials и manifest в publisher не передаются. Сам процесс не требует LLM;
+существующая установка и проверка manifest для staging API остаётся отдельным
+обязательным шагом deployment.
+
+После миграций выбранный image выполняет
+`python -m app.publication_worker --check-config` без внешних запросов, БД,
+Redis, leases и Sentry. Проверяются наличие write identity, числовой bot ID и
+безопасный ASCII token. Ошибка не запускает publisher. Это не доказательство
+действительности token, личности bot-user или прав записи в GitHub.
+`--once` выполняет настоящую обработку и может отправить COMMENT; для preflight
+его использовать нельзя.
+
+Перед первым включением оператор должен установить владельца и состояние
+возможного ручного publisher на VPS, проверить предназначенный backlog и
+разрешённые цели публикации. Отсутствие сервиса в старом Compose не доказывало
+отсутствия ручного процесса. Штатный read-only запрос с bot credential должен
+подтвердить ожидаемый числовой ID и доступ к согласованному PR; только отдельная
+разрешённая COMMENT-публикация доказывает write permission этого token/target.
+Значения credentials не копируйте в команды, отчёты и логи.
+
+Workflow останавливает прежний Compose publisher **до миграций**, в том числе
+при переходе `true → false`, затем выполняет offline gate и запускает только
+выбранные сервисы. Проверяются состояние running и совпадение образа publisher
+с `API_IMAGE`. Running не является доказательством доставки review. Чтобы
+отключить publisher, установите флаг `false` и выполните обычный deployment;
+retained результаты, очередь и ledger не удаляются. После явного включения publisher использует `restart: unless-stopped`, чтобы серия временных сбоев не исчерпывала три перезапуска. Ошибочная конфигурация по-прежнему блокируется offline preflight до старта; профиль выключен по умолчанию. Исчезновение контейнера перед проверкой image pin завершает deploy с явным сообщением и диагностикой.
+
+SIGTERM завершает текущий pass и не дренирует весь backlog. Compose даёт 120s
+grace period; это технический параметр, а не гарантия максимальной длительности
+pass. Принудительное завершение может оставить неоднозначную операцию: сохраните
+её состояние и используйте существующий UNKNOWN reconcile. Не сбрасывайте
+очередь/operation и не предоставляйте новый POST ради отката. Для rollback сначала
+выключите producer/publisher, дождитесь текущей операции и сохраните совместимый
+образ/forward schema для retained работ.
+
+Наличие этой конфигурации не доказывает rollout, готовность credentials, live LLM
+или реальную GitHub публикацию. Приёмка отдельно фиксирует точные API/UI heads, PR/base/head,
+bot ID, publication operation/provider IDs, OLD/NEW inline/overview, SSE и
+повторную доставку без второго review. Тесты с HTTP fake доказывают plumbing,
+а не качество модели и внешние permissions.
 
 ### PostgreSQL
 
@@ -349,14 +409,34 @@ POSTGRES__DB=dmc
 | `AUTH__GITHUB_REDIRECT_URI` | `AUTH__GITHUB_REDIRECT_URI` | `https://dmc268-t2.ddns.net/api/v1/auth/github/callback` |
 | `AUTH__FRONTEND_ORIGINS` | `AUTH__FRONTEND_ORIGINS` | JSON-список, `["https://dmc268-t2.ddns.net"]` |
 
-Все шесть имён получает только сервис `api`. Вход остаётся недоступен, пока набор неполный: API проверяет его в момент запроса, не при старте.
+OAuth/browser-поля получает только `api`; единственное исключение —
+`AUTH__CREDENTIAL_KEY` для recovery, описанное ниже. Вход остаётся недоступен,
+пока набор неполный: API проверяет его в момент запроса, не при старте.
 
 `webhook-worker` запускает recovery GitHub intake отдельно от ReviewJob worker.
-Нужны PostgreSQL и доступ к GitHub API; подробности: [GitHub intake](github-webhook-intake.md).
+Для capture Level1 нужны PostgreSQL и доступ к GitHub API. Автоматический запуск
+дополнительно требует включённого analysis runtime (`ANALYSIS__CONFIG_PATH`),
+того же доверенного manifest в `/app/runtime:ro` и `AUTH__CREDENTIAL_KEY` для
+перепроверки сохранённого личного OAuth-доступа администратора. Recovery не
+получает LLM API keys, OAuth client secret, JWT secret или write-токен.
+Без runtime/key Level1-only/default-off работает как раньше; выбранные новые
+опт-ин события остаются в существующем ограниченном retry (до трёх попыток),
+затем завершаются FAILED без создания ReviewJob. Включение настройки репозитория
+не включает глобальные analysis-сервисы. При выключении analysis не удаляйте
+receipt/job/outbox: уже привязанный receipt возвращает тот же run, даже после
+истечения обычного idempotency key. Подробности: [GitHub intake](github-webhook-intake.md).
 
-Write-токен не передаётся `webhook-worker`. Publisher подключается явно через
-runtime factory; его очередь, session auth и production composition root
-интегрируются с PR #29. Контракт и ограничения:
+При rollout workflow останавливает прежний `webhook-worker` до migrations и
+старта нового API, затем запускает совместимый consumer из выбранного image.
+Пока есть выбранные automatic receipts, rollback к L1-only consumer запрещён:
+он не знает durable job binding и может завершить такой receipt без запуска.
+Сохраните forward-compatible recovery/publisher до обработки или явного
+отключения новых producer-процессов; не удаляйте ledger и не публикуйте повторно
+с более широким порогом серьёзности.
+
+Write-токен не передаётся `webhook-worker`. Publisher использует существующие
+runtime factory, PostgreSQL outbox, Redis publish stream и lease/fencing;
+его отдельный opt-in процесс описан выше. Контракт и ограничения:
 [GitHub review publication](github-review-publication.md).
 
 Настройки LLM gateway (ключ и параметры Eurorouter/Ollama) описаны отдельно — см. раздел «LLM gateway: ключ Eurorouter» ниже.
@@ -525,7 +605,7 @@ gh workflow run deploy-staging.yml \
 7. создаёт env-файл окружения (включая passthrough секретов);
 8. временно авторизуется в GHCR;
 9. выполняет `docker compose pull`;
-10. останавливает прежние analysis-процессы; только для staging проверяет SHA-256 кода installer и атомарно устанавливает manifest в отдельный root-owned runtime directory с проверкой SHA-256, root:root 0644 и runtime schema выбранного image; запускает PostgreSQL и Redis;
+10. останавливает прежние analysis-процессы и publisher; только для staging проверяет SHA-256 кода installer и атомарно устанавливает manifest в отдельный root-owned runtime directory с проверкой SHA-256, root:root 0644 и runtime schema выбранного image; запускает PostgreSQL и Redis;
 11. ждёт их healthchecks;
 12. выполняет:
 
@@ -533,9 +613,9 @@ gh workflow run deploy-staging.yml \
 alembic upgrade head
 ```
 
-13. при включённом staging analysis выполняет restricted preflight; запускает API;
+13. для выбранных staging профилей выполняет analysis restricted preflight и/или offline publication check; запускает API;
 14. ждёт Docker healthcheck API;
-15. запускает `webhook-worker` и, при включённом analysis после успешного preflight, `worker` и `outbox-dispatcher`; проверяет состояние running;
+15. запускает `webhook-worker` и выбранные `worker`/`outbox-dispatcher`/`publication-worker` после их preflight; проверяет состояние running;
 16. запускает web/Nginx;
 17. проверяет web endpoint окружения (`http://127.0.0.1/` для staging, `http://127.0.0.1:8080/` для develop);
 18. выполняет logout из GHCR.

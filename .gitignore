@@ -11,6 +11,7 @@ venv/
 dist/
 logs/
 .scratch/
+eval_report.json
 
 # Terraform
 **/.terraform/*

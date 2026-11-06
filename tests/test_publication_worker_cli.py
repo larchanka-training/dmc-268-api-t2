@@ -10,13 +10,17 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import asyncpg  # type: ignore[import-untyped]
+import httpx
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 from redis.asyncio import Redis
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app import publication_worker
+from app.core.config import Github, Settings
 from app.db import models, publication_models  # noqa: F401 -- register ORM metadata
 from app.db.base import Base
 
@@ -46,6 +50,81 @@ def test_help_needs_no_database_credentials_or_analysis_manifest() -> None:
     assert result.returncode == 0, result.stderr
     assert "--once" in result.stdout and "--poll-interval" in result.stdout
     assert "private-" not in result.stdout + result.stderr
+
+
+def test_check_config_validates_offline_without_worker_or_sentry_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("Offline configuration check attempted an external side effect")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ANALYSIS__CONFIG_PATH", "/private-missing-analysis-manifest")
+    settings = Settings(
+        github=Github(
+            write_token=SecretStr("private-synthetic-write"), bot_user_id="9002"
+        ),
+    )
+    monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["publication-worker", "--check-config"])
+    monkeypatch.setattr(publication_worker, "run", forbidden)
+    monkeypatch.setattr("app.core.sentry.configure_sentry", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "send", forbidden)
+    monkeypatch.setattr(AsyncEngine, "connect", forbidden)
+    monkeypatch.setattr(Redis, "execute_command", forbidden)
+    publication_worker.main()
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "Publication configuration is valid."
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("private-synthetic-write\r\n", id="control"),
+        pytest.param("private-synthetic-é", id="unicode"),
+    ],
+)
+def test_check_config_rejects_invalid_token_without_leaking_it(token: str) -> None:
+    result = invoke(
+        "--check-config",
+        overrides={
+            "POSTGRES__PORT": "5432",
+            "GITHUB__WRITE_TOKEN": token,
+            "GITHUB__BOT_USER_ID": "9002",
+        },
+    )
+    assert result.returncode == 1
+    assert '"error_type": "PublicationConfigError"' in result.stdout
+    assert result.stderr == ""
+    assert "private-" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", ["GITHUB__WRITE_TOKEN", "GITHUB__BOT_USER_ID"])
+def test_check_config_requires_write_identity_and_never_falls_back_to_read_token(
+    missing: str,
+) -> None:
+    overrides = {
+        "POSTGRES__PORT": "5432",
+        "GITHUB__TOKEN": "private-synthetic-read",
+        "GITHUB__WRITE_TOKEN": "private-synthetic-write",
+        "GITHUB__BOT_USER_ID": "9002",
+    }
+    overrides[missing] = ""
+    result = invoke("--check-config", overrides=overrides)
+    assert result.returncode == 1
+    assert '"error_type": "PublicationConfigError"' in result.stdout
+    assert result.stderr == ""
+    assert "private-" not in result.stdout
+
+
+def test_check_config_cannot_be_combined_with_a_publication_pass() -> None:
+    result = invoke("--check-config", "--once")
+    assert result.returncode == 2  # noqa: PLR2004 -- argparse usage error
+    assert "not allowed with argument" in result.stderr
+    assert result.stdout == ""
 
 
 def test_invalid_poll_interval_is_rejected_before_startup() -> None:

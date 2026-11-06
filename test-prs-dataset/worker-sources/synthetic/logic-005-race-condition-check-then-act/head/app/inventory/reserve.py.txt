@@ -1,0 +1,5 @@
+def reserve_item(inventory, sku, quantity):
+    available = inventory.get_quantity(sku)
+    if available < quantity:
+        raise ValueError("not enough stock")
+    inventory.set_quantity(sku, available - quantity)

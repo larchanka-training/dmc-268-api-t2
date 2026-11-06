@@ -1,0 +1,7 @@
+{
+  "title": "Избыточно вложенные условия вместо единого выражения",
+  "description": "Проверка, что значение входит в допустимый диапазон.",
+  "language": "python",
+  "category": "clean",
+  "label_rationale": "Nested conditions preserve the stated inclusive range semantics; simplification is a refactoring preference, not a demonstrated bug. Verified .agents/reviewer/v3/system.md forbids style/formatter/linter findings and requires likely bugs for maintainability."
+}

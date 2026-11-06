@@ -5,21 +5,27 @@ import asyncio
 
 import structlog
 
+from app.adapters.automatic_review_admission import AutomaticReviewAdmission
 from app.application.github_ports import GithubPort
 from app.application.use_cases.process_webhook import process_webhook
-from app.application.webhook_ports import WebhookInbox
+from app.application.webhook_ports import AutomaticWebhookAdmission, WebhookInbox
 from app.core.config import get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
+from app.core.metrics import metrics_server
 from app.core.sentry import configure_sentry
 from app.db.session import async_session_factory, engine
 from app.db.webhook_inbox import SqlAlchemyWebhookInbox
 
 
-async def run_once(inbox: WebhookInbox, github: GithubPort) -> int:
+async def run_once(
+    inbox: WebhookInbox,
+    github: GithubPort,
+    automatic: AutomaticWebhookAdmission | None = None,
+) -> int:
     pending = await inbox.pending()
     for receipt_id in pending:
-        await process_webhook(receipt_id, inbox, github)
+        await process_webhook(receipt_id, inbox, github, automatic)
     return len(pending)
 
 
@@ -31,7 +37,9 @@ async def _run(*, once: bool) -> None:
         async with github_connection(settings) as github:
             while True:
                 count = await run_once(
-                    SqlAlchemyWebhookInbox(async_session_factory), github
+                    SqlAlchemyWebhookInbox(async_session_factory),
+                    github,
+                    AutomaticReviewAdmission(async_session_factory),
                 )
                 structlog.get_logger().info("webhook_batch", selected=count)
                 if once:
@@ -47,7 +55,8 @@ def main() -> None:
         "--once", action="store_true", help="Process one due batch and exit."
     )
     args = parser.parse_args()
-    asyncio.run(_run(once=args.once))
+    with metrics_server(get_settings().metrics):
+        asyncio.run(_run(once=args.once))
 
 
 if __name__ == "__main__":

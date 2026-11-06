@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from starlette.responses import JSONResponse
 from structlog.contextvars import get_contextvars
 
+from app.adapters.automatic_review_admission import AutomaticReviewAdmission
 from app.application.github_ports import GithubPort, GithubRequest
 from app.application.use_cases.process_webhook import process_webhook
 from app.application.webhook_ports import InboxUnavailable, WebhookInbox
@@ -174,7 +175,13 @@ async def github_webhook(  # noqa: PLR0911 - explicit guarded HTTP exits
                         },
                     )
                 if receipt_id is not None:
-                    background.add_task(process_webhook, receipt_id, inbox, github)
+                    background.add_task(
+                        process_webhook,
+                        receipt_id,
+                        inbox,
+                        github,
+                        AutomaticReviewAdmission(async_session_factory),
+                    )
         return JSONResponse(status_code=202, content=None)
     return JSONResponse(
         status_code=401,

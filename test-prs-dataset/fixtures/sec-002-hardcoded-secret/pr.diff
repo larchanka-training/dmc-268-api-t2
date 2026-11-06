@@ -1,0 +1,18 @@
+diff --git a/app/payments/client.py b/app/payments/client.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/payments/client.py
+@@ -0,0 +1,12 @@
++import httpx
++
++PAYMENT_API_KEY = "sk_live_51Hc8x2F9sA0bQnR7pLmZq"
++
++def charge(amount_cents, customer_id):
++    response = httpx.post(
++        "https://payments.example.com/v1/charges",
++        json={"amount": amount_cents, "customer": customer_id},
++        headers={"Authorization": f"Bearer {PAYMENT_API_KEY}"},
++    )
++    response.raise_for_status()
++    return response.json()

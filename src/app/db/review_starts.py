@@ -2,11 +2,11 @@
 
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -14,6 +14,7 @@ from app.application.github_ports import GithubPullRequest
 from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
+    AutomaticReceiptClaimLostError,
     ChangeRequestIdentity,
     IdempotencyConflictError,
     RepositoryIdentity,
@@ -23,6 +24,8 @@ from app.application.review_start_ports import (
     SettingsVersionChangedError,
 )
 from app.application.use_cases.start_review import compute_config_digest
+from app.application.webhook_ports import AutomaticReceiptContext
+from app.context.snapshot import valid_snapshot
 from app.db.models import (
     ChangeRequest,
     IdempotencyRecord,
@@ -31,6 +34,7 @@ from app.db.models import (
     RepositoryAccess,
     RepositorySettings,
     ReviewJob,
+    WebhookReceipt,
 )
 from app.db.uow import SqlAlchemyUnitOfWork
 
@@ -60,6 +64,8 @@ def settings_identity(settings: RepositorySettings) -> str:
             "surrounding_lines",
         )
     }
+    if settings.review_policy is not None:
+        values["review_policy"] = settings.review_policy
     return hashlib.sha256(
         json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -154,7 +160,30 @@ async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimisti
     saved.description = live.description
 
 
-async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with optional materialization
+async def _verify_effective_settings(
+    session: AsyncSession,
+    command: StartReviewCommand,
+    source_id: UUID,
+    expected_settings: str,
+    repository_id: UUID,
+) -> None:
+    if source_id != command.repository_settings_id:
+        effective = await session.get(
+            RepositorySettings, command.repository_settings_id
+        )
+        if (
+            effective is None
+            or effective.repository_id != repository_id
+            or not valid_snapshot(effective)
+            or effective.rules_source is None
+            or effective.rules_source.get("source_settings_id") != str(source_id)
+            or effective.rules_source.get("source_settings_identity")
+            != expected_settings
+        ):
+            raise SettingsVersionChangedError
+
+
+async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- one fenced aggregate transaction
     command: StartReviewCommand,
     *,
     factory: async_sessionmaker[AsyncSession],
@@ -166,12 +195,25 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
     expected_settings: str,
     new_change: GithubPullRequest | None = None,
     saved_change: ChangeRequestIdentity | None = None,
+    source_settings_id: UUID | None = None,
+    automatic: AutomaticReceiptContext | None = None,
 ) -> tuple[UUID, str, bool]:
     repository_id = expected_repository.id
     async with SqlAlchemyUnitOfWork(factory) as uow:
         repository = await uow.session.scalar(
             select(Repository).where(Repository.id == repository_id).with_for_update()
         )
+        if automatic is not None:
+            bound = await _lock_automatic_receipt(
+                uow.session,
+                automatic,
+                command,
+                repository=expected_repository,
+                source_id=source_settings_id or command.repository_settings_id,
+                source_identity=expected_settings,
+            )
+            if bound is not None:
+                return (*bound, False)
         access = await uow.session.scalar(
             select(RepositoryAccess.id)
             .where(
@@ -198,7 +240,9 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
             != expected_repository
         ):
             raise AdmissionResourceNotFoundError
-        if repository.current_settings_id != command.repository_settings_id:
+        if repository.current_settings_id != (
+            source_id := source_settings_id or command.repository_settings_id
+        ):
             raise SettingsVersionChangedError
         if new_change is not None and saved_change is not None:
             await _refresh_saved_change(
@@ -276,13 +320,16 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
         settings = await uow.session.scalar(
             select(RepositorySettings)
             .where(
-                RepositorySettings.id == command.repository_settings_id,
+                RepositorySettings.id == source_id,
                 RepositorySettings.repository_id == repository_id,
             )
             .with_for_update(read=True)
         )
         if settings is None or settings_identity(settings) != expected_settings:
             raise SettingsVersionChangedError
+        await _verify_effective_settings(
+            uow.session, command, source_id, expected_settings, repository_id
+        )
         config_digest = compute_config_digest(command)
         equivalent = await uow.session.scalar(
             select(ReviewJob.id).where(
@@ -293,6 +340,14 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
             )
         )
         if equivalent is not None:
+            if automatic is not None:
+                status = await uow.session.scalar(
+                    select(ReviewJob.status).where(ReviewJob.id == equivalent)
+                )
+                assert status is not None
+                await _bind_automatic_review(uow.session, automatic, equivalent)
+                await uow.commit()
+                return equivalent, status, False
             raise ReviewAlreadyActiveError
         await _check_quotas(
             uow.session, repository_id, command.initiator_user_id, settings, window
@@ -315,7 +370,8 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
                     QuotaUsage.type,
                     QuotaUsage.window_start,
                 ],
-                index_where=QuotaUsage.type == "starts",
+                # Match the partial index even when PostgreSQL uses a generic plan.
+                index_where=QuotaUsage.type == literal_column("'starts'"),
                 set_={"value": QuotaUsage.value + 1},
                 where=QuotaUsage.value < settings.max_starts_per_hour,
             ).returning(QuotaUsage.id)
@@ -332,5 +388,116 @@ async def persist_start(  # noqa: PLR0912, PLR0913 -- atomic admission with opti
                 expires_at=now + timedelta(hours=24),
             )
         )
+        if automatic is not None:
+            await _bind_automatic_review(uow.session, automatic, review_id)
         await uow.commit()
         return review_id, "QUEUED", True
+
+
+def _same_automatic_receipt(
+    receipt: WebhookReceipt, context: AutomaticReceiptContext
+) -> bool:
+    intent = context.claim.automatic
+    data = receipt.request_data
+    return (
+        intent is not None
+        and data is not None
+        and data.get("request") == asdict(context.claim.request)
+        and data.get("automatic") == intent.model_dump(mode="json")
+    )
+
+
+async def find_automatic_replay(
+    session: AsyncSession,
+    context: AutomaticReceiptContext,
+) -> tuple[UUID, str] | None:
+    """A durable receipt link precedes expiring keys or current-user settings."""
+    receipt = await session.get(
+        WebhookReceipt, context.claim.id, populate_existing=True
+    )
+    if receipt is None or not _same_automatic_receipt(receipt, context):
+        raise AutomaticReceiptClaimLostError
+    if receipt.review_job_id is None:
+        return None
+    job = await session.get(ReviewJob, receipt.review_job_id)
+    intent = context.claim.automatic
+    assert intent is not None
+    if (
+        job is None
+        or job.repository_id != intent.repository_id
+        or job.requested_head_sha != context.claim.request.head_sha
+    ):
+        raise AutomaticReceiptClaimLostError
+    return job.id, job.status
+
+
+async def _lock_automatic_receipt(  # noqa: PLR0913 -- bound delivery and frozen source authority
+    session: AsyncSession,
+    context: AutomaticReceiptContext,
+    command: StartReviewCommand,
+    *,
+    repository: RepositoryIdentity,
+    source_id: UUID,
+    source_identity: str,
+) -> tuple[UUID, str] | None:
+    receipt = await session.scalar(
+        select(WebhookReceipt)
+        .where(WebhookReceipt.id == context.claim.id)
+        .with_for_update()
+    )
+    if receipt is None or not _same_automatic_receipt(receipt, context):
+        raise AutomaticReceiptClaimLostError
+    bound = await find_automatic_replay(session, context)
+    if bound is not None:
+        return bound
+    now = await session.scalar(select(func.clock_timestamp()))
+    intent = context.claim.automatic
+    assert intent is not None
+    if (
+        now is None
+        or receipt.processing_status != "PROCESSING"
+        or receipt.attempts != context.claim.attempts
+        or receipt.lease_until is None
+        or receipt.lease_until <= now
+        or intent.repository_id != repository.id
+        or context.claim.request.repository_external_id != repository.external_id
+        or context.claim.request.head_sha != command.requested_head_sha
+        or intent.source_settings_id != source_id
+        or intent.source_settings_identity != source_identity
+        or not intent.policy.auto_review_enabled
+        or intent.actor_user_id != command.initiator_user_id
+        or intent.policy.authorized_by != command.initiator_user_id
+    ):
+        raise AutomaticReceiptClaimLostError
+    return None
+
+
+async def _bind_automatic_review(
+    session: AsyncSession,
+    context: AutomaticReceiptContext,
+    review_id: UUID,
+) -> None:
+    # Flush every aggregate write before the final lease check/one commit.
+    await session.flush()
+    bound = await session.scalar(
+        update(WebhookReceipt)
+        .where(
+            WebhookReceipt.id == context.claim.id,
+            WebhookReceipt.processing_status == "PROCESSING",
+            WebhookReceipt.attempts == context.claim.attempts,
+            WebhookReceipt.lease_until > func.clock_timestamp(),
+            WebhookReceipt.review_job_id.is_(None),
+        )
+        .values(
+            review_job_id=review_id,
+            processing_status="READY",
+            snapshot_data=context.snapshot,
+            raw_diff=context.raw_diff,
+            reason_code=None,
+            lease_until=None,
+            retry_at=None,
+        )
+        .returning(WebhookReceipt.id)
+    )
+    if bound is None:
+        raise AutomaticReceiptClaimLostError

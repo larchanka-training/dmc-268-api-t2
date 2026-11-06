@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/attachments/download.py",
+    "side": "NEW",
+    "start_line": 6,
+    "end_line": 6,
+    "category": "security",
+    "severity": "high"
+  }
+]

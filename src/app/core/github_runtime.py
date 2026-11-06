@@ -5,7 +5,11 @@ from contextlib import asynccontextmanager
 
 import httpx
 
-from app.application.github_ports import GithubPort, GithubPullRequestReader
+from app.application.github_ports import (
+    GithubPort,
+    GithubPullRequestReader,
+    RepositoryFileReader,
+)
 from app.core.config import Settings
 from app.vcs.github import GithubClient
 
@@ -20,6 +24,14 @@ async def github_connection(settings: Settings) -> AsyncIterator[GithubPort]:
 async def github_pull_request_connection(
     settings: Settings,
 ) -> AsyncIterator[GithubPullRequestReader]:
+    async with _github_client(settings) as client:
+        yield client
+
+
+@asynccontextmanager
+async def github_file_connection(
+    settings: Settings,
+) -> AsyncIterator[RepositoryFileReader]:
     async with _github_client(settings) as client:
         yield client
 

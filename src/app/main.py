@@ -10,6 +10,7 @@ from app.api import api_router
 from app.api.errors import ApiError, api_error_response
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
+from app.core.metrics import MetricsMiddleware, metrics_server, queue_metrics
 from app.core.middleware import RequestIdMiddleware
 from app.core.sentry import configure_sentry
 from app.db.session import engine
@@ -21,7 +22,9 @@ logger = structlog.get_logger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown."""
 
-    yield
+    with metrics_server(get_settings().metrics):
+        async with queue_metrics(get_settings()):
+            yield
 
     await engine.dispose()
 
@@ -39,6 +42,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.add_middleware(RequestIdMiddleware)
+    if settings.metrics.enabled:
+        app.add_middleware(MetricsMiddleware)
     app.include_router(api_router)
     app.add_exception_handler(ApiError, api_error_response)
 

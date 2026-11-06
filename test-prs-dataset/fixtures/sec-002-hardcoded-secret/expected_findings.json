@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/payments/client.py",
+    "side": "NEW",
+    "start_line": 3,
+    "end_line": 3,
+    "category": "security",
+    "severity": "critical"
+  }
+]

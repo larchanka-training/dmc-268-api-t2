@@ -15,7 +15,7 @@ import pytest_asyncio
 from fastapi import Depends, FastAPI
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_postgres_integration import (
     PostgresHarness,
     ReviewScope,
@@ -734,6 +734,45 @@ def configured(
         )
     )
     return providers
+
+
+async def test_start_admission_supports_postgres_generic_query_plans(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    # PostgreSQL can select this plan after repeated prepared admissions.
+    engine = create_async_engine(
+        postgres.engine.url,
+        connect_args={"server_settings": {"plan_cache_mode": "force_generic_plan"}},
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def session() -> AsyncIterator[AsyncSession]:
+        async with factory() as value:
+            yield value
+
+    previous = app.dependency_overrides[get_session]
+    app.dependency_overrides[get_session] = session
+    try:
+        response = await client.post(
+            scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+        )
+        assert response.status_code == HTTPStatus.ACCEPTED
+        async with factory() as value:
+            quota = (
+                await value.scalars(
+                    select(models.QuotaUsage).where(
+                        models.QuotaUsage.repository_id == scope.repository
+                    )
+                )
+            ).one()
+            assert quota.type == "starts" and quota.value == 1
+    finally:
+        app.dependency_overrides[get_session] = previous
+        await engine.dispose()
 
 
 async def test_new_start_is_durable_and_atomic(

@@ -11,13 +11,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import sentry_sdk
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from referencing import Registry, Resource
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_authority import current_analysis_authority
-from app.application.github_ports import GithubFailure, GithubPort, GithubRequest
+from app.application.github_ports import (
+    GithubFailure,
+    GithubPort,
+    GithubRequest,
+    SourceFileReader,
+)
 from app.application.ports import (
     BuiltContextPayload,
     DurableTaskOutcome,
@@ -29,6 +35,7 @@ from app.application.ports import (
     TaskLeaseSnapshot,
     TokenUsage,
 )
+from app.context.enrichment import enrich_context
 from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
     ChangeRequest,
@@ -398,6 +405,7 @@ class PostgresAnalysisHandler:
                 review.base_sha or change.base_sha,
             )
             settings_id = settings.id
+            context_enabled = review.prompt_version == "v4"
             language = settings.output_language
             ignores = list(
                 project_historical_empty_settings(settings.ignores, "globs")["globs"]
@@ -416,20 +424,27 @@ class PostgresAnalysisHandler:
         if await self._already_finished(lease.review_job_id):
             return DurableTaskOutcome.COMPLETED
         await self._ensure_call_authority(task, lease)
-        try:
-            captured = await self._github.fetch(request)
-        except GithubFailure as failure:
-            if failure.retryable:
-                raise
-            raise _AnalysisFailureError(ReviewReasonCode(failure.reason_code)) from None
-        # Fetch is not aborted. A cancel that committed during it inserts nothing.
-        if await self._already_finished(lease.review_job_id):
-            return DurableTaskOutcome.COMPLETED
-        self._check_snapshot(captured.metadata["snapshot"], request, expected_source)
-        try:
-            parsed = parse_diff(captured.raw_diff, ignore_globs=ignores)
-        except InvalidDiff:
-            raise _AnalysisFailureError(ReviewReasonCode.DIFF_UNTRUSTWORTHY) from None
+        with sentry_sdk.start_span(op="review.diff", name="Diff"):
+            try:
+                captured = await self._github.fetch(request)
+            except GithubFailure as failure:
+                if failure.retryable:
+                    raise
+                raise _AnalysisFailureError(
+                    ReviewReasonCode(failure.reason_code)
+                ) from None
+            # Fetch is not aborted. A cancel that committed during it inserts nothing.
+            if await self._already_finished(lease.review_job_id):
+                return DurableTaskOutcome.COMPLETED
+            self._check_snapshot(
+                captured.metadata["snapshot"], request, expected_source
+            )
+            try:
+                parsed = parse_diff(captured.raw_diff, ignore_globs=ignores)
+            except InvalidDiff:
+                raise _AnalysisFailureError(
+                    ReviewReasonCode.DIFF_UNTRUSTWORTHY
+                ) from None
         if not parsed.files:
             async with self._factory.begin() as session:
                 if await self._locked_finished(session, lease.review_job_id):
@@ -442,80 +457,100 @@ class PostgresAnalysisHandler:
                     parsed.coverage,
                 )
             return DurableTaskOutcome.COMPLETED
-        body: dict[str, Any] = {
-            **captured.metadata,
-            "metadata": {
-                **captured.metadata["metadata"],
-                "rules_version": str(settings_id),
-                "output_language": language,
-            },
-            "files": parsed.files,
-            "related_symbols": [],
-            "coverage": parsed.coverage,
-            "budget": {
-                "estimated_input_tokens": 0,
-                "reserved_output_tokens": reserved,
-                "limit_input_tokens": limit,
-            },
-        }
-        context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
-        contexts, coverage = [context], parsed.coverage
-        # The real gateway also knows the rendered prompt: system prompt and
-        # few-shots come on top of the diff, so the wire estimate alone is not enough.
-        prompt_fits = llm.prompt_fits if isinstance(llm, LlmGatewayAdapter) else None
-        if _estimate(context) > limit or (
-            prompt_fits is not None and not prompt_fits(context)
-        ):
-            contexts, coverage = _chunk_contexts(
-                lease.review_job_id,
-                body,
-                parsed,
-                limit=limit,
-                max_chunks=max_chunks,
-                prompt_fits=prompt_fits,
-            )
-            if not contexts and _estimate(context) <= limit:
-                # The diff fits; only the fixed prompt does not. That is a
-                # configuration failure for the gateway (prompt_too_large).
-                contexts, coverage = [context], parsed.coverage
-        if not contexts:
-            coverage = {
-                "included": [],
-                "skipped": [
-                    *parsed.skipped,
-                    *[
-                        {**entry, "reason": "token_budget"}
-                        for entry in parsed.coverage["included"]
-                    ],
-                ],
-                "context_quality": "diff_only",
+        with sentry_sdk.start_span(op="review.context", name="Context"):
+            body: dict[str, Any] = {
+                **captured.metadata,
+                "metadata": {
+                    **captured.metadata["metadata"],
+                    "rules_version": str(settings_id),
+                    "output_language": language,
+                },
+                "files": parsed.files,
+                "related_symbols": [],
+                "coverage": parsed.coverage,
+                "budget": {
+                    "estimated_input_tokens": 0,
+                    "reserved_output_tokens": reserved,
+                    "limit_input_tokens": limit,
+                },
             }
+            context = BuiltContextPayload(1, lease.review_job_id, uuid.uuid4(), body)
+            if context_enabled:
+                await enrich_context(body, cast(SourceFileReader, self._github))
+            if _estimate(context) > limit and context_enabled:
+                # Optional source context has the same bounded fallback as before.
+                for file in body["files"]:
+                    file["source_windows"] = []
+                    file["whole_file"] = None
+                body["related_symbols"] = []
+                body["coverage"]["context_quality"] = "degraded"
+                body["budget"]["estimated_input_tokens"] = 0
+            contexts, coverage = [context], body["coverage"]
+            # The real gateway also knows the rendered prompt: system prompt and
+            # few-shots add to the diff, so the wire estimate alone is not enough.
+            prompt_fits = (
+                llm.prompt_fits if isinstance(llm, LlmGatewayAdapter) else None
+            )
+            if _estimate(context) > limit or (
+                prompt_fits is not None and not prompt_fits(context)
+            ):
+                contexts, coverage = _chunk_contexts(
+                    lease.review_job_id,
+                    body,
+                    parsed,
+                    limit=limit,
+                    max_chunks=max_chunks,
+                    prompt_fits=prompt_fits,
+                )
+                if not contexts and _estimate(context) <= limit:
+                    # The diff fits; only the fixed prompt does not. That is a
+                    # configuration failure for the gateway (prompt_too_large).
+                    contexts, coverage = [context], body["coverage"]
+            if not contexts:
+                coverage = {
+                    "included": [],
+                    "skipped": [
+                        *parsed.skipped,
+                        *[
+                            {**entry, "reason": "token_budget"}
+                            for entry in parsed.coverage["included"]
+                        ],
+                    ],
+                    "context_quality": "diff_only",
+                }
+                async with self._factory.begin() as session:
+                    if await self._locked_finished(session, lease.review_job_id):
+                        return DurableTaskOutcome.COMPLETED
+                    await self._transition(session, task, lease, ReviewStatus.SKIPPED)
+                    await self._save_snapshot(
+                        session, lease, body["snapshot"], coverage
+                    )
+                return DurableTaskOutcome.COMPLETED
+            for context in contexts:
+                self._validate_context(context)
+        created_at = utcnow()
+        with sentry_sdk.start_span(op="review.db", name="Context commit"):
             async with self._factory.begin() as session:
                 if await self._locked_finished(session, lease.review_job_id):
                     return DurableTaskOutcome.COMPLETED
-                await self._transition(session, task, lease, ReviewStatus.SKIPPED)
-                await self._save_snapshot(session, lease, body["snapshot"], coverage)
-            return DurableTaskOutcome.COMPLETED
-        for context in contexts:
-            self._validate_context(context)
-        created_at = utcnow()
-        async with self._factory.begin() as session:
-            if await self._locked_finished(session, lease.review_job_id):
-                return DurableTaskOutcome.COMPLETED
-            await self._transition(session, task, lease, ReviewStatus.PARSING_CONTEXT)
-            await self._save_snapshot(session, lease, body["snapshot"], coverage)
-            for index, context in enumerate(contexts):
-                session.add(
-                    ContextPayload(
-                        id=context.chunk_id,
-                        review_job_id=context.review_id,
-                        schema_version=context.schema_version,
-                        payload_body=context.payload_body,
-                        # Chunk order is the plan order; /diff reads (created_at, id).
-                        created_at=created_at + timedelta(microseconds=index),
-                    )
+                await self._transition(
+                    session, task, lease, ReviewStatus.PARSING_CONTEXT
                 )
-            await self._transition(session, task, lease, ReviewStatus.LLM_PROCESSING)
+                await self._save_snapshot(session, lease, body["snapshot"], coverage)
+                for index, context in enumerate(contexts):
+                    session.add(
+                        ContextPayload(
+                            id=context.chunk_id,
+                            review_job_id=context.review_id,
+                            schema_version=context.schema_version,
+                            payload_body=context.payload_body,
+                            # /diff reads plan order through (created_at, id).
+                            created_at=created_at + timedelta(microseconds=index),
+                        )
+                    )
+                await self._transition(
+                    session, task, lease, ReviewStatus.LLM_PROCESSING
+                )
 
         return await self._infer(task, lease, contexts, llm)
 
@@ -574,8 +609,9 @@ class PostgresAnalysisHandler:
             if await self._already_finished(lease.review_job_id):
                 return DurableTaskOutcome.COMPLETED
             await self._ensure_call_authority(task, lease)
-            # Do not close the provider call. Stop only skips the insert after it.
-            result = await llm.review(context)
+            with sentry_sdk.start_span(op="review.llm", name="LLM"):
+                # Do not close the provider call. Stop only skips the insert after it.
+                result = await llm.review(context)
             if await self._already_finished(lease.review_job_id):
                 return DurableTaskOutcome.COMPLETED
             authority = current_analysis_authority.get()
@@ -596,23 +632,24 @@ class PostgresAnalysisHandler:
                         error_code="backend_result_invalid",
                     )
                 return DurableTaskOutcome.COMPLETED
-            async with self._factory.begin() as session:
-                if await self._locked_finished(session, lease.review_job_id):
-                    return DurableTaskOutcome.COMPLETED
-                locked = await lock_owned_lease(session, lease)
-                if locked is None:
-                    raise LeaseLostError("Analysis lease is no longer current")
-                if authority is not None:
-                    authority.check()
-                await self._save_chunk_result(session, context, result)
-                if index == len(contexts) - 1:
-                    deadline = locked[0].analysis_deadline_at
-                    await self._finish(
-                        session,
-                        task,
-                        lease,
-                        late=deadline is not None and deadline <= locked[2],
-                    )
+            with sentry_sdk.start_span(op="review.db", name="Result commit"):
+                async with self._factory.begin() as session:
+                    if await self._locked_finished(session, lease.review_job_id):
+                        return DurableTaskOutcome.COMPLETED
+                    locked = await lock_owned_lease(session, lease)
+                    if locked is None:
+                        raise LeaseLostError("Analysis lease is no longer current")
+                    if authority is not None:
+                        authority.check()
+                    await self._save_chunk_result(session, context, result)
+                    if index == len(contexts) - 1:
+                        deadline = locked[0].analysis_deadline_at
+                        await self._finish(
+                            session,
+                            task,
+                            lease,
+                            late=deadline is not None and deadline <= locked[2],
+                        )
         return DurableTaskOutcome.COMPLETED
 
     async def _save_chunk_result(
@@ -889,10 +926,14 @@ def _wire_file(diff: FileDiff) -> dict[str, Any]:
 def _chunk_body(
     body: dict[str, Any], files: list[dict[str, Any]], skipped: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    coverage = ParsedDiff(files, skipped, 0).coverage
+    if body["coverage"]["context_quality"] != "diff_only":
+        coverage["context_quality"] = "degraded"
     return {
         **body,
         "files": files,
-        "coverage": ParsedDiff(files, skipped, 0).coverage,
+        "related_symbols": [],
+        "coverage": coverage,
         "budget": {**body["budget"], "estimated_input_tokens": 0},
     }
 
@@ -973,6 +1014,8 @@ def _chunk_contexts(  # noqa: PLR0913 -- explicit plan inputs and limits
                 for entry in ParsedDiff(overflow, [], 0).coverage["included"]
             ],
         ],
-        "context_quality": "diff_only",
+        "context_quality": cast(dict[str, Any], shell.payload_body["coverage"])[
+            "context_quality"
+        ],
     }
     return contexts, coverage

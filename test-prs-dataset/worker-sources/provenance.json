@@ -1,0 +1,103 @@
+{
+  "repository": "psf/requests",
+  "fixture_id": "public-001-requests-proxy-auth-fix",
+  "benchmark_head": "996cbd33d1feba71341ade92d5b9cf9c34ee6299",
+  "corpus_sha256": "b7c2ad5a5ff606d4985af74191143fbf106e5aeabcd9b96f209397b1075f5396",
+  "head": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+  "parent": "302225334678490ec66b3614a9dddb8a02c5f4fe",
+  "head_tree": "ab6e18cda9d2c7bb7479e6f17f323aa379821ada",
+  "commit_url": "https://github.com/psf/requests/commit/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+  "commit_api_url": "https://api.github.com/repos/psf/requests/commits/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+  "commit_date": "2023-05-22T15:08:57Z",
+  "changed_files": [
+    {
+      "path": "requests/sessions.py",
+      "blob_sha": "dbcf2a7b0ee2898b72714b756e4b27fbbad4beab",
+      "patch": "@@ -324,7 +324,9 @@ def rebuild_proxies(self, prepared_request, proxies):\n         except KeyError:\n             username, password = None, None\n \n-        if username and password:\n+        # urllib3 handles proxy authorization for us in the standard adapter.\n+        # Avoid appending this to TLS tunneled requests where it may be leaked.\n+        if not scheme.startswith('https') and username and password:\n             headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)\n \n         return new_proxies"
+    }
+  ],
+  "downloads": [
+    {
+      "side": "parent",
+      "ref": "302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "path": "requests/sessions.py",
+      "blob_sha": "6cb3b4dae397930fba60e4c08b25b9444783b6f7",
+      "html_url": "https://github.com/psf/requests/blob/302225334678490ec66b3614a9dddb8a02c5f4fe/requests/sessions.py",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/requests/sessions.py?ref=302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/requests/sessions.py",
+      "saved_path": "upstream/parent/requests/sessions.py",
+      "byte_count": 30180,
+      "sha256": "294a8971144ba2f35e7d4b3b49c39749454271f49ac93156b5b889ee03929532",
+      "git_blob_verified": true
+    },
+    {
+      "side": "parent",
+      "ref": "302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "path": "LICENSE",
+      "blob_sha": "67db8588217f266eb561f75fae738656325deac9",
+      "html_url": "https://github.com/psf/requests/blob/302225334678490ec66b3614a9dddb8a02c5f4fe/LICENSE",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/LICENSE?ref=302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/LICENSE",
+      "saved_path": "licenses/LICENSE",
+      "byte_count": 10142,
+      "sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+      "git_blob_verified": true
+    },
+    {
+      "side": "parent",
+      "ref": "302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "path": "NOTICE",
+      "blob_sha": "1ff62db688277b77c83c1766dac7f165364d3528",
+      "html_url": "https://github.com/psf/requests/blob/302225334678490ec66b3614a9dddb8a02c5f4fe/NOTICE",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/NOTICE?ref=302225334678490ec66b3614a9dddb8a02c5f4fe",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/302225334678490ec66b3614a9dddb8a02c5f4fe/NOTICE",
+      "saved_path": "licenses/NOTICE",
+      "byte_count": 38,
+      "sha256": "f5110972dedad2b4e9d314518daf3b7d72d6e02e499acd802181de6f74571dcc",
+      "git_blob_verified": true
+    },
+    {
+      "side": "head",
+      "ref": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "path": "requests/sessions.py",
+      "blob_sha": "dbcf2a7b0ee2898b72714b756e4b27fbbad4beab",
+      "html_url": "https://github.com/psf/requests/blob/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/requests/sessions.py",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/requests/sessions.py?ref=74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/requests/sessions.py",
+      "saved_path": "upstream/head/requests/sessions.py",
+      "byte_count": 30373,
+      "sha256": "f8bbd3ceb3ed7ad493ad1ddbbb1bb85e176032b2452c1d6ae43ecffbe2f65e1c",
+      "git_blob_verified": true
+    },
+    {
+      "side": "head",
+      "ref": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "path": "LICENSE",
+      "blob_sha": "67db8588217f266eb561f75fae738656325deac9",
+      "html_url": "https://github.com/psf/requests/blob/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/LICENSE",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/LICENSE?ref=74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/LICENSE",
+      "saved_path": "licenses/LICENSE",
+      "byte_count": 10142,
+      "sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+      "git_blob_verified": true
+    },
+    {
+      "side": "head",
+      "ref": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "path": "NOTICE",
+      "blob_sha": "1ff62db688277b77c83c1766dac7f165364d3528",
+      "html_url": "https://github.com/psf/requests/blob/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/NOTICE",
+      "api_url": "https://api.github.com/repos/psf/requests/contents/NOTICE?ref=74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "raw_url": "https://raw.githubusercontent.com/psf/requests/74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5/NOTICE",
+      "saved_path": "licenses/NOTICE",
+      "byte_count": 38,
+      "sha256": "f5110972dedad2b4e9d314518daf3b7d72d6e02e499acd802181de6f74571dcc",
+      "git_blob_verified": true
+    }
+  ],
+  "commit_changed_paths": [
+    "requests/sessions.py",
+    "tests/test_requests.py"
+  ]
+}

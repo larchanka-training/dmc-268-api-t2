@@ -1,0 +1,7 @@
+{
+  "title": "Недостижимая ветка кода после return",
+  "description": "Форматирование статуса заказа для отображения.",
+  "language": "python",
+  "category": "clean",
+  "label_rationale": "Unreachable print is linter-detectable; no business requirement establishes a missing logging defect. Do not invent one. Verified .agents/reviewer/v3/system.md forbids style/formatter/linter findings and requires likely bugs for maintainability."
+}

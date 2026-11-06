@@ -177,3 +177,22 @@ preflight не подходит. API и локальная Compose-заглуш�
 Контракты, SSE, recovery и интеграция
 с объединёнными зависимостями:
 [`docs/github-review-publication.md`](docs/github-review-publication.md).
+
+## Gold benchmark / Eval
+
+24 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
+[`test-prs-dataset/README.md`](test-prs-dataset/README.md).
+
+```bash
+uv run python -m scripts.eval_harness --mode offline --report-out eval-offline.json
+uv run python -m scripts.eval_harness --mode deterministic --report-out eval-deterministic.json
+```
+
+CI загружает оба отчёта как `gold-benchmark-reports`. Replay и deterministic
+проверяют регрессию; они не измеряют качество LLM. Live запускается отдельно
+только с явным runtime manifest, разрешением и лимитом расходов.
+
+Inference metadata использует непрозрачный SHA-256 case title и пустой body:
+названия дефектов, description, категории и labels датасета не подсказывают ответ
+через PR metadata. Исходные человекочитаемые данные сохраняются для отчёта и
+scoring; версия metadata policy входит в provenance/config identity.

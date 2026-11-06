@@ -210,7 +210,9 @@ def test_start_review_module_has_no_db_dependency() -> None:
 async def test_sqlalchemy_adapter_maps_initial_aggregate_without_commit() -> None:
     repository_id = uuid.UUID("00000000-0000-0000-0000-000000000055")
     session = Mock()
-    session.scalar = AsyncMock(return_value=repository_id)
+    result = Mock()
+    result.one_or_none.return_value = (repository_id, "base-sha")
+    session.execute = AsyncMock(return_value=result)
     session.add_all = Mock()
     repository = SqlAlchemyReviewJobRepository(cast(AsyncSession, session))
     command = make_command()
@@ -240,7 +242,9 @@ async def test_sqlalchemy_adapter_maps_initial_aggregate_without_commit() -> Non
 async def test_sqlalchemy_uow_commits_once_and_closes_session() -> None:
     repository_id = uuid.UUID("00000000-0000-0000-0000-000000000055")
     session = Mock()
-    session.scalar = AsyncMock(return_value=repository_id)
+    result = Mock()
+    result.one_or_none.return_value = (repository_id, "base-sha")
+    session.execute = AsyncMock(return_value=result)
     session.add_all = Mock()
     session.commit = AsyncMock()
     session.rollback = AsyncMock()
@@ -259,7 +263,9 @@ async def test_sqlalchemy_uow_commits_once_and_closes_session() -> None:
 async def test_sqlalchemy_uow_rolls_back_failed_commit() -> None:
     repository_id = uuid.UUID("00000000-0000-0000-0000-000000000055")
     session = Mock()
-    session.scalar = AsyncMock(return_value=repository_id)
+    result = Mock()
+    result.one_or_none.return_value = (repository_id, "base-sha")
+    session.execute = AsyncMock(return_value=result)
     session.add_all = Mock()
     session.commit = AsyncMock(side_effect=RuntimeError("constraint failure"))
     session.rollback = AsyncMock()

@@ -1,0 +1,13 @@
+diff --git a/app/cache/session_store.py b/app/cache/session_store.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/cache/session_store.py
+@@ -0,0 +1,7 @@
++import pickle
++
++def load_session(redis_client, session_id):
++    raw = redis_client.get(f"session:{session_id}")
++    if raw is None:
++        return None
++    return pickle.loads(raw)

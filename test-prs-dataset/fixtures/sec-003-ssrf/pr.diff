@@ -1,0 +1,12 @@
+diff --git a/app/previews/fetch.py b/app/previews/fetch.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/previews/fetch.py
+@@ -0,0 +1,6 @@
++import httpx
++
++def fetch_preview_image(image_url: str) -> bytes:
++    response = httpx.get(image_url, timeout=5.0)
++    response.raise_for_status()
++    return response.content

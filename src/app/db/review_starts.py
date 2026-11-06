@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -370,7 +370,8 @@ async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- one fenced aggreg
                     QuotaUsage.type,
                     QuotaUsage.window_start,
                 ],
-                index_where=QuotaUsage.type == "starts",
+                # Match the partial index even when PostgreSQL uses a generic plan.
+                index_where=QuotaUsage.type == literal_column("'starts'"),
                 set_={"value": QuotaUsage.value + 1},
                 where=QuotaUsage.value < settings.max_starts_per_hour,
             ).returning(QuotaUsage.id)

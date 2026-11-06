@@ -33,6 +33,7 @@ from app.application.github_ports import GithubRequest
 from app.application.webhook_ports import AutomaticReceiptContext
 from app.core.config import get_settings
 from app.db import models
+from app.db.publication_models import PublicationOperation
 from app.db.webhook_inbox import SqlAlchemyWebhookInbox
 from app.review.prompt import PromptBuilder, ReflectionBundle
 from app.vcs.github import GithubClient
@@ -87,7 +88,7 @@ class AutomaticScope:
 
 
 @pytest_asyncio.fixture
-async def automatic_scope(
+async def automatic_scope(  # noqa: PLR0915 -- admission fixture and owned full-chain cleanup
     settings_scope: SettingsScope, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> AsyncIterator[AutomaticScope]:
     scope = settings_scope
@@ -202,11 +203,22 @@ async def automatic_scope(
                     == external_id
                 )
             )
+            chunks = select(models.ChunkResult.id).where(
+                models.ChunkResult.review_job_id.in_(ids)
+            )
+            await connection.execute(
+                delete(models.Finding).where(models.Finding.chunk_result_id.in_(chunks))
+            )
             for table in (
+                PublicationOperation,
+                models.ReviewLlmAttempt,
                 models.ReviewEvent,
                 models.IdempotencyRecord,
                 models.OutboxEvent,
                 models.Publication,
+                models.ChunkResult,
+                models.ContextPayload,
+                models.TaskLease,
             ):
                 await connection.execute(
                     delete(table).where(table.review_job_id.in_(ids))
@@ -224,6 +236,11 @@ async def automatic_scope(
             await connection.execute(
                 delete(models.ChangeRequest).where(
                     models.ChangeRequest.repository_id == scope.repository
+                )
+            )
+            await connection.execute(
+                delete(models.AuthSession).where(
+                    models.AuthSession.user_id == scope.catalog.user
                 )
             )
             await connection.execute(

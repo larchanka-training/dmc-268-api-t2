@@ -34,6 +34,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m scripts.eval_harness",
         description="Run the gold-benchmark eval harness against test-prs-dataset.",
     )
+    parser.add_argument("--scope", choices=["gateway", "worker"], default="gateway")
+    parser.add_argument(
+        "--worker-pass",
+        choices=["baseline", "rules", "reflection", "all"],
+        default="all",
+    )
+    parser.add_argument("--fixture")
     parser.add_argument(
         "--mode",
         choices=["offline", "deterministic", "live"],
@@ -64,6 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-cost-usd")
     parser.add_argument("--input-usd-per-million")
     parser.add_argument("--output-usd-per-million")
+    parser.add_argument("--campaign-journal", type=Path)
     return parser.parse_args(argv)
 
 
@@ -87,6 +95,56 @@ def run(
     fixtures = load_dataset(args.dataset_dir, category_filter=args.filter)
     if not fixtures:
         raise ValueError("No fixtures selected; check the manifest and category filter")
+    if args.fixture:
+        fixtures = [fixture for fixture in fixtures if fixture.id == args.fixture]
+        if not fixtures:
+            raise ValueError("No fixture selected")
+    if args.scope == "worker":
+        if args.mode not in {"deterministic", "live"}:
+            raise LlmConfigurationError(
+                "Worker scope requires deterministic or explicitly approved live mode"
+            )
+        from scripts.eval_harness.worker import run_worker  # noqa: PLC0415
+
+        live_config = (
+            LlmConfig.approved(
+                args.runtime_manifest,
+                args.max_cost_usd,
+                args.input_usd_per_million,
+                args.output_usd_per_million,
+                len(fixtures),
+            )
+            if args.mode == "live"
+            else None
+        )
+        if live_config and (
+            args.fixture
+            or args.filter
+            or args.worker_pass != "all"
+            or not args.campaign_journal
+        ):
+            raise LlmConfigurationError(
+                "Live worker requires the full three-pass corpus "
+                "and a new campaign journal"
+            )
+        report = asyncio.run(
+            run_worker(
+                fixtures,
+                args.dataset_dir,
+                args.dataset_dir / "worker-sources",
+                passes=("baseline", "rules", "reflection")
+                if args.worker_pass == "all"
+                else (args.worker_pass,),
+                live_config=live_config,
+                journal_path=args.campaign_journal,
+                provider_transport=transport,
+            )
+        )
+        args.report_out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        )
+        print_console_summary(report)
+        return report
 
     llm_config = (
         LlmConfig.approved(

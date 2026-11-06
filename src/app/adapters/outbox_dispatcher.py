@@ -62,7 +62,9 @@ class PostgresOutboxDispatcher:
             )
             yield session
 
-    async def dispatch_batch(self, *, batch_size: int = 100) -> int:
+    async def dispatch_batch(
+        self, *, batch_size: int = 100, review_id: uuid.UUID | None = None
+    ) -> int:
         """Dispatch genuine initial analyze commands; publish remains parked."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -76,6 +78,11 @@ class PostgresOutboxDispatcher:
                         OutboxEvent.broker_published_at.is_(None),
                         OutboxEvent.broker_message_id.is_(None),
                         OutboxEvent.quarantined_at.is_(None),
+                        *(
+                            [OutboxEvent.review_job_id == review_id]
+                            if review_id is not None
+                            else []
+                        ),
                     )
                     .order_by(OutboxEvent.created_at, OutboxEvent.id)
                     .limit(min(batch_size, _MAX_CANDIDATES))

@@ -1,0 +1,8 @@
+_GEOCODE_CACHE = {}
+
+def geocode(address, geocoder):
+    if address in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[address]
+    result = geocoder.lookup(address)
+    _GEOCODE_CACHE[address] = result
+    return result

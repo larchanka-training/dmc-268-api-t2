@@ -654,10 +654,18 @@ def test_live_worker_cli_uses_real_worker_with_injected_provider_only(
 
 
 @pytest.mark.parametrize(
-    ("option", "value"), [("--max-cost-usd", "1.01"), ("--input-usd-per-million", "0")]
+    ("option", "value", "expected_error"),
+    [
+        ("--max-cost-usd", "1.01", "approval ceilings"),
+        ("--input-usd-per-million", "0", "Invalid live configuration"),
+    ],
 )
 def test_live_worker_rejects_unapproved_cost_ceilings_before_dispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str, value: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    option: str,
+    value: str,
+    expected_error: str,
 ) -> None:
     arguments = live_arguments(tmp_path)
     arguments[arguments.index(option) + 1] = value
@@ -670,7 +678,7 @@ def test_live_worker_rejects_unapproved_cost_ceilings_before_dispatch(
         raise AssertionError("Unapproved provider dispatch")
 
     try:
-        with pytest.raises(LlmConfigurationError, match="approval ceilings"):
+        with pytest.raises(LlmConfigurationError, match=expected_error):
             run(arguments, transport=httpx.MockTransport(provider))
         assert not calls and not journal.exists()
     finally:

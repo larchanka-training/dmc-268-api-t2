@@ -5,13 +5,14 @@ import json
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
 import pytest_asyncio
+import sentry_sdk
 from redis.asyncio import Redis
 from redis.asyncio.connection import Connection
 from sqlalchemy import select
@@ -34,6 +35,7 @@ from app.adapters.redis_queue import RedisQueue
 from app.analysis_worker import run
 from app.application.ports import QueueTaskEnvelope
 from app.core.config import get_settings
+from app.core.sentry import configure_sentry
 from app.db.models import (
     ChunkResult,
     Finding,
@@ -48,6 +50,27 @@ from app.domain.settings import compute_rules_digest
 
 pytest_plugins = ("test_analysis_handler",)
 STREAM = "dmc268:review-tasks"
+
+
+@pytest.fixture
+def worker_traces(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
+    transactions: list[dict[str, Any]] = []
+
+    class Capture(sentry_sdk.transport.Transport):
+        def capture_envelope(self, envelope: object) -> None:
+            for item in envelope.items:  # type: ignore[attr-defined]
+                if item.type == "transaction":
+                    transactions.append(item.payload.json)
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", lambda options: Capture())
+    monkeypatch.setenv("SENTRY__DSN", "https://public@o0.ingest.sentry.io/1")
+    get_settings.cache_clear()
+    configure_sentry(get_settings())
+    try:
+        yield transactions
+    finally:
+        sentry_sdk.init(dsn="")
+        get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
@@ -81,12 +104,13 @@ async def runtime_environment(
 
 @pytest.mark.usefixtures("runtime_environment")
 @pytest.mark.parametrize("prompt_version", ["v1", "v2", "v3"])
-async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # noqa: PLR0915 -- inspect debit and handoff at external edges
+async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # noqa: PLR0913, PLR0915, PLR0917 -- public runtime and trace fixtures
     postgres: PostgresHarness,
     redis_client: Redis,
     review_id: uuid.UUID,
     monkeypatch: pytest.MonkeyPatch,
     prompt_version: str,
+    worker_traces: list[dict[str, Any]],
 ) -> None:
     factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
     monkeypatch.setenv("LLM__RUN_MAX_REFLECTIONS", "8")
@@ -210,6 +234,17 @@ async def test_once_preserves_frozen_execution_and_durable_proof_before_ack(  # 
         assert publish.dispatch_not_before is None
     assert len(transports) == 2
     assert set(closed) == set(transports)
+    sentry_sdk.flush()
+    trace = next(
+        (item for item in worker_traces if item["transaction"] == "review.analyze"),
+        None,
+    )
+    assert trace is not None
+    assert trace["tags"]["review_id"] == str(review_id)
+    assert {"review.diff", "review.context", "review.llm", "review.db"} <= {
+        span["op"] for span in trace["spans"]
+    }
+    assert "synthetic-test-key" not in json.dumps(worker_traces)
 
 
 @pytest.mark.usefixtures("runtime_environment")

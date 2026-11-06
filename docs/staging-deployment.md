@@ -409,10 +409,30 @@ POSTGRES__DB=dmc
 | `AUTH__GITHUB_REDIRECT_URI` | `AUTH__GITHUB_REDIRECT_URI` | `https://dmc268-t2.ddns.net/api/v1/auth/github/callback` |
 | `AUTH__FRONTEND_ORIGINS` | `AUTH__FRONTEND_ORIGINS` | JSON-список, `["https://dmc268-t2.ddns.net"]` |
 
-Все шесть имён получает только сервис `api`. Вход остаётся недоступен, пока набор неполный: API проверяет его в момент запроса, не при старте.
+OAuth/browser-поля получает только `api`; единственное исключение —
+`AUTH__CREDENTIAL_KEY` для recovery, описанное ниже. Вход остаётся недоступен,
+пока набор неполный: API проверяет его в момент запроса, не при старте.
 
 `webhook-worker` запускает recovery GitHub intake отдельно от ReviewJob worker.
-Нужны PostgreSQL и доступ к GitHub API; подробности: [GitHub intake](github-webhook-intake.md).
+Для capture Level1 нужны PostgreSQL и доступ к GitHub API. Автоматический запуск
+дополнительно требует включённого analysis runtime (`ANALYSIS__CONFIG_PATH`),
+того же доверенного manifest в `/app/runtime:ro` и `AUTH__CREDENTIAL_KEY` для
+перепроверки сохранённого личного OAuth-доступа администратора. Recovery не
+получает LLM API keys, OAuth client secret, JWT secret или write-токен.
+Без runtime/key Level1-only/default-off работает как раньше; выбранные новые
+опт-ин события остаются в существующем ограниченном retry (до трёх попыток),
+затем завершаются FAILED без создания ReviewJob. Включение настройки репозитория
+не включает глобальные analysis-сервисы. При выключении analysis не удаляйте
+receipt/job/outbox: уже привязанный receipt возвращает тот же run, даже после
+истечения обычного idempotency key. Подробности: [GitHub intake](github-webhook-intake.md).
+
+При rollout workflow останавливает прежний `webhook-worker` до migrations и
+старта нового API, затем запускает совместимый consumer из выбранного image.
+Пока есть выбранные automatic receipts, rollback к L1-only consumer запрещён:
+он не знает durable job binding и может завершить такой receipt без запуска.
+Сохраните forward-compatible recovery/publisher до обработки или явного
+отключения новых producer-процессов; не удаляйте ledger и не публикуйте повторно
+с более широким порогом серьёзности.
 
 Write-токен не передаётся `webhook-worker`. Publisher использует существующие
 runtime factory, PostgreSQL outbox, Redis publish stream и lease/fencing;

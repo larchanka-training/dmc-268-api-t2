@@ -294,6 +294,7 @@ paths:
               schema: { $ref: '#/components/schemas/RepositorySettings' }
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
         '409': { $ref: '#/components/responses/LegacySettingsUnsupported' }
     put:
@@ -330,10 +331,36 @@ paths:
               schema: { $ref: '#/components/schemas/RepositorySettings' }
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
         '409':
           $ref: '#/components/responses/SettingsVersionConflict'
         '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/repositories/{id}/rules-preview:
+    get:
+      tags: [repositories]
+      operationId: getRepositoryRulesPreview
+      summary: Preview root file criteria at the current default branch
+      description: >-
+        Requires a local connection and fresh personal repository-read permission.
+        Resolves the default branch to a fresh immutable SHA on every request,
+        then reads only .review/rules.md with the bounded shared parser.
+        Never includes database instructions, modifies settings or changes admitted jobs.
+        Missing, empty and invalid file states are successful safe previews;
+        access/provider failures remain explicit errors rather than absence.
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+      responses:
+        '200':
+          description: File-only parsed criteria and immutable source provenance
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepositoryRulesPreview' }
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/repositories/{id}/pull-requests/{number}/reviews:
     post:
       tags: [reviews]
@@ -922,25 +949,78 @@ components:
       additionalProperties: false
       required: [rules, ignores, max_starts_per_hour, max_active_jobs, output_language, surrounding_lines]
       properties:
+        auto_review_enabled: { type: boolean, default: false }
+        base_branches:
+          type: array
+          maxItems: 128
+          items: { type: string, minLength: 1, maxLength: 1024 }
+          description: >-
+            Exact valid Git branch names, never globs; empty allows all base branches.
+            Input resource bounds are 128 names and 1024 UTF-8 bytes per name.
+            A leading dash, forbidden Git ref characters and noncanonical ref structure are rejected.
+        minimum_severity: { enum: [critical, high, medium, low], default: low }
         rules: { $ref: '#/components/schemas/Rules' }
         ignores: { $ref: '#/components/schemas/Ignores' }
-        max_starts_per_hour: { type: integer, minimum: 0 }
-        max_active_jobs: { type: integer, minimum: 0 }
+        max_starts_per_hour: { type: integer, minimum: 0, maximum: 2147483647 }
+        max_active_jobs: { type: integer, minimum: 0, maximum: 2147483647 }
         output_language: { const: ru }
-        surrounding_lines: { type: integer, minimum: 0 }
+        surrounding_lines: { type: integer, minimum: 0, maximum: 2147483647 }
     RepositorySettings:
       type: object
       additionalProperties: false
-      required: [version, rules, ignores, max_starts_per_hour, max_active_jobs, output_language, surrounding_lines, created_at]
+      required: [version, rules, ignores, max_starts_per_hour, max_active_jobs, output_language, surrounding_lines, created_at, auto_review_enabled, base_branches, minimum_severity]
       properties:
+        auto_review_enabled: { type: boolean, default: false }
+        base_branches:
+          type: array
+          maxItems: 128
+          items: { type: string, minLength: 1, maxLength: 1024 }
+          description: >-
+            Exact valid Git branch names, never globs; empty allows all base branches.
+            Input resource bounds are 128 names and 1024 UTF-8 bytes per name.
+            A leading dash, forbidden Git ref characters and noncanonical ref structure are rejected.
+        minimum_severity: { enum: [critical, high, medium, low], default: low }
         version: { type: string, description: Opaque immutable settings version/id }
         rules: { $ref: '#/components/schemas/Rules' }
         ignores: { $ref: '#/components/schemas/Ignores' }
-        max_starts_per_hour: { type: integer, minimum: 0 }
-        max_active_jobs: { type: integer, minimum: 0 }
+        max_starts_per_hour: { type: integer, minimum: 0, maximum: 2147483647 }
+        max_active_jobs: { type: integer, minimum: 0, maximum: 2147483647 }
         output_language: { type: string, minLength: 1, description: Actual stored language; historical versions are not rewritten }
-        surrounding_lines: { type: integer, minimum: 0 }
+        surrounding_lines: { type: integer, minimum: 0, maximum: 2147483647 }
         created_at: { type: string, format: date-time }
+    RepositoryRulesPreview:
+      type: object
+      additionalProperties: false
+      required: [default_branch, instructions, provenance]
+      properties:
+        default_branch: { type: string, minLength: 1, maxLength: 1024 }
+        instructions:
+          type: array
+          description: File criteria only, with canonical rule labels; no raw HTML rendering.
+          items: { type: string }
+        provenance:
+          type: object
+          additionalProperties: false
+          required: [parser_version, path, tenant, repository_external_id, revision, blob_sha, content_digest, state, diagnostics, severities, allowed_rule_refs]
+          properties:
+            parser_version: { const: rules-md/1 }
+            path: { const: .review/rules.md }
+            tenant: { type: string, format: uuid }
+            repository_external_id: { type: string, pattern: '^[1-9][0-9]*$' }
+            revision: { type: string, pattern: '^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$' }
+            blob_sha: { type: [string, 'null'], pattern: '^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$' }
+            content_digest: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$' }
+            state: { enum: [absent, empty, valid, invalid] }
+            diagnostics:
+              type: array
+              description: Fixed diagnostic codes and line numbers, never raw invalid content.
+              items: { type: string, pattern: '^[a-z_]+:[0-9]+$' }
+            severities:
+              type: object
+              additionalProperties: { enum: [critical, high, medium, low] }
+            allowed_rule_refs:
+              type: array
+              items: { type: string }
     StartReviewRequest:
       type: object
       additionalProperties: false

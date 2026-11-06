@@ -63,6 +63,10 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 
 ## Логирование
 
+Optional metrics, dashboard, Sentry stage timing and operational gates:
+[`docs/observability.md`](docs/observability.md). PostgreSQL/Redis backup and
+isolated restore: [`docs/backup-restore.md`](docs/backup-restore.md).
+
 Логи пишутся одновременно в stdout и в файл `logs/app.log` (ротация: 10 МБ × 5 копий). Настройки — в `.env`:
 
 - `LOGGING__LEVEL` — уровень журнала (по умолчанию `INFO`);
@@ -179,6 +183,9 @@ preflight не подходит. API и локальная Compose-заглуш�
 [`docs/github-review-publication.md`](docs/github-review-publication.md).
 
 ## Gold benchmark / Eval
+
+Controlled scripted worker passes, signed full-chain coverage and interpretation:
+[`docs/qa27-worker-benchmark.md`](docs/qa27-worker-benchmark.md).
 
 24 публичных и синтетических случая с canonical schema и воспроизводимым отчётом:
 [`test-prs-dataset/README.md`](test-prs-dataset/README.md).

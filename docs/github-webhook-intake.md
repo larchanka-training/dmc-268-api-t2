@@ -1,15 +1,15 @@
 # GitHub webhook intake (#14)
 
-Текущий scope — только GitHub `pull_request` actions `opened` и `synchronize`.
-GitLab, OAuth, запуск review, LLM, обогащение context Level 2–4 и публикация
-результата сюда не входят. Webhook подтверждает доставку и сохраняет
-проверяемый Level 1 artifact, но **не создаёт `ReviewJob` автоматически**.
-Подключение repository и авторизованный запуск review остаются отдельными
-контрактами. Интеграции с Redis worker
-[#13](https://github.com/larchanka-training/dmc-268-api-t2/issues/13),
-LLM Gateway [#18](https://github.com/larchanka-training/dmc-268-api-t2/pull/18)
-и UI [#22](https://github.com/larchanka-training/dmc-268-ui-t2/pull/22)
-не являются частью этого intake.
+Поддерживаются GitHub `pull_request` actions `opened` и `synchronize`.
+По умолчанию webhook сохраняет только проверяемый Level1 artifact. Для новых
+receipts после явного admin opt-in добавлен автоматический запуск через тот же
+авторизованный admission, квоты и outbox, что у manual Start. Политика и
+авторизующий администратор фиксируются при приёме; sender не даёт полномочий.
+Подробный контракт, предпросмотр правил, durable binding и совместимость:
+[Repository settings](repository-settings.md).
+GitLab, OAuth mint/refresh, Level2–4 cache reuse, LLM вызовы и публикация прямо
+из intake сюда не входят. Analysis worker и publisher остаются отдельными
+существующими процессами.
 
 ## Граница HTTP
 
@@ -35,14 +35,15 @@ GitHub repositories; webhook не подключает repository и не дов
 #13, а затем повторить delivery. Строка вместо списка не превращается в
 побуквенные glob-правила.
 
-`WebhookReceipt` хранит только выбранные поля запроса и зафиксированные на
-приёме `ignore_globs` в `request_data`, а не полный webhook body. Состояния
+`WebhookReceipt` хранит только выбранные поля запроса, зафиксированные на
+приёме `ignore_globs` и optional automatic intent для новых opt-in receipts в `request_data`, а не полный webhook body. Состояния
 intake: `PENDING`, `PROCESSING`, `READY`, `FAILED`, `IGNORED` (последнее также
 является default для ранее существовавших receipts). Уникальность
 `(provider_name, delivery_id)` обеспечивает дедупликацию. Попыток не больше
 трёх; `PROCESSING` держит lease на 90 секунд, `retry_at` определяет следующий
 захват, `reason_code` содержит только безопасный код отказа. `READY` хранит
-`snapshot_data` и `raw_diff` в PostgreSQL; raw diff — чувствительный исходный
+`snapshot_data` и `raw_diff` в PostgreSQL; принятый auto run также связан
+через durable `review_job_id`, независимо от TTL idempotency key. Raw diff — чувствительный исходный
 код, не содержимое очереди или логов.
 
 ## Снимок и восстановление
@@ -86,7 +87,9 @@ PR #22 не содержит этого runtime-изменения.
 installation token [истекает через час](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app):
 он подходит для короткого smoke либо при внешней ротации с обновлением
 окружения и перезапуском API/webhook-worker до истечения. Автоматического
-mint/refresh installation token и OAuth/login flow здесь нет. Секреты
+mint/refresh installation token в intake нет. Автоматический admission
+проверяет существующий сохранённый личный OAuth администратора через общий
+credential context; browser login остаётся отдельным API. Секреты
 передаются окружением/secret store, не добавляются в репозиторий.
 
 ## Handoff другим ролям
@@ -107,10 +110,9 @@ mint/refresh installation token и OAuth/login flow здесь нет. Секр�
   `previous_path=old_path` только для rename. UI adapter использует canonical
   `deleted`/`kind`/snake_case, не текущие mock `removed`/`type`/camelCase.
 - **Architecture/UI #22:** status-only lifecycle относится к ReviewJob,
-  состояния receipt — отдельный intake. Общая диаграмма `UI/webhook ->
-  ReviewJob + outbox` описывает целевой review pipeline, а не автоматический
-  side effect реализованного webhook. Actor/access/quota и создание ReviewJob
-  остаются во владении #13.
+  состояния receipt — отдельный intake. При opt-in автоматический admission
+  связывает receipt/job/квоту/outbox/READY одним commit с attempt/lease fence;
+  default-off и старые receipts сохраняют прежний Level1-only контракт.
 - **LLM PR #18:** rebase/adaptation на принятый #21 и этот PR сохраняет
   canonical schemas, миграцию `0005`, GitHub config/token passthrough,
   independent webhook-worker, безопасный env encoder и integration CI.

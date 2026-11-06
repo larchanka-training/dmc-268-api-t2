@@ -1,5 +1,6 @@
 """PostgreSQL-backed GitHub webhook intake."""
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
@@ -16,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.application.github_ports import GithubFailure, GithubRequest
 from app.application.webhook_ports import InboxUnavailable, WebhookDelivery
 from app.db.models import Repository, RepositorySettings, WebhookReceipt
+from app.db.review_starts import settings_identity
+from app.domain.repository_policy import AutomaticReviewIntent, read_review_policy
 
 _MAX_ATTEMPTS = 3
 
@@ -92,6 +95,22 @@ class SqlAlchemyWebhookInbox:
                 not isinstance(pattern, str) for pattern in ignores
             ):
                 raise InboxUnavailable
+            automatic = None
+            if settings is not None:
+                try:
+                    policy = read_review_policy(settings.review_policy)
+                    if policy.auto_review_enabled:
+                        if policy.authorized_by is None:
+                            raise ValueError("Missing authorizing actor")
+                        automatic = AutomaticReviewIntent(
+                            repository_id=repository.id,
+                            source_settings_id=settings.id,
+                            source_settings_identity=settings_identity(settings),
+                            actor_user_id=policy.authorized_by,
+                            policy=policy,
+                        ).model_dump(mode="json")
+                except ValueError, TypeError:
+                    raise InboxUnavailable from None
             return (
                 await session.execute(
                     insert(WebhookReceipt)
@@ -103,6 +122,11 @@ class SqlAlchemyWebhookInbox:
                             "schema_version": "1.0",
                             "request": asdict(stored_request),
                             "ignore_globs": ignores,
+                            **(
+                                {"automatic": automatic}
+                                if automatic is not None
+                                else {}
+                            ),
                         },
                     )
                     .on_conflict_do_nothing(
@@ -126,6 +150,8 @@ class SqlAlchemyWebhookInbox:
                 receipt.raw_diff,
                 receipt.reason_code,
                 tuple(receipt.request_data["ignore_globs"]),
+                _automatic_intent(receipt.request_data.get("automatic")),
+                receipt.review_job_id,
             )
 
     async def get_by_delivery(self, delivery_id: str) -> WebhookDelivery | None:
@@ -196,6 +222,8 @@ class SqlAlchemyWebhookInbox:
                 receipt.raw_diff,
                 receipt.reason_code,
                 tuple(receipt.request_data["ignore_globs"]),
+                _automatic_intent(receipt.request_data.get("automatic")),
+                receipt.review_job_id,
             )
 
     async def _lock_claim(self, session: AsyncSession, claim: WebhookDelivery) -> bool:
@@ -211,8 +239,31 @@ class SqlAlchemyWebhookInbox:
         )
         return receipt_id is not None
 
+    async def renew(self, claim: WebhookDelivery) -> bool:
+        """Extend only this still-live attempt; never resurrect a lost claim."""
+        async with self._session() as session:
+            if not await self._lock_claim(session, claim):
+                return False
+            result = await session.scalar(
+                update(WebhookReceipt)
+                .where(
+                    WebhookReceipt.id == claim.id,
+                    WebhookReceipt.processing_status == "PROCESSING",
+                    WebhookReceipt.attempts == claim.attempts,
+                    WebhookReceipt.lease_until > func.clock_timestamp(),
+                )
+                .values(lease_until=func.clock_timestamp() + timedelta(seconds=90))
+                .returning(WebhookReceipt.id)
+            )
+            return result is not None
+
     async def complete(
-        self, claim: WebhookDelivery, snapshot: dict[str, Any], raw_diff: str
+        self,
+        claim: WebhookDelivery,
+        snapshot: dict[str, Any],
+        raw_diff: str,
+        *,
+        reason_code: str | None = None,
     ) -> bool:
         async with self._session() as session:
             if not await self._lock_claim(session, claim):
@@ -229,7 +280,7 @@ class SqlAlchemyWebhookInbox:
                     processing_status="READY",
                     snapshot_data=snapshot,
                     raw_diff=raw_diff,
-                    reason_code=None,
+                    reason_code=reason_code,
                     lease_until=None,
                     retry_at=None,
                 )
@@ -267,3 +318,12 @@ class SqlAlchemyWebhookInbox:
                     else None,
                 )
             )
+
+
+def _automatic_intent(value: Any) -> AutomaticReviewIntent | None:
+    if value is None:
+        return None
+    try:
+        return AutomaticReviewIntent.model_validate_json(json.dumps(value))
+    except ValueError, TypeError:
+        raise InboxUnavailable from None

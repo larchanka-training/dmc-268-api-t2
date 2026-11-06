@@ -1,0 +1,7 @@
+from pathlib import Path
+
+ATTACHMENTS_ROOT = Path("/var/data/attachments")
+
+def read_attachment(filename: str) -> bytes:
+    file_path = ATTACHMENTS_ROOT / filename
+    return file_path.read_bytes()

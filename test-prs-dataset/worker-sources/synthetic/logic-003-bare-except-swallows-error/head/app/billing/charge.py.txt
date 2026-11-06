@@ -1,0 +1,7 @@
+def charge_balance(account, amount):
+    try:
+        account.balance -= amount
+        account.save()
+    except:
+        pass
+    return account.balance

@@ -573,6 +573,8 @@ jobs:
           # activation changes. This also retires the old sleep placeholder.
           compose --profile analysis stop worker outbox-dispatcher
           compose --profile publication stop publication-worker
+          # An old L1-only consumer must not finish new selected auto receipts.
+          compose stop webhook-worker
 
           if [[ "${ENV_NAME}" == staging ]]; then
             # The uploaded installer is writable by the SSH user. Anchor its

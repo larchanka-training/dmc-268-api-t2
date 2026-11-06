@@ -2,6 +2,7 @@
 
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import Text, and_, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -15,6 +16,7 @@ from app.application.publication_ports import (
     PublicationOperationSnapshot,
     PublicationState,
 )
+from app.context.snapshot import valid_snapshot
 from app.db.models import (
     ChangeRequest,
     ChunkResult,
@@ -22,11 +24,15 @@ from app.db.models import (
     Finding,
     Publication,
     Repository,
+    RepositorySettings,
     ReviewJob,
     TaskLease,
 )
 from app.db.publication_models import PublicationOperation
 from app.db.review_events import append_review_event
+from app.domain.frozen_configuration import ModelSettings
+from app.domain.repository_policy import read_review_policy
+from app.domain.settings import compute_repository_settings_digest
 
 
 class PostgresPublicationStore:
@@ -514,7 +520,9 @@ class PostgresPublicationStore:
             .exists()
         )
 
-    async def load(self, review_id: UUID) -> PublicationInput | None:
+    async def load(  # noqa: PLR0911 -- explicit frozen-input rejection branches
+        self, review_id: UUID
+    ) -> PublicationInput | None:
         async with self._sessions() as session:
             row = (
                 await session.execute(
@@ -562,6 +570,37 @@ class PostgresPublicationStore:
                 for context in contexts
             ):
                 return None
+            settings = await session.get(
+                RepositorySettings, review.repository_settings_id
+            )
+            if settings is None:
+                return None
+            # Frozen jobs validate raw identity even when the saved policy is NULL.
+            try:
+                threshold = read_review_policy(settings.review_policy).minimum_severity
+                if (
+                    review.frozen_configuration_version is not None
+                    or settings.review_policy is not None
+                ):
+                    policy = ModelSettings.from_stored(review.model_settings)
+                    checksum = compute_repository_settings_digest(
+                        id=settings.id,
+                        repository_id=settings.repository_id,
+                        rules=settings.rules,
+                        ignores=settings.ignores,
+                        output_language=settings.output_language,
+                        surrounding_lines=settings.surrounding_lines,
+                        review_policy=settings.review_policy,
+                    )
+                    if (
+                        review.frozen_configuration_version != 1
+                        or settings.repository_id != review.repository_id
+                        or not valid_snapshot(settings)
+                        or checksum != policy.repository_settings_digest
+                    ):
+                        return None
+            except ValidationError, TypeError, ValueError:
+                return None
             findings = await session.scalars(
                 select(Finding)
                 .join(ChunkResult)
@@ -592,4 +631,5 @@ class PostgresPublicationStore:
                     for finding in findings
                 ),
                 integration_status=repository.integration_status,
+                minimum_severity=threshold,
             )

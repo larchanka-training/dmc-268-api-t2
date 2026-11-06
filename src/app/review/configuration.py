@@ -41,6 +41,7 @@ from app.domain.frozen_configuration import (
     RepositoryInstructions,
     Selector,
 )
+from app.domain.repository_policy import read_review_policy
 from app.domain.settings import (
     compute_repository_settings_digest,
     compute_rules_digest,
@@ -85,6 +86,7 @@ class ExecutionConfiguration:
     ignores: tuple[str, ...]
     surrounding_lines: int
     service_settings: ExecutionSettings
+    minimum_severity: Literal["critical", "high", "medium", "low"] = "low"
     rule_severities: tuple[tuple[str, str], ...] = ()
     rules_source_state: str | None = None
     rules_diagnostics: tuple[str, ...] = ()
@@ -417,6 +419,7 @@ class FrozenConfigurationReader:
                     ignores=settings.ignores,
                     output_language=settings.output_language,
                     surrounding_lines=settings.surrounding_lines,
+                    review_policy=settings.review_policy,
                 )
                 != policy.repository_settings_digest
             ):
@@ -478,6 +481,9 @@ class FrozenConfigurationReader:
                 ),
                 surrounding_lines=settings.surrounding_lines,
                 service_settings=service,
+                minimum_severity=read_review_policy(
+                    settings.review_policy
+                ).minimum_severity,
                 allowed_rule_refs=frozenset(
                     settings.rules_source.get("file", {}).get("allowed_rule_refs", [])
                 )
@@ -599,6 +605,7 @@ class FrozenAdmissionResolver:
                 ignores=settings.ignores,
                 output_language=settings.output_language,
                 surrounding_lines=settings.surrounding_lines,
+                review_policy=settings.review_policy,
             )
             try:
                 instructions = RepositoryInstructions(

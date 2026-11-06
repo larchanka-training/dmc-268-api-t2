@@ -176,10 +176,14 @@ services:
       POSTGRES__PASSWORD: ${POSTGRES__PASSWORD:?POSTGRES__PASSWORD is required}
       POSTGRES__DB: ${POSTGRES__DB:?POSTGRES__DB is required}
       GITHUB__TOKEN: ${GITHUB__TOKEN:-}
+      AUTH__CREDENTIAL_KEY: ${AUTH__CREDENTIAL_KEY:-}
+      ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
       LOGGING__LEVEL: INFO
       LOGGING__FORMAT: json
       LOGGING__FILE_ENABLED: "false"
       SENTRY__DSN: ${SENTRY__DSN:-}
+    volumes:
+      - ${ANALYSIS_RUNTIME_DIR:-./analysis-runtime}:/app/runtime:ro
     depends_on:
       db:
         condition: service_healthy

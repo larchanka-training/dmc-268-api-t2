@@ -1,0 +1,7 @@
+import pickle
+
+def load_session(redis_client, session_id):
+    raw = redis_client.get(f"session:{session_id}")
+    if raw is None:
+        return None
+    return pickle.loads(raw)

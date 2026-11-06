@@ -7,9 +7,10 @@ from collections import defaultdict, deque
 
 import httpx
 import pytest
+from prometheus_client import generate_latest
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from app.core.config import LLM, Eurorouter, LLMConfigError, Ollama
+from app.core.config import LLM, Eurorouter, LLMConfigError, Ollama, get_settings
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.client import ChatMessage, LLMRequest
 from app.llm.errors import (
@@ -28,6 +29,46 @@ class Answer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdict: str
+
+
+async def test_metrics_observe_each_dispatched_attempt_without_model_or_payload_labels(
+    provider: Provider,
+    sleeper: Sleeper,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("METRICS__ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        gateway = _gateway(provider, sleeper, clock)
+        await gateway.generate_structured(
+            _request(), Answer, budget=_budget(clock), input_tokens=10
+        )
+        provider.queue(
+            "key-one", httpx.Response(400, json={"error": "private-provider-body"})
+        )
+        provider.queue(
+            "key-two", httpx.Response(400, json={"error": "private-provider-body"})
+        )
+        with pytest.raises(ProviderRequestError):
+            await gateway.generate_structured(
+                _request(), Answer, budget=_budget(clock), input_tokens=10
+            )
+        metrics = generate_latest().decode()
+        assert (
+            'dmc_llm_attempt_seconds_count{call_kind="initial",'
+            'outcome="success",provider="eurorouter"} 1.0' in metrics
+        )
+        assert (
+            'dmc_llm_attempt_seconds_count{call_kind="initial",'
+            'outcome="error",provider="eurorouter"} 1.0' in metrics
+        )
+        expected_attempts = 2
+        assert len(provider.calls) == expected_attempts
+        assert "private-provider-body" not in metrics
+        assert 'model="euro"' not in metrics
+    finally:
+        get_settings.cache_clear()
 
 
 class Provider:

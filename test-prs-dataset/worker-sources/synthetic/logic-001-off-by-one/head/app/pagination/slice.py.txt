@@ -1,0 +1,4 @@
+def page_slice(items, page_number, page_size):
+    start = (page_number - 1) * page_size
+    end = start + page_size - 1
+    return items[start:end]

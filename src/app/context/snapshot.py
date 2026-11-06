@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context.loader import LoadedRules
 from app.db.models import RepositorySettings
+from app.domain.frozen_configuration import FrozenConfigurationError
 from app.domain.settings import compute_rules_digest
 
 _FIELDS = (
@@ -25,15 +26,21 @@ _FIELDS = (
 
 
 def capture_settings(settings: RepositorySettings) -> dict[str, Any]:
-    return {
+    values = {
         "id": settings.id,
         **{key: deepcopy(getattr(settings, key)) for key in _FIELDS},
     }
+    if settings.review_policy is not None:
+        values["review_policy"] = deepcopy(settings.review_policy)
+    return values
 
 
 def snapshot_id(values: dict[str, Any]) -> UUID:
+    payload = {key: values[key] for key in (*_FIELDS, "rules_source")}
+    if values.get("review_policy") is not None:
+        payload["review_policy"] = values["review_policy"]
     canonical = json.dumps(
-        {key: values[key] for key in (*_FIELDS, "rules_source")},
+        payload,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -81,5 +88,5 @@ async def materialize_settings(
     await session.commit()
     stored = await session.get(RepositorySettings, values["id"], populate_existing=True)
     if stored is None or not valid_snapshot(stored):
-        raise ValueError("invalid_rules_snapshot")
+        raise FrozenConfigurationError("invalid_rules_snapshot")
     return values

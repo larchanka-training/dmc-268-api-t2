@@ -1,0 +1,4 @@
+def can_edit(user, resource):
+    is_owner = resource.owner_id == user.id
+    is_admin = user.role == "admin"
+    return is_owner and is_admin

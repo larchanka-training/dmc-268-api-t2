@@ -44,6 +44,7 @@ async def test_admission_and_reader_enforce_pinned_verifier_before_inference() -
         output_language="ru",
         surrounding_lines=3,
         rules_source=None,
+        review_policy=None,
     )
     settings.rules_digest = compute_rules_digest(settings.rules)
     settings_digest = compute_repository_settings_digest(

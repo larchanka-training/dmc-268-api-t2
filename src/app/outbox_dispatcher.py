@@ -15,6 +15,7 @@ from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
 from app.adapters.redis_queue import RedisQueue
 from app.core.config import Logging, get_settings
 from app.core.logging_config import configure_logging
+from app.core.metrics import metrics_server
 from app.core.sentry import configure_sentry
 
 
@@ -115,13 +116,14 @@ def main() -> None:
     configure_logging(Logging(format="json", file_enabled=False))
     try:
         configure_sentry(get_settings())
-        asyncio.run(
-            _run(
-                once=args.once,
-                batch_size=args.batch_size,
-                poll_interval=args.poll_interval,
+        with metrics_server(get_settings().metrics):
+            asyncio.run(
+                _run(
+                    once=args.once,
+                    batch_size=args.batch_size,
+                    poll_interval=args.poll_interval,
+                )
             )
-        )
     except Exception as error:
         structlog.get_logger().error("outbox_failed", error_type=type(error).__name__)
         raise SystemExit(1) from None

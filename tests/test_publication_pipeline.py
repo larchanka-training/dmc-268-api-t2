@@ -14,6 +14,7 @@ from test_analysis_handler import BASE, HEAD, DeterministicLlm, github_http
 from test_analysis_handler import (
     review_id as review_id,  # noqa: PLC0414 -- shared analysis fixture
 )
+from test_analysis_terminal import freeze
 from test_contracts import SCHEMAS
 from test_github_publisher_postgres import FakeGithub
 from test_postgres_integration import PostgresHarness
@@ -42,6 +43,7 @@ async def test_completed_analysis_is_published_and_acknowledged(  # noqa: PLR091
     rule_ref: str | None,
 ) -> None:
     sessions = async_sessionmaker(postgres.engine)
+    await freeze(sessions, review_id)
     queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
     llm = DeterministicLlm()
     llm.result = replace(

@@ -8,10 +8,12 @@ import textwrap
 from http import HTTPStatus
 from pathlib import Path
 
+import httpx
 import pytest
 import sentry_sdk
 import yaml
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from app.core.config import get_settings
 from app.main import create_app
@@ -19,6 +21,64 @@ from app.main import create_app
 ROOT = Path(__file__).parents[1]
 
 _DSN = "https://public@o0.ingest.sentry.io/1"
+
+
+def test_manual_worker_tracing_does_not_export_provider_urls_or_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads: list[str] = []
+
+    class Capture(sentry_sdk.transport.Transport):
+        def capture_envelope(self, envelope: object) -> None:
+            payloads.append(envelope.serialize().decode())  # type: ignore[attr-defined]
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", lambda options: Capture())
+    monkeypatch.setenv("SENTRY__DSN", _DSN)
+    get_settings.cache_clear()
+    create_app()
+    with sentry_sdk.start_transaction(name="review.analyze", op="review.worker"):
+        engine = create_engine("sqlite://")
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 'private-sql-marker'"))
+        engine.dispose()
+        with httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200))
+        ) as client:
+            client.get(
+                "https://provider.invalid/private-source-marker?secret=private-query-marker"
+            )
+        logging.getLogger("safe-test").error("safe_worker_failure")
+    sentry_sdk.flush()
+    captured = "\n".join(payloads)
+    assert "review.analyze" in captured
+    for marker in (
+        "private-sql-marker",
+        "private-source-marker",
+        "private-query-marker",
+    ):
+        assert marker not in captured
+
+
+def test_descendant_transport_warnings_are_not_exported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payloads: list[str] = []
+
+    class Capture(sentry_sdk.transport.Transport):
+        def capture_envelope(self, envelope: object) -> None:
+            payloads.append(envelope.serialize().decode())  # type: ignore[attr-defined]
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", lambda options: Capture())
+    monkeypatch.setenv("SENTRY__DSN", _DSN)
+    get_settings.cache_clear()
+    create_app()
+    for name in ("httpcore.connection", "sqlalchemy.engine.Engine"):
+        logging.getLogger(name).warning("private-descendant-transport-marker")
+    logging.getLogger("safe-test").error("safe_worker_error")
+    sentry_sdk.flush()
+    captured = "\n".join(payloads)
+    assert "safe_worker_error" in captured
+    assert "private-descendant-transport-marker" not in captured
 
 
 @pytest.fixture(autouse=True)

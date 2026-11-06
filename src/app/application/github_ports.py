@@ -143,7 +143,15 @@ class GithubPort(Protocol):
     async def fetch(self, request: GithubRequest) -> GithubSnapshot: ...
 
 
-class GithubRepositoryReader(Protocol):
+@dataclass(frozen=True, slots=True)
+class RepositoryRevision:
+    owner: str
+    name: str
+    branch: str
+    revision: str
+
+
+class GithubRepositoryReader(RepositoryFileReader, Protocol):
     """Current read access, using only the authenticated user's credentials."""
 
     async def list_available_repositories(
@@ -151,6 +159,8 @@ class GithubRepositoryReader(Protocol):
     ) -> tuple[list[dict[str, Any]], int | None]: ...
 
     async def get_repository(self, external_id: str) -> dict[str, Any]: ...
+
+    async def resolve_default_branch(self, external_id: str) -> RepositoryRevision: ...
 
     async def has_read_access(self, external_id: str) -> bool: ...
 

@@ -5,14 +5,16 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from time import perf_counter
 
+import structlog
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis.asyncio import Redis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from redis.exceptions import RedisError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import Metrics, Settings, get_settings
+
+logger = structlog.get_logger(__name__)
 
 HTTP_REQUESTS = Counter(
     "dmc_http_requests_total",
@@ -59,8 +61,9 @@ async def sample_queues(client: Redis) -> None:
                 value = group.get("lag")
                 if isinstance(value, int) and value >= 0:
                     lag = float(value)
-        except RedisError:
-            pass
+        except Exception:
+            # Telemetry failure must invalidate the sample, not stop polling.
+            logger.warning("queue_metrics_sample_failed", queue=queue)
         QUEUE_PENDING.labels(queue).set(pending)
         QUEUE_LAG.labels(queue).set(lag)
         QUEUE_SUCCESS.labels(queue).set(success)

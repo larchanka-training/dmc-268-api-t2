@@ -12,6 +12,7 @@ PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
 VALIDATION_CALLS = 2
 EXISTING_BACKUPS = 9
+COMMAND_UNAVAILABLE = 127
 
 
 def prepare(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -26,6 +27,9 @@ def prepare(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     docker.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
+        "if os.environ.get('REQUIRE_COMPOSE_LAYOUT') and not "
+        "os.path.isfile('docker-compose.staging.yml'):\n"
+        " sys.exit(42)\n"
         "with open(os.environ['CALLS'], 'a') as out:\n"
         " out.write(json.dumps(sys.argv[1:])+'\\n')\n"
         "if 'redis-check-rdb' in sys.argv[-1]:\n"
@@ -56,7 +60,7 @@ def prepare(tmp_path: Path) -> tuple[Path, dict[str, str]]:
 
 def run(script: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(script), "synthetic", "fixture.env"],
+        [shutil.which("bash") or "bash", str(script), "synthetic", "fixture.env"],
         env=env,
         capture_output=True,
         text=True,
@@ -107,7 +111,7 @@ def test_invalid_snapshot_preserves_previous_backup_and_removes_partial(
     assert "SYNTHETIC_SECRET_DO_NOT_LOG" not in result.stdout + result.stderr
     assert final.read_bytes() == b"previous-validated-backup"
     assert not list(final.parent.glob("*.partial"))
-    assert "fail" in (final.parent / "backup.log").read_text()
+    assert "fail validate-rdb" in (final.parent / "backup.log").read_text()
     assert (
         "SYNTHETIC_SECRET_DO_NOT_LOG" not in (final.parent / "backup.log").read_text()
     )
@@ -134,9 +138,61 @@ def test_success_retains_seven_daily_snapshots_only(tmp_path: Path) -> None:
 
 def test_busy_lock_skips_without_contacting_redis(tmp_path: Path) -> None:
     script, env = prepare(tmp_path)
+    dest = script.parent / "backups/redis"
+    dest.mkdir(parents=True)
+    active_partial = dest / "redis-2026-11-05.rdb.partial"
+    active_partial.write_bytes(b"other-locked-backup-in-progress")
     flock = tmp_path / "bin/flock"
     flock.write_text("#!/bin/sh\nexit 1\n")
     result = run(script, env)
     assert result.returncode == 0
     assert not Path(env["CALLS"]).exists()
     assert "skip-lock" in (script.parent / "backups/redis/backup.log").read_text()
+    assert active_partial.read_bytes() == b"other-locked-backup-in-progress"
+
+
+def test_checkout_script_uses_the_parent_compose_deployment(tmp_path: Path) -> None:
+    script, env = prepare(tmp_path)
+    checkout = script.parent
+    (checkout / "docker-compose.staging.yml").write_text("services: {}\n")
+    (checkout / "fixture.env").write_text("# synthetic only\n")
+    scripts = checkout / "scripts"
+    scripts.mkdir()
+    nested_script = scripts / script.name
+    script.rename(nested_script)
+
+    result = run(nested_script, {**env, "REQUIRE_COMPOSE_LAYOUT": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert (checkout / "backups/redis/redis-2026-11-05.rdb").read_bytes() == PAYLOAD
+    assert not (scripts / "backups").exists()
+
+
+def test_unavailable_flock_fails_with_a_safe_reason_instead_of_skipping(
+    tmp_path: Path,
+) -> None:
+    script, env = prepare(tmp_path)
+    (tmp_path / "bin/flock").write_text("#!/bin/sh\nexit 127\n")
+
+    result = run(script, env)
+
+    assert result.returncode == COMMAND_UNAVAILABLE
+    assert (
+        "fail flock exit=127"
+        in (script.parent / "backups/redis/backup.log").read_text()
+    )
+    assert not Path(env["CALLS"]).exists()
+    assert not list((script.parent / "backups/redis").glob("*.rdb"))
+
+
+def test_cron_path_restores_standard_tools_without_replacing_supplied_docker(
+    tmp_path: Path,
+) -> None:
+    script, env = prepare(tmp_path)
+
+    result = run(script, {**env, "PATH": str(tmp_path / "bin")})
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        script.parent / "backups/redis/redis-2026-11-05.rdb"
+    ).read_bytes() == PAYLOAD

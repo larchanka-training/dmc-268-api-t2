@@ -4,16 +4,19 @@ import socket
 import sys
 from http import HTTPStatus
 from types import ModuleType
+from typing import cast
 from urllib.error import URLError
 from urllib.request import urlopen
 
 import pytest
 from fastapi.testclient import TestClient
 from prometheus_client import generate_latest
+from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app import analysis_worker, outbox_dispatcher, publication_worker, webhook_worker
 from app.core.config import get_settings
+from app.core.metrics import sample_queues
 from app.main import create_app
 
 
@@ -190,3 +193,34 @@ def test_http_observer_preserves_unhandled_500_and_bounds_unknown_routes(
         assert "unknown-private-path" not in metrics
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_queue_sample_failure_is_visible_and_can_recover(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FlakyRedis:
+        failing = False
+
+        async def xinfo_groups(self, name: str) -> list[dict[str, object]]:
+            if self.failing:
+                raise ValueError("private-queue-diagnostic")
+            return [{"name": "review-workers", "pending": 2, "lag": 4}]
+
+    client = FlakyRedis()
+    await sample_queues(cast(Redis, client))
+    assert 'dmc_queue_sample_success{queue="analyze"} 1.0' in generate_latest().decode()
+
+    client.failing = True
+    caplog.set_level("WARNING")
+    await sample_queues(cast(Redis, client))
+    metrics = generate_latest().decode()
+    assert 'dmc_queue_sample_success{queue="analyze"} 0.0' in metrics
+    assert 'dmc_queue_pending{queue="analyze"} NaN' in metrics
+    assert 'dmc_queue_lag{queue="publish"} NaN' in metrics
+    assert "queue_metrics_sample_failed" in caplog.text
+    assert "private-queue-diagnostic" not in caplog.text
+
+    client.failing = False
+    await sample_queues(cast(Redis, client))
+    assert 'dmc_queue_sample_success{queue="analyze"} 1.0' in generate_latest().decode()

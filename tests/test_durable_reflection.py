@@ -3,24 +3,35 @@
 # ruff: noqa: PLR2004 -- fixed accounting/retry/fence contract vectors
 
 import asyncio
+import json
 from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy import select
 from test_analysis_accounting import Execution, freeze_test_policy
-from test_frozen_configuration import PROMPTS
+from test_frozen_configuration import PROMPTS, runtime_profiles
 from test_postgres_integration import PostgresHarness
 
 from app.application.analysis_ports import AccountingIdentityError
-from app.application.ports import LeaseLostError, StartReviewCommand
+from app.application.ports import (
+    BuiltContextPayload,
+    LeaseLostError,
+    StartReviewCommand,
+)
 from app.application.use_cases.start_review import start_review
 from app.db.models import ContextPayload, OutboxEvent, Publication, ReviewJob
 from app.db.task_leases import PostgresTaskLeaseStore
 from app.db.uow import SqlAlchemyUnitOfWork
 from app.llm.errors import BudgetExceededError
+from app.llm.tokens import ConservativeTokenCounter
+from app.review.configuration import FrozenConfigurationReader, build_frozen_gateway
+from app.review.port_adapter import LlmGatewayAdapter
 from app.review.prompt import PromptBuilder, ReflectionBundle
+from app.review.service import ReviewService
+from app.review.validation import FindingValidator
 
 pytest_plugins = ("test_postgres_integration", "test_analysis_accounting")
 
@@ -94,6 +105,97 @@ async def enable_reflection(execution: Execution, *, allowance: int = 1) -> None
         assert digest is not None
         job.prompt_digest = digest
         freeze_test_policy(job, policy_two(job.model_settings, allowance=allowance))
+
+
+async def test_optional_reflection_preserves_request_for_later_planned_chunk(
+    execution: Execution, payload_data: dict[str, Any]
+) -> None:
+    await enable_reflection(execution)
+    async with execution.factory.begin() as session:
+        job = await session.get(ReviewJob, execution.lease.review_job_id)
+        assert job is not None
+        values = dict(job.model_settings)
+        values["limits"] = values["limits"] | {"run_max_requests": 2}
+        freeze_test_policy(job, values)
+        other = uuid4()
+        session.add(
+            ContextPayload(
+                id=other, review_job_id=job.id, schema_version=1, payload_body={}
+            )
+        )
+    assert (
+        await execution.store().begin(task=execution.task, lease=execution.lease)
+    ).accepted
+    config = await FrozenConfigurationReader(
+        execution.factory, PROMPTS, runtime_profiles()
+    ).resolve(execution.lease.review_job_id)
+    body = {
+        key: value
+        for key, value in payload_data.items()
+        if key not in {"schema_version", "review_id", "chunk_id"}
+    }
+    body["metadata"] = body["metadata"] | {
+        "rules_version": str(config.repository_settings_id)
+    }
+    calls: list[str] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        schema = json.loads(request.content)["response_format"]["json_schema"]["schema"]
+        reflection = "verdicts" in schema["properties"]
+        calls.append("reflection" if reflection else "initial")
+        answer = (
+            {"verdicts": []}
+            if reflection
+            else {
+                "summary": "Reviewed required chunk",
+                "findings": [
+                    {
+                        "path": "src/review.py",
+                        "side": "NEW",
+                        "start_line": 39,
+                        "end_line": 39,
+                        "category": "correctness",
+                        "severity": "high",
+                        "title": "Uncaught validation failure",
+                        "explanation": "Invalid input raises without a handled result.",
+                        "evidence": "return Schema.model_validate(data)",
+                        "recommendation": "Handle invalid input.",
+                        "rule_ref": None,
+                        "proposed_diff_fix": None,
+                    }
+                ],
+                "limitations": [],
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "test-model",
+                "choices": [{"message": {"content": json.dumps(answer)}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 40},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as http:
+        service = ReviewService(
+            build_frozen_gateway(config, runtime_profiles(), http),
+            PromptBuilder.load(PROMPTS, "v4", expected_digest=config.prompt_digest),
+            FindingValidator(),
+            ConservativeTokenCounter(),
+            config.service_settings,
+            frozen_configuration=config,
+        )
+        adapter = LlmGatewayAdapter(service, execution.budget())
+        first = await adapter.review(
+            BuiltContextPayload(1, config.review_id, execution.chunk_id, body)
+        )
+        later = await adapter.review(
+            BuiltContextPayload(1, config.review_id, other, body)
+        )
+    assert first.findings and later.findings
+    assert calls == ["initial", "initial"]
+    assert (await execution.budget().snapshot()).requests_used == 2
+    assert first.limitations  # Optional verification skipped safely and visibly.
 
 
 async def test_durable_reflection_reservation_is_committed_and_counted(

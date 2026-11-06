@@ -2,6 +2,7 @@
 # Daily RDB snapshot of the Compose Redis service; files stay on this host.
 set -euo pipefail
 umask 077
+export PATH="${PATH:+${PATH}:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 if [[ $# -ne 2 ]]; then
   echo "usage: backup-redis.sh COMPOSE_PROJECT ENV_FILE" >&2
@@ -10,6 +11,9 @@ fi
 compose_project="$1"
 env_file="$2"
 root="$(cd "$(dirname "$0")" && pwd)"
+if [[ ! -f "${root}/docker-compose.staging.yml" && -f "${root}/../docker-compose.staging.yml" ]]; then
+  root="$(cd "${root}/.." && pwd)"
+fi
 cd "${root}"
 install -d -m 700 "${root}/backups" "${root}/backups/redis"
 chmod 700 "${root}/backups" "${root}/backups/redis"
@@ -26,14 +30,20 @@ finish() {
   local status=$?
   rm -f "${partial}"
   if ((status != 0)); then
-    log_status fail
+    log_status "fail ${stage} exit=${status}"
   fi
 }
 exec 9>"${dest}/backup.lock"
-if ! flock -n 9; then
-  log_status skip-lock
-  exit 0
-fi
+flock -n 9 2>/dev/null || {
+  status=$?
+  if ((status == 1)); then
+    log_status skip-lock
+    exit 0
+  fi
+  log_status "fail flock exit=${status}"
+  exit "${status}"
+}
+stage=snapshot
 trap finish EXIT
 
 docker compose -p "${compose_project}" --env-file "${env_file}" \
@@ -46,6 +56,7 @@ docker compose -p "${compose_project}" --env-file "${env_file}" \
     cat "$snapshot"
   ' > "${partial}" 2>/dev/null
 
+stage=validate-rdb
 docker compose -p "${compose_project}" --env-file "${env_file}" \
   -f docker-compose.staging.yml exec -T redis sh -c '
     set -eu

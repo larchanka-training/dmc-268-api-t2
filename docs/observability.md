@@ -11,6 +11,8 @@ Defaults: `METRICS__HOST=127.0.0.1`, `METRICS__PORT=9100`. API, analysis,
 publication, webhook recovery and outbox dispatcher each expose their own process
 metrics. `publication_worker --check-config` stays offline and opens no listener.
 Use one process per container; this is not a multiprocess collector setup.
+For Uvicorn, keep `--workers 1` / `WEB_CONCURRENCY=1` when metrics are enabled;
+each process owns its listener, and a shared port is not a worker aggregator.
 
 The optional staging override sets the listener host to `0.0.0.0` **inside the
 backend network** and publishes no metrics port. Never route it through Caddy or
@@ -30,6 +32,9 @@ expose it publicly: there is no authentication on the internal listener.
   It does not create groups, receive/claim/ACK deliveries or inspect envelopes.
   `dmc_queue_sample_success=0` and NaN values mean unavailable/missing metadata;
   Redis NULL lag is also NaN. ACKed history/XLEN is never called backlog.
+  Sampling errors invalidate the previous sample and emit only the fixed
+  `queue_metrics_sample_failed` warning with the bounded queue name. Exception
+  text is omitted; the next poll can recover normally.
 - Standard Python process CPU/RSS metrics are available on Linux. The dashboard's
   node CPU/RAM collector uses no host filesystem/PID mounts. On Docker Desktop its
   kernel counters describe the Linux VM, **not macOS**. Process CPU uses one core

@@ -432,6 +432,57 @@ def test_live_mode_requires_explicit_manifest_and_spend_approval(
         )
 
 
+def test_live_mode_rejects_zero_declared_prices_before_provider_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = Path(__file__).parents[1]
+    monkeypatch.setenv("LLM__EUROROUTER__API_KEYS", "fixture-key")
+    requests: list[httpx.Request] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"summary": "ok", "findings": [], "limitations": []}
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+        )
+
+    report_path = tmp_path / "report.json"
+    with pytest.raises(LlmConfigurationError, match="Invalid live configuration"):
+        run(
+            [
+                "--mode",
+                "live",
+                "--allow-live",
+                "--runtime-manifest",
+                str(root / "deploy/analysis-runtime.staging.json"),
+                "--max-cost-usd",
+                "0.000001",
+                "--input-usd-per-million",
+                "0",
+                "--output-usd-per-million",
+                "0",
+                "--filter",
+                "clean",
+                "--report-out",
+                str(report_path),
+            ],
+            transport=httpx.MockTransport(provider),
+        )
+    assert requests == []
+    assert not report_path.exists()
+
+
 def test_authorized_live_path_uses_runtime_gateway_with_a_local_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -503,6 +554,9 @@ def test_authorized_live_path_uses_runtime_gateway_with_a_local_transport(
     assert report["fixtures"][0]["model"] == "fixture-model"
     assert report["fixtures"][0]["provider"] == "eurorouter"
     assert report["provenance"]["mode"] == "live"
+    assert report["provenance"]["quality_measurement"] is False
+    persisted = json.loads((tmp_path / "report.json").read_text())
+    assert persisted["provenance"]["quality_measurement"] is False
     assert report["usage"]["requests"] == len(requests)
     assert (
         report["usage"]["cost_usd"] == "0.000027"

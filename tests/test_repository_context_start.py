@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -469,3 +470,159 @@ async def test_real_worker_persists_ast_and_sends_it_to_frozen_gateway(  # noqa:
         else:
             assert payload.payload_body["files"][0]["source_windows"]
             assert payload.payload_body["related_symbols"]
+
+
+async def test_queued_review_keeps_admitted_base_when_another_start_refreshes_pr(  # noqa: PLR0913, PLR0917 -- public admission to real worker regression
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
+    newer_base = "e" * 40
+    rules = {
+        BASE: b"# Security\n## SEC-1: Base A\nApply tenant policy A.\n",
+        newer_base: b"# Security\n## SEC-1: Base B\nApply tenant policy B.\n",
+    }
+
+    def github(request: httpx.Request) -> httpx.Response:  # noqa: PLR0911 -- fixed GitHub endpoint fixture
+        if request.url.path.endswith("/contents/.review/rules.md"):
+            raw = rules[request.url.params["ref"]]
+            return httpx.Response(
+                200,
+                json={
+                    "type": "file",
+                    "size": len(raw),
+                    "sha": "d" * 40,
+                    "encoding": "base64",
+                    "content": base64.b64encode(raw).decode(),
+                },
+            )
+        if "/contents/" in request.url.path:
+            return httpx.Response(404)
+        if "/commits/" in request.url.path:
+            return httpx.Response(200, json={"sha": request.url.path.rsplit("/", 1)[1]})
+        if "/pulls/" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "title": "Check",
+                    "body": "",
+                    "state": "open",
+                    "head": {
+                        "repo": {"id": 123456},
+                        "sha": HEAD,
+                        "ref": "feature/postgres-validation",
+                    },
+                    "base": {
+                        "repo": {"id": 123456},
+                        "sha": configured.pull_request.base_sha,
+                        "ref": "main",
+                    },
+                },
+            )
+        if request.headers.get("accept") == "application/vnd.github.diff":
+            return httpx.Response(
+                200,
+                text=(
+                    "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+                    "@@ -1 +1 @@\n-return value\n+return value / 0\n"
+                ),
+            )
+        if "/compare/" in request.url.path:
+            return httpx.Response(200, json={"merge_base_commit": {"sha": newer_base}})
+        return httpx.Response(200, json={"id": 123456})
+
+    monkeypatch.setattr(
+        "httpx._client.AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(github)
+    )
+    first = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert first.status_code == 202, first.json()
+    identifier = UUID(first.json()["review_id"])
+    reader = FrozenConfigurationReader(factory, PROMPTS, runtime_profiles())
+    frozen_a = await reader.resolve(identifier)
+    assert frozen_a.instructions == (
+        "[SEC-1] Security: Base A\nApply tenant policy A.",
+    )
+
+    configured.pull_request = replace(configured.pull_request, base_sha=newer_base)
+    second = await client.post(
+        scope.url,
+        json={"requested_head_sha": HEAD},
+        headers={**HEADERS, "Idempotency-Key": "base-b"},
+    )
+    assert second.status_code == 202, second.json()
+    frozen_b = await reader.resolve(UUID(second.json()["review_id"]))
+    assert frozen_b.instructions == (
+        "[SEC-1] Security: Base B\nApply tenant policy B.",
+    )
+    assert frozen_a.repository_settings_id != frozen_b.repository_settings_id
+
+    calls: list[httpx.Request] = []
+
+    def model(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "test-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "summary": "ok",
+                                    "findings": [],
+                                    "limitations": [],
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+            },
+        )
+
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        identifier, owner="frozen-base", task_kind="analyze"
+    )
+    assert lease is not None
+    task = await analysis_task(factory, identifier)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(github)) as vcs,
+        httpx.AsyncClient(transport=httpx.MockTransport(model)) as http,
+    ):
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(vcs),
+            None,
+            schemas_dir=Path("schemas"),
+            execution_factory=FrozenAnalysisExecutionFactory(
+                factory, PROMPTS, runtime_profiles(), http
+            ),
+        )
+        token = current_analysis_authority.set(
+            LiveAnalysisAuthority(lease, started=time.monotonic())
+        )
+        try:
+            await handler.handle(task, lease)
+        finally:
+            current_analysis_authority.reset(token)
+            async with factory.begin() as session:
+                await session.execute(
+                    delete(ReviewLlmAttempt).where(
+                        ReviewLlmAttempt.review_job_id == identifier
+                    )
+                )
+    app.dependency_overrides[get_authenticated_principal] = lambda: (
+        AuthenticatedPrincipal(scope.user)
+    )
+    detail = await client.get(f"/api/v1/reviews/{identifier}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "SKIPPED"
+    assert detail.json()["error"]["reason_code"] == "PR_STALE_OR_CLOSED"
+    assert len(calls) == 0

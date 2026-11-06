@@ -233,6 +233,34 @@ class PostgresReviewRunBudget:
             ):
                 raise BudgetExceededError("invalid per-call token reservation")
             used = await self._snapshot(session)
+            if call_kind == "reflection":
+                pending = await session.scalar(
+                    select(func.count(ContextPayload.id)).where(
+                        ContextPayload.review_job_id == job.id,
+                        ContextPayload.id != chunk_id,
+                        ~exists(
+                            select(ChunkResult.id).where(
+                                ChunkResult.context_payload_id == ContextPayload.id,
+                                ChunkResult.review_job_id == job.id,
+                            )
+                        ),
+                    )
+                )
+                if pending and (
+                    used.requests_used + 1 + pending > limits.run_max_requests
+                    or used.input_tokens_used
+                    + input_tokens
+                    + pending * limits.max_input_tokens
+                    > limits.run_max_input_tokens
+                    or used.output_tokens_used
+                    + output_tokens
+                    + pending * limits.max_output_tokens
+                    > limits.run_max_output_tokens
+                ):
+                    raise BudgetExceededError(
+                        "reflection preserves remaining chunk budget",
+                        error_code="reflection_headroom_exhausted",
+                    )
             if used.input_tokens_used + input_tokens > limits.run_max_input_tokens:
                 raise BudgetExceededError(
                     "run input token limit exhausted",

@@ -2,10 +2,13 @@
 
 from uuid import UUID
 
+import structlog
+
 from app.application.github_ports import GithubFailure, GithubPort
 from app.application.webhook_ports import (
     AutomaticReceiptContext,
     AutomaticWebhookAdmission,
+    InboxUnavailable,
     WebhookInbox,
 )
 from app.vcs.diff import InvalidDiff, parse_diff
@@ -16,6 +19,23 @@ async def process_webhook(
     inbox: WebhookInbox,
     github: GithubPort,
     automatic: AutomaticWebhookAdmission | None = None,
+) -> None:
+    try:
+        await _process_webhook(receipt_id, inbox, github, automatic)
+    except InboxUnavailable:
+        # The durable claim remains recoverable after its lease expires.
+        structlog.get_logger().warning(
+            "webhook_processing_deferred",
+            receipt_id=str(receipt_id),
+            reason_code="INBOX_UNAVAILABLE",
+        )
+
+
+async def _process_webhook(
+    receipt_id: UUID,
+    inbox: WebhookInbox,
+    github: GithubPort,
+    automatic: AutomaticWebhookAdmission | None,
 ) -> None:
     claim = await inbox.claim(receipt_id)
     if claim is None:

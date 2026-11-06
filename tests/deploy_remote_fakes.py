@@ -10,6 +10,10 @@ printf "%s\n" "$*" >> "$trace_file"
 
 # docker compose ... ps -q <service>
 if [[ "$1" == compose && " $* " == *" ps -q "* ]]; then
+  if [[ "${@: -1}" == publication-worker && "${PUBLICATION_DISAPPEARS:-0}" == 1 &&
+        "$(grep -c ' ps -q publication-worker$' "$trace_file")" -gt 1 ]]; then
+    exit 0
+  fi
   echo "cid-${@: -1}"
   exit 0
 fi

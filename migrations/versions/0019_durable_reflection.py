@@ -37,6 +37,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Keep the forward schema while any policy2 or Reflection history remains.
+    # Narrowing CHECKs rejects retained policy2/Reflection rows; operators must
+    # keep the forward schema while such history remains.
     _call_kinds("'initial', 'repair', 'overflow_rebuild'")
     _policy_shape("'1'")

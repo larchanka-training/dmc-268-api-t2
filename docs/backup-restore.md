@@ -10,30 +10,39 @@ unchanged. Redis backup does not enable AOF, a volume, or automatic replay of jo
 
 Run on the Linux staging host with Bash, GNU date, gzip, flock, Docker and Docker Compose.
 Both scripts accept the Compose project and environment-file path. They use the existing
-`db` / `redis` services in the rendered `docker-compose.staging.yml` installed
-alongside the scripts (the same deployment layout as the PostgreSQL script).
+`db` / `redis` services in the rendered `docker-compose.staging.yml`. The Redis
+script supports both the flat installed layout alongside Compose and a checkout's
+`scripts/` directory one level below it. The existing deploy workflow installs only
+the PostgreSQL script/schedule; copying and scheduling Redis remains an explicit
+operator step, not an automatic deployment feature.
 
 ```bash
-/path/to/scripts/backup-postgres.sh dmc268-staging /path/to/staging.env
-/path/to/scripts/backup-redis.sh dmc268-staging /path/to/staging.env
+# After approving the host and deployment directory:
+install -m 755 /path/to/checkout/scripts/backup-redis.sh /path/to/deployment/backup-redis.sh
+/path/to/deployment/backup-postgres.sh dmc268-staging /path/to/staging.env
+/path/to/deployment/backup-redis.sh dmc268-staging /path/to/staging.env
 ```
 
 PostgreSQL retains its existing daily/predeploy behavior. Redis captures an RDB using
 `redis-cli --rdb`, then validates the received bytes with the Redis service's
 `redis-check-rdb`. Only a validated file replaces
-`scripts/backups/redis/redis-YYYY-MM-DD.rdb`. The last seven date-named Redis snapshots
+`backups/redis/redis-YYYY-MM-DD.rdb` under the selected Compose directory. The last seven date-named Redis snapshots
 remain after a successful backup; other files are untouched. A failure keeps the previous
 snapshot and removes the partial file. A busy per-script lock skips that run. Directories
 are mode 0700; newly created snapshot, lock and status-log files are mode 0600. The Redis
-log keeps the last 30 fixed status lines and excludes tool output and credentials.
+log keeps the last 30 fixed status/stage/exit-code lines and excludes raw tool output
+and credentials. Failed capture/validation reports `snapshot` / `validate-rdb`;
+unavailable `flock` fails with `flock exit=127` rather than a successful busy-lock
+skip. Standard tool directories are appended to PATH for cron, preserving an
+explicitly supplied executable path. Redis/Docker stderr remains suppressed deliberately.
 
 Example cron entries below are documentation only; install them deliberately as the
 same account that owns the deployment. The environment file must already be protected.
 There is no password in either command line. Check both exit status and backup age.
 
 ```cron
-15 2 * * * /path/to/scripts/backup-postgres.sh dmc268-staging /path/to/staging.env
-25 2 * * * /path/to/scripts/backup-redis.sh dmc268-staging /path/to/staging.env
+15 2 * * * /path/to/deployment/backup-postgres.sh dmc268-staging /path/to/staging.env
+25 2 * * * /path/to/deployment/backup-redis.sh dmc268-staging /path/to/staging.env
 ```
 
 ## Restore deliberately into fresh targets

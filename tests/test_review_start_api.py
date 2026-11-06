@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Depends, FastAPI
 from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from test_postgres_integration import (
     PostgresHarness,
@@ -2514,6 +2515,68 @@ async def test_second_cancel_returns_ok_without_another_event(
     assert second.status_code == HTTPStatus.OK
     assert second.json() == first.json()
     assert await _cancel_events(postgres, review_id) == 1
+
+
+async def test_cancel_sqlalchemy_error_returns_503_retryable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    async def boom(*_args: object, **_kwargs: object) -> tuple[UUID, str] | None:
+        raise SQLAlchemyError("simulated disconnect")
+
+    monkeypatch.setattr("app.api.review_cancel.find_replay", boom)
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers()
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+    assert response.json()["retryable"] is True
+    assert_schema(response, "Error")
+
+
+async def test_same_cancel_idempotency_ok_when_user_cancel_not_latest_event(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    first = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("cancel-idem-order"),
+    )
+    assert first.status_code == HTTPStatus.OK
+    rid = uuid.UUID(review_id)
+    async with postgres.engine.begin() as connection:
+        last_seq = await connection.scalar(
+            select(func.max(models.ReviewEvent.sequence)).where(
+                models.ReviewEvent.review_job_id == rid
+            )
+        )
+        assert last_seq is not None
+        await connection.execute(
+            insert(models.ReviewEvent).values(
+                review_job_id=rid,
+                sequence=last_seq + 1,
+                event_type="FAILURE",
+                status="FAILED",
+                publication_status="NOT_READY",
+                reason_code="LLM_UNAVAILABLE",
+                retryable=True,
+                attempt=1,
+            )
+        )
+    replay = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("cancel-idem-order"),
+    )
+    assert replay.status_code == HTTPStatus.OK
+    assert replay.json() == first.json()
 
 
 async def test_same_key_replay_skips_access_check_and_new_key_stays_ok(

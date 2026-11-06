@@ -1,16 +1,19 @@
 """Stop a review that has not finished."""
 
 import hashlib
+from collections.abc import Callable, Coroutine
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.routing import APIRoute
 from pydantic import AnyUrl, TypeAdapter, ValidationError
-from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import JSONResponse
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse, Response
 
 from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identity
 from app.api.errors import ApiError
@@ -33,7 +36,45 @@ from app.db.review_starts import find_replay
 from app.db.session import get_session
 from app.domain.enums import ReviewReasonCode
 
-router = APIRouter(prefix="/api/v1/reviews")
+
+class CancelReviewRoute(APIRoute):
+    def get_route_handler(
+        self,
+    ) -> Callable[[StarletteRequest], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def protected(request: StarletteRequest) -> Response:
+            try:
+                return await handler(request)
+            except IntegrityError as error:
+                cause = getattr(error.orig, "__cause__", None)
+                if (
+                    getattr(cause, "constraint_name", None)
+                    == "uq_review_job_active_equivalent"
+                ):
+                    raise ApiError(
+                        409,
+                        "REVIEW_ALREADY_ACTIVE",
+                        "An equivalent review is already active.",
+                    ) from None
+                raise ApiError(
+                    503,
+                    "SERVICE_UNAVAILABLE",
+                    "Service is unavailable.",
+                    retryable=True,
+                ) from None
+            except SQLAlchemyError:
+                raise ApiError(
+                    503,
+                    "SERVICE_UNAVAILABLE",
+                    "Service is unavailable.",
+                    retryable=True,
+                ) from None
+
+        return protected
+
+
+router = APIRouter(prefix="/api/v1/reviews", route_class=CancelReviewRoute)
 _NOT_CANCELLABLE = "The review cannot be cancelled."
 
 
@@ -84,13 +125,17 @@ def _not_cancellable() -> ApiError:
     return ApiError(409, "REVIEW_NOT_CANCELLABLE", _NOT_CANCELLABLE)
 
 
-async def _terminal_reason(session: AsyncSession, review_id: UUID) -> str | None:
-    return await session.scalar(
-        select(ReviewEvent.reason_code)
-        .where(ReviewEvent.review_job_id == review_id)
-        .order_by(ReviewEvent.sequence.desc())
-        .limit(1)
+async def _user_cancel_recorded(session: AsyncSession, review_id: UUID) -> bool:
+    """True if this review was stopped successfully (USER_CANCELLED), any sequence."""
+    recorded = await session.scalar(
+        select(
+            exists().where(
+                ReviewEvent.review_job_id == review_id,
+                ReviewEvent.reason_code == ReviewReasonCode.USER_CANCELLED.value,
+            )
+        )
     )
+    return bool(recorded)
 
 
 async def _remember(
@@ -123,7 +168,7 @@ async def _remember(
 
 
 async def _outcome(session: AsyncSession, review_id: UUID) -> JSONResponse:
-    if await _terminal_reason(session, review_id) == ReviewReasonCode.USER_CANCELLED:
+    if await _user_cancel_recorded(session, review_id):
         return _ok(review_id)
     raise _not_cancellable()
 
@@ -175,6 +220,7 @@ async def cancel_review_http(
         ) from None
     if replay is not None:
         return await _outcome(session, review_id)
+    await session.commit()
     if repository.integration_status != "healthy":
         raise ApiError(
             409, "INTEGRATION_UNHEALTHY", "The repository integration is unhealthy."
@@ -227,8 +273,7 @@ async def _apply_cancel(
     )
     if updated is None:
         await session.rollback()
-        reason = await _terminal_reason(session, review_id)
-        if reason == ReviewReasonCode.USER_CANCELLED:
+        if await _user_cancel_recorded(session, review_id):
             return _ok(review_id)
         await _remember(
             session,

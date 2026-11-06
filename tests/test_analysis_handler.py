@@ -63,6 +63,8 @@ from app.db.uow import SqlAlchemyUnitOfWork
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.domain.frozen_configuration import admission_policy
 from app.domain.settings import compute_rules_digest
+from app.review.port_adapter import ChunkReviewFailedError
+from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome, Usage
 from app.vcs.github import GithubClient
 
 pytest_plugins = ("test_postgres_integration", "test_redis_queue")
@@ -1904,6 +1906,60 @@ async def test_failure_audit_uses_durable_execution_attempt(
             )
         ).all()
         assert [event.attempt for event in events] == [1, 2]
+
+
+async def test_chunk_failure_after_cancel_completes_without_lease_lost(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class FailingLlm(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            await super().review(payload)
+            await _mark_cancelled(factory, review_id)
+            raise ChunkReviewFailedError(
+                ReviewChunkOutcome(
+                    schema_version=1,
+                    review_id=str(payload.review_id),
+                    chunk_id=str(payload.chunk_id),
+                    status=ChunkStatus.FAILED,
+                    summary=None,
+                    findings=[],
+                    rejected_findings_count=0,
+                    limitations=[],
+                    usage=Usage(
+                        input_tokens=None,
+                        output_tokens=None,
+                        requests=1,
+                        latency_ms=1,
+                    ),
+                    model="test",
+                    model_digest=None,
+                    provider="test",
+                    prompt_version="v1",
+                    error_code="llm_error",
+                    retryable=False,
+                )
+            )
+
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", 1, event.trace_id
+        )
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-then-chunk-fail", task_kind="analyze"
+    )
+    assert lease is not None
+    async with httpx.AsyncClient(transport=github_http()) as http:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(http), FailingLlm(), schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
 
 
 async def test_local_authority_loss_before_result_persistence_keeps_delivery_pending(

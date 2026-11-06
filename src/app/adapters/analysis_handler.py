@@ -191,6 +191,8 @@ class PostgresAnalysisHandler:
             return await self._execute(task, lease)
         except FrozenConfigurationError as failure:
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -219,6 +221,8 @@ class PostgresAnalysisHandler:
             ):
                 return None
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -238,6 +242,8 @@ class PostgresAnalysisHandler:
             ):
                 return None
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -248,6 +254,8 @@ class PostgresAnalysisHandler:
             return DurableTaskOutcome.COMPLETED
         except _AnalysisFailureError as failure:
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 status = (
                     ReviewStatus.SKIPPED
                     if failure.reason == ReviewReasonCode.PR_STALE_OR_CLOSED
@@ -551,6 +559,8 @@ class PostgresAnalysisHandler:
         if not contexts:
             # Every chunk already has a result but the run never ended.
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,

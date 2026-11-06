@@ -1,0 +1,25 @@
+{
+  "versions": {
+    "v1": {
+      "digest_format": "review-reflection-bundle/v1",
+      "renderer_version": "reflection-renderer-v1",
+      "artifacts": [
+        {
+          "role": "system",
+          "path": "v1/system.md",
+          "sha256": "b067f3ca4e5f1963abba1c468494a2fcc4d5770e4a3398ebce27a62dee727148"
+        },
+        {
+          "role": "renderer",
+          "path": "src/app/review/renderers/reflection_v1.py",
+          "sha256": "dacb846a6cfaa01419a29e3378a27253c45f51957995494dd8e7ed3d03630f92"
+        },
+        {
+          "role": "llm_output_schema",
+          "path": "schemas/reflection-output/v1.json",
+          "sha256": "dcb52dba6fe84ace92010cf73629fb51575263d51ba778223266257b53c40763"
+        }
+      ]
+    }
+  }
+}

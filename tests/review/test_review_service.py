@@ -1063,3 +1063,31 @@ async def test_v3_fallback_preserves_provenance_limitation(
     result = await v3_service.review_chunk(payload, _budget())
     assert result.provider == "ollama"
     assert "Чанк обработан резервным провайдером (ollama/qwen)." in result.limitations
+
+
+async def test_verifier_schema_must_fit_before_claiming_allowance(
+    providers: ScriptedProviders,
+    payload: ContextPayload,
+) -> None:
+    class SchemaHeavyCounter:
+        def count(self, text: str) -> int:
+            return 1000 if '"verdicts"' in text else 1
+
+    settings = _settings().model_copy(update={"max_input_tokens": 100})
+    counter = SchemaHeavyCounter()
+    service = ReviewService(
+        build_gateway(
+            settings,
+            httpx.AsyncClient(transport=httpx.MockTransport(providers.handler)),
+        ),
+        PromptBuilder.load(_PROMPTS, "v3", counter),
+        FindingValidator(),
+        counter,
+        settings,
+    )
+    providers.script.extend([_output(_v3_finding(39)), _confirmed(0)])
+    budget = _budget(max_reflections=1)
+    result = await service.review_chunk(payload, budget)
+    assert result.status == ChunkStatus.COMPLETED
+    assert len(providers.requests) == 1
+    assert budget.state().reflections_used == 0

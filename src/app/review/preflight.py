@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import ReviewJob
 from app.domain.frozen_configuration import FrozenConfigurationError
-from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.prompt import PromptBuilder, PromptConfigError, reflection_bundle
 
 if TYPE_CHECKING:
     from app.review.configuration import TrustedRuntimeConfiguration
@@ -60,6 +60,9 @@ async def offline_preflight(
             runtime.admission.prompt_version,
             expected_digest=runtime.admission.prompt_digest,
         ).ensure_verified()
+        reflection_bundle(
+            prompt_root, runtime.admission.policy, runtime.admission.prompt_version
+        )
     except PromptConfigError:
         issues.append(PreflightIssue(None, "unsupported_prompt_bundle"))
     async with factory() as session:

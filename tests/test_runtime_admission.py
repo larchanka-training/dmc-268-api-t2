@@ -1,18 +1,26 @@
 """Trusted API selection freezes configuration without execution credentials."""
 
 import os
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from test_durable_reflection import policy_two
 from test_postgres_integration import PostgresHarness
 from test_review_start_api import HEAD, HEADERS, FakeStartGithub, StartScope
 from test_runtime_manifest import PROMPTS, manifest_values, write_manifest
 
-from app.application.review_start_ports import RepositoryIdentity
+from app.api.review_start_dependencies import get_review_configuration_resolver
+from app.application.review_start_ports import (
+    FrozenAnalysisConfiguration,
+    RepositoryIdentity,
+)
 from app.domain.settings import compute_rules_digest
 from app.review.configuration import load_runtime_configuration
+from app.review.prompt import PromptBuilder
 
 pytest_plugins = ("test_review_start_api",)
 
@@ -55,3 +63,33 @@ async def test_http_uses_trusted_manifest_without_llm_credentials(
         scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
     )
     assert response.status_code == 202  # noqa: PLR2004
+
+
+async def test_http_rejects_bad_verifier_pin_from_configuration_port(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    app: Any,
+) -> None:
+
+    resolver = app.dependency_overrides[get_review_configuration_resolver]()
+    digest = PromptBuilder.load(PROMPTS, "v4").prompt_digest
+    assert digest is not None
+
+    class BadVerifierPin:
+        async def resolve(self, **kwargs: Any) -> FrozenAnalysisConfiguration:
+            assert digest is not None
+            valid = await resolver.resolve(**kwargs)
+            assert isinstance(valid, FrozenAnalysisConfiguration)
+            policy = policy_two(valid.model_settings)
+            policy["reflection"]["verifier_digest"] = "0" * 64
+            return replace(
+                valid, model_settings=policy, prompt_version="v4", prompt_digest=digest
+            )
+
+    app.dependency_overrides[get_review_configuration_resolver] = BadVerifierPin
+    response = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert response.status_code == 503  # noqa: PLR2004 -- unavailable configuration
+    assert response.json()["message"] == "Review configuration is unavailable."

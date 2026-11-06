@@ -17,7 +17,11 @@ from app.db.analysis_authority import (
     validate_config_identity,
 )
 from app.db.models import ChunkResult, ContextPayload, ReviewJob, ReviewLlmAttempt
-from app.domain.frozen_configuration import FrozenConfigurationError, ModelSettings
+from app.domain.frozen_configuration import (
+    FrozenConfigurationError,
+    ModelSettings,
+    ModelSettingsV2,
+)
 from app.llm.client import known_token_usage
 from app.llm.errors import BudgetExceededError
 
@@ -42,14 +46,16 @@ class PostgresReviewRunBudget:
             raise BudgetExceededError("analysis execution has not begun")
         return (snapshot.analysis_deadline_at - snapshot.sampled_at).total_seconds()
 
-    async def snapshot(self) -> DurableBudgetSnapshot:
+    async def snapshot(self, *, chunk_id: UUID | None = None) -> DurableBudgetSnapshot:
         async with self._factory() as session:
             job = await session.get(ReviewJob, self._lease.review_job_id)
             if job is None or job.frozen_configuration_version != 1:
                 raise FrozenConfigurationError("historical_budget_unknown")
-            return await self._snapshot(session)
+            return await self._snapshot(session, chunk_id=chunk_id)
 
-    async def _snapshot(self, session: AsyncSession) -> DurableBudgetSnapshot:
+    async def _snapshot(
+        self, session: AsyncSession, *, chunk_id: UUID | None = None
+    ) -> DurableBudgetSnapshot:
         requests, actual_inputs, actual_outputs, unknown_inputs, unknown_outputs = (
             await session.execute(
                 select(
@@ -68,7 +74,14 @@ class PostgresReviewRunBudget:
                         ),
                         0,
                     ),
-                ).where(ReviewLlmAttempt.review_job_id == self._lease.review_job_id)
+                ).where(
+                    ReviewLlmAttempt.review_job_id == self._lease.review_job_id,
+                    *(
+                        [ReviewLlmAttempt.chunk_id == chunk_id]
+                        if chunk_id is not None
+                        else []
+                    ),
+                )
             )
         ).one()
         deadline = await session.scalar(
@@ -143,6 +156,35 @@ class PostgresReviewRunBudget:
                 raise AccountingIdentityError("operation_identity_mismatch")
             if len(operation) >= policy.retry.provider_max_attempts_per_operation:
                 raise BudgetExceededError("operation request limit exhausted")
+            if call_kind == "reflection" and (
+                not isinstance(policy, ModelSettingsV2)
+                or policy.reflection.max_reflections_per_run == 0
+            ):
+                raise BudgetExceededError(
+                    "reflection disabled", error_code="reflection_allowance_exhausted"
+                )
+            if call_kind == "reflection" and any(
+                row.call_kind == "reflection"
+                and row.chunk_id == chunk_id
+                and row.operation_id != operation_id
+                for row in rows
+            ):
+                raise BudgetExceededError(
+                    "reflection already used for chunk",
+                    error_code="reflection_allowance_exhausted",
+                )
+            if call_kind == "reflection" and isinstance(policy, ModelSettingsV2):
+                reflected = {
+                    row.operation_id for row in rows if row.call_kind == "reflection"
+                }
+                if (
+                    operation_id not in reflected
+                    and len(reflected) >= policy.reflection.max_reflections_per_run
+                ):
+                    raise BudgetExceededError(
+                        "reflection run allowance exhausted",
+                        error_code="reflection_allowance_exhausted",
+                    )
             if call_kind == "overflow_rebuild" and any(
                 row.chunk_id == chunk_id
                 and row.call_kind == "overflow_rebuild"
@@ -180,7 +222,7 @@ class PostgresReviewRunBudget:
                 job.format_repair_chunk_id,
             ) != (operation_id, self._lease.fencing_token, chunk_id):
                 raise AccountingIdentityError("repair_claim_mismatch")
-            if call_kind not in {"initial", "overflow_rebuild", "repair"}:
+            if call_kind not in {"initial", "overflow_rebuild", "repair", "reflection"}:
                 raise AccountingIdentityError("unsupported_call_kind")
             if (
                 type(input_tokens) is not int
@@ -191,6 +233,34 @@ class PostgresReviewRunBudget:
             ):
                 raise BudgetExceededError("invalid per-call token reservation")
             used = await self._snapshot(session)
+            if call_kind == "reflection":
+                pending = await session.scalar(
+                    select(func.count(ContextPayload.id)).where(
+                        ContextPayload.review_job_id == job.id,
+                        ContextPayload.id != chunk_id,
+                        ~exists(
+                            select(ChunkResult.id).where(
+                                ChunkResult.context_payload_id == ContextPayload.id,
+                                ChunkResult.review_job_id == job.id,
+                            )
+                        ),
+                    )
+                )
+                if pending and (
+                    used.requests_used + 1 + pending > limits.run_max_requests
+                    or used.input_tokens_used
+                    + input_tokens
+                    + pending * limits.max_input_tokens
+                    > limits.run_max_input_tokens
+                    or used.output_tokens_used
+                    + output_tokens
+                    + pending * limits.max_output_tokens
+                    > limits.run_max_output_tokens
+                ):
+                    raise BudgetExceededError(
+                        "reflection preserves remaining chunk budget",
+                        error_code="reflection_headroom_exhausted",
+                    )
             if used.input_tokens_used + input_tokens > limits.run_max_input_tokens:
                 raise BudgetExceededError(
                     "run input token limit exhausted",

@@ -22,7 +22,11 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.frozen_configuration import RepositoryInstructions
+from app.domain.frozen_configuration import (
+    ModelPolicy,
+    ModelSettingsV2,
+    RepositoryInstructions,
+)
 from app.llm.client import ChatMessage
 from app.llm.tokens import ConservativeTokenCounter, TokenCounter
 from app.review.schemas.context import ContextPayload, FileDiff
@@ -339,6 +343,12 @@ def _verify_artifacts(
             f"schemas/review-result/v{_PROMPT_IDENTITIES[version][2]}.json"
         ),
     }
+    return _verify_artifact_files(root, entry, source_root, required)
+
+
+def _verify_artifact_files(
+    root: Path, entry: dict[str, Any], source_root: Path, required: dict[str, str]
+) -> dict[str, bytes]:
     artifacts = entry["artifacts"]
     if not isinstance(artifacts, list):
         raise PromptConfigError("artifacts must be a list")
@@ -378,6 +388,10 @@ def _verify_artifacts(
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[3]
 _RENDERERS = {
+    "reflection-renderer-v1": (
+        "app.review.renderers.reflection_v1",
+        "src/app/review/renderers/reflection_v1.py",
+    ),
     "review-renderer-v1": ("app.review.renderers.v1", "src/app/review/renderers/v1.py"),
     "review-renderer-v2": ("app.review.renderers.v2", "src/app/review/renderers/v2.py"),
     "review-renderer-v3": ("app.review.renderers.v3", "src/app/review/renderers/v3.py"),
@@ -462,3 +476,101 @@ def delimiter_block_list() -> str:
 def estimate_messages(messages: Sequence[ChatMessage], counter: TokenCounter) -> int:
     """Content estimate including chat-template framing for every message."""
     return sum(counter.count(message.content) + 4 for message in messages)
+
+
+@dataclass(frozen=True)
+class ReflectionBundle:
+    """Independent attested verifier closure; policy pins its descriptor digest."""
+
+    digest: str
+    system: str
+    output_schema_json: str
+    renderer: ModuleType
+
+    @classmethod
+    def load(
+        cls,
+        root: Path,
+        version: str,
+        *,
+        expected_digest: str | None = None,
+        source_root: Path | None = None,
+    ) -> ReflectionBundle:
+        try:
+            if version != "v1":
+                raise PromptConfigError("unsupported verifier version")
+            entry = json.loads(
+                (root / "manifest.json").read_text("utf-8"),
+                object_pairs_hook=_unique_keys,
+            )["versions"][version]
+            if (
+                entry["digest_format"] != "review-reflection-bundle/v1"
+                or entry["renderer_version"] != "reflection-renderer-v1"
+            ):
+                raise PromptConfigError("unsupported verifier descriptor")
+            artifacts = _verify_artifact_files(
+                root,
+                entry,
+                source_root or _SOURCE_ROOT,
+                {
+                    "system": "v1/system.md",
+                    "renderer": "src/app/review/renderers/reflection_v1.py",
+                    "llm_output_schema": "schemas/reflection-output/v1.json",
+                },
+            )
+            descriptor = {
+                "digest_format": entry["digest_format"],
+                "verifier_version": version,
+                "renderer_version": entry["renderer_version"],
+                "artifacts": sorted(
+                    entry["artifacts"], key=lambda a: (a["role"], a["path"])
+                ),
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    descriptor,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest()
+            if expected_digest is not None and digest != expected_digest:
+                raise PromptConfigError("verifier digest mismatch")
+            schema = artifacts["llm_output_schema"].decode("utf-8")
+            Draft202012Validator.check_schema(json.loads(schema))
+            return cls(
+                digest,
+                artifacts["system"].decode("utf-8"),
+                schema,
+                _load_renderer(artifacts["renderer"], entry["renderer_version"]),
+            )
+        except (
+            OSError,
+            KeyError,
+            ValueError,
+            TypeError,
+            SyntaxError,
+            SchemaError,
+        ) as exc:
+            raise PromptConfigError("cannot load verifier bundle") from exc
+
+    def build(self, context: str, findings: list[dict[str, Any]]) -> list[ChatMessage]:
+        return [
+            ChatMessage(role="system", content=self.system),
+            ChatMessage(role="user", content=self.renderer.render(context, findings)),
+        ]
+
+
+def reflection_bundle(
+    root: Path, policy: ModelPolicy, prompt_version: str
+) -> ReflectionBundle | None:
+    if isinstance(policy, ModelSettingsV2):
+        if prompt_version != "v4":
+            raise PromptConfigError("unsupported initial prompt for verifier")
+        return ReflectionBundle.load(
+            root / "reflection",
+            policy.reflection.verifier_version,
+            expected_digest=policy.reflection.verifier_digest,
+        )
+    return None

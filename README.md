@@ -77,6 +77,9 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 [`repository-context.md`](docs/repository-context.md). Текущая runtime-конфигурация
 и исторические задания автоматически не переключаются.
 
+Явная frozen policy2 включает durable Reflection в пределах существующего
+ledger; контракт, ограничения и rollback: [`durable-reflection.md`](docs/durable-reflection.md).
+
 ## Проверки качества
 
 ```bash

@@ -65,6 +65,7 @@ from app.db.review_starts import (
 )
 from app.db.session import get_session
 from app.domain.frozen_configuration import (
+    ModelPolicy,
     ModelRoute,
     ModelSettings,
     RepositoryInstructions,
@@ -75,7 +76,7 @@ from app.domain.settings import (
     project_historical_empty_settings,
 )
 from app.review.configuration import FrozenConfigurationError
-from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.prompt import PromptBuilder, PromptConfigError, reflection_bundle
 
 
 class ReviewStartRoute(APIRoute):
@@ -341,7 +342,7 @@ def _validate_configuration(
     *,
     settings_digest: str,
     instructions: tuple[str, ...],
-) -> ModelSettings:
+) -> ModelPolicy:
     try:
         if (
             not isinstance(config, FrozenAnalysisConfiguration)
@@ -366,6 +367,11 @@ def _validate_configuration(
             config.prompt_version,
             expected_digest=config.prompt_digest,
             repository_instructions=RepositoryInstructions(instructions=instructions),
+        )
+        reflection_bundle(
+            Path(__file__).resolve().parents[3] / ".agents/reviewer",
+            policy,
+            config.prompt_version,
         )
         return policy
     except ValidationError, ValueError, TypeError, PromptConfigError:

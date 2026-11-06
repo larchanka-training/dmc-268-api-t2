@@ -88,8 +88,13 @@ and counts, never raw verifier answers, prompts, source or credentials.
 No admission limit increases: requests8, input80000/output16000 per run,
 input10000/output2000 per call, context16384, chunks5 and deadline600s remain the
 existing defaults. Enabled verification shares these totals; allowance is not a
-promise that every chunk can be verified. No paid quality improvement is claimed
-by mocked deterministic tests.
+promise that every chunk can be verified. Before reserving each verifier HTTP
+attempt, the existing job/ledger lock protects one initial request and the frozen
+per-call input/output token ceilings for every other unfinished persisted chunk.
+Insufficient headroom skips verification through the existing visible fail-open
+path. This protects the remaining initial calls, not an allowance for every
+possible retry or a guarantee of complete coverage. No paid quality improvement
+is claimed by mocked deterministic tests.
 
 Migration0019 widens the policy-shape and attempt-kind CHECKs without backfilling
 historical data. Rollback activation first: select policy1 for **new** admission,

@@ -87,7 +87,27 @@ jobs:
         run: uv run alembic check
 
       - name: Pytest
+        env:
+          DMC268_RULES_E2E_RECORDS_DIR: ${{ runner.temp }}/rules-e2e-${{ github.run_id }}-${{ github.run_attempt }}/records
         run: uv run pytest -m "not chaos"
+
+      - name: Generate rules state E2E report
+        id: rules_e2e_report
+        run: >-
+          uv run python -m scripts.rules_e2e_report
+          --records-dir "${{ runner.temp }}/rules-e2e-${{ github.run_id }}-${{ github.run_attempt }}/records"
+          --output-dir "${{ runner.temp }}/rules-e2e-${{ github.run_id }}-${{ github.run_attempt }}/report"
+
+      - name: Upload rules state E2E report
+        if: steps.rules_e2e_report.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rules-e2e-report
+          path: |
+            ${{ runner.temp }}/rules-e2e-${{ github.run_id }}-${{ github.run_attempt }}/report/rules-e2e-states.json
+            ${{ runner.temp }}/rules-e2e-${{ github.run_id }}-${{ github.run_attempt }}/report/rules-e2e-states.md
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Gold benchmark replay
         run: >-

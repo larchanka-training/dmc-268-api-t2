@@ -1,4 +1,4 @@
-"""MVP full chain: one signed receipt's same job, four existing root-rule states."""
+"""Full review chain: one signed receipt's same job, four existing root-rule states."""
 
 # ruff: noqa: PLR2004 -- fixed signed-chain and provider contract vectors
 
@@ -45,12 +45,12 @@ ADVERSARIAL = (
 
 
 @pytest.mark.parametrize(
-    ("rule_bytes", "state"),
+    ("rule_bytes", "state", "case_id"),
     [
-        (None, "absent"),
-        (GENERIC_RULES, "valid"),
-        (b"", "empty"),
-        (ADVERSARIAL, "valid"),
+        (None, "absent", "absent"),
+        (GENERIC_RULES, "valid", "valid"),
+        (b"", "empty", "empty"),
+        (ADVERSARIAL, "valid", "adversarial"),
     ],
     ids=["absent", "valid", "empty", "adversarial"],
 )
@@ -61,6 +61,7 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
     monkeypatch: pytest.MonkeyPatch,
     rule_bytes: bytes | None,
     state: str,
+    case_id: str,
 ) -> None:
     scope = automatic_scope
     catalog = scope.settings.catalog
@@ -196,6 +197,9 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
             )
         )
         assert len(attempts) == 2 and all(row.state == "SUCCEEDED" for row in attempts)
+        analyzed_job = await session.get(models.ReviewJob, review_id)
+        assert analyzed_job is not None
+        analysis_status = analyzed_job.status
     assert all(
         read["ref"] == scenario.base
         for read in scenario.reads
@@ -233,7 +237,7 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
         factory,
         queue,
         settings=publication_settings,
-        owner="qa27-publish",
+        owner="rules-e2e-publish",
         transport=httpx.MockTransport(publish),
     )
     messages = await redis_client.xrange(stream_prefix + ":publish")
@@ -243,14 +247,16 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
     assert fields is not None
     publication_task = QueueTaskEnvelope(**json.loads(fields["envelope"]))
     assert publication_task.review_id == str(review_id)
+    posts_before_replay = len(remote.posts)
     await queue.enqueue(publication_task)
-    assert await run_once(
+    replay_processed = await run_once(
         factory,
         queue,
         settings=publication_settings,
-        owner="qa27-replay",
+        owner="rules-e2e-replay",
         transport=httpx.MockTransport(publish),
     )
+    assert replay_processed
     assert len(remote.posts) == 1
     assert remote.posts[0]["event"] == "COMMENT"
     assert remote.posts[0]["commit_id"] == scenario.head
@@ -260,7 +266,7 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
     assert published.provider_metadata is not None
     assert published.provider_metadata["comment_ids"] == {fingerprint: "9003"}
 
-    secret = "synthetic-qa27-session-signing-key-long-enough"
+    secret = "synthetic-rules-e2e-session-signing-key-long-enough"
     monkeypatch.setenv("AUTH__JWT_SECRET", secret)
     get_settings.cache_clear()
     session_id = uuid4()
@@ -301,3 +307,40 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
     )
     assert '"publication_status": "PUBLISHED"' in stream.text
     assert token not in stream.text and "synthetic-personal-token" not in stream.text
+
+    # Opt-in, one exclusive file per successful invocation; no shared pytest state.
+    if records_dir := os.environ.get("DMC268_RULES_E2E_RECORDS_DIR"):
+        record = {
+            "case_id": case_id,
+            "base_revision_sha": frozen_settings.rules_source["file"]["revision"],
+            "file_parser_state": frozen_settings.rules_source["file"]["state"],
+            "effective_rules_digest": job.rules_digest,
+            "file_content_digest": frozen_settings.rules_source["file"][
+                "content_digest"
+            ],
+            "analysis_status": analysis_status,
+            "findings_count": len(findings),
+            "reflection_succeeded_calls": sum(
+                row.call_kind == "reflection" and row.state == "SUCCEEDED"
+                for row in attempts
+            ),
+            "publication_status": published.status,
+            "github_review_posts_before_replay": posts_before_replay,
+            "github_review_posts_after_replay": len(remote.posts),
+            "replay_worker_processed": replay_processed,
+            "replay_without_second_post": replay_processed
+            and posts_before_replay == len(remote.posts),
+            "sse_http_status": stream.status_code,
+            "sse_snapshot_received": "event: review.snapshot" in stream.text,
+            "sse_event_received": "event: review.event" in stream.text,
+            "sse_published_received": '"publication_status": "PUBLISHED"'
+            in stream.text,
+            "sse_credentials_absent": token not in stream.text
+            and "synthetic-personal-token" not in stream.text,
+        }
+        destination = Path(records_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        with (destination / f"{case_id}-{uuid4().hex}.json").open(
+            "x", encoding="utf-8"
+        ) as output:
+            output.write(json.dumps(record, indent=2) + "\n")

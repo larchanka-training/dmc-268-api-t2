@@ -1,0 +1,8 @@
+diff --git a/src/handler.py b/src/handler.py
+index 34d858efc63b926c98d8a93db99c93722ad288f9..31deb03683765fa9e5b908f18973d8f2767154ac 100644
+--- a/src/handler.py
++++ b/src/handler.py
+@@ -1,2 +1,2 @@
+ def handle(client, user, request):
+-    return None
++    return client.records.find_one({"id": request.record_id})

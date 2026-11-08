@@ -1,0 +1,50 @@
+[
+  {
+    "id": "security-a",
+    "category": "security"
+  },
+  {
+    "id": "security-b",
+    "category": "security"
+  },
+  {
+    "id": "security-c",
+    "category": "security"
+  },
+  {
+    "id": "security-d",
+    "category": "security"
+  },
+  {
+    "id": "performance-a",
+    "category": "performance"
+  },
+  {
+    "id": "performance-b",
+    "category": "performance"
+  },
+  {
+    "id": "performance-c",
+    "category": "performance"
+  },
+  {
+    "id": "performance-d",
+    "category": "performance"
+  },
+  {
+    "id": "maintainability-a",
+    "category": "maintainability"
+  },
+  {
+    "id": "maintainability-b",
+    "category": "maintainability"
+  },
+  {
+    "id": "maintainability-c",
+    "category": "maintainability"
+  },
+  {
+    "id": "maintainability-d",
+    "category": "maintainability"
+  }
+]

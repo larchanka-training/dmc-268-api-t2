@@ -1,0 +1,20 @@
+{
+  "summary": "Scripted public synthetic response.",
+  "findings": [
+    {
+      "path": "src/handler.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "maintainability",
+      "rule_ref": "STYLE-1",
+      "severity": "medium",
+      "title": "Public error code lacks required APP_ prefix.",
+      "explanation": "Public error code lacks required APP_ prefix.",
+      "evidence": "return {\"error_code\": \"NOT_FOUND\", \"status\": 404}",
+      "recommendation": "Use APP_NOT_FOUND.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

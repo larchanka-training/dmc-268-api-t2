@@ -1,0 +1,8 @@
+diff --git a/src/handler.py b/src/handler.py
+index 34d858efc63b926c98d8a93db99c93722ad288f9..62cc4575bd8f2bce58448e98b332a6b454fa112e 100644
+--- a/src/handler.py
++++ b/src/handler.py
+@@ -1,2 +1,2 @@
+ def handle(client, user, request):
+-    return None
++    return client.post("https://service.example.invalid/events", json={})

@@ -1,0 +1,8 @@
+diff --git a/src/handler.py b/src/handler.py
+index 34d858efc63b926c98d8a93db99c93722ad288f9..9a89ffd70b69f81d1828f12ce3f109cd65e037fd 100644
+--- a/src/handler.py
++++ b/src/handler.py
+@@ -1,2 +1,2 @@
+ def handle(client, user, request):
+-    return None
++    return client.get("https://service.example.invalid/items", timeout=5.0)

@@ -1,0 +1,20 @@
+{
+  "summary": "Scripted public synthetic response.",
+  "findings": [
+    {
+      "path": "src/handler.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "security",
+      "rule_ref": "SEC-1",
+      "severity": "medium",
+      "title": "Tenant-owned record lookup omits authenticated tenant filtering.",
+      "explanation": "Tenant-owned record lookup omits authenticated tenant filtering.",
+      "evidence": "return client.records.find_one({\"id\": request.record_id})",
+      "recommendation": "Add tenant_id: user.tenant_id to the lookup.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

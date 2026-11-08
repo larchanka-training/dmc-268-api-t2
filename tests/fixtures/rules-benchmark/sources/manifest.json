@@ -1,0 +1,176 @@
+{
+  "format": "qa27-worker-sources/v1",
+  "original_corpus_sha256": "ef860a9f15e932ca061ae7cfcd3655d349572ea5a62bf120741ee32e28443045",
+  "files": {
+    "security-a/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "security-a/new.py.txt": "d6ae4a27b375f50450aad666f9d7d8c06452597dd493760ce9dc136295818f33",
+    "security-b/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "security-b/new.py.txt": "df4a5c76ef67c90a51ee15a172ee9c0a197a6575c87fa4f5cc62797ac4fc80cf",
+    "security-c/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "security-c/new.py.txt": "c0e80313dfaf27faf16de8ba6a8f0ab601b5617b3fa2851dce0360bc8849bd3d",
+    "security-d/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "security-d/new.py.txt": "509f8921823af2546216faffd4a727d32b18fc0896ae41f531ed86f84f2f76cb",
+    "performance-a/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "performance-a/new.py.txt": "6a4137941b9a12a7a1152e66e3466ca76e9138f5898d2daba416d44724a3b1a6",
+    "performance-b/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "performance-b/new.py.txt": "5b4b66f8907bdf09fba4ff8bb75eb8cc85963ab55aa8b7950841d9155f5dac76",
+    "performance-c/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "performance-c/new.py.txt": "7baddc609ca25f501954e8a3f91d038d97aba164f8444fc0683529360ee69605",
+    "performance-d/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "performance-d/new.py.txt": "f774e4811ad9e3929c0018b71b94fcd9c72dab8885b1dd1749d9a50ec5c68714",
+    "maintainability-a/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "maintainability-a/new.py.txt": "4d8cd30f6dcff22388eb813e968a3fede4a28f408bcc35ebfedcaec8d73f3c7b",
+    "maintainability-b/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "maintainability-b/new.py.txt": "1b35708af625602806028e30fe292477b5fff56503a8eba973b384e9a083df8f",
+    "maintainability-c/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "maintainability-c/new.py.txt": "5ce6e080014a1844c738d289aa781ae5f8eda9529fe725346cfd57a498c8fe11",
+    "maintainability-d/old.py.txt": "20d23f3cbee64c8eebea519ee952e69fc724385e658d9eeac75c80e5bc8464dd",
+    "maintainability-d/new.py.txt": "2709075edc0642376d31e9497258161b3dc6e2f2e9ec3e9f039959333df8ad95"
+  },
+  "fixtures": {
+    "security-a": {
+      "old": {
+        "stored_path": "security-a/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "security-a/new.py.txt",
+        "git_blob_sha1": "31deb03683765fa9e5b908f18973d8f2767154ac",
+        "path": "src/handler.py"
+      }
+    },
+    "security-b": {
+      "old": {
+        "stored_path": "security-b/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "security-b/new.py.txt",
+        "git_blob_sha1": "40a4657432453f17937dabfb7cd25bc859e58597",
+        "path": "src/handler.py"
+      }
+    },
+    "security-c": {
+      "old": {
+        "stored_path": "security-c/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "security-c/new.py.txt",
+        "git_blob_sha1": "cd38db784ca4c6dcb90b8f534e304db371a06a98",
+        "path": "src/handler.py"
+      }
+    },
+    "security-d": {
+      "old": {
+        "stored_path": "security-d/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "security-d/new.py.txt",
+        "git_blob_sha1": "5d15823cff439d8ac1b967833c3e03cd0a11923f",
+        "path": "src/handler.py"
+      }
+    },
+    "performance-a": {
+      "old": {
+        "stored_path": "performance-a/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "performance-a/new.py.txt",
+        "git_blob_sha1": "9ea93f73c7ff029d2803b404a1155c3557b46c01",
+        "path": "src/handler.py"
+      }
+    },
+    "performance-b": {
+      "old": {
+        "stored_path": "performance-b/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "performance-b/new.py.txt",
+        "git_blob_sha1": "62cc4575bd8f2bce58448e98b332a6b454fa112e",
+        "path": "src/handler.py"
+      }
+    },
+    "performance-c": {
+      "old": {
+        "stored_path": "performance-c/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "performance-c/new.py.txt",
+        "git_blob_sha1": "9a89ffd70b69f81d1828f12ce3f109cd65e037fd",
+        "path": "src/handler.py"
+      }
+    },
+    "performance-d": {
+      "old": {
+        "stored_path": "performance-d/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "performance-d/new.py.txt",
+        "git_blob_sha1": "19512ac2976f8c49c9dbb55f319be8946779d2e2",
+        "path": "src/handler.py"
+      }
+    },
+    "maintainability-a": {
+      "old": {
+        "stored_path": "maintainability-a/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "maintainability-a/new.py.txt",
+        "git_blob_sha1": "cbcae3c92010d53fa0644859048abd387773d1d3",
+        "path": "src/handler.py"
+      }
+    },
+    "maintainability-b": {
+      "old": {
+        "stored_path": "maintainability-b/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "maintainability-b/new.py.txt",
+        "git_blob_sha1": "375cff2cbc8fe4ad5b7d7f36acffdab0a73dc0ab",
+        "path": "src/handler.py"
+      }
+    },
+    "maintainability-c": {
+      "old": {
+        "stored_path": "maintainability-c/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "maintainability-c/new.py.txt",
+        "git_blob_sha1": "4765e1981f5800949f4d42f774e0762f446b42a7",
+        "path": "src/handler.py"
+      }
+    },
+    "maintainability-d": {
+      "old": {
+        "stored_path": "maintainability-d/old.py.txt",
+        "git_blob_sha1": "34d858efc63b926c98d8a93db99c93722ad288f9",
+        "path": "src/handler.py"
+      },
+      "new": {
+        "stored_path": "maintainability-d/new.py.txt",
+        "git_blob_sha1": "564ebd3be6010573cdc6997249422fefb6d3aca5",
+        "path": "src/handler.py"
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+Public synthetic fixtures for DMC-268 QA-04B.
+To the extent possible under law, the authors dedicate this original synthetic
+corpus to the public domain under CC0 1.0 Universal.
+https://creativecommons.org/publicdomain/zero/1.0/
+No external repository code, credentials, or private data are included.

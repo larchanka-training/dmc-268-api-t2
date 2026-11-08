@@ -1,0 +1,20 @@
+{
+  "summary": "Scripted public synthetic response.",
+  "findings": [
+    {
+      "path": "src/handler.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "security",
+      "rule_ref": "SEC-1",
+      "severity": "medium",
+      "title": "Record query trusts request tenant rather than authenticated user.",
+      "explanation": "Record query trusts request tenant rather than authenticated user.",
+      "evidence": "return client.records.find({\"tenant_id\": request.tenant_id})",
+      "recommendation": "Filter using user.tenant_id.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

@@ -192,3 +192,9 @@ uv run python -m scripts.rules_e2e_report \
 
 The environment variable is opt-in; ordinary local pytest runs keep their
 existing behavior. Skipped or incomplete E2E runs cannot produce a complete report.
+
+## Independent rule-specific experiment (QA-04B)
+
+The separate [12-example rule-specific benchmark](rules-quality-benchmark.md)
+uses its own paired Worker runner, scorer, report artifact and future live gates.
+It inherits no authorization from this document’s original 24-case campaign.

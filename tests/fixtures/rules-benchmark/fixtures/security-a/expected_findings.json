@@ -1,0 +1,10 @@
+[
+  {
+    "path": "src/handler.py",
+    "side": "NEW",
+    "start_line": 2,
+    "end_line": 2,
+    "category": "security",
+    "rule_ref": "SEC-1"
+  }
+]

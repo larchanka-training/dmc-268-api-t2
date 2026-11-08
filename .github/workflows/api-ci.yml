@@ -109,6 +109,22 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+      - name: Rule-specific paired benchmark (scripted Worker, no model quality)
+        run: >-
+          uv run python -m scripts.eval_harness.rules_runner
+          --mode deterministic --disposable
+          --output-dir "${{ runner.temp }}/rules-quality"
+
+      - name: Upload rule-specific quality report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rules-quality-report
+          path: |
+            ${{ runner.temp }}/rules-quality/rules-quality-report.json
+            ${{ runner.temp }}/rules-quality/rules-quality-report.md
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Gold benchmark replay
         run: >-
           uv run python -m scripts.eval_harness --mode offline

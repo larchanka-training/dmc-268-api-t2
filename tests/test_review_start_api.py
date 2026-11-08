@@ -2806,3 +2806,38 @@ async def test_cancel_commits_after_authorizer_closes_the_session(
         assert review is not None
         assert review.status == "FAILED" and review.finished_at is not None
     assert await _cancel_events(postgres, review_id) == 1
+
+
+async def test_access_revoked_during_cancel_authorize_does_not_stop_job(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    class Revoking:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            async with postgres.engine.begin() as connection:
+                await connection.execute(
+                    delete(models.RepositoryAccess).where(
+                        models.RepositoryAccess.repository_id == scope.repository
+                    )
+                )
+
+    app.dependency_overrides[get_review_start_authorizer] = Revoking
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("revoke-race"),
+    )
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["code"] == "RESOURCE_NOT_FOUND"
+    assert_schema(response, "Error")
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0

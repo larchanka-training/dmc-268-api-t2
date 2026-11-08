@@ -249,20 +249,43 @@ async def cancel_review_http(
     return await _apply_cancel(
         session,
         review_id=review_id,
+        user_id=caller.user_id,
         scope=scope,
         key=key,
         request_hash=request_hash,
     )
 
 
-async def _apply_cancel(
+async def _apply_cancel(  # noqa: PLR0913 -- apply txn needs caller identity for access recheck
     session: AsyncSession,
     *,
     review_id: UUID,
+    user_id: UUID,
     scope: str,
     key: str,
     request_hash: str,
 ) -> JSONResponse:
+    found = (
+        await session.execute(
+            select(ReviewJob, Repository)
+            .join(Repository, Repository.id == ReviewJob.repository_id)
+            .join(
+                RepositoryAccess,
+                RepositoryAccess.repository_id == ReviewJob.repository_id,
+            )
+            .where(
+                ReviewJob.id == review_id,
+                RepositoryAccess.user_id == user_id,
+            )
+        )
+    ).one_or_none()
+    if found is None:
+        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    _, repository = found
+    if repository.integration_status != "healthy":
+        raise ApiError(
+            409, "INTEGRATION_UNHEALTHY", "The repository integration is unhealthy."
+        )
     now = await session.scalar(select(func.clock_timestamp()))
     assert now is not None
     updated = await session.scalar(

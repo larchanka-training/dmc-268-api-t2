@@ -579,6 +579,87 @@ def _shifted_hunk() -> dict[str, Any]:
 SUPPRESS_KEY = "4a292c575fb4ed21b73d47d50bcb3ef17f192605730b787730b515e74039b37d"
 
 
+def _early_hunk() -> dict[str, Any]:
+    """An added line at 10: a second function above the fixture's one."""
+    return {
+        "hunk_id": "hunk_0",
+        "old_start": 9,
+        "old_count": 2,
+        "new_start": 9,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def parse(data):",
+                "old_line": 9,
+                "new_line": 9,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 10,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 10,
+            },
+        ],
+    }
+
+
+def test_prepare_review_publishes_second_finding_of_published_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """A new finding of an already-published identity posts inline (#53 review).
+
+    Two defects can share path/side/category/title (one per function), so the
+    identity key alone cannot tell them apart. Earlier-cycle comments occupy
+    one suppression slot each; the exact repeat (full fingerprint match)
+    claims the slot first and the surplus publishes — even when it ranks
+    before the repeat.
+    """
+    data = deepcopy(payload_data)
+    data["files"][0]["diff"]["hunks"] = [_early_hunk(), _shifted_hunk()]
+    data["coverage"]["included"][0]["ranges"] = [
+        {"start_line": 45, "end_line": 45},
+        {"start_line": 10, "end_line": 10},
+    ]
+    review = publication_input(data)
+    copy = replace(
+        review.findings[0],
+        id=UUID("00000000-0000-0000-0000-000000000010"),
+        fingerprint="finding-copy",
+        start_line=10,
+        end_line=10,
+        explanation="Вторая функция без валидации.",
+        evidence="return request.data",
+    )
+    original = replace(
+        review.findings[0],
+        fingerprint="finding-45",
+        start_line=45,
+        end_line=45,
+    )
+    review = replace(review, findings=(original, copy))
+
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1, "finding-45": 1},
+    )
+
+    # The repeat stays suppressed; the new same-identity finding is posted.
+    assert len(prepared.comments) == 1
+    assert prepared.comments[0]["line"] == 10
+    assert str(prepared.comments[0]["body"]).endswith(
+        "<!-- dmc268-finding:finding-copy -->"
+    )
+    assert "finding-45" in prepared.body  # listed as already noted
+    assert "finding-copy" not in prepared.body
+
+
 def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
     payload_data: dict[str, Any],
 ) -> None:
@@ -600,7 +681,7 @@ def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
     )
     review = replace(review, findings=(moved,))
 
-    prepared = prepare_github_review(review, published=frozenset({SUPPRESS_KEY}))
+    prepared = prepare_github_review(review, published={SUPPRESS_KEY: 1})
 
     assert prepared.comments == ()
     assert "Уже отмечено в прошлых циклах" in prepared.body

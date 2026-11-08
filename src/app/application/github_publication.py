@@ -6,7 +6,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby
 from typing import Protocol
@@ -200,20 +201,54 @@ def _request_for(review: PublicationInput) -> GithubRequest:
     )
 
 
-def _already_published(item: PersistedFinding, published: frozenset[str]) -> bool:
-    return item.fingerprint in published or _suppress_key(item) in published
+def _match_suppression_slots(
+    ranked: list[PersistedFinding],
+    published: Mapping[str, int],
+) -> tuple[list[PersistedFinding], list[PersistedFinding]]:
+    """Split ranked findings into suppressed repeats and fresh ones (#53).
+
+    An earlier-cycle comment occupies one slot of its identity. Exact
+    fingerprint repeats claim slots first (they carry the strongest match),
+    then ranked same-identity candidates fill the rest — the surplus posts
+    inline, so ambiguity resolves toward publishing.
+    """
+    suppressed: list[PersistedFinding] = []
+    slots_used: Counter[str] = Counter()
+    remaining: list[PersistedFinding] = []
+    for item in ranked:
+        if item.fingerprint in published:
+            suppressed.append(item)
+            slots_used[_suppress_key(item)] += 1
+        else:
+            remaining.append(item)
+    fresh: list[PersistedFinding] = []
+    for item in remaining:
+        key = _suppress_key(item)
+        if key in published and slots_used[key] < published[key]:
+            suppressed.append(item)
+            slots_used[key] += 1
+        else:
+            fresh.append(item)
+    return suppressed, fresh
 
 
 def prepare_github_review(
-    review: PublicationInput, *, published: frozenset[str] = frozenset()
+    review: PublicationInput,
+    *,
+    published: Mapping[str, int] | None = None,
 ) -> PreparedGithubReview:
     """Render saved analysis without another model call.
 
-    ``published`` carries identities already published in earlier review
-    cycles (full fingerprints and line-free suppress keys): those findings
-    are not posted again as inline comments, they are only named as already
-    noted in the review body (issue #53).
+    ``published`` counts identities the bot already posted in earlier review
+    cycles (full fingerprints and line-free suppress keys, one entry per
+    earlier inline comment): those findings are not posted again as inline
+    comments, they are only named as already noted in the review body
+    (issue #53). Suppression is slot-matched (issue #53 review): exact
+    fingerprint repeats claim their identity's slots first, ranked
+    same-identity candidates fill the rest, and the surplus — a second
+    independent finding sharing path/side/category/title — posts inline.
     """
+    published = published or {}
     expected = {
         "provider": "github",
         "base_repository_id": review.repository_external_id,
@@ -268,10 +303,10 @@ def prepare_github_review(
             item.fingerprint,
         ),
     )
-    noted = [item for item in ranked if _already_published(item, published)][:20]
-    publishable = [item for item in ranked if not _already_published(item, published)][
-        :20
-    ]
+    # Suppression slots (issue #53 review): see _match_suppression_slots.
+    suppressed, fresh = _match_suppression_slots(ranked, published)
+    noted = suppressed[:20]
+    publishable = fresh[:20]
     comments: tuple[dict[str, object], ...] = tuple(
         {
             "path": _github_path(item, review),
@@ -463,23 +498,25 @@ class GithubPublisher:
         except ValueError:
             return None
 
-    async def _already_noted_fingerprints(
+    async def _published_identities(
         self,
         review: PublicationInput,
         github: GithubPublicationGateway,
-    ) -> frozenset[str]:
-        """Identities the bot published in earlier cycles of this PR.
+    ) -> Counter[str]:
+        """Multiset of identities the bot posted in earlier cycles of this PR.
 
         Full fingerprints (``dmc268-finding:``) and line-free suppress keys
-        (``dmc268-suppress:``), so a repeat survives a line shift between
-        commits (issue #53 review). Only the publisher-emitted marker tail is
-        parsed (RT-12): model text elsewhere in the body may carry forged
-        markers. The reads happen before the claim exists, so they carry no
-        operation; the gateway is still lease-fenced to keep expired workers
-        off the provider (the same posture as AC-PUB-15).
+        (``dmc268-suppress:``), one count per earlier inline comment, so a
+        repeat survives a line shift between commits and a second independent
+        finding of the same identity still posts inline (issue #53 review).
+        Only the publisher-emitted marker tail is parsed (RT-12): model text
+        elsewhere in the body may carry forged markers. The reads happen
+        before the claim exists, so they carry no operation; the gateway is
+        still lease-fenced to keep expired workers off the provider (the same
+        posture as AC-PUB-15).
         """
         request = _request_for(review)
-        identities: set[str] = set()
+        identities: Counter[str] = Counter()
         for item in await github.list_reviews(request):
             if item.author_id != self._bot_user_id:
                 continue
@@ -493,7 +530,7 @@ class GithubPublisher:
                 match = _MARKER_TAIL.search(comment.body)
                 if match:
                     identities.update(token for token in match.groups() if token)
-        return frozenset(identities)
+        return identities
 
     async def publish(  # noqa: PLR0911, PLR0912, PLR0915 - explicit durable outcome branches
         self,
@@ -518,14 +555,14 @@ class GithubPublisher:
         if review is None:
             raise LookupError("Frozen publication input is unavailable")
         denial_reason: str | None = None
-        noted: frozenset[str]
+        noted: Counter[str]
         if review.integration_status != "healthy":
             # AC6: no new provider attempts for an unhealthy repository —
             # the claim-free suppression read included.
-            noted = frozenset()
+            noted = Counter()
         else:
             try:
-                noted = await self._already_noted_fingerprints(
+                noted = await self._published_identities(
                     review,
                     self._github.with_authority(self._require_lease),
                 )
@@ -536,7 +573,7 @@ class GithubPublisher:
                 if error.reason_code != "VCS_ACCESS_DENIED":
                     raise
                 denial_reason = error.reason_code
-                noted = frozenset()
+                noted = Counter()
         prepared = prepare_github_review(review, published=noted)
         payload_hash = self._payload_hash(prepared)
         claim = await self._store.begin(
@@ -654,7 +691,7 @@ class GithubPublisher:
             lambda: self._require_reconciliation_authority(review_job_id)
         )
         await self._require_reconciliation_authority(review_job_id)
-        noted = await self._already_noted_fingerprints(review, github)
+        noted = await self._published_identities(review, github)
         prepared = prepare_github_review(review, published=noted)
         if (
             operation.marker != prepared.marker

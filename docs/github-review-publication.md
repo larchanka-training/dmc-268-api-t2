@@ -55,14 +55,20 @@ in earlier cycles of the same PR: before the publish claim is taken, the
 publisher reads earlier-cycle reviews and comments under the live publish
 lease and collects both markers — full fingerprints (`dmc268-finding:`) and
 line-free identity keys (`dmc268-suppress:`, SHA-256 over normalized
-path/side/category/title). Only the publisher-emitted trailing marker lines
-are trusted (RT-12): model text elsewhere in a comment body may carry forged
-markers and never reaches outgoing bodies anyway, because model text is
-stripped of HTML comments at render time. A repeat matches either marker, so
-a finding that moved between commits (new range, new fingerprint) is still
-suppressed and named in the Overview instead of being posted again. Comments
-published before the suppress marker existed match by full fingerprint only.
-The current cycle's own comments never enter this set.
+path/side/category/title) — as counts, one slot per earlier inline comment.
+Only the publisher-emitted trailing marker lines are trusted (RT-12): model
+text elsewhere in a comment body may carry forged markers and never reaches
+outgoing bodies anyway, because model text is stripped of HTML comments at
+render time. Exact fingerprint repeats claim an identity's slots first, then
+ranked same-identity candidates fill the rest; a repeat — including a finding
+that moved between commits (new range, new fingerprint) — is suppressed and
+named in the Overview instead of being posted again. Because the identity key
+is line-free, it cannot tell two defects apart, so a cycle holding more
+findings of an identity than earlier comments published (for example the same
+category and title appearing in a second function) posts the surplus inline —
+ambiguity resolves toward publishing. Comments published before the suppress
+marker existed match by full fingerprint only. The current cycle's own
+comments never enter this set.
 
 Reconciliation re-derives the same suppression set before the payload check, so
 a parked outcome stays verifiable. If earlier-cycle comments change between

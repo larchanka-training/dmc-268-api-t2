@@ -37,6 +37,7 @@ from app.application.publication_ports import (
 from app.db.models import (
     ChangeRequest,
     ChunkResult,
+    ContextPayload,
     Finding,
     ReviewJob,
     TaskLease,
@@ -599,3 +600,169 @@ async def test_new_cycle_suppresses_repeat_after_line_shift(
     ).reconcile(review_job_id=review_2)
     assert resolved["status"] == "PUBLISHED", f"resolved={resolved}"
     assert len(provider.posts) == 2  # reconciliation never POSTs again
+
+
+def _second_hunk() -> dict[str, object]:
+    """A second function's hunk: the same defect appears at line 60."""
+    return {
+        "hunk_id": "hunk_2",
+        "old_start": 59,
+        "old_count": 2,
+        "new_start": 59,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def validate_request(request):",
+                "old_line": 59,
+                "new_line": 59,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return request.data",
+                "old_line": 60,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(request.data)",
+                "old_line": None,
+                "new_line": 60,
+            },
+        ],
+    }
+
+
+async def _add_second_function_defect(engine: AsyncEngine, review_2: UUID) -> None:
+    """Seed the inverse scenario: a NEW defect with an already-published identity.
+
+    The original defect is unchanged (same fingerprint as cycle 1's comment);
+    a second function now carries the same category/title defect at line 60 —
+    same path/side/category/title, therefore the same line-free suppress key,
+    but a new fingerprint.
+    """
+    async with engine.begin() as connection:
+        payload = (
+            await connection.execute(
+                select(ContextPayload.payload_body).where(
+                    ContextPayload.review_job_id == review_2
+                )
+            )
+        ).scalar_one()
+        payload["files"][0]["diff"]["hunks"].append(_second_hunk())
+        await connection.execute(
+            update(ContextPayload)
+            .where(ContextPayload.review_job_id == review_2)
+            .values(payload_body=payload)
+        )
+        await connection.execute(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_2)
+            .values(
+                coverage={
+                    "included": [
+                        {
+                            "path": "src/review.py",
+                            "ranges": [
+                                {"start_line": 39, "end_line": 39},
+                                {"start_line": 60, "end_line": 60},
+                            ],
+                        }
+                    ],
+                    "skipped": [],
+                    "context_quality": "diff_only",
+                }
+            )
+        )
+        chunk_id = await connection.scalar(
+            select(ChunkResult.id).where(ChunkResult.review_job_id == review_2)
+        )
+        await connection.execute(
+            insert(Finding).values(
+                id=uuid4(),
+                chunk_result_id=chunk_id,
+                fingerprint="finding-v1-copy",
+                path="src/review.py",
+                side="NEW",
+                start_line=60,
+                end_line=60,
+                category="security",
+                severity="high",
+                title="Validate input",
+                explanation="Untrusted input is returned in a second function",
+                evidence="return request.data",
+                recommendation="Validate the input",
+                proposed_diff_fix=None,
+            )
+        )
+
+
+async def test_second_independent_finding_of_same_identity_is_published(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """A new finding of an already-published identity still posts inline (#53 review).
+
+    Cycle 1 publishes the defect at line 39. Cycle 2 reviews a new commit
+    where the same defect survives unchanged and an identical-looking defect
+    appeared in a second function (line 60). The shared identity must not
+    hide the new finding: the exact repeat suppresses, the new one posts.
+    """
+    engine = publication_engine
+    store, authority = await setup_publication(engine, payload_data)
+    review_1 = authority.review_job_id
+    provider = TwoCycleGithub()
+
+    outcome_1 = await _publisher(store, provider, authority).publish(
+        review_job_id=review_1
+    )
+    assert outcome_1["status"] == "PUBLISHED"
+    provider.comments_for_review = {"9001": list(provider.comments)}
+
+    async with async_sessionmaker(engine)() as session:
+        change_id = await session.scalar(
+            select(ReviewJob.change_request_id).where(ReviewJob.id == review_1)
+        )
+    new_head = "e" * 40
+    review_2, _ = await seed_review(
+        engine, payload_data, change_id=change_id, head_sha=new_head
+    )
+    await _add_second_function_defect(engine, review_2)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ChangeRequest)
+            .where(ChangeRequest.id == change_id)
+            .values(head_sha=new_head)
+        )
+        await connection.execute(
+            insert(TaskLease).values(
+                **lease_values(
+                    id=uuid4(),
+                    review_job_id=review_2,
+                    owner="cycle-2",
+                    fencing_token=1,
+                    expires_at=datetime.now(UTC) + timedelta(seconds=90),
+                )
+            )
+        )
+    authority_2 = PublicationAuthority(review_2, "cycle-2", 1)
+    provider.review_change = {"id": 9002}
+    provider.head = new_head
+    provider.metadata = {
+        **provider.metadata,
+        "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
+    }
+
+    outcome_2 = await _publisher(store, provider, authority_2).publish(
+        review_job_id=review_2
+    )
+    assert outcome_2["status"] == "PUBLISHED"
+    assert len(provider.posts) == 2
+    # The surviving repeat stays suppressed; the new finding gets its comment.
+    assert len(provider.posts[1]["comments"]) == 1
+    comment = provider.posts[1]["comments"][0]
+    assert comment["line"] == 60
+    assert comment["body"].endswith("<!-- dmc268-finding:finding-v1-copy -->")
+    assert "Уже отмечено в прошлых циклах" in provider.posts[1]["body"]
+    assert "finding-v1 -->" in provider.posts[1]["body"]
+    assert "finding-v1-copy" not in provider.posts[1]["body"]

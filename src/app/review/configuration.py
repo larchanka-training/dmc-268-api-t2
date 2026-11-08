@@ -178,7 +178,7 @@ class ProfileDescriptor(FrozenDTO):
 class AdmissionSelection(FrozenDTO):
     primary: ModelRoute
     policy: ModelPolicy
-    prompt_version: Literal["v1", "v2", "v3", "v4"]
+    prompt_version: Literal["v1", "v2", "v3", "v4", "v5"]
     prompt_digest: Digest
 
 
@@ -487,20 +487,20 @@ class FrozenConfigurationReader:
                 allowed_rule_refs=frozenset(
                     settings.rules_source.get("file", {}).get("allowed_rule_refs", [])
                 )
-                if settings.rules_source is not None and job.prompt_version == "v4"
+                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
                 else None,
                 rules_diagnostics=tuple(
                     settings.rules_source.get("file", {}).get("diagnostics", [])
                 )
-                if settings.rules_source is not None and job.prompt_version == "v4"
+                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
                 else (),
                 rules_source_state=settings.rules_source.get("file", {}).get("state")
-                if settings.rules_source is not None and job.prompt_version == "v4"
+                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
                 else None,
                 rule_severities=tuple(
                     settings.rules_source.get("file", {}).get("severities", {}).items()
                 )
-                if settings.rules_source is not None and job.prompt_version == "v4"
+                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
                 else (),
             )
 
@@ -580,7 +580,7 @@ class FrozenAdmissionResolver:
 
     @property
     def context_enabled(self) -> bool:
-        return self._version == "v4"
+        return self._version in {"v4", "v5"}
 
     async def resolve(
         self, *, repository: RepositoryIdentity, settings_id: UUID, rules_digest: str

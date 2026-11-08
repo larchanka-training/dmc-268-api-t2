@@ -149,14 +149,38 @@ def _github_path(item: PersistedFinding, review: PublicationInput) -> str:
     return item.path
 
 
+def _suppress_key(item: PersistedFinding) -> str:
+    """Line-free identity hash for cross-cycle suppression (issue #53).
+
+    The full fingerprint pins the line range, so a finding moved between
+    commits changes it and would be re-published; the suppress key keeps the
+    same normalized components minus the range and survives pure line shifts.
+    Published inline as a ``dmc268-suppress`` marker next to the fingerprint.
+    """
+    key = "|".join(
+        [
+            item.path,
+            item.side,
+            item.category,
+            " ".join(item.title.lower().split()),
+        ]
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _already_published(item: PersistedFinding, published: frozenset[str]) -> bool:
+    return item.fingerprint in published or _suppress_key(item) in published
+
+
 def prepare_github_review(
     review: PublicationInput, *, published: frozenset[str] = frozenset()
 ) -> PreparedGithubReview:
     """Render saved analysis without another model call.
 
-    ``published`` carries fingerprints already published in earlier review
-    cycles: those findings are not posted again as inline comments, they are
-    only named as already noted in the review body (issue #53).
+    ``published`` carries identities already published in earlier review
+    cycles (full fingerprints and line-free suppress keys): those findings
+    are not posted again as inline comments, they are only named as already
+    noted in the review body (issue #53).
     """
     expected = {
         "provider": "github",
@@ -210,8 +234,10 @@ def prepare_github_review(
             item.fingerprint,
         ),
     )
-    noted = [item for item in ranked if item.fingerprint in published][:20]
-    publishable = [item for item in ranked if item.fingerprint not in published][:20]
+    noted = [item for item in ranked if _already_published(item, published)][:20]
+    publishable = [item for item in ranked if not _already_published(item, published)][
+        :20
+    ]
     comments: tuple[dict[str, object], ...] = tuple(
         {
             "path": _github_path(item, review),
@@ -221,6 +247,7 @@ def prepare_github_review(
                 f"**{item.severity}: {item.title}**\n\n"
                 + (f"Правило: {item.rule_ref}\n\n" if item.rule_ref else "")
                 + f"{item.explanation}\n\n{item.recommendation}\n\n"
+                + f"<!-- dmc268-suppress:{_suppress_key(item)} -->\n"
                 f"<!-- dmc268-finding:{item.fingerprint} -->"
             ),
             **(
@@ -413,11 +440,13 @@ class GithubPublisher:
         review: PublicationInput,
         github: GithubPublicationGateway,
     ) -> frozenset[str]:
-        """Fingerprints the bot published in earlier cycles of this PR.
+        """Identities the bot published in earlier cycles of this PR.
 
-        The reads happen before the claim exists, so they carry no operation;
-        the gateway is still lease-fenced to keep expired workers off the
-        provider (the same posture as AC-PUB-15).
+        Full fingerprints (``dmc268-finding:``) and line-free suppress keys
+        (``dmc268-suppress:``), so a repeat survives a line shift between
+        commits (issue #53 review). The reads happen before the claim exists,
+        so they carry no operation; the gateway is still lease-fenced to keep
+        expired workers off the provider (the same posture as AC-PUB-15).
         """
         request = GithubRequest(
             review.owner,
@@ -427,7 +456,7 @@ class GithubPublisher:
             review.head_sha,
             review.base_sha,
         )
-        fingerprints: set[str] = set()
+        identities: set[str] = set()
         for item in await github.list_reviews(request):
             if item.author_id != self._bot_user_id:
                 continue
@@ -438,10 +467,13 @@ class GithubPublisher:
             ):
                 if comment.author_id != self._bot_user_id:
                     continue
-                fingerprints.update(
+                identities.update(
                     re.findall(r"<!-- dmc268-finding:(.*?) -->", comment.body)
                 )
-        return frozenset(fingerprints)
+                identities.update(
+                    re.findall(r"<!-- dmc268-suppress:(.*?) -->", comment.body)
+                )
+        return frozenset(identities)
 
     async def publish(  # noqa: PLR0911, PLR0912, PLR0915 - explicit durable outcome branches
         self,

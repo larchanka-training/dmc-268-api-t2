@@ -20,7 +20,7 @@ so payload_hash stays deterministic for reconciliation.
 
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from sqlalchemy import insert, select, update
@@ -30,11 +30,73 @@ from test_publications_postgres import lease_values, seed_review
 
 from app.application.github_publication import GithubPublisher
 from app.application.publication_ports import PublicationAuthority
-from app.db.models import ChangeRequest, ReviewJob, TaskLease
+from app.db.models import (
+    ChangeRequest,
+    ChunkResult,
+    Finding,
+    ReviewJob,
+    TaskLease,
+)
 from app.db.publications import PostgresPublicationStore
 from app.vcs.github import GithubClient
 
 pytest_plugins = ("test_publications_postgres",)
+
+SHIFTED_LINE = 45
+
+
+def _shifted_hunk() -> dict[str, object]:
+    """The fixture hunk with its added line moved from 39 to 45 (new commit)."""
+    return {
+        "hunk_id": "hunk_1",
+        "old_start": 38,
+        "old_count": 2,
+        "new_start": 44,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def validate(data):",
+                "old_line": 38,
+                "new_line": 44,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 39,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": SHIFTED_LINE,
+            },
+        ],
+    }
+
+
+async def _shift_cycle_two(engine: AsyncEngine, review_2: UUID) -> None:
+    """Re-point the seeded finding to line 45: a real line shift between commits.
+
+    Same path/side/category/title identity, new coordinates and therefore a
+    new fingerprint — the shift only survives suppression via the line-free
+    dmc268-suppress marker published by cycle 1.
+    """
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Finding)
+            .where(
+                Finding.chunk_result_id.in_(
+                    select(ChunkResult.id).where(ChunkResult.review_job_id == review_2)
+                )
+            )
+            .values(
+                fingerprint="finding-v1-shifted",
+                start_line=SHIFTED_LINE,
+                end_line=SHIFTED_LINE,
+            )
+        )
 
 
 class TwoCycleGithub(FakeGithub):
@@ -234,3 +296,107 @@ async def test_reconcile_of_suppressed_cycle_resolves_without_new_writes(
     assert len(provider.posts) == 2  # reconciliation never POSTs again
     state = await store.get(review_2)
     assert state is not None and state.status == "PUBLISHED"
+
+
+async def test_new_cycle_suppresses_repeat_after_line_shift(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """The same finding moved between commits is still suppressed (#53 review).
+
+    Cycle 1 publishes the finding at line 39 with a line-free dmc268-suppress
+    marker. Cycle 2 reviews a new commit where the code moved to line 45: the
+    full fingerprint changed, so only the suppress marker can suppress the
+    repeat. Reconciliation of a lost cycle-2 POST still reproduces it.
+    """
+    engine = publication_engine
+    store, authority = await setup_publication(engine, payload_data)
+    review_1 = authority.review_job_id
+    provider = TwoCycleGithub()
+
+    outcome_1 = await _publisher(store, provider, authority).publish(
+        review_job_id=review_1
+    )
+    assert outcome_1["status"] == "PUBLISHED"
+    cycle_1_comment = provider.posts[0]["comments"][0]
+    assert "<!-- dmc268-suppress:" in cycle_1_comment["body"]
+    assert cycle_1_comment["body"].endswith("<!-- dmc268-finding:finding-v1 -->")
+    provider.comments_for_review = {"9001": list(provider.comments)}
+
+    async with async_sessionmaker(engine)() as session:
+        change_id = await session.scalar(
+            select(ReviewJob.change_request_id).where(ReviewJob.id == review_1)
+        )
+    new_head = "f" * 40
+    # The new commit moved the reviewed code: the hunk's added line is now 45.
+    payload_data["files"][0]["diff"]["hunks"] = [_shifted_hunk()]
+    payload_data["coverage"]["included"][0]["ranges"] = [
+        {"start_line": SHIFTED_LINE, "end_line": SHIFTED_LINE}
+    ]
+    review_2, _ = await seed_review(
+        engine, payload_data, change_id=change_id, head_sha=new_head
+    )
+    await _shift_cycle_two(engine, review_2)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ChangeRequest)
+            .where(ChangeRequest.id == change_id)
+            .values(head_sha=new_head)
+        )
+        await connection.execute(
+            insert(TaskLease).values(
+                **lease_values(
+                    id=uuid4(),
+                    review_job_id=review_2,
+                    owner="cycle-2",
+                    fencing_token=1,
+                    expires_at=datetime.now(UTC) + timedelta(seconds=90),
+                )
+            )
+        )
+    authority_2 = PublicationAuthority(review_2, "cycle-2", 1)
+    provider.review_change = {"id": 9002}
+    provider.head = new_head
+    provider.metadata = {
+        **provider.metadata,
+        "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
+    }
+    # The accepted cycle-2 POST loses its response: durable UNKNOWN, so the
+    # reconciliation path below must reproduce the suppressed payload.
+    provider.lose_post_response = True
+
+    outcome_2 = await _publisher(store, provider, authority_2).publish(
+        review_job_id=review_2
+    )
+    assert outcome_2["status"] == "UNKNOWN"
+    assert len(provider.posts) == 2
+    assert provider.posts[1]["commit_id"] == new_head
+    # The shifted repeat is not posted again; the body names it as noted.
+    assert provider.posts[1]["comments"] == []
+    assert "Уже отмечено в прошлых циклах" in provider.posts[1]["body"]
+    assert "finding-v1-shifted" in provider.posts[1]["body"]
+    assert provider.reviews[0]["body"].startswith(
+        f"<!-- dmc268-review:v1 review={review_1} "
+    )  # the old review is never edited
+
+    # A lost cycle-2 POST still reconciles against the same suppression set.
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(TaskLease)
+            .where(TaskLease.review_job_id == review_2)
+            .values(
+                owner="reconciler",
+                fencing_token=2,
+                expires_at=datetime.now(UTC) + timedelta(seconds=90),
+            )
+        )
+    resolved = await GithubPublisher(
+        store,
+        GithubClient(
+            httpx.AsyncClient(transport=httpx.MockTransport(provider.respond))
+        ),
+        authority=PublicationAuthority(review_2, "reconciler", 2),
+        bot_user_id="9002",
+    ).reconcile(review_job_id=review_2)
+    assert resolved["status"] == "PUBLISHED", f"resolved={resolved}"
+    assert len(provider.posts) == 2  # reconciliation never POSTs again

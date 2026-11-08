@@ -1,6 +1,8 @@
 # ruff: noqa: PLR2004, RUF001 - literal contract examples and Russian fixtures
 """Saved result -> provider-ready review, through the publication service seam."""
 
+import hashlib
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 from uuid import UUID
@@ -73,6 +75,8 @@ def test_prepare_review_maps_saved_new_line_and_builds_overview(
             "body": (
                 "**high: Проверяйте входные данные**\n\n"
                 "Нет валидации схемы.\n\nДобавьте проверку схемы.\n\n"
+                "<!-- dmc268-suppress:4a292c575fb4ed21b73d47d50bcb3ef17f192605730b7877"
+                "30b515e74039b37d -->\n"
                 "<!-- dmc268-finding:finding-39 -->"
             ),
         },
@@ -538,3 +542,90 @@ index 1111111..2222222 100644
     assert prepared.comments == ()
     assert "high: Проверяйте входные данные" in prepared.body
     assert "Не опубликованы inline: 1" in prepared.body
+
+
+def _shifted_hunk() -> dict[str, Any]:
+    """The fixture hunk with its added line moved from 39 to 45 (new commit)."""
+    return {
+        "hunk_id": "hunk_1",
+        "old_start": 38,
+        "old_count": 2,
+        "new_start": 44,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def validate(data):",
+                "old_line": 38,
+                "new_line": 44,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 39,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 45,
+            },
+        ],
+    }
+
+
+def _suppress_key(path: str, side: str, category: str, title: str) -> str:
+    """Line-free identity of a finding, as published in dmc268-suppress markers."""
+    normalized = " ".join(title.lower().split())
+    key = "|".join([path, side, category, normalized])
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """A repeat after a line shift between two commits is not posted again (#53).
+
+    The full fingerprint pins the line range, so the moved finding carries a
+    new fingerprint; suppression must still match on the line-free identity
+    the earlier cycle published.
+    """
+    shifted = deepcopy(payload_data)
+    shifted["files"][0]["diff"]["hunks"] = [_shifted_hunk()]
+    shifted["coverage"]["included"][0]["ranges"] = [{"start_line": 45, "end_line": 45}]
+    review = publication_input(shifted)
+    moved = replace(
+        review.findings[0],
+        fingerprint="finding-45",
+        start_line=45,
+        end_line=45,
+    )
+    review = replace(review, findings=(moved,))
+    key = _suppress_key(
+        "src/review.py", "NEW", "correctness", "Проверяйте входные данные"
+    )
+
+    prepared = prepare_github_review(review, published=frozenset({key}))
+
+    assert prepared.comments == ()
+    assert "Уже отмечено в прошлых циклах" in prepared.body
+    assert "finding-45" in prepared.body
+
+
+def test_prepare_review_marks_inline_comment_with_line_free_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """Inline comments publish the line-free identity for later cycles (#53).
+
+    The finding marker stays the last line of the body (proof matching);
+    the suppress marker goes on its own line right before it.
+    """
+    prepared = prepare_github_review(publication_input(payload_data))
+
+    key = _suppress_key(
+        "src/review.py", "NEW", "correctness", "Проверяйте входные данные"
+    )
+    body = str(prepared.comments[0]["body"])
+    assert f"<!-- dmc268-suppress:{key} -->" in body
+    assert body.endswith("<!-- dmc268-finding:finding-39 -->")

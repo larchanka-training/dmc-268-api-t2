@@ -21,7 +21,7 @@ OLD-coordinate coverage check.
 
 The Overview contains the summary, checked files, risks, skipped files and
 context quality. At most 20 unique fingerprints become inline comments, ordered
-by severity and location. Fingerprints already published by earlier cycles of
+by severity and location. Findings already published by earlier cycles of
 the same PR are excluded from inline comments and are listed under «Уже
 отмечено в прошлых циклах» instead (at most 20 listed, ordered the same way);
 the omitted count excludes those listed as already noted. Text is masked again
@@ -48,11 +48,16 @@ and each comment's fingerprint, path, side and range. Provider IDs are retained
 in publication metadata. Human text with the same marker is not bot output.
 Repeated delivery of a finished cycle returns its retained outcome without HTTP.
 Fingerprint deduplication covers a review payload. A new analysis starts a new
-cycle, but a cycle suppresses repeats of fingerprints the bot already published
-in earlier cycles of the same PR (`dmc268-finding:` markers): before the publish
-claim is taken, the publisher reads earlier-cycle reviews and comments under the
-live publish lease, and a repeat is named in the Overview instead of being
-posted again. The current cycle's own comments never enter this set.
+cycle, but a cycle suppresses repeats of identities the bot already published
+in earlier cycles of the same PR: before the publish claim is taken, the
+publisher reads earlier-cycle reviews and comments under the live publish
+lease and collects both markers — full fingerprints (`dmc268-finding:`) and
+line-free identity keys (`dmc268-suppress:`, SHA-256 over normalized
+path/side/category/title). A repeat matches either marker, so a finding that
+moved between commits (new range, new fingerprint) is still suppressed and
+named in the Overview instead of being posted again. Comments published
+before the suppress marker existed match by full fingerprint only. The
+current cycle's own comments never enter this set.
 
 Reconciliation re-derives the same suppression set before the payload check, so
 a parked outcome stays verifiable. If earlier-cycle comments change between

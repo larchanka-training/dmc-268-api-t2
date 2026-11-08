@@ -487,20 +487,32 @@ class FrozenConfigurationReader:
                 allowed_rule_refs=frozenset(
                     settings.rules_source.get("file", {}).get("allowed_rule_refs", [])
                 )
-                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
+                if (
+                    settings.rules_source is not None
+                    and job.prompt_version in {"v4", "v5"}
+                )
                 else None,
                 rules_diagnostics=tuple(
                     settings.rules_source.get("file", {}).get("diagnostics", [])
                 )
-                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
+                if (
+                    settings.rules_source is not None
+                    and job.prompt_version in {"v4", "v5"}
+                )
                 else (),
                 rules_source_state=settings.rules_source.get("file", {}).get("state")
-                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
+                if (
+                    settings.rules_source is not None
+                    and job.prompt_version in {"v4", "v5"}
+                )
                 else None,
                 rule_severities=tuple(
                     settings.rules_source.get("file", {}).get("severities", {}).items()
                 )
-                if settings.rules_source is not None and job.prompt_version in {"v4", "v5"}
+                if (
+                    settings.rules_source is not None
+                    and job.prompt_version in {"v4", "v5"}
+                )
                 else (),
             )
 

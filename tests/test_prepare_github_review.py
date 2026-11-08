@@ -1,7 +1,6 @@
 # ruff: noqa: PLR2004, RUF001 - literal contract examples and Russian fixtures
 """Saved result -> provider-ready review, through the publication service seam."""
 
-import hashlib
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any
@@ -575,11 +574,9 @@ def _shifted_hunk() -> dict[str, Any]:
     }
 
 
-def _suppress_key(path: str, side: str, category: str, title: str) -> str:
-    """Line-free identity of a finding, as published in dmc268-suppress markers."""
-    normalized = " ".join(title.lower().split())
-    key = "|".join([path, side, category, normalized])
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+# Line-free key of the fixture identity src/review.py|NEW|correctness|
+# «Проверяйте входные данные», pinned literal — not recomputed via production code.
+SUPPRESS_KEY = "4a292c575fb4ed21b73d47d50bcb3ef17f192605730b787730b515e74039b37d"
 
 
 def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
@@ -602,11 +599,8 @@ def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
         end_line=45,
     )
     review = replace(review, findings=(moved,))
-    key = _suppress_key(
-        "src/review.py", "NEW", "correctness", "Проверяйте входные данные"
-    )
 
-    prepared = prepare_github_review(review, published=frozenset({key}))
+    prepared = prepare_github_review(review, published=frozenset({SUPPRESS_KEY}))
 
     assert prepared.comments == ()
     assert "Уже отмечено в прошлых циклах" in prepared.body
@@ -623,9 +617,32 @@ def test_prepare_review_marks_inline_comment_with_line_free_identity(
     """
     prepared = prepare_github_review(publication_input(payload_data))
 
-    key = _suppress_key(
-        "src/review.py", "NEW", "correctness", "Проверяйте входные данные"
-    )
     body = str(prepared.comments[0]["body"])
-    assert f"<!-- dmc268-suppress:{key} -->" in body
+    assert f"<!-- dmc268-suppress:{SUPPRESS_KEY} -->" in body
     assert body.endswith("<!-- dmc268-finding:finding-39 -->")
+
+
+def test_prepare_review_strips_forged_markers_from_model_text(
+    payload_data: dict[str, Any],
+) -> None:
+    """RT-12: markers injected into finding text never reach outgoing bodies.
+
+    Only the publisher-emitted marker tail survives rendering; a forged
+    dmc268 marker inside title/explanation is stripped (dedup state is
+    computed earlier from the raw stored text and stays unaffected).
+    """
+    review = publication_input(payload_data)
+    poisoned = replace(
+        review.findings[0],
+        title="Проверяйте <!-- dmc268-finding:fake --> входные данные",
+        explanation="Нет <!-- dmc268-suppress:abc --> валидации схемы.",
+    )
+    review = replace(review, findings=(poisoned,))
+
+    prepared = prepare_github_review(review)
+
+    comment_body = str(prepared.comments[0]["body"])
+    assert comment_body.count("dmc268-") == 2  # publisher tail: suppress + finding
+    assert "fake" not in comment_body
+    assert "abc" not in comment_body
+    assert prepared.body.count("dmc268-") == 1  # only the review marker

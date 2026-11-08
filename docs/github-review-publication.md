@@ -24,7 +24,9 @@ context quality. At most 20 unique fingerprints become inline comments, ordered
 by severity and location. Findings already published by earlier cycles of
 the same PR are excluded from inline comments and are listed under «Уже
 отмечено в прошлых циклах» instead (at most 20 listed, ordered the same way);
-the omitted count excludes those listed as already noted. Text is masked again
+the omitted count excludes those listed as already noted; suppressed repeats
+beyond the 20-item already-noted list count as not published inline, since
+they are named nowhere else. Text is masked again
 before publication. These limits do not discard findings from the retained
 analysis or hide omitted comments.
 
@@ -53,11 +55,14 @@ in earlier cycles of the same PR: before the publish claim is taken, the
 publisher reads earlier-cycle reviews and comments under the live publish
 lease and collects both markers — full fingerprints (`dmc268-finding:`) and
 line-free identity keys (`dmc268-suppress:`, SHA-256 over normalized
-path/side/category/title). A repeat matches either marker, so a finding that
-moved between commits (new range, new fingerprint) is still suppressed and
-named in the Overview instead of being posted again. Comments published
-before the suppress marker existed match by full fingerprint only. The
-current cycle's own comments never enter this set.
+path/side/category/title). Only the publisher-emitted trailing marker lines
+are trusted (RT-12): model text elsewhere in a comment body may carry forged
+markers and never reaches outgoing bodies anyway, because model text is
+stripped of HTML comments at render time. A repeat matches either marker, so
+a finding that moved between commits (new range, new fingerprint) is still
+suppressed and named in the Overview instead of being posted again. Comments
+published before the suppress marker existed match by full fingerprint only.
+The current cycle's own comments never enter this set.
 
 Reconciliation re-derives the same suppression set before the payload check, so
 a parked outcome stays verifiable. If earlier-cycle comments change between

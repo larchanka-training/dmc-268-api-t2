@@ -35,6 +35,20 @@ from app.domain.repository_policy import read_review_policy
 from app.domain.settings import compute_repository_settings_digest
 
 
+def _live_lease_conditions(
+    review_job_id: UUID, owner: str, fencing_token: int
+) -> list[ColumnElement[bool]]:
+    """Shared liveness filter: this owner's live publish-kind lease."""
+    kind = literal_column("to_jsonb(task_lease)->>'task_kind'", type_=Text())
+    return [
+        TaskLease.review_job_id == review_job_id,
+        TaskLease.owner == owner,
+        TaskLease.fencing_token == fencing_token,
+        TaskLease.expires_at > func.clock_timestamp(),
+        or_(kind.is_(None), kind == "publish"),
+    ]
+
+
 class PostgresPublicationStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = session_factory
@@ -152,18 +166,10 @@ class PostgresPublicationStore:
                 .join(ReviewJob, ReviewJob.id == TaskLease.review_job_id)
                 .join(Publication, Publication.review_job_id == ReviewJob.id)
                 .where(
-                    TaskLease.review_job_id == claim.review_id,
-                    TaskLease.owner == claim.authority.owner,
-                    TaskLease.fencing_token == claim.authority.fencing_token,
-                    TaskLease.expires_at > func.clock_timestamp(),
-                    or_(
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        ).is_(None),
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        )
-                        == "publish",
+                    *_live_lease_conditions(
+                        claim.review_id,
+                        claim.authority.owner,
+                        claim.authority.fencing_token,
                     ),
                     PublicationOperation.id == claim.operation_id,
                     PublicationOperation.state == "IN_FLIGHT",
@@ -186,19 +192,11 @@ class PostgresPublicationStore:
         async with self._sessions() as session:
             current = await session.scalar(
                 select(TaskLease.id).where(
-                    TaskLease.review_job_id == authority.review_job_id,
-                    TaskLease.owner == authority.owner,
-                    TaskLease.fencing_token == authority.fencing_token,
-                    TaskLease.expires_at > func.clock_timestamp(),
-                    or_(
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        ).is_(None),
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        )
-                        == "publish",
-                    ),
+                    *_live_lease_conditions(
+                        authority.review_job_id,
+                        authority.owner,
+                        authority.fencing_token,
+                    )
                 )
             )
             return current is not None

@@ -33,7 +33,15 @@ from app.application.publication_ports import (
 from app.domain.contract_validation import validate_hunks
 from app.review.schemas.context import FileDiff
 from app.review.schemas.finding import LLMFinding
-from app.review.validation import has_changed_anchor, mask_secrets
+from app.review.validation import has_changed_anchor, mask_secrets, normalize_text
+
+# The publisher always ends an inline comment with its marker tail. Harvest
+# trusts only that tail (RT-12): model text elsewhere in the body may carry
+# forged dmc268 markers, and a forged suppress key would poison the
+# suppression set for a chosen future identity.
+_MARKER_TAIL = re.compile(
+    r"(?:<!-- dmc268-suppress:(\S+) -->\n)?<!-- dmc268-finding:(\S+) -->\Z"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +157,18 @@ def _github_path(item: PersistedFinding, review: PublicationInput) -> str:
     return item.path
 
 
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _strip_comments(text: str) -> str:
+    """RT-12: model text must not carry forged markers into outgoing bodies.
+
+    Dedup state (fingerprints, suppress keys) is computed earlier from the
+    raw stored text and stays unaffected.
+    """
+    return _HTML_COMMENT.sub("", text)
+
+
 def _suppress_key(item: PersistedFinding) -> str:
     """Line-free identity hash for cross-cycle suppression (issue #53).
 
@@ -162,10 +182,22 @@ def _suppress_key(item: PersistedFinding) -> str:
             item.path,
             item.side,
             item.category,
-            " ".join(item.title.lower().split()),
+            normalize_text(item.title),
         ]
     )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _request_for(review: PublicationInput) -> GithubRequest:
+    """The provider coordinates of the captured PR (same shape at all call sites)."""
+    return GithubRequest(
+        review.owner,
+        review.name,
+        review.repository_external_id,
+        review.number,
+        review.head_sha,
+        review.base_sha,
+    )
 
 
 def _already_published(item: PersistedFinding, published: frozenset[str]) -> bool:
@@ -204,8 +236,10 @@ def prepare_github_review(
         for item in review.findings
         if severity.get(item.severity, 4) <= severity[review.minimum_severity]
     )
-    summary = review.summary
-    risks = "\n".join(f"- {item.severity}: {item.title}" for item in eligible)
+    summary = _strip_comments(review.summary)
+    risks = "\n".join(
+        f"- {item.severity}: {_strip_comments(item.title)}" for item in eligible
+    )
     if review.minimum_severity != "low":
         summary = (
             "Проверка завершена. Минимальный уровень серьёзности: "
@@ -244,9 +278,10 @@ def prepare_github_review(
             "line": item.end_line,
             "side": "LEFT" if item.side == "OLD" else "RIGHT",
             "body": mask_secrets(
-                f"**{item.severity}: {item.title}**\n\n"
+                f"**{item.severity}: {_strip_comments(item.title)}**\n\n"
                 + (f"Правило: {item.rule_ref}\n\n" if item.rule_ref else "")
-                + f"{item.explanation}\n\n{item.recommendation}\n\n"
+                + f"{_strip_comments(item.explanation)}\n\n"
+                + f"{_strip_comments(item.recommendation)}\n\n"
                 + f"<!-- dmc268-suppress:{_suppress_key(item)} -->\n"
                 f"<!-- dmc268-finding:{item.fingerprint} -->"
             ),
@@ -265,19 +300,12 @@ def prepare_github_review(
     already_noted = ""
     if noted:
         already_noted = "\n\nУже отмечено в прошлых циклах:\n" + "\n".join(
-            f"- {item.path}: {item.severity}: {item.title} "
+            f"- {item.path}: {item.severity}: {_strip_comments(item.title)} "
             f"<!-- dmc268-finding:{item.fingerprint} -->"
             for item in noted
         )
     return PreparedGithubReview(
-        request=GithubRequest(
-            review.owner,
-            review.name,
-            review.repository_external_id,
-            review.number,
-            review.head_sha,
-            review.base_sha,
-        ),
+        request=_request_for(review),
         marker=marker,
         body=mask_secrets(
             f"{marker}\n## Обзор AI-ревью\n\n{summary}\n\n"
@@ -444,18 +472,13 @@ class GithubPublisher:
 
         Full fingerprints (``dmc268-finding:``) and line-free suppress keys
         (``dmc268-suppress:``), so a repeat survives a line shift between
-        commits (issue #53 review). The reads happen before the claim exists,
-        so they carry no operation; the gateway is still lease-fenced to keep
-        expired workers off the provider (the same posture as AC-PUB-15).
+        commits (issue #53 review). Only the publisher-emitted marker tail is
+        parsed (RT-12): model text elsewhere in the body may carry forged
+        markers. The reads happen before the claim exists, so they carry no
+        operation; the gateway is still lease-fenced to keep expired workers
+        off the provider (the same posture as AC-PUB-15).
         """
-        request = GithubRequest(
-            review.owner,
-            review.name,
-            review.repository_external_id,
-            review.number,
-            review.head_sha,
-            review.base_sha,
-        )
+        request = _request_for(review)
         identities: set[str] = set()
         for item in await github.list_reviews(request):
             if item.author_id != self._bot_user_id:
@@ -467,12 +490,9 @@ class GithubPublisher:
             ):
                 if comment.author_id != self._bot_user_id:
                     continue
-                identities.update(
-                    re.findall(r"<!-- dmc268-finding:(.*?) -->", comment.body)
-                )
-                identities.update(
-                    re.findall(r"<!-- dmc268-suppress:(.*?) -->", comment.body)
-                )
+                match = _MARKER_TAIL.search(comment.body)
+                if match:
+                    identities.update(token for token in match.groups() if token)
         return frozenset(identities)
 
     async def publish(  # noqa: PLR0911, PLR0912, PLR0915 - explicit durable outcome branches

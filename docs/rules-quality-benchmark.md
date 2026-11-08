@@ -44,7 +44,8 @@ fixture metadata and scripted answers are never provider input or metadata.
 `provider_quality` evaluates the **final observed provider response before Worker
 filtering** as a model diagnostic. `canonical_quality` evaluates the **persisted
 canonical findings** as the delivered result. Each includes detection and
-attribution scores per case, per pass and per rule, plus B-minus-A deltas. A
+attribution scores per case and per pass, rule-attribution scores in `by_rule`,
+fixture cohorts in `by_category`, plus B-minus-A deltas. A
 provider detection TP that Worker drops is a canonical FN, never a canonical TP.
 This preserves evidence of unknown/wrong rule references that production correctly
 rejects without crediting them as persisted findings. All attempt
@@ -64,6 +65,29 @@ Clean cases and cases with false positives are counted separately. All zero
 Precision/Recall/F1 denominators produce **0**, including empty clean cases;
 aggregate metrics are micro counts, not an average of case ratios.
 
+`by_rule[rule_ref][pass].attribution` distributes individual findings using the
+same one-to-one attribution matching as the overall counts. Exact matches give
+TP to their reference; every nonempty prediction without an exact match gives
+FP to its predicted reference; every expected label without an exact match gives
+FN to its expected reference. This includes duplicates, clean-case predictions
+and ungrounded predictions (which cannot match). Unknown nonempty references
+remain explicit keys under their literal values, without a separate bucket.
+Missing/null/empty references add no rule-specific FP and preserve expected FN
+and existing missing diagnostics. An omitted required field still fails schema
+validation, so that response contributes FN and schema errors, as before.
+For each target and pass, summing `by_rule` TP/FP/FN equals the overall attribution
+micro-counts; precision/recall/F1 are recomputed from each rule's counts.
+
+For example, expected SEC-1 predicted PERF-1, followed by expected PERF-1
+predicted PERF-1, produces SEC-1 TP/FP/FN = 0/0/1 and PERF-1 = 1/1/0
+(Precision = 0.5). Both predictions can remain detection TP regardless of refs.
+`by_rule` no longer includes detection, clean-case or validation metrics based on
+fixture category. Those complete-case aggregates are retained in `by_category`,
+keyed by the fixture's declared category; a cohort's attribution FP may cite
+another rule. Overall detection, per-case diagnostics and pass-level
+missing/wrong/unjustified diagnostics keep their existing meaning. Both report
+formats include `per_rule_semantics` explaining this separation.
+
 Both JSON and Markdown explicitly separate the two quality targets and include
 `filtered_findings`: provider findings absent from the canonical result, matched
 by location, category, masked title and rule reference with duplicate counts
@@ -72,6 +96,7 @@ This records removals, including deduplication; it does not infer a rejection
 reason. Severity and evidence normalization alone do not count as removals.
 The legacy JSON `score`, top-level `passes`, `by_rule` and `delta` remain aliases
 for the provider diagnostic, identified by `scoring_target`.
+The new top-level `by_category` is also a provider diagnostic alias.
 
 Both JSON and Markdown include per-case A/B scores, per-rule aggregates, deltas,
 canonical validation, provider attempt diagnostics, frozen identities, model,

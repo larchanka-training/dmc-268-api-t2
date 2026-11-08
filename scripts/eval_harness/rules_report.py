@@ -117,6 +117,14 @@ def build_rules_report(dataset: Path, execution: dict[str, Any]) -> dict[str, An
             "Precision, recall and F1 are zero when their denominator is zero; "
             "clean cases are counted separately."
         ),
+        "per_rule_semantics": (
+            "by_rule contains finding-level rule attribution only. "
+            "Every observed nonempty rule_ref, including unknown references, "
+            "is retained under its literal reference; no unknown bucket is used. "
+            "by_category groups complete cases by fixture category, including "
+            "detection, clean controls and validation diagnostics; overall "
+            "detection is independent of rule_ref."
+        ),
     }
 
 
@@ -173,6 +181,26 @@ def _quality_summary(
         "passes": passes,
         "by_rule": {
             reference: {
+                mode: {
+                    "attribution": metrics(
+                        *(
+                            sum(
+                                row[target]["by_rule"].get(reference, {}).get(key, 0)
+                                for row in scored
+                                if row["pass"] == mode
+                            )
+                            for key in ("tp", "fp", "fn")
+                        )
+                    ),
+                }
+                for mode in ("baseline", "rules")
+            }
+            for reference in sorted(
+                {reference for row in scored for reference in row[target]["by_rule"]}
+            )
+        },
+        "by_category": {
+            category: {
                 mode: _aggregate(
                     [
                         row[target]
@@ -183,13 +211,7 @@ def _quality_summary(
                 )
                 for mode in ("baseline", "rules")
             }
-            for category, reference in sorted(
-                {
-                    (fixture.category, label["rule_ref"])
-                    for fixture in labels.values()
-                    for label in fixture.expected_findings
-                }
-            )
+            for category in sorted({fixture.category for fixture in labels.values()})
         },
         "delta": {
             group: {
@@ -302,10 +324,18 @@ def write_rules_report(report: dict[str, Any], output_dir: Path) -> None:
             "",
             report["zero_denominator_convention"],
             "",
-            "## Per-rule metrics",
+            "## Per-rule attribution",
+            "",
+            report["per_rule_semantics"],
             "",
             "```json",
             json.dumps(report[target]["by_rule"], indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Per-category fixture cohorts",
+            "",
+            "```json",
+            json.dumps(report[target]["by_category"], indent=2, sort_keys=True),
             "```",
             "",
             "## Deltas (B minus A)",

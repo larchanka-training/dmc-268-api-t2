@@ -1,5 +1,6 @@
 """Rule detection and attribution are independent; Gold scoring is unchanged."""
 
+from collections import Counter
 from typing import Any
 
 from scripts.eval_harness.validator import is_grounded, parse_diff, validate_shape
@@ -133,7 +134,20 @@ def score_rules(
     missing = sum(not predicted[p].get("rule_ref") for p, _ in residual)
     wrong = len(residual) - missing
     rule_predictions = sum(bool(p.get("rule_ref")) for p in predicted)
+    expected_refs = Counter(item["rule_ref"] for item in expected)
+    predicted_refs = Counter(
+        item["rule_ref"] for item in predicted if item.get("rule_ref")
+    )
+    attributed_refs = Counter(predicted[p]["rule_ref"] for p, _ in attributed)
     return {
+        "by_rule": {
+            reference: metrics(
+                attributed_refs[reference],
+                predicted_refs[reference] - attributed_refs[reference],
+                expected_refs[reference] - attributed_refs[reference],
+            )
+            for reference in sorted(expected_refs.keys() | predicted_refs.keys())
+        },
         "clean": {
             "case": not expected,
             "false_positive": not expected and bool(predicted),
@@ -181,5 +195,12 @@ def evaluate_rules(
         **metrics(count["tp"], count["fp"] + extra, count["fn"]),
         "unjustified": count["unjustified"] + extra,
     }
+    for reference, extra_fp in Counter(
+        item["rule_ref"] for item in ungrounded if item.get("rule_ref")
+    ).items():
+        count = score["by_rule"].get(reference, metrics(0, 0, 0))
+        score["by_rule"][reference] = metrics(
+            count["tp"], count["fp"] + extra_fp, count["fn"]
+        )
     score["clean"]["false_positive"] = not expected and bool(predicted)
     return {**score, "schema_errors": errors, "grounding_errors": len(ungrounded)}

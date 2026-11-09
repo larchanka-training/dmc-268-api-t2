@@ -1,0 +1,4 @@
+def handle(client, user, request):
+    return client.post(
+        "https://service.example.invalid/events", json={}, timeout=2.0,
+    )

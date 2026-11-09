@@ -1,0 +1,8 @@
+diff --git a/src/handler.py b/src/handler.py
+index 34d858efc63b926c98d8a93db99c93722ad288f9..4765e1981f5800949f4d42f774e0762f446b42a7 100644
+--- a/src/handler.py
++++ b/src/handler.py
+@@ -1,2 +1,2 @@
+ def handle(client, user, request):
+-    return None
++    return {"error_code": "APP_NOT_FOUND", "status": 404}

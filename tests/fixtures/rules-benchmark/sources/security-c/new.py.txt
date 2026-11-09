@@ -1,0 +1,5 @@
+def handle(client, user, request):
+    return client.records.find_one({
+        "id": request.record_id,
+        "tenant_id": user.tenant_id,
+    })

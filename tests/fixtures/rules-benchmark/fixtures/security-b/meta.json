@@ -1,0 +1,6 @@
+{
+  "category": "security",
+  "title": "Public synthetic rule example",
+  "description": "Hand-authored isolated repository-policy example.",
+  "language": "Python"
+}

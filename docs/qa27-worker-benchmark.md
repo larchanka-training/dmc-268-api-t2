@@ -158,3 +158,43 @@ migration checks remain. The existing benchmark artifact additionally includes
 No real LLM call, spend, bot POST, deployment or team notification is performed.
 The separately approved ceilings (three passes at≤$1each/≤$3total) and exact bot
 acceptance target remain unexecuted real-run gates, not claims made by scripted CI.
+
+## Rules states E2E report
+
+Tracked in [Issue #27](https://github.com/larchanka-training/dmc-268-api-t2/issues/27).
+
+The separate `rules-e2e-report` GitHub Actions artifact contains
+`rules-e2e-states.json` and `rules-e2e-states.md`. It records observed frozen
+base revisions, parser states and rules digests, persisted analysis/findings and
+Reflection ledger results, publication status, review POST counts before/after
+replay, and authenticated SSE checks for absent/valid/empty/adversarial scenarios.
+The adversarial scenario retains its actual parser state `valid` separately.
+
+This is E2E integration evidence with `quality_measurement: false`: LLM and
+GitHub publication use scripted HTTP transport. It measures neither real model
+quality nor real GitHub write acceptance. Reports contain safe identities,
+counts and states, without source, complete rules, prompts or provider payloads.
+Only successful scenarios write records; missing, duplicate or invalid records
+make generation fail. The existing `gold-benchmark-reports` artifact is unchanged.
+
+To reproduce, use the disposable migrated PostgreSQL18 and Redis8 setup above,
+with `DMC268_TEST_DATABASE_URL` and `DMC268_TEST_REDIS_URL` set. Create a fresh
+directory for each run so earlier evidence cannot fill gaps in a partial run:
+
+```bash
+mkdir -p .scratch
+rules_e2e_report_dir=$(mktemp -d .scratch/rules-e2e.XXXXXX)
+DMC268_RULES_E2E_RECORDS_DIR="$rules_e2e_report_dir/records" \
+  uv run pytest tests/test_webhook_review_publication_e2e.py::test_signed_receipt_reaches_one_published_review_and_authenticated_sse -q
+uv run python -m scripts.rules_e2e_report \
+  --records-dir "$rules_e2e_report_dir/records" --output-dir "$rules_e2e_report_dir/report"
+```
+
+The environment variable is opt-in; ordinary local pytest runs keep their
+existing behavior. Skipped or incomplete E2E runs cannot produce a complete report.
+
+## Independent rule-specific experiment (QA-04B)
+
+The separate [12-example rule-specific benchmark](rules-quality-benchmark.md)
+uses its own paired Worker runner, scorer, report artifact and future live gates.
+It inherits no authorization from this document’s original 24-case campaign.

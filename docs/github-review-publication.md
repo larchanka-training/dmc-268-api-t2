@@ -59,14 +59,17 @@ path/side/category/title) — as counts, one slot per earlier inline comment.
 Only the publisher-emitted trailing marker lines are trusted (RT-12): model
 text elsewhere in a comment body may carry forged markers and never reaches
 outgoing bodies anyway, because model text is stripped of HTML comments at
-render time. Exact fingerprint repeats claim an identity's slots first, then
-ranked same-identity candidates fill the rest; a repeat — including a finding
-that moved between commits (new range, new fingerprint) — is suppressed and
-named in the Overview instead of being posted again. Because the identity key
-is line-free, it cannot tell two defects apart, so a cycle holding more
-findings of an identity than earlier comments published (for example the same
-category and title appearing in a second function) posts the surplus inline —
-ambiguity resolves toward publishing. Comments published before the suppress
+render time. Exact fingerprint repeats claim an identity's slots first — the
+pinned range makes the match unambiguous. Identity-only candidates then fill a
+slot only where the earlier comment was anchored on the provider (same path,
+same side, within 10 lines of its anchor): the identity key is line-free and
+cannot tell a shifted repeat from a second independent defect, so a candidate
+far from every unfilled anchor — the same category and title appearing in a
+second function, or a new finding whose published look-alike left the ranked
+set (a fragment re-analysis) — posts inline. Suppression still covers the
+usual line shift between commits (the regression scenario moves the finding 6
+lines); a larger shift resolves toward publishing: a visible duplicate is
+preferred over a hidden finding. Comments published before the suppress
 marker existed match by full fingerprint only. The current cycle's own
 comments never enter this set.
 

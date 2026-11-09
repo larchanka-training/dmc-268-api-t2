@@ -8,7 +8,10 @@ from uuid import UUID
 
 import pytest
 
-from app.application.github_publication import prepare_github_review
+from app.application.github_publication import (
+    PublishedAnchor,
+    prepare_github_review,
+)
 from app.application.publication_ports import PersistedFinding, PublicationInput
 from app.vcs.diff import parse_diff
 
@@ -667,7 +670,7 @@ def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
 
     The full fingerprint pins the line range, so the moved finding carries a
     new fingerprint; suppression must still match on the line-free identity
-    the earlier cycle published.
+    the earlier cycle published, anchored near the same place in the file.
     """
     shifted = deepcopy(payload_data)
     shifted["files"][0]["diff"]["hunks"] = [_shifted_hunk()]
@@ -681,11 +684,96 @@ def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
     )
     review = replace(review, findings=(moved,))
 
-    prepared = prepare_github_review(review, published={SUPPRESS_KEY: 1})
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1},
+        published_anchors={
+            SUPPRESS_KEY: [
+                PublishedAnchor(
+                    path="src/review.py", side="RIGHT", start_line=39, end_line=39
+                )
+            ]
+        },
+    )
 
     assert prepared.comments == ()
     assert "Уже отмечено в прошлых циклах" in prepared.body
     assert "finding-45" in prepared.body
+
+
+def _far_hunk() -> dict[str, Any]:
+    """An added line at 60: a second function far below the fixture's one."""
+    return {
+        "hunk_id": "hunk_far",
+        "old_start": 59,
+        "old_count": 2,
+        "new_start": 59,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def parse_far(data):",
+                "old_line": 59,
+                "new_line": 59,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 60,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 60,
+            },
+        ],
+    }
+
+
+def test_prepare_review_publishes_identity_match_far_from_published_anchor(
+    payload_data: dict[str, Any],
+) -> None:
+    """A same-identity finding far from the published anchor posts inline (#60 review).
+
+    The earlier cycle published the identity at line 39; the new cycle's ranked
+    set holds only a new same-identity finding at line 60 (the published one
+    left the ranked set, e.g. a fragment re-analysis). The identity key alone
+    cannot tell the two apart, so the place check decides: far from the
+    published anchor the match is ambiguous and ambiguity resolves toward
+    publishing — the finding must not disappear into an unfilled slot.
+    """
+    data = deepcopy(payload_data)
+    data["files"][0]["diff"]["hunks"] = [_far_hunk()]
+    data["coverage"]["included"][0]["ranges"] = [{"start_line": 60, "end_line": 60}]
+    review = publication_input(data)
+    fresh = replace(
+        review.findings[0],
+        fingerprint="finding-60",
+        start_line=60,
+        end_line=60,
+    )
+    review = replace(review, findings=(fresh,))
+
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1},
+        published_anchors={
+            SUPPRESS_KEY: [
+                PublishedAnchor(
+                    path="src/review.py", side="RIGHT", start_line=39, end_line=39
+                )
+            ]
+        },
+    )
+
+    assert len(prepared.comments) == 1
+    assert prepared.comments[0]["line"] == 60
+    assert str(prepared.comments[0]["body"]).endswith(
+        "<!-- dmc268-finding:finding-60 -->"
+    )
+    assert "Уже отмечено" not in prepared.body
 
 
 def test_prepare_review_marks_inline_comment_with_line_free_identity(

@@ -766,3 +766,106 @@ async def test_second_independent_finding_of_same_identity_is_published(
     assert "Уже отмечено в прошлых циклах" in provider.posts[1]["body"]
     assert "finding-v1 -->" in provider.posts[1]["body"]
     assert "finding-v1-copy" not in provider.posts[1]["body"]
+
+
+async def _fragment_cycle_two(engine: AsyncEngine, review_2: UUID) -> None:
+    """Seed the fragment scenario: only a NEW same-identity finding is ranked.
+
+    The published finding at line 39 left the ranked set (the cycle analyzed
+    only the new fragment, issue #69 direction); the same category/title
+    defect appeared at line 60 — same line-free suppress key, new fingerprint.
+    """
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(Finding)
+            .where(
+                Finding.chunk_result_id.in_(
+                    select(ChunkResult.id).where(ChunkResult.review_job_id == review_2)
+                )
+            )
+            .values(
+                fingerprint="finding-v1-fragment",
+                start_line=60,
+                end_line=60,
+            )
+        )
+
+
+async def test_new_finding_of_published_identity_publishes_when_repeat_left_ranked(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """A new same-identity finding posts inline when the repeat is not ranked.
+
+    Issue #60 review: the cycle-2 fragment does not re-rank the published
+    finding, and the unfilled slot must not hide the new defect.
+
+    Cycle 1 publishes the defect at line 39. Cycle 2 analyzes only the new
+    fragment, so its ranked set holds just the new defect at line 60 — same
+    path/side/category/title, therefore the same suppress key, new fingerprint.
+    The unfilled slot must not hide the new finding: the place is far from the
+    published anchor, the match is ambiguous and ambiguity resolves toward
+    publishing. The finding gets its own inline comment.
+    """
+    engine = publication_engine
+    store, authority = await setup_publication(engine, payload_data)
+    review_1 = authority.review_job_id
+    provider = TwoCycleGithub()
+
+    outcome_1 = await _publisher(store, provider, authority).publish(
+        review_job_id=review_1
+    )
+    assert outcome_1["status"] == "PUBLISHED"
+    provider.comments_for_review = {"9001": list(provider.comments)}
+
+    async with async_sessionmaker(engine)() as session:
+        change_id = await session.scalar(
+            select(ReviewJob.change_request_id).where(ReviewJob.id == review_1)
+        )
+    new_head = "b" * 40
+    # The cycle-2 fragment covers only the second function at line 60.
+    payload_data["files"][0]["diff"]["hunks"] = [_second_hunk()]
+    payload_data["coverage"]["included"][0]["ranges"] = [
+        {"start_line": 60, "end_line": 60}
+    ]
+    review_2, _ = await seed_review(
+        engine, payload_data, change_id=change_id, head_sha=new_head
+    )
+    await _fragment_cycle_two(engine, review_2)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(ChangeRequest)
+            .where(ChangeRequest.id == change_id)
+            .values(head_sha=new_head)
+        )
+        await connection.execute(
+            insert(TaskLease).values(
+                **lease_values(
+                    id=uuid4(),
+                    review_job_id=review_2,
+                    owner="cycle-2",
+                    fencing_token=1,
+                    expires_at=datetime.now(UTC) + timedelta(seconds=90),
+                )
+            )
+        )
+    authority_2 = PublicationAuthority(review_2, "cycle-2", 1)
+    provider.review_change = {"id": 9002}
+    provider.head = new_head
+    provider.metadata = {
+        **provider.metadata,
+        "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
+    }
+
+    outcome_2 = await _publisher(store, provider, authority_2).publish(
+        review_job_id=review_2
+    )
+    assert outcome_2["status"] == "PUBLISHED", f"outcome_2={outcome_2}"
+    assert len(provider.posts) == 2
+    # The new same-identity finding is published inline, not suppressed into
+    # the slot of the published finding that left the ranked set.
+    assert len(provider.posts[1]["comments"]) == 1
+    comment = provider.posts[1]["comments"][0]
+    assert comment["line"] == 60
+    assert comment["body"].endswith("<!-- dmc268-finding:finding-v1-fragment -->")
+    assert "Уже отмечено" not in provider.posts[1]["body"]

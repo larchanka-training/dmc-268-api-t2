@@ -2841,3 +2841,38 @@ async def test_access_revoked_during_cancel_authorize_does_not_stop_job(
         assert review is not None
         assert review.status == "QUEUED" and review.finished_at is None
     assert await _cancel_events(postgres, review_id) == 0
+
+
+async def test_integration_flip_during_cancel_authorize_does_not_stop_job(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    class Flipping:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            async with postgres.engine.begin() as connection:
+                await connection.execute(
+                    update(models.Repository)
+                    .where(models.Repository.id == scope.repository)
+                    .values(integration_status="bot_denied")
+                )
+
+    app.dependency_overrides[get_review_start_authorizer] = Flipping
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("integration-flip-race"),
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "INTEGRATION_UNHEALTHY"
+    assert_schema(response, "Error")
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0

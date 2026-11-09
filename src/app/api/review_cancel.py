@@ -281,21 +281,36 @@ async def _apply_cancel(  # noqa: PLR0913 -- apply txn needs caller identity for
     ).one_or_none()
     if found is None:
         raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
-    _, repository = found
-    if repository.integration_status != "healthy":
-        raise ApiError(
-            409, "INTEGRATION_UNHEALTHY", "The repository integration is unhealthy."
-        )
     now = await session.scalar(select(func.clock_timestamp()))
     assert now is not None
+    # Tie healthy status to the cancel write (avoid identity-map stale attrs).
     updated = await session.scalar(
         update(ReviewJob)
-        .where(ReviewJob.id == review_id, ReviewJob.finished_at.is_(None))
+        .where(
+            ReviewJob.id == review_id,
+            ReviewJob.finished_at.is_(None),
+            exists().where(
+                Repository.id == ReviewJob.repository_id,
+                Repository.integration_status == "healthy",
+            ),
+        )
         .values(status="FAILED", finished_at=now)
         .returning(ReviewJob.id)
     )
     if updated is None:
         await session.rollback()
+        integration_status = await session.scalar(
+            select(Repository.integration_status)
+            .select_from(ReviewJob)
+            .join(Repository, Repository.id == ReviewJob.repository_id)
+            .where(ReviewJob.id == review_id)
+        )
+        if integration_status is not None and integration_status != "healthy":
+            raise ApiError(
+                409,
+                "INTEGRATION_UNHEALTHY",
+                "The repository integration is unhealthy.",
+            )
         if await _user_cancel_recorded(session, review_id):
             return _ok(review_id)
         await _remember(

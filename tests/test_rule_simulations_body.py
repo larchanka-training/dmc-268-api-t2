@@ -1,10 +1,11 @@
 """Transport body limits at the real authenticated simulation HTTP boundary."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from http import HTTPStatus
 
 import httpx
 import pytest
+import sentry_sdk
 from test_postgres_integration import PostgresHarness
 from test_rule_simulations_access import (
     VALID_SIMULATION_BODY,
@@ -13,6 +14,17 @@ from test_rule_simulations_access import (
 )
 
 pytest_plugins = ("test_rule_simulations_access",)
+
+
+@pytest.fixture(autouse=True)
+def isolate_stream_from_sentry() -> Iterator[None]:
+    # Other tests can leave Sentry's default FastAPI integration enabled: it
+    # pre-reads JSON bodies and swallows the stream's read-ahead AssertionError.
+    # Restore only the body-capture option; creating/binding a client also
+    # mutates SDK metadata and global scope attributes.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sentry_sdk.get_client().options, "max_request_body_size", "never")
+        yield
 
 
 @pytest.mark.parametrize("content_length", [None, "1", "262144", "not-a-number"])

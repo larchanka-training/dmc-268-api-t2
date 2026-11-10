@@ -1,7 +1,8 @@
-"""Rule simulation authentication boundary; execution is not available yet."""
+"""Rule simulation boundary; execution requires an explicit dependency override."""
 
 import json
 import re
+from contextlib import suppress
 from ntpath import splitdrive
 from typing import Annotated, Literal
 from uuid import UUID
@@ -11,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from app.adapters.personal_github import (
     PersonalCredentialUnavailableError,
@@ -25,6 +26,7 @@ from app.core.config import Settings, get_settings
 from app.db.models import Repository, RepositoryAccess
 from app.db.session import get_session
 from app.review.schemas.finding import RelPath
+from app.review.simulation import CodeSimulationError, CodeSimulationService
 from app.vcs.diff import InvalidDiff, parse_diff
 
 router = APIRouter(prefix="/api/v1/repositories")
@@ -184,6 +186,11 @@ def _validate_simulation_headers(request: Request) -> None:
         raise ApiError(422, "VALIDATION_FAILED", "Request is invalid.")
 
 
+async def get_simulation_executor() -> CodeSimulationService | None:
+    """Unavailable by default; no production provider is composed here."""
+    return None
+
+
 @router.post(
     "/{id}/rule-simulations",
     status_code=503,
@@ -201,7 +208,7 @@ def _validate_simulation_headers(request: Request) -> None:
         503: {"description": "SERVICE_UNAVAILABLE"},
     },
 )
-async def create_rule_simulation(
+async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0917 -- preserve ordered HTTP guards and explicit injected dependencies
     id: str,
     request: Request,
     identity: Annotated[
@@ -209,6 +216,7 @@ async def create_rule_simulation(
     ],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
+    executor: Annotated[CodeSimulationService | None, Depends(get_simulation_executor)],
 ) -> Response:
     try:
         repository_id = UUID(id)
@@ -274,4 +282,12 @@ async def create_rule_simulation(
             diagnostics_truncated=truncated,
         )
     # Preliminary permission check only. Future paid admission must recheck access.
-    raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
+    if executor is None:
+        raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
+    result = None
+    with suppress(CodeSimulationError):
+        result = await executor.simulate(payload.input, payload.rules)
+    # Raise outside the handler so the service/provider exception is not retained.
+    if result is None:
+        raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
+    return JSONResponse(status_code=200, content=result.model_dump(mode="json"))

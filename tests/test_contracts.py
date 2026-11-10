@@ -649,6 +649,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories/{id}/settings", "get"),
         ("/api/v1/repositories/{id}/settings", "put"),
         ("/api/v1/repositories/{id}/rules-preview", "get"),
+        ("/api/v1/repositories/{id}/rule-simulations", "post"),
         ("/api/v1/repositories/{id}/pull-requests/{number}/reviews", "post"),
         ("/api/v1/repositories/{id}/reviews", "get"),
         ("/api/v1/repositories/{id}/analytics", "get"),
@@ -710,3 +711,93 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
     accepted_ref = start_responses["202"]["content"]["application/json"]["schema"]
     assert replay_ref["$ref"].endswith("/StartReviewReplayResponse")
     assert accepted_ref["$ref"].endswith("/StartReviewResponse")
+
+
+def test_simulation_rule_diagnostic_component_is_closed_and_allowlisted() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    schema = api["components"]["schemas"]["SimulationRuleDiagnostic"]
+    Draft202012Validator.check_schema(schema)
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]["code"]["enum"]) == {
+        "RULES_DUPLICATE_REF",
+        "RULES_INVALID_SECTION",
+        "RULES_INVALID_SEVERITY",
+        "RULES_INVALID_IGNORE",
+        "RULES_UNCLOSED_FENCE",
+        "RULES_TOO_LARGE",
+        "RULES_CANONICAL_LIMIT",
+        "RULES_NO_ACTIVE_CRITERIA",
+        "RULES_INVALID",
+    }
+    validator = _api_validator("SimulationRuleDiagnostic")
+    valid = {
+        "code": "RULES_DUPLICATE_REF",
+        "line": 7,
+        "message": "Rule references must be unique.",
+    }
+    validator.validate(valid)
+    validator.validate(valid | {"line": None})
+    for invalid in (
+        valid | {"code": "private-unknown"},
+        valid | {"line": 0},
+        valid | {"line": -1},
+        valid | {"line": True},
+        valid | {"line": "7"},
+        valid | {"message": "x" * 161},
+        valid | {"raw": "private-secret"},
+        {"code": "RULES_INVALID", "message": "Rules could not be validated."},
+    ):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+
+def test_simulation_rules_error_component_preserves_closed_canonical_error() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    schema = api["components"]["schemas"]["SimulationRulesValidationError"]
+    Draft202012Validator.check_schema(schema)
+    assert schema["additionalProperties"] is False
+    canonical = {
+        "code": "VALIDATION_FAILED",
+        "message": "Request is invalid.",
+        "request_id": "req_example",
+        "retryable": False,
+        "retry_after": None,
+    }
+    diagnostics: list[dict[str, object]] = [
+        {
+            "code": "RULES_DUPLICATE_REF",
+            "line": 7,
+            "message": "Rule references must be unique.",
+        }
+    ]
+    specialized = canonical | {
+        "diagnostics": diagnostics,
+        "diagnostics_truncated": False,
+    }
+    validator = _api_validator("SimulationRulesValidationError")
+    validator.validate(specialized)
+    for invalid in (
+        canonical,
+        specialized | {"raw": "private-secret"},
+        specialized | {"diagnostics": diagnostics * 21},
+        specialized | {"retryable": True},
+        specialized | {"retry_after": 1},
+        specialized | {"code": "SERVICE_UNAVAILABLE"},
+        specialized | {"message": "private-secret"},
+    ):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+    _api_validator("Error").validate(canonical)
+    with pytest.raises(ValidationError):
+        _api_validator("Error").validate(specialized)
+
+
+def test_simulation_operation_documents_only_current_fail_closed_outcomes() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    path = "/api/v1/repositories/{id}/rule-simulations"
+    operation = api["paths"][path]["post"]
+    assert operation["operationId"] == "createRuleSimulation"
+    assert set(api["paths"][path]) == {"post"}
+    assert set(operation["responses"]) == {"401", "403", "404", "413", "422", "503"}
+    assert "temporarily unavailable" in operation["description"]
+    assert not any(p.startswith(path + "/") for p in api["paths"])

@@ -12,6 +12,7 @@ from app.api.repository_settings import router as repository_settings_router
 from app.api.review_start import router as review_start_router
 from app.api.review_stream import router as review_stream_router
 from app.api.reviews import router as reviews_router
+from app.api.rule_simulations import router as rule_simulations_router
 
 api_router = APIRouter()
 api_router.include_router(github_auth_router)
@@ -24,3 +25,4 @@ api_router.include_router(repositories_router)
 api_router.include_router(repository_insights_router)
 api_router.include_router(pull_requests_router)
 api_router.include_router(repository_settings_router)
+api_router.include_router(rule_simulations_router)

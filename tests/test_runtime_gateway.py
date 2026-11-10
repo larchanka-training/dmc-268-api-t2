@@ -10,6 +10,7 @@ from test_analysis_terminal import PROFILES, PROMPTS, freeze
 from test_frozen_configuration import runtime_profiles, save_policy
 from test_postgres_integration import PostgresHarness
 
+from app.core.circuit_breaker import BreakerRegistry
 from app.domain.frozen_configuration import FrozenConfigurationError
 from app.review.configuration import FrozenConfigurationReader, build_frozen_gateway
 
@@ -63,3 +64,23 @@ async def test_direct_frozen_gateway_refuses_credentials_before_transport(
         ):
             build_frozen_gateway(config, profiles, http)
     assert calls == []
+
+
+async def test_frozen_gateway_pools_share_process_breakers_by_profile(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine, expire_on_commit=False)
+    await freeze(factory, review_id)
+    config = await FrozenConfigurationReader(factory, PROMPTS, PROFILES).resolve(
+        review_id
+    )
+    breakers = BreakerRegistry()
+
+    async with httpx.AsyncClient() as http:
+        first = build_frozen_gateway(config, PROFILES, http, breakers=breakers)
+        second = build_frozen_gateway(config, PROFILES, http, breakers=breakers)
+
+    assert [pool.breaker for pool in first._pools] == [
+        breakers.get(pool.profile_ref or "") for pool in second._pools
+    ]
+    assert all(pool.breaker is not None for pool in first._pools)

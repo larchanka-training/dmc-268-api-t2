@@ -17,6 +17,7 @@ from redis.backoff import NoBackoff
 
 from app.adapters.redis_queue import RedisQueue
 from app.application.ports import LeaseLostError
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Logging, get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
@@ -63,7 +64,7 @@ async def run(*, once: bool, poll_interval: float) -> None:  # noqa: PLR0912 -- 
                 socket_timeout=5,
                 retry=Retry(NoBackoff(), 0),
             ) as client,
-            github_connection(settings) as github,
+            github_connection(settings, breaker=CircuitBreaker()) as github,
             httpx.AsyncClient(timeout=120, follow_redirects=False) as http,
         ):
             owner = f"analysis-{uuid.uuid4()}"

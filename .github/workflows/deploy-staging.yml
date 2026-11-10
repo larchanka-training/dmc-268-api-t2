@@ -410,6 +410,7 @@ jobs:
           AUTH_JWT_SECRET: ${{ secrets.AUTH__JWT_SECRET }}
           AUTH_CREDENTIAL_KEY: ${{ secrets.AUTH__CREDENTIAL_KEY }}
           AUTH_FRONTEND_ORIGINS: ${{ vars.AUTH__FRONTEND_ORIGINS }}
+          FRONTEND_BASE_URL: ${{ vars.FRONTEND__BASE_URL }}
           SENTRY_DSN: ${{ secrets.SENTRY__DSN }}
         shell: bash
         run: |
@@ -476,6 +477,7 @@ jobs:
             append_optional 'AUTH__JWT_SECRET' "${AUTH_JWT_SECRET:-}"
             append_optional 'AUTH__CREDENTIAL_KEY' "${AUTH_CREDENTIAL_KEY:-}"
             append_optional 'AUTH__FRONTEND_ORIGINS' "${AUTH_FRONTEND_ORIGINS:-}"
+            append_optional 'FRONTEND__BASE_URL' "${FRONTEND_BASE_URL:-}"
             append_optional 'SENTRY__DSN' "${SENTRY_DSN:-}"
           } | sshpass -e ssh \
             -o StrictHostKeyChecking=yes \

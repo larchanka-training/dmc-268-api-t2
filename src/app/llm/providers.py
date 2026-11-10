@@ -8,6 +8,7 @@ from collections.abc import Callable
 import httpx
 import structlog
 
+from app.core.circuit_breaker import BreakerRegistry
 from app.core.config import LLM
 from app.llm.client import BaseLLMClient
 from app.llm.gateway import Endpoint, LLMGateway, ProviderPool, Sleep
@@ -17,13 +18,14 @@ from app.llm.openai_compatible import OpenAICompatibleClient
 logger = structlog.get_logger(__name__)
 
 
-def build_gateway(
+def build_gateway(  # noqa: PLR0913 -- injected runtime seams
     settings: LLM,
     http: httpx.AsyncClient,
     *,
     sleep: Sleep = asyncio.sleep,
     rng: random.Random | None = None,
     clock: Callable[[], float] = time.monotonic,
+    breakers: BreakerRegistry | None = None,
 ) -> LLMGateway:
     """Gateway over ``settings.provider_chain``: primary first, then fallback."""
     settings.check_provider_chain()
@@ -36,6 +38,7 @@ def build_gateway(
             name,
             [Endpoint(client) for client in _clients(name, settings, http)],
             timeout_s=min(timeouts[name], settings.request_timeout_s),
+            breaker=breakers.get(name) if breakers is not None else None,
         )
         for name in settings.provider_chain
     ]

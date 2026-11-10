@@ -133,6 +133,13 @@ async def test_retryable_failure_defers_original_redis_delivery_without_ack(  # 
             job = await session.get(ReviewJob, review_id)
             assert job is not None and job.analysis_attempts == 2
             assert job.analysis_deadline_at == deadline
+            # The second consecutive failure waits twice as long as the first (2s).
+            remaining = await session.scalar(
+                select(
+                    func.extract("epoch", ReviewJob.retry_at - func.clock_timestamp())
+                ).where(ReviewJob.id == review_id)
+            )
+            assert remaining is not None and 3 < remaining <= 4
             events = (
                 await session.scalars(
                     select(ReviewEvent).where(

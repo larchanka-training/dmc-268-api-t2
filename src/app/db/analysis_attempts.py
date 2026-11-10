@@ -136,7 +136,9 @@ class PostgresAnalysisAttemptStore:
                 or job.analysis_attempt_fence != lease.fencing_token
             ):
                 raise LeaseLostError("Analysis execution is no longer current")
-            retry_at = now + timedelta(seconds=min(20.0, max(1.0, delay_s)))
+            # Exponential per consecutive attempt of this review: 2s, 4s, 8s, ...
+            backoff = delay_s * 2.0 ** max(0, job.analysis_attempts - 1)
+            retry_at = now + timedelta(seconds=min(20.0, max(1.0, backoff)))
             if (
                 job.analysis_attempts >= policy.retry.worker_max_attempts
                 or job.analysis_deadline_at is None

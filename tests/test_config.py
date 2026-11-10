@@ -208,3 +208,32 @@ def test_github_token_is_loaded_and_redacted(monkeypatch: pytest.MonkeyPatch) ->
     settings = Settings()
     assert settings.github.token.get_secret_value() == "github-test-token"
     assert "github-test-token" not in repr(settings)
+
+
+def test_commit_status_settings_have_safe_defaults() -> None:
+    settings = Settings()
+
+    assert settings.frontend.base_url == ""
+    assert settings.github.status_context == "dmc268/ai-review"
+
+
+def test_frontend_base_url_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FRONTEND__BASE_URL", "https://review.example/app/")
+    monkeypatch.setenv("GITHUB__STATUS_CONTEXT", "team/ai")
+
+    settings = Settings()
+
+    assert settings.frontend.base_url == "https://review.example/app"
+    assert settings.github.status_context == "team/ai"
+
+
+@pytest.mark.parametrize(
+    "value", ["review.example", "ftp://review.example", "https://", "https://a b"]
+)
+def test_frontend_base_url_rejects_non_http_links(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("FRONTEND__BASE_URL", value)
+
+    with pytest.raises(ValidationError, match="FRONTEND__BASE_URL"):
+        Settings()

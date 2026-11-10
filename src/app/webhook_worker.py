@@ -9,6 +9,7 @@ from app.adapters.automatic_review_admission import AutomaticReviewAdmission
 from app.application.github_ports import GithubPort
 from app.application.use_cases.process_webhook import process_webhook
 from app.application.webhook_ports import AutomaticWebhookAdmission, WebhookInbox
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import get_settings
 from app.core.github_runtime import github_connection
 from app.core.logging_config import configure_logging
@@ -34,7 +35,7 @@ async def _run(*, once: bool) -> None:
     configure_logging(settings.logging)
     configure_sentry(settings)
     try:
-        async with github_connection(settings) as github:
+        async with github_connection(settings, breaker=CircuitBreaker()) as github:
             while True:
                 count = await run_once(
                     SqlAlchemyWebhookInbox(async_session_factory),

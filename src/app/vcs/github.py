@@ -8,7 +8,8 @@ import json
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Any
@@ -30,6 +31,7 @@ from app.application.github_ports import (
     RepositoryFileRejected,
     RepositoryRevision,
 )
+from app.core.circuit_breaker import CircuitBreaker
 from app.domain.repository_policy import MAX_BRANCH_NAME_BYTES
 
 __all__ = ["GithubClient", "GithubFailure", "GithubRequest", "GithubSnapshot"]
@@ -46,6 +48,8 @@ _TOTAL_TIMEOUT_SECONDS = 15
 _MAX_READ_PAGES = 20
 _MAX_PAGE = 2_147_483_647
 _SECONDARY_RETRY_AFTER_SECONDS = 60
+_COMMIT_STATES = frozenset({"pending", "success", "failure", "error"})
+_MAX_STATUS_DESCRIPTION = 140
 
 
 def _secondary_rate_limit(body: bytes) -> bool:
@@ -435,10 +439,12 @@ class GithubClient:
         *,
         timeout_seconds: float = _TOTAL_TIMEOUT_SECONDS,
         authorize: Callable[[], Awaitable[None]] | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> None:
         self._client = client
         self._timeout_seconds = timeout_seconds
         self._authorize = authorize
+        self._breaker = breaker
 
     async def read_file(  # noqa: PLR0913 -- implements RepositoryFileReader identity contract
         self,
@@ -784,6 +790,7 @@ class GithubClient:
             self._client,
             timeout_seconds=self._timeout_seconds,
             authorize=authorize,
+            breaker=self._breaker,
         )
 
     async def check_pull(self, request: GithubRequest) -> None:
@@ -936,12 +943,82 @@ class GithubClient:
             raise GithubWriteFailure("VCS_UNAVAILABLE", remote_effect="unknown")
         return GithubReviewReference(remote_review_id=str(remote_id))
 
+    async def create_commit_status(  # noqa: PLR0913 -- one GitHub status payload
+        self,
+        owner: str,
+        name: str,
+        sha: str,
+        *,
+        state: str,
+        description: str,
+        context: str,
+        target_url: str | None,
+    ) -> None:
+        """Set the latest status for one context; repeating it is idempotent."""
+        if (
+            not _OWNER.fullmatch(owner)
+            or not _REPOSITORY.fullmatch(name)
+            or name in {".", ".."}
+            or not _SHA.fullmatch(sha)
+            or state not in _COMMIT_STATES
+        ):
+            raise GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False)
+        payload = {
+            "state": state,
+            "description": description[:_MAX_STATUS_DESCRIPTION],
+            "context": context,
+        }
+        if target_url is not None:
+            payload["target_url"] = target_url
+        if self._authorize is not None:
+            await self._authorize()
+        async with self._guarded():
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    response = await self._client.post(
+                        f"https://api.github.com/repos/{owner}/{name}/statuses/{sha}",
+                        headers={"Accept": "application/vnd.github+json"},
+                        json=payload,
+                        follow_redirects=False,
+                    )
+            except httpx.RequestError, TimeoutError:
+                raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+            _check_status(response, response.content[:_MAX_ERROR_BYTES])
+
     async def fetch(self, request: GithubRequest) -> GithubSnapshot:
         try:
             async with asyncio.timeout(_TOTAL_TIMEOUT_SECONDS):
                 return await self._fetch(request)
         except TimeoutError:
             raise GithubFailure("VCS_UNAVAILABLE", retryable=True) from None
+
+    def _admit(self) -> None:
+        if self._breaker is not None and not self._breaker.allow():
+            raise GithubFailure(
+                "VCS_UNAVAILABLE",
+                retryable=True,
+                retry_after=max(1, math.ceil(self._breaker.retry_after_s)),
+            )
+
+    @asynccontextmanager
+    async def _guarded(self) -> AsyncIterator[None]:
+        """Only overload signals count; provider rejections prove availability."""
+        self._admit()
+        failed = False
+        try:
+            yield
+        except GithubFailure as failure:
+            failed = failure.retryable
+            raise
+        except asyncio.CancelledError, httpx.RequestError:
+            failed = True
+            raise
+        finally:
+            if self._breaker is not None:
+                if failed:
+                    self._breaker.record_failure()
+                else:
+                    self._breaker.record_success()
 
     async def _get(  # noqa: PLR0913 -- existing transport with file absence and response bound
         self,
@@ -955,6 +1032,26 @@ class GithubClient:
     ) -> httpx.Response:
         if self._authorize is not None:
             await self._authorize()
+        async with self._guarded():
+            return await self._send_get(
+                url,
+                accept,
+                token=token,
+                missing_pull=missing_pull,
+                missing_file=missing_file,
+                response_limit=response_limit,
+            )
+
+    async def _send_get(  # noqa: PLR0913 -- existing transport with file absence and response bound
+        self,
+        url: str,
+        accept: str,
+        *,
+        token: str | None,
+        missing_pull: bool,
+        missing_file: bool,
+        response_limit: int,
+    ) -> httpx.Response:
         headers = {"Accept": accept}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"

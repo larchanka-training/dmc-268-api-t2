@@ -22,6 +22,7 @@ from app.application.publication_ports import (
     PublicationAuthority,
     PublicationAuthorityError,
 )
+from app.db import commit_status_models  # noqa: F401 -- table for create_all
 from app.db.base import Base
 from app.db.models import (
     ChangeRequest,

@@ -189,8 +189,13 @@ async def test_repository_rule_reaches_github_once_through_real_gateway(  # noqa
             transport=httpx.MockTransport(publish_http),
         )
         assert len(provider.posts) == 1
-        assert [path for method, path in provider.requests if method == "POST"] == [
-            "/repos/team/api/pulls/13/reviews"
+        assert [
+            path
+            for method, path in provider.requests
+            if method == "POST" and "/statuses/" not in path
+        ] == ["/repos/team/api/pulls/13/reviews"]
+        assert [(sha, body["state"]) for sha, body in provider.statuses] == [
+            (HEAD, "success")
         ]
         posted = provider.posts[0]
         assert posted["commit_id"] == HEAD

@@ -21,6 +21,14 @@ from app.db.review_starts import settings_identity
 from app.domain.repository_policy import AutomaticReviewIntent, read_review_policy
 
 _MAX_ATTEMPTS = 3
+_BACKOFF_BASE_SECONDS = 30
+_BACKOFF_CAP_SECONDS = 600
+
+
+def _retry_delay(attempts: int, retry_after: int | None) -> timedelta:
+    """Double per attempt (30s, 60s, ...); provider Retry-After is a lower bound."""
+    backoff = min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** (attempts - 1))
+    return timedelta(seconds=max(retry_after or 0, backoff))
 
 
 class SqlAlchemyWebhookInbox:
@@ -313,7 +321,7 @@ class SqlAlchemyWebhookInbox:
                     processing_status="PENDING" if retry else "FAILED",
                     reason_code=failure.reason_code,
                     lease_until=None,
-                    retry_at=now + timedelta(seconds=failure.retry_after or 60)
+                    retry_at=now + _retry_delay(claim.attempts, failure.retry_after)
                     if retry
                     else None,
                 )

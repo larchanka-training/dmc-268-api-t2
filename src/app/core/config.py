@@ -45,6 +45,10 @@ class Github(BaseModel):
     token: SecretStr = SecretStr("")
     write_token: SecretStr = SecretStr("")
     bot_user_id: str = ""
+    # Commit status context; mark it required in branch protection to gate merges.
+    status_context: str = Field(
+        default="dmc268/ai-review", min_length=1, max_length=100
+    )
 
     @field_validator("bot_user_id")
     @classmethod
@@ -53,6 +57,27 @@ class Github(BaseModel):
             not value.isascii() or not value.isdecimal() or value.startswith("0")
         ):
             raise ValueError("GITHUB__BOT_USER_ID must be a positive numeric string")
+        return value
+
+
+class Frontend(BaseModel):
+    """Public UI address used for report links; empty omits the link."""
+
+    base_url: str = ""
+
+    @field_validator("base_url")
+    @classmethod
+    def _http_link(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value:
+            return ""
+        uri = urlsplit(value)
+        if (
+            uri.scheme not in {"http", "https"}
+            or not uri.hostname
+            or any(char.isspace() or ord(char) < 32 for char in value)  # noqa: PLR2004
+        ):
+            raise ValueError("FRONTEND__BASE_URL must be an http(s) URL")
         return value
 
 
@@ -261,6 +286,7 @@ class Settings(BaseSettings):
     webhook: Webhook = Field(default_factory=Webhook)
     github: Github = Field(default_factory=Github)
     auth: Auth = Field(default_factory=Auth)
+    frontend: Frontend = Field(default_factory=Frontend)
     logging: Logging = Field(default_factory=Logging)
     sentry: Sentry = Field(default_factory=Sentry)
     metrics: Metrics = Field(default_factory=Metrics)

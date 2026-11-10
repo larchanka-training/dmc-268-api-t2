@@ -10,6 +10,7 @@ import pytest
 from prometheus_client import generate_latest
 from pydantic import BaseModel, ConfigDict, SecretStr
 
+from app.core.circuit_breaker import BreakerRegistry
 from app.core.config import LLM, Eurorouter, LLMConfigError, Ollama, get_settings
 from app.llm.budget import BudgetLimits, RunBudget
 from app.llm.client import ChatMessage, LLMRequest
@@ -156,6 +157,7 @@ def _gateway(
     sleeper: Sleeper,
     clock: Clock,
     settings: LLM | None = None,
+    breakers: BreakerRegistry | None = None,
 ) -> LLMGateway:
     return build_gateway(
         settings or _settings(),
@@ -163,6 +165,7 @@ def _gateway(
         sleep=sleeper,
         rng=random.Random(0),
         clock=clock,
+        breakers=breakers,
     )
 
 
@@ -403,3 +406,51 @@ async def test_whole_http_timeout_includes_blocked_transport_pool() -> None:
         assert error.value.retryable
         assert error.value.last_error_code == "provider_timeout"
         assert entered.is_set() and cancelled.is_set()
+
+
+async def test_open_provider_circuit_skips_it_for_later_reviews(
+    provider: Provider, sleeper: Sleeper, clock: Clock
+) -> None:
+    breakers = BreakerRegistry(failure_threshold=2, reset_timeout_s=60, clock=clock)
+    provider.queue("key-one", httpx.Response(503))
+    provider.queue("key-two", httpx.Response(503))
+
+    # Gateways are rebuilt per review; the process-wide breaker outlives them.
+    assert (
+        await _call(
+            _gateway(provider, sleeper, clock, breakers=breakers), _budget(clock)
+        )
+        == "ollama"
+    )
+    assert (
+        await _call(
+            _gateway(provider, sleeper, clock, breakers=breakers), _budget(clock)
+        )
+        == "ollama"
+    )
+    assert provider.calls == ["key-one", "key-two", "ollama", "ollama"]
+
+    clock.now += 60
+    assert (
+        await _call(
+            _gateway(provider, sleeper, clock, breakers=breakers), _budget(clock)
+        )
+        == "eurorouter"
+    )
+    assert breakers.get("eurorouter").state == "closed"
+
+
+async def test_all_open_circuits_fail_fast_as_retryable(
+    provider: Provider, sleeper: Sleeper, clock: Clock
+) -> None:
+    breakers = BreakerRegistry(failure_threshold=1, reset_timeout_s=60, clock=clock)
+    breakers.get("eurorouter").record_failure()
+    breakers.get("ollama").record_failure()
+
+    with pytest.raises(LLMUnavailableError) as error:
+        await _call(
+            _gateway(provider, sleeper, clock, breakers=breakers), _budget(clock)
+        )
+
+    assert provider.calls == []
+    assert error.value.retryable is True

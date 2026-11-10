@@ -329,6 +329,31 @@ async def test_transient_failure_retries_after_delay_and_stops_at_three_attempts
 
 
 @pytest.mark.asyncio
+async def test_transient_failure_without_retry_after_backs_off_exponentially(
+    postgres: PostgresHarness,
+) -> None:
+    async with postgres.engine.begin() as connection:
+        await _create_repository(postgres, connection, external_id="123")
+    inbox = SqlAlchemyWebhookInbox(async_sessionmaker(postgres.engine))
+    receipt_id = await inbox.accept(
+        str(uuid.uuid4()), GithubRequest("owner", "repo", "123", 7, "a" * 40, "b" * 40)
+    )
+    assert receipt_id is not None
+    postgres.track("webhook_receipt", receipt_id)
+    now = datetime.now(UTC)
+    for delay in (30, 60):
+        claim = await inbox.claim(receipt_id, now=now)
+        assert claim is not None
+        await inbox.fail(claim, GithubFailure("VCS_UNAVAILABLE", True), now=now)
+        assert (
+            await inbox.claim(receipt_id, now=now + timedelta(seconds=delay - 1))
+            is None
+        )
+        now += timedelta(seconds=delay)
+    assert await inbox.claim(receipt_id, now=now) is not None
+
+
+@pytest.mark.asyncio
 async def test_recovery_lists_due_pending_and_expired_claims(
     postgres: PostgresHarness,
 ) -> None:

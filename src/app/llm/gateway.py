@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from app.application.analysis_authority import current_analysis_authority
 from app.application.analysis_ports import AccountingIdentityError, ReviewRunBudgetPort
 from app.application.ports import LeaseLostError
+from app.core.metrics import llm_attempt
 from app.llm.budget import RunBudget
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
 from app.llm.errors import (
@@ -167,10 +168,13 @@ class LLMGateway:
                             async with asyncio.timeout(timeout_s):
                                 if authority is not None:
                                     authority.check()
-                                result = await endpoint.client.generate_structured(
-                                    request.model_copy(update={"timeout_s": timeout_s}),
-                                    response_model,
-                                )
+                                with llm_attempt(pool.name, call_kind):
+                                    result = await endpoint.client.generate_structured(
+                                        request.model_copy(
+                                            update={"timeout_s": timeout_s}
+                                        ),
+                                        response_model,
+                                    )
                         except TimeoutError:
                             raise ProviderTimeoutError from None
                         if authority is not None:

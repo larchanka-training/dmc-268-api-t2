@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 
@@ -43,6 +43,7 @@ class PublicationInput:
     # Fingerprints already posted inline by earlier review cycles of this PR.
     published_before: frozenset[str] = frozenset()
     integration_status: str = "healthy"
+    minimum_severity: Literal["critical", "high", "medium", "low"] = "low"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +103,11 @@ class PublicationStore(Protocol):
     ) -> PublicationClaim | None: ...
 
     async def check_authority(self, claim: PublicationClaim) -> bool: ...
+
+    async def check_publication_authority(
+        self,
+        authority: PublicationAuthority,
+    ) -> bool: ...
 
     async def check_reconciliation_authority(
         self,

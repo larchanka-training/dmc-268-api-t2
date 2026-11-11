@@ -41,6 +41,40 @@ class GithubPullRequestReader(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class RepositoryFile:
+    text: str
+    blob_sha: str
+
+
+class RepositoryFileReader(Protocol):
+    async def authorize_revision(
+        self, owner: str, name: str, external_id: str, revision: str
+    ) -> None: ...
+
+    async def read_file(  # noqa: PLR0913 -- immutable repository/file identity and response bound
+        self,
+        owner: str,
+        name: str,
+        external_id: str,
+        revision: str,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> RepositoryFile | None: ...
+
+
+class SourceFileReader(Protocol):
+    async def read_file_by_id(
+        self,
+        external_id: str,
+        revision: str,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> RepositoryFile | None: ...
+
+
+@dataclass(frozen=True, slots=True)
 class GithubReviewReference:
     remote_review_id: str
 
@@ -84,6 +118,15 @@ class GithubRepositoryMismatch(GithubFailure):
         super().__init__("VCS_ACCESS_DENIED", False)
 
 
+class RepositoryFileRejected(GithubFailure):
+    """Content-only rejection; transport/access/ref failures never use this type."""
+
+    def __init__(self, diagnostic: str, *, blob_sha: str | None = None) -> None:
+        self.diagnostic = diagnostic
+        self.blob_sha = blob_sha
+        super().__init__("DIFF_UNTRUSTWORTHY", False)
+
+
 class GithubWriteFailure(GithubFailure):
     def __init__(
         self,
@@ -118,6 +161,15 @@ class CompareReader(Protocol):
 
 
 class GithubRepositoryReader(Protocol):
+@dataclass(frozen=True, slots=True)
+class RepositoryRevision:
+    owner: str
+    name: str
+    branch: str
+    revision: str
+
+
+class GithubRepositoryReader(RepositoryFileReader, Protocol):
     """Current read access, using only the authenticated user's credentials."""
 
     async def list_available_repositories(
@@ -125,6 +177,8 @@ class GithubRepositoryReader(Protocol):
     ) -> tuple[list[dict[str, Any]], int | None]: ...
 
     async def get_repository(self, external_id: str) -> dict[str, Any]: ...
+
+    async def resolve_default_branch(self, external_id: str) -> RepositoryRevision: ...
 
     async def has_read_access(self, external_id: str) -> bool: ...
 

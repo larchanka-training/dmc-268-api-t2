@@ -1,8 +1,9 @@
-# Prompt identities during PR29 / main integration
+# Prompt identities and Reflection execution
 
-Status: integrated local candidate. V3 is registered and supported by explicit
-trusted admission and preflight. Production worker/dispatcher activation is unchanged.
-Source pins: PR29 `fe08f5f962ef7f165567eebdf719db64ce6ca712`,
+V3 and v4 are supported by explicit trusted admission and preflight. Durable
+Reflection additionally requires explicit frozen model policy2 and the pinned
+verifier bundle. Default worker/dispatcher activation is unchanged.
+Historical integration source pins: PR29 `fe08f5f962ef7f165567eebdf719db64ce6ca712`,
 main `33b7a4e452368cd39c1b626e3130dc87669925ff`.
 
 ## Historical identities
@@ -55,21 +56,29 @@ reductions fail, and the resulting prompt carries a limitation and reports the
 rules actually sent. The final repaired/overflow prompt owns the `rule_ref`
 whitelist. Unknown labels are rejected by deterministic validation.
 
-`AdmissionSelection` accepts v1/v2/v3, trusted manifests pin a bundle digest, and
-preflight verifies all supported closures and saved active-job configurations.
+`AdmissionSelection` accepts v1/v2/v3/v4, trusted manifests pin a bundle digest, and
+preflight verifies historical closures, the selected bundle and saved active-job
+configurations.
 Historical jobs resolve their saved prompt/policy/settings identity. No default
 switch enables v3: use an explicit trusted admission selection and matching
 verified digest. Existing LLM defaults remain v1; resolver defaults remain v2.
 Neither worker nor dispatcher is enabled in production by this integration.
 
 For supported in-memory execution, `review_chunk(..., rules=...)` binds a new
-immutable verified v3 builder. Durable execution rejects rules overrides and
-uses only frozen configuration instructions. Reflection requires verified prompt
-identity v3 and an in-memory budget; historical v1/v2 never run the verifier.
-Reflection uses its own schema
-and the context/rules actually sent, including after repair; durable composition
-disables Reflection and retains the PostgreSQL budget ledger. The frozen policy
-DTO and its digest have not acquired a Reflection field.
+immutable verified v3 builder. This legacy Reflection path uses an in-memory
+`RunBudget`; historical initial prompts v1/v2 never run the verifier.
+
+Durable execution rejects rules overrides and uses only frozen configuration
+instructions. Historical model policy1 retains its original fields and disables
+durable Reflection. Explicit model policy2 adds the required `reflection` DTO
+block: bounded allowances, fail-open mode, verifier version and digest. The frozen
+configuration envelope remains version1, and its digest covers the selected
+inner policy, including that block. Policy2 requires verified initial promptv4
+and the independently attested verifier; incompatible identities are rejected.
+The verifier receives the context/rules actually sent, including after repair,
+and shares the existing PostgreSQL ledger and request/token/deadline limits.
+Allowance0 disables the pass. See [durable-reflection.md](durable-reflection.md)
+for admission, recovery and rollback behavior; no default activation is implied.
 
 ## Result persistence and recovery
 
@@ -82,3 +91,15 @@ Migration 0014 adds nullable `finding.rule_ref` after 0013; historical migration
 are unchanged. Retained v1/v2 results can be read and reused without another LLM
 call, including terminal recovery after ContextPayload retention has removed
 its source payload. No stored result, fingerprint, policy or digest is rewritten.
+
+## V4 source context
+
+Bundle digest: `3658c8c09838eff2e09409a295ca8ed685c8fb98104f91378b68e09366590dd1`.
+
+Issue #23 adds an explicitly selected verified `review-renderer-v4` bundle using
+provider/result schema2. It renders persisted source windows and AST symbols as
+untrusted data, neutralizes protected blocks/chat role markers, and drops optional
+AST before diff or rules. Frozen base rules and structured refs/severity/default
+provenance are described in [repository-context.md](repository-context.md).
+Historical artifacts and default activation are unchanged. Explicit durable
+Reflection on v4 is described above and in [durable-reflection.md](durable-reflection.md).

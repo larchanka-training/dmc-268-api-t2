@@ -150,6 +150,8 @@ class RepositorySettings(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
     rules_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_source: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    review_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     repository: Mapped[Repository] = relationship(
         back_populates="settings",
@@ -393,7 +395,7 @@ class ReviewJob(Base):
         CheckConstraint(
             "frozen_configuration_version IS NULL OR "
             "COALESCE(jsonb_typeof(model_settings) = 'object' "
-            "AND model_settings->>'schema_version' = '1', false)",
+            "AND model_settings->>'schema_version' IN ('1', '2'), false)",
             name=conv("ck_review_job_frozen_settings_shape"),
         ),
         CheckConstraint(
@@ -782,6 +784,10 @@ class QuotaUsage(Base):
 class WebhookReceipt(Base):
     __tablename__ = "webhook_receipt"
 
+    review_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("review_job.id"), nullable=True
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
@@ -877,7 +883,7 @@ class ReviewLlmAttempt(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "call_kind IN ('initial', 'repair', 'overflow_rebuild')",
+            "call_kind IN ('initial', 'repair', 'overflow_rebuild', 'reflection')",
             name=conv("ck_review_llm_attempt_kind"),
         ),
         CheckConstraint(

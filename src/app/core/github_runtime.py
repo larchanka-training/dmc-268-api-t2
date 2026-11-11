@@ -16,6 +16,10 @@ from app.application.github_ports import (
     GithubPullRequestReader,
 )
 from app.application.review_start_ports import RepositoryIdentity
+    GithubPort,
+    GithubPullRequestReader,
+    RepositoryFileReader,
+)
 from app.core.config import Settings
 from app.db.models import GithubIdentity
 from app.vcs.github import GithubClient
@@ -38,6 +42,14 @@ async def github_connection(settings: Settings) -> AsyncIterator[GithubPort]:
 async def github_pull_request_connection(
     settings: Settings,
 ) -> AsyncIterator[GithubPullRequestReader]:
+    async with _github_client(settings) as client:
+        yield client
+
+
+@asynccontextmanager
+async def github_file_connection(
+    settings: Settings,
+) -> AsyncIterator[RepositoryFileReader]:
     async with _github_client(settings) as client:
         yield client
 

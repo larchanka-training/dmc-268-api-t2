@@ -1,0 +1,20 @@
+{
+  "summary": "Scripted public synthetic response.",
+  "findings": [
+    {
+      "path": "src/handler.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "maintainability",
+      "rule_ref": "STYLE-1",
+      "severity": "medium",
+      "title": "Public error code is not APP_ uppercase snake case.",
+      "explanation": "Public error code is not APP_ uppercase snake case.",
+      "evidence": "return {\"error_code\": \"permissionDenied\", \"status\": 403}",
+      "recommendation": "Use APP_PERMISSION_DENIED.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

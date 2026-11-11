@@ -1,13 +1,17 @@
 # ruff: noqa: PLR2004, RUF001 - literal contract examples and Russian fixtures
 """Saved result -> provider-ready review, through the publication service seam."""
 
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 from uuid import UUID
 
 import pytest
 
-from app.application.github_publication import prepare_github_review
+from app.application.github_publication import (
+    PublishedAnchor,
+    prepare_github_review,
+)
 from app.application.publication_ports import PersistedFinding, PublicationInput
 from app.vcs.diff import parse_diff
 
@@ -73,6 +77,8 @@ def test_prepare_review_maps_saved_new_line_and_builds_overview(
             "body": (
                 "**high: Проверяйте входные данные**\n\n"
                 "Нет валидации схемы.\n\nДобавьте проверку схемы.\n\n"
+                "<!-- dmc268-suppress:4a292c575fb4ed21b73d47d50bcb3ef17f192605730b7877"
+                "30b515e74039b37d -->\n"
                 "<!-- dmc268-finding:finding-39 -->"
             ),
         },
@@ -605,3 +611,274 @@ index 1111111..2222222 100644
     assert prepared.comments == ()
     assert "high: Проверяйте входные данные" in prepared.body
     assert "Не опубликованы inline: 1" in prepared.body
+
+
+def _shifted_hunk() -> dict[str, Any]:
+    """The fixture hunk with its added line moved from 39 to 45 (new commit)."""
+    return {
+        "hunk_id": "hunk_1",
+        "old_start": 38,
+        "old_count": 2,
+        "new_start": 44,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def validate(data):",
+                "old_line": 38,
+                "new_line": 44,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 39,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 45,
+            },
+        ],
+    }
+
+
+# Line-free key of the fixture identity src/review.py|NEW|correctness|
+# «Проверяйте входные данные», pinned literal — not recomputed via production code.
+SUPPRESS_KEY = "4a292c575fb4ed21b73d47d50bcb3ef17f192605730b787730b515e74039b37d"
+
+
+def _early_hunk() -> dict[str, Any]:
+    """An added line at 10: a second function above the fixture's one."""
+    return {
+        "hunk_id": "hunk_0",
+        "old_start": 9,
+        "old_count": 2,
+        "new_start": 9,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def parse(data):",
+                "old_line": 9,
+                "new_line": 9,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 10,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 10,
+            },
+        ],
+    }
+
+
+def test_prepare_review_publishes_second_finding_of_published_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """A new finding of an already-published identity posts inline (#53 review).
+
+    Two defects can share path/side/category/title (one per function), so the
+    identity key alone cannot tell them apart. Earlier-cycle comments occupy
+    one suppression slot each; the exact repeat (full fingerprint match)
+    claims the slot first and the surplus publishes — even when it ranks
+    before the repeat.
+    """
+    data = deepcopy(payload_data)
+    data["files"][0]["diff"]["hunks"] = [_early_hunk(), _shifted_hunk()]
+    data["coverage"]["included"][0]["ranges"] = [
+        {"start_line": 45, "end_line": 45},
+        {"start_line": 10, "end_line": 10},
+    ]
+    review = publication_input(data)
+    copy = replace(
+        review.findings[0],
+        id=UUID("00000000-0000-0000-0000-000000000010"),
+        fingerprint="finding-copy",
+        start_line=10,
+        end_line=10,
+        explanation="Вторая функция без валидации.",
+        evidence="return request.data",
+    )
+    original = replace(
+        review.findings[0],
+        fingerprint="finding-45",
+        start_line=45,
+        end_line=45,
+    )
+    review = replace(review, findings=(original, copy))
+
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1, "finding-45": 1},
+    )
+
+    # The repeat stays suppressed; the new same-identity finding is posted.
+    assert len(prepared.comments) == 1
+    assert prepared.comments[0]["line"] == 10
+    assert str(prepared.comments[0]["body"]).endswith(
+        "<!-- dmc268-finding:finding-copy -->"
+    )
+    assert "finding-45" in prepared.body  # listed as already noted
+    assert "finding-copy" not in prepared.body
+
+
+def test_prepare_review_suppresses_line_shifted_repeat_by_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """A repeat after a line shift between two commits is not posted again (#53).
+
+    The full fingerprint pins the line range, so the moved finding carries a
+    new fingerprint; suppression must still match on the line-free identity
+    the earlier cycle published, anchored near the same place in the file.
+    """
+    shifted = deepcopy(payload_data)
+    shifted["files"][0]["diff"]["hunks"] = [_shifted_hunk()]
+    shifted["coverage"]["included"][0]["ranges"] = [{"start_line": 45, "end_line": 45}]
+    review = publication_input(shifted)
+    moved = replace(
+        review.findings[0],
+        fingerprint="finding-45",
+        start_line=45,
+        end_line=45,
+    )
+    review = replace(review, findings=(moved,))
+
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1},
+        published_anchors={
+            SUPPRESS_KEY: [
+                PublishedAnchor(
+                    path="src/review.py", side="RIGHT", start_line=39, end_line=39
+                )
+            ]
+        },
+    )
+
+    assert prepared.comments == ()
+    assert "Уже отмечено в прошлых циклах" in prepared.body
+    assert "finding-45" in prepared.body
+
+
+def _far_hunk() -> dict[str, Any]:
+    """An added line at 60: a second function far below the fixture's one."""
+    return {
+        "hunk_id": "hunk_far",
+        "old_start": 59,
+        "old_count": 2,
+        "new_start": 59,
+        "new_count": 2,
+        "lines": [
+            {
+                "kind": "context",
+                "text": "def parse_far(data):",
+                "old_line": 59,
+                "new_line": 59,
+            },
+            {
+                "kind": "deleted",
+                "text": "    return data",
+                "old_line": 60,
+                "new_line": None,
+            },
+            {
+                "kind": "added",
+                "text": "    return Schema.model_validate(data)",
+                "old_line": None,
+                "new_line": 60,
+            },
+        ],
+    }
+
+
+def test_prepare_review_publishes_identity_match_far_from_published_anchor(
+    payload_data: dict[str, Any],
+) -> None:
+    """A same-identity finding far from the published anchor posts inline (#60 review).
+
+    The earlier cycle published the identity at line 39; the new cycle's ranked
+    set holds only a new same-identity finding at line 60 (the published one
+    left the ranked set, e.g. a fragment re-analysis). The identity key alone
+    cannot tell the two apart, so the place check decides: far from the
+    published anchor the match is ambiguous and ambiguity resolves toward
+    publishing — the finding must not disappear into an unfilled slot.
+    """
+    data = deepcopy(payload_data)
+    data["files"][0]["diff"]["hunks"] = [_far_hunk()]
+    data["coverage"]["included"][0]["ranges"] = [{"start_line": 60, "end_line": 60}]
+    review = publication_input(data)
+    fresh = replace(
+        review.findings[0],
+        fingerprint="finding-60",
+        start_line=60,
+        end_line=60,
+    )
+    review = replace(review, findings=(fresh,))
+
+    prepared = prepare_github_review(
+        review,
+        published={SUPPRESS_KEY: 1},
+        published_anchors={
+            SUPPRESS_KEY: [
+                PublishedAnchor(
+                    path="src/review.py", side="RIGHT", start_line=39, end_line=39
+                )
+            ]
+        },
+    )
+
+    assert len(prepared.comments) == 1
+    assert prepared.comments[0]["line"] == 60
+    assert str(prepared.comments[0]["body"]).endswith(
+        "<!-- dmc268-finding:finding-60 -->"
+    )
+    assert "Уже отмечено" not in prepared.body
+
+
+def test_prepare_review_marks_inline_comment_with_line_free_identity(
+    payload_data: dict[str, Any],
+) -> None:
+    """Inline comments publish the line-free identity for later cycles (#53).
+
+    The finding marker stays the last line of the body (proof matching);
+    the suppress marker goes on its own line right before it.
+    """
+    prepared = prepare_github_review(publication_input(payload_data))
+
+    body = str(prepared.comments[0]["body"])
+    assert f"<!-- dmc268-suppress:{SUPPRESS_KEY} -->" in body
+    assert body.endswith("<!-- dmc268-finding:finding-39 -->")
+
+
+def test_prepare_review_strips_forged_markers_from_model_text(
+    payload_data: dict[str, Any],
+) -> None:
+    """RT-12: markers injected into finding text never reach outgoing bodies.
+
+    Only the publisher-emitted marker tail survives rendering; a forged
+    dmc268 marker inside title/explanation is stripped (dedup state is
+    computed earlier from the raw stored text and stays unaffected).
+    """
+    review = publication_input(payload_data)
+    poisoned = replace(
+        review.findings[0],
+        title="Проверяйте <!-- dmc268-finding:fake --> входные данные",
+        explanation="Нет <!-- dmc268-suppress:abc --> валидации схемы.",
+    )
+    review = replace(review, findings=(poisoned,))
+
+    prepared = prepare_github_review(review)
+
+    comment_body = str(prepared.comments[0]["body"])
+    assert comment_body.count("dmc268-") == 2  # publisher tail: suppress + finding
+    assert "fake" not in comment_body
+    assert "abc" not in comment_body
+    assert prepared.body.count("dmc268-") == 1  # only the review marker

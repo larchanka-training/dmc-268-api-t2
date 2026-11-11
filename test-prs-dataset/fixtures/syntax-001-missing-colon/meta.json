@@ -1,0 +1,10 @@
+{
+  "title": "Add payload validation helper",
+  "description": "Add a Python helper used by the request handler.",
+  "language": "python",
+  "category": "correctness",
+  "source": {
+    "kind": "synthetic",
+    "origin": "Constructed for issue #15 syntax-error coverage; no external or private source."
+  }
+}

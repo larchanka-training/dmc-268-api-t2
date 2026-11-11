@@ -15,7 +15,12 @@ from pydantic import BaseModel
 
 from app.application.analysis_ports import ReviewRunBudgetPort
 from app.core.config import LLM
-from app.domain.frozen_configuration import ExecutionSettings, RepositoryInstructions
+from app.domain.enums import FindingSeverity
+from app.domain.frozen_configuration import (
+    ExecutionSettings,
+    ModelSettingsV2,
+    RepositoryInstructions,
+)
 from app.domain.settings import rule_instructions
 from app.llm.budget import RunBudget
 from app.llm.client import ChatMessage, LLMCallResult, LLMRequest
@@ -122,6 +127,23 @@ class ReviewService:
         self._settings = settings
         self._frozen = frozen_configuration
 
+    def prompt_fits(self, payload: ContextPayload) -> bool:
+        """Whether the chunk's first call fits the per-call input limit.
+
+        Mirrors ``_send``: the reservation is the rendered prompt plus the
+        output schema, which the provider receives separately. No provider call.
+        """
+        self._prompts.ensure_verified()
+        counter = ConservativeTokenCounter() if self._frozen else self._counter
+        schema = counter.count(self._prompts.output_schema_json)
+        try:
+            self._prompts.build(
+                payload, max_input_tokens=self._settings.max_input_tokens - schema
+            )
+        except PromptTooLargeError:
+            return False
+        return True
+
     async def review_chunk(
         self,
         payload: ContextPayload,
@@ -182,7 +204,7 @@ class ReviewService:
                     budget,
                     call_kind="overflow_rebuild",
                     repair_input_limit=smaller
-                    if self._prompts.prompt_version == "v3"
+                    if self._prompts.prompt_version in {"v3", "v4"}
                     else None,
                 )
         except LLMGatewayError as exc:
@@ -204,27 +226,82 @@ class ReviewService:
             limitations.append(
                 f"Чанк обработан резервным провайдером ({call.provider}/{call.model})."
             )
-        outcome = self._validator.validate(
-            call.parsed.findings,
-            payload,
-            rule_refs=rule_refs_from_text(prompt.included_rules),
-        )
+        outcome = self._validate_findings(call.parsed, payload, prompt)
         # Historical renderers do not neutralize every Reflection delimiter.
         if (
+            self._frozen is not None
+            and isinstance(self._frozen.policy, ModelSettingsV2)
+            and self._frozen.policy.reflection.max_reflections_per_run > 0
+            and not isinstance(budget, RunBudget)
+        ) or (
             self._prompts.prompt_version == "v3"
             and self._frozen is None
             and isinstance(budget, RunBudget)
         ):
-            outcome = await self._reflect(payload, prompt, outcome, budget, attempt)
+            outcome = await self._reflect(
+                payload, prompt, outcome, budget, attempt, limitations
+            )
+        summary = self._rules_notes(call.parsed.summary, limitations)
         return await self._result(
             payload,
             budget,
             attempt,
             prompt.prompt_version,
-            summary=call.parsed.summary,
+            summary=summary,
             outcome=outcome,
             limitations=limitations,
         )
+
+    def _validate_findings(
+        self,
+        parsed: LLMReviewOutputV1 | LLMReviewOutput,
+        payload: ContextPayload,
+        prompt: BuiltPrompt,
+    ) -> ValidationOutcome:
+        rule_refs = rule_refs_from_text(prompt.included_rules)
+        if self._frozen is not None and self._frozen.allowed_rule_refs is not None:
+            rule_refs &= self._frozen.allowed_rule_refs
+        outcome = self._validator.validate(
+            parsed.findings,
+            payload,
+            rule_refs=rule_refs,
+        )
+        if self._frozen is not None and prompt.prompt_version == "v4":
+            severities = dict(self._frozen.rule_severities)
+            outcome = ValidationOutcome(
+                accepted=[
+                    finding.model_copy(
+                        update={
+                            "severity": FindingSeverity(severities[finding.rule_ref])
+                        }
+                    )
+                    if finding.rule_ref in severities
+                    else finding
+                    for finding in outcome.accepted
+                ],
+                rejected_count=outcome.rejected_count,
+            )
+        return outcome
+
+    def _rules_notes(self, summary: str, limitations: list[str]) -> str:
+        if self._frozen is not None and self._frozen.rules_diagnostics:
+            note = "Правила репозитория применены не полностью: " + ", ".join(
+                self._frozen.rules_diagnostics[:10]
+            )
+            limitations.append(note)
+            summary += "\n\n" + note
+        if self._frozen is not None and self._frozen.rules_source_state in {
+            "absent",
+            "empty",
+        }:
+            state = (
+                "отсутствует" if self._frozen.rules_source_state == "absent" else "пуст"
+            )
+            summary += (
+                f"\n\nФайл правил {state}; применены стандартные правила "  # noqa: RUF001 -- Russian product text
+                "и настройки репозитория."
+            )
+        return summary
 
     async def _generate(
         self,
@@ -333,13 +410,14 @@ class ReviewService:
             call_kind=call_kind,
         )
 
-    async def _reflect(
+    async def _reflect(  # noqa: PLR0913, PLR0917 -- one chunk plus shared outcome/limitations
         self,
         payload: ContextPayload,
         prompt: BuiltPrompt,
         outcome: ValidationOutcome,
-        budget: RunBudget,
+        budget: RunBudget | ReviewRunBudgetPort,
         attempt: _Attempt,
+        limitations: list[str],
     ) -> ValidationOutcome:
         """Second structured call; drops findings the verifier rejects.
 
@@ -373,11 +451,35 @@ class ReviewService:
                 ),
             ),
         ]
+        verifier = self._frozen.verifier if self._frozen else None
+        if self._frozen is not None and verifier is None:
+            raise FrozenConfigurationError("unsupported_verifier_bundle")
+        if verifier is not None:
+            messages = verifier.build(context, findings)
+        schema_json = (
+            verifier.output_schema_json
+            if verifier
+            else json.dumps(
+                ReflectionOutput.model_json_schema(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
         estimated = estimate_messages(messages, self._counter)
-        if estimated > self._settings.max_input_tokens:
+        schema_counter = ConservativeTokenCounter() if self._frozen else self._counter
+        if (
+            estimated + schema_counter.count(schema_json)
+            > self._settings.max_input_tokens
+        ):
             logger.info("reflection_pass_skipped", reason="input_limit")
+            if self._frozen is not None:
+                limitations.append(
+                    "Дополнительная проверка находок не завершена; "
+                    "сохранены исходные находки."
+                )
             return outcome
-        if not budget.try_use_reflection():
+        if isinstance(budget, RunBudget) and not budget.try_use_reflection():
             return outcome
         try:
             call = await self._send(
@@ -387,14 +489,14 @@ class ReviewService:
                 payload,
                 ReflectionOutput,
                 call_kind="reflection",
-                output_schema_json=json.dumps(
-                    ReflectionOutput.model_json_schema(),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ),
+                output_schema_json=schema_json,
             )
         except LLMGatewayError as exc:
+            if self._frozen is not None:
+                limitations.append(
+                    "Дополнительная проверка находок не завершена; "
+                    "сохранены исходные находки."
+                )
             logger.info(
                 "reflection_pass_failed",
                 fallback="deterministic_result",
@@ -402,6 +504,16 @@ class ReviewService:
             )
             return outcome
         attempt.reflection_calls.append(call)
+        covered = {
+            verdict.index
+            for verdict in call.parsed.verdicts
+            if verdict.index < len(outcome.accepted)
+        }
+        if self._frozen is not None and len(covered) < len(outcome.accepted):
+            limitations.append(
+                "Дополнительная проверка не охватила все находки; "
+                "непроверенные находки сохранены."
+            )
         rejected = {
             index
             for index in (
@@ -442,6 +554,11 @@ class ReviewService:
             *attempt.calls,
             *attempt.reflection_calls,
         ]
+        durable_usage = (
+            None
+            if isinstance(budget, RunBudget)
+            else await budget.snapshot(chunk_id=UUID(payload.chunk_id))
+        )
         result = ReviewChunkOutcome(
             schema_version=self._prompts.result_schema_version,
             review_id=payload.review_id,
@@ -452,9 +569,23 @@ class ReviewService:
             rejected_findings_count=outcome.rejected_count if outcome else 0,
             limitations=limitations or [],
             usage=Usage(
-                input_tokens=_sum_known(c.input_tokens for c in billed),
-                output_tokens=_sum_known(c.output_tokens for c in billed),
-                requests=(await _requests_used(budget)) - attempt.requests_before,
+                input_tokens=(
+                    None
+                    if durable_usage.unknown_input_tokens
+                    else durable_usage.actual_input_tokens
+                )
+                if durable_usage
+                else _sum_known(c.input_tokens for c in billed),
+                output_tokens=(
+                    None
+                    if durable_usage.unknown_output_tokens
+                    else durable_usage.actual_output_tokens
+                )
+                if durable_usage
+                else _sum_known(c.output_tokens for c in billed),
+                requests=durable_usage.requests_used
+                if durable_usage
+                else (await _requests_used(budget)) - attempt.requests_before,
                 latency_ms=int((time.monotonic() - attempt.started) * 1000),
             ),
             model=last.model if last else self._configured_model(),

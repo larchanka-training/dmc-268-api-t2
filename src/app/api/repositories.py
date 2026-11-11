@@ -16,6 +16,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.personal_github import (
+    PersonalCredentialUnavailableError,
+    personal_github_connection,
+)
 from app.api.auth import (
     AuthenticatedPrincipal,
     VerifiedSession,
@@ -62,6 +66,14 @@ async def get_repository_reader(
         ) from None
     async with user_github_client(token) as client:
         yield client
+        async with personal_github_connection(
+            principal.user_id, settings, session
+        ) as reader:
+            yield reader
+    except PersonalCredentialUnavailableError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
 
 
 @router.get("", operation_id="listRepositories")

@@ -1,0 +1,2 @@
+def handle(client, user, request):
+    return {"error_code": "APP_NOT_FOUND", "status": 404}

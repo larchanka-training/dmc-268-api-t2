@@ -114,6 +114,14 @@ class Sentry(BaseModel):
     dsn: SecretStr = SecretStr("")
 
 
+class Metrics(BaseModel):
+    """Opt-in internal Prometheus listener (METRICS__*)."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=9100, ge=1, le=65535)
+
+
 class Logging(BaseModel):
     """Logging settings (LOGGING__* env variables)."""
 
@@ -271,6 +279,12 @@ class ReviewCache(ReviewCachePolicy):
 class Settings(BaseSettings):
     """Runtime configuration for the application."""
 
+    @field_validator("git_sha")
+    @classmethod
+    def _blank_git_sha_is_unknown(cls, value: str) -> str:
+        """A blank build arg is the same as a missing commit."""
+        return value.strip() or "unknown"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -278,6 +292,7 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    git_sha: str = "unknown"
     postgres: Postgres = Field(default_factory=Postgres)
     redis: Redis = Field(default_factory=Redis)
     webhook: Webhook = Field(default_factory=Webhook)
@@ -285,6 +300,7 @@ class Settings(BaseSettings):
     auth: Auth = Field(default_factory=Auth)
     logging: Logging = Field(default_factory=Logging)
     sentry: Sentry = Field(default_factory=Sentry)
+    metrics: Metrics = Field(default_factory=Metrics)
     llm: LLM = Field(default_factory=LLM)
     input_guards: InputGuards = Field(default_factory=InputGuards)
     incremental: Incremental = Field(default_factory=Incremental)

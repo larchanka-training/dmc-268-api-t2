@@ -6,15 +6,16 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from uuid import UUID
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
-from sqlalchemy import delete, insert, select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from fastapi import Depends, FastAPI
+from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_postgres_integration import (
     PostgresHarness,
     ReviewScope,
@@ -734,6 +735,45 @@ def configured(
         )
     )
     return providers
+
+
+async def test_start_admission_supports_postgres_generic_query_plans(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    # PostgreSQL can select this plan after repeated prepared admissions.
+    engine = create_async_engine(
+        postgres.engine.url,
+        connect_args={"server_settings": {"plan_cache_mode": "force_generic_plan"}},
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def session() -> AsyncIterator[AsyncSession]:
+        async with factory() as value:
+            yield value
+
+    previous = app.dependency_overrides[get_session]
+    app.dependency_overrides[get_session] = session
+    try:
+        response = await client.post(
+            scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+        )
+        assert response.status_code == HTTPStatus.ACCEPTED
+        async with factory() as value:
+            quota = (
+                await value.scalars(
+                    select(models.QuotaUsage).where(
+                        models.QuotaUsage.repository_id == scope.repository
+                    )
+                )
+            ).one()
+            assert quota.type == "starts" and quota.value == 1
+    finally:
+        app.dependency_overrides[get_session] = previous
+        await engine.dispose()
 
 
 async def test_new_start_is_durable_and_atomic(
@@ -2353,6 +2393,156 @@ async def test_concurrent_refresh_to_same_head_with_new_base_is_not_found(
 )
 async def test_newer_head_start_while_pr_review_is_active(  # noqa: PLR0913, PLR0917 -- explicit fixture and parameter boundaries
     app: FastAPI,
+def _cancel_headers(key: str = "cancel") -> dict[str, str]:
+    return {**HEADERS, "Idempotency-Key": key}
+
+
+def _closing_authorizer(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> object:
+    class Closing:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            await session.close()
+
+    return Closing()
+
+
+async def test_queued_review_cancel_fails_job_and_keeps_start_quota(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    started = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert started.status_code == HTTPStatus.ACCEPTED
+    review_id = started.json()["review_id"]
+    app.dependency_overrides[get_authenticated_principal] = lambda: (
+        AuthenticatedPrincipal(scope.user)
+    )
+    fetches = configured.calls
+    pull_reads = 0
+    read_pull_request = configured.get_pull_request
+
+    async def count_pull_reads(
+        owner: str, name: str, repository_external_id: str, number: int
+    ) -> GithubPullRequest:
+        nonlocal pull_reads
+        pull_reads += 1
+        return await read_pull_request(owner, name, repository_external_id, number)
+
+    configured.get_pull_request = count_pull_reads  # type: ignore[method-assign]
+    async with async_sessionmaker(postgres.engine)() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(models.ReviewJob)
+                .where(
+                    models.ReviewJob.repository_id == scope.repository,
+                    models.ReviewJob.finished_at.is_(None),
+                )
+            )
+        ) == 1
+        assert (
+            await session.scalar(
+                select(models.QuotaUsage.value).where(
+                    models.QuotaUsage.repository_id == scope.repository,
+                    models.QuotaUsage.type == "starts",
+                )
+            )
+        ) == 1
+
+    cancelled = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers()
+    )
+    assert cancelled.status_code == HTTPStatus.OK
+    assert cancelled.json() == {
+        "review_id": review_id,
+        "status": "FAILED",
+        "reason_code": "USER_CANCELLED",
+    }
+    assert_schema(cancelled, "CancelReviewResponse")
+    detail = await client.get(f"/api/v1/reviews/{review_id}")
+    assert detail.status_code == HTTPStatus.OK
+    body = detail.json()
+    assert body["status"] == "FAILED"
+    assert body["finished_at"] is not None
+    assert body["publication_status"] == "NOT_READY"
+    assert body["error"] == {
+        "reason_code": "USER_CANCELLED",
+        "retryable": False,
+        "retry_at": None,
+    }
+    assert_schema(detail, "ReviewDetail")
+    assert configured.calls == fetches
+    assert pull_reads == 0
+    async with async_sessionmaker(postgres.engine)() as session:
+        assert (
+            await session.scalar(
+                select(models.Repository.integration_status).where(
+                    models.Repository.id == scope.repository
+                )
+            )
+        ) == "healthy"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(models.ReviewJob)
+                .where(
+                    models.ReviewJob.repository_id == scope.repository,
+                    models.ReviewJob.finished_at.is_(None),
+                )
+            )
+        ) == 0
+        assert (
+            await session.scalar(
+                select(models.QuotaUsage.value).where(
+                    models.QuotaUsage.repository_id == scope.repository,
+                    models.QuotaUsage.type == "starts",
+                )
+            )
+        ) == 1
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(models.ReviewEvent)
+                .where(
+                    models.ReviewEvent.review_job_id == uuid.UUID(review_id),
+                    models.ReviewEvent.reason_code == "USER_CANCELLED",
+                )
+            )
+        ) == 1
+
+
+async def _queued_review(client: httpx.AsyncClient, scope: StartScope) -> str:
+    started = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert started.status_code == HTTPStatus.ACCEPTED
+    review_id = started.json()["review_id"]
+    assert isinstance(review_id, str)
+    return review_id
+
+
+async def _cancel_events(postgres: PostgresHarness, review_id: str) -> int:
+    async with async_sessionmaker(postgres.engine)() as session:
+        counted = await session.scalar(
+            select(func.count())
+            .select_from(models.ReviewEvent)
+            .where(
+                models.ReviewEvent.review_job_id == uuid.UUID(review_id),
+                models.ReviewEvent.reason_code == "USER_CANCELLED",
+            )
+        )
+    assert isinstance(counted, int)
+    return counted
+
+
+async def test_second_cancel_returns_ok_without_another_event(
     client: httpx.AsyncClient,
     scope: StartScope,
     configured: FakeStartGithub,
@@ -2393,3 +2583,339 @@ async def test_newer_head_start_while_pr_review_is_active(  # noqa: PLR0913, PLR
         assert jobs == [HEAD]
     else:
         assert sorted(jobs) == sorted([HEAD, newer])
+) -> None:
+    review_id = await _queued_review(client, scope)
+    first = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("first")
+    )
+    assert first.status_code == HTTPStatus.OK
+    assert first.json()["reason_code"] == "USER_CANCELLED"
+    assert await _cancel_events(postgres, review_id) == 1
+    second = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("second")
+    )
+    assert second.status_code == HTTPStatus.OK
+    assert second.json() == first.json()
+    assert await _cancel_events(postgres, review_id) == 1
+
+
+async def test_cancel_sqlalchemy_error_returns_503_retryable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    async def boom(*_args: object, **_kwargs: object) -> tuple[UUID, str] | None:
+        raise SQLAlchemyError("simulated disconnect")
+
+    monkeypatch.setattr("app.api.review_cancel.find_replay", boom)
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers()
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+    assert response.json()["retryable"] is True
+    assert_schema(response, "Error")
+
+
+async def test_same_cancel_idempotency_ok_when_user_cancel_not_latest_event(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    first = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("cancel-idem-order"),
+    )
+    assert first.status_code == HTTPStatus.OK
+    rid = uuid.UUID(review_id)
+    async with postgres.engine.begin() as connection:
+        last_seq = await connection.scalar(
+            select(func.max(models.ReviewEvent.sequence)).where(
+                models.ReviewEvent.review_job_id == rid
+            )
+        )
+        assert last_seq is not None
+        await connection.execute(
+            insert(models.ReviewEvent).values(
+                review_job_id=rid,
+                sequence=last_seq + 1,
+                event_type="FAILURE",
+                status="FAILED",
+                publication_status="NOT_READY",
+                reason_code="LLM_UNAVAILABLE",
+                retryable=True,
+                attempt=1,
+            )
+        )
+    replay = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("cancel-idem-order"),
+    )
+    assert replay.status_code == HTTPStatus.OK
+    assert replay.json() == first.json()
+
+
+async def test_same_key_replay_skips_access_check_and_new_key_stays_ok(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    calls = 0
+
+    class Counting:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            nonlocal calls
+            calls += 1
+
+    app.dependency_overrides[get_review_start_authorizer] = Counting
+    first = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("same")
+    )
+    assert first.status_code == HTTPStatus.OK
+    assert calls == 1
+    replay = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("same")
+    )
+    assert replay.status_code == HTTPStatus.OK
+    assert replay.json() == first.json()
+    assert calls == 1
+    assert await _cancel_events(postgres, review_id) == 1
+    before_new_key = calls
+    again = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("other")
+    )
+    assert again.status_code == HTTPStatus.OK
+    assert again.json() == first.json()
+    assert calls == before_new_key + 1
+    assert await _cancel_events(postgres, review_id) == 1
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "PARTIAL", "SKIPPED", "FAILED"])
+async def test_finished_review_cancel_is_not_cancellable(
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+    status: str,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.ReviewJob)
+            .where(models.ReviewJob.id == uuid.UUID(review_id))
+            .values(status=status, finished_at=datetime.now(UTC))
+        )
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers(status)
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "REVIEW_NOT_CANCELLABLE"
+    assert_schema(response, "Error")
+    assert await _cancel_events(postgres, review_id) == 0
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None and review.status == status
+        assert (
+            await session.scalar(
+                select(models.QuotaUsage.value).where(
+                    models.QuotaUsage.repository_id == scope.repository,
+                    models.QuotaUsage.type == "starts",
+                )
+            )
+        ) == 1
+
+
+async def test_unhealthy_integration_refuses_cancel_without_row_update(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            update(models.Repository)
+            .where(models.Repository.id == scope.repository)
+            .values(integration_status="bot_denied")
+        )
+    calls = 0
+
+    class Counting:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            nonlocal calls
+            calls += 1
+
+    app.dependency_overrides[get_review_start_authorizer] = Counting
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers()
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "INTEGRATION_UNHEALTHY"
+    assert_schema(response, "Error")
+    assert calls == 0
+    async with async_sessionmaker(postgres.engine)() as session:
+        assert (
+            await session.scalar(
+                select(models.Repository.integration_status).where(
+                    models.Repository.id == scope.repository
+                )
+            )
+        ) == "bot_denied"
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0
+
+
+async def test_cancel_access_denial_is_forbidden_and_keeps_integration(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    fetches = configured.calls
+
+    class Denied:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            raise GithubFailure("VCS_ACCESS_DENIED", retryable=False)
+
+    app.dependency_overrides[get_review_start_authorizer] = Denied
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers()
+    )
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert response.json()["code"] == "ACCESS_DENIED"
+    assert_schema(response, "Error")
+    assert configured.calls == fetches
+    async with async_sessionmaker(postgres.engine)() as session:
+        assert (
+            await session.scalar(
+                select(models.Repository.integration_status).where(
+                    models.Repository.id == scope.repository
+                )
+            )
+        ) == "healthy"
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0
+
+
+async def test_unknown_review_cancel_is_not_found(
+    client: httpx.AsyncClient, scope: StartScope
+) -> None:
+    response = await client.post(
+        f"/api/v1/reviews/{uuid.uuid4()}/cancellation", headers=_cancel_headers()
+    )
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["code"] == "RESOURCE_NOT_FOUND"
+    assert_schema(response, "Error")
+
+
+async def test_cancel_commits_after_authorizer_closes_the_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+    app.dependency_overrides[get_review_start_authorizer] = _closing_authorizer
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation", headers=_cancel_headers("closed")
+    )
+    assert response.status_code == HTTPStatus.OK
+    assert response.json()["reason_code"] == "USER_CANCELLED"
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "FAILED" and review.finished_at is not None
+    assert await _cancel_events(postgres, review_id) == 1
+
+
+async def test_access_revoked_during_cancel_authorize_does_not_stop_job(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    class Revoking:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            async with postgres.engine.begin() as connection:
+                await connection.execute(
+                    delete(models.RepositoryAccess).where(
+                        models.RepositoryAccess.repository_id == scope.repository
+                    )
+                )
+
+    app.dependency_overrides[get_review_start_authorizer] = Revoking
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("revoke-race"),
+    )
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["code"] == "RESOURCE_NOT_FOUND"
+    assert_schema(response, "Error")
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0
+
+
+async def test_integration_flip_during_cancel_authorize_does_not_stop_job(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+) -> None:
+    review_id = await _queued_review(client, scope)
+
+    class Flipping:
+        async def authorize_start(
+            self, *, user_id: uuid.UUID, repository: RepositoryIdentity
+        ) -> None:
+            async with postgres.engine.begin() as connection:
+                await connection.execute(
+                    update(models.Repository)
+                    .where(models.Repository.id == scope.repository)
+                    .values(integration_status="bot_denied")
+                )
+
+    app.dependency_overrides[get_review_start_authorizer] = Flipping
+    response = await client.post(
+        f"/api/v1/reviews/{review_id}/cancellation",
+        headers=_cancel_headers("integration-flip-race"),
+    )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["code"] == "INTEGRATION_UNHEALTHY"
+    assert_schema(response, "Error")
+    async with async_sessionmaker(postgres.engine)() as session:
+        review = await session.get(models.ReviewJob, uuid.UUID(review_id))
+        assert review is not None
+        assert review.status == "QUEUED" and review.finished_at is None
+    assert await _cancel_events(postgres, review_id) == 0

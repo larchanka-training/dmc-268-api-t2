@@ -225,6 +225,9 @@ def test_historical_settings_and_context_retain_their_actual_language() -> None:
         "output_language": "en",
         "surrounding_lines": 5,
         "created_at": "2026-09-24T10:00:00Z",
+        "auto_review_enabled": False,
+        "base_branches": [],
+        "minimum_severity": "low",
     }
     _api_validator("RepositorySettings").validate(settings)
     replacement = {
@@ -692,6 +695,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories/{id}/pull-requests", "get"),
         ("/api/v1/repositories/{id}/settings", "get"),
         ("/api/v1/repositories/{id}/settings", "put"),
+        ("/api/v1/repositories/{id}/rules-preview", "get"),
         ("/api/v1/repositories/{id}/pull-requests/{number}/reviews", "post"),
         ("/api/v1/repositories/{id}/reviews", "get"),
         ("/api/v1/repositories/{id}/analytics", "get"),
@@ -702,6 +706,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/reviews/{id}/events", "get"),
         ("/api/v1/reviews/{id}/events/stream", "get"),
         ("/api/v1/reviews/{id}/publication-retries", "post"),
+        ("/api/v1/reviews/{id}/cancellation", "post"),
         ("/api/v1/webhooks/github", "post"),
         ("/healthcheck", "get"),
         ("/readiness", "get"),
@@ -753,3 +758,15 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
     accepted_ref = start_responses["202"]["content"]["application/json"]["schema"]
     assert replay_ref["$ref"].endswith("/StartReviewReplayResponse")
     assert accepted_ref["$ref"].endswith("/StartReviewResponse")
+
+    cancel = document["paths"]["/api/v1/reviews/{id}/cancellation"]["post"]
+    assert cancel["operationId"] == "cancelReview"
+    assert "requestBody" not in cancel
+    assert cancel["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/CancelReviewResponse")
+    assert "USER_CANCELLED" in document["components"]["schemas"]["ReasonCode"]["enum"]
+    assert (
+        "REVIEW_NOT_CANCELLABLE"
+        in document["components"]["schemas"]["ErrorCode"]["enum"]
+    )

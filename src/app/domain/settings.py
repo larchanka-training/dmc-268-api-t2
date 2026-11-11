@@ -47,6 +47,7 @@ def compute_repository_settings_digest(  # noqa: PLR0913 -- exact raw stored fie
     ignores: Mapping[str, object],
     output_language: str,
     surrounding_lines: int,
+    review_policy: Mapping[str, object] | None = None,
 ) -> str:
     """Hash raw stored analysis fields *before* the historical read projection."""
     values = {
@@ -57,6 +58,8 @@ def compute_repository_settings_digest(  # noqa: PLR0913 -- exact raw stored fie
         "output_language": output_language,
         "surrounding_lines": surrounding_lines,
     }
+    if review_policy is not None:
+        values["review_policy"] = review_policy
     return hashlib.sha256(
         json.dumps(
             values,

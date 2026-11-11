@@ -139,8 +139,14 @@ def _poll_interval(value: str) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once", action="store_true", help="Dispatch and process one bounded pass."
+    )
+    mode.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate local publication credentials without external side effects.",
     )
     parser.add_argument(
         "--poll-interval",
@@ -157,8 +163,21 @@ def main() -> None:
 
     configure_logging(Logging(format="json", file_enabled=False))
     try:
+        if args.check_config:
+            from app.core.publication_runtime import (  # noqa: PLC0415 -- offline mode
+                validate_publication_settings,
+            )
+
+            validate_publication_settings(get_settings())
+            print("Publication configuration is valid.")
+            return
+        from app.core.metrics import (  # noqa: PLC0415 -- keep offline mode offline
+            metrics_server,
+        )
+
         configure_sentry(get_settings())
-        asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
+        with metrics_server(get_settings().metrics):
+            asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
     except Exception as error:
         structlog.get_logger().error(
             "publication_worker_failed", error_type=type(error).__name__

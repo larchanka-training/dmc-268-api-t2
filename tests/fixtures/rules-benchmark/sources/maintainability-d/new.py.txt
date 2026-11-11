@@ -1,0 +1,2 @@
+def handle(client, user, request):
+    return {"error_code": "APP_PERMISSION_DENIED", "status": 403}

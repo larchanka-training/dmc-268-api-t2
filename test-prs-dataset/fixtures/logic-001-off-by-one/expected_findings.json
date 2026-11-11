@@ -1,0 +1,10 @@
+[
+  {
+    "path": "app/pagination/slice.py",
+    "side": "NEW",
+    "start_line": 3,
+    "end_line": 4,
+    "category": "correctness",
+    "severity": "medium"
+  }
+]

@@ -41,6 +41,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Materialize remote body so docker compose cannot drain bash -s stdin
+          # (nested <<'PY' / <<'REDIS_PY' must stay intact inside the file).
           timeout 120s sshpass -e ssh \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
@@ -49,7 +51,9 @@ jobs:
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=2 \
-            "${SSH_USER}@${SSH_HOST}" 'bash -s' <<'REMOTE'
+            "${SSH_USER}@${SSH_HOST}" \
+            "cat > '/opt/dmc-268-t2/.staging-backlog-audit.remote.sh' && chmod 700 '/opt/dmc-268-t2/.staging-backlog-audit.remote.sh' && bash '/opt/dmc-268-t2/.staging-backlog-audit.remote.sh'; status=\$?; rm -f '/opt/dmc-268-t2/.staging-backlog-audit.remote.sh'; exit \"\$status\"" \
+            <<'REMOTE'
           set -euo pipefail
           cd /opt/dmc-268-t2
 

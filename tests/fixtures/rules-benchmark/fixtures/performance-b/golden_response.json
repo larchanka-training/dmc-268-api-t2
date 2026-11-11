@@ -1,0 +1,20 @@
+{
+  "summary": "Scripted public synthetic response.",
+  "findings": [
+    {
+      "path": "src/handler.py",
+      "side": "NEW",
+      "start_line": 2,
+      "end_line": 2,
+      "category": "performance",
+      "rule_ref": "PERF-1",
+      "severity": "medium",
+      "title": "Outbound POST has no explicit timeout.",
+      "explanation": "Outbound POST has no explicit timeout.",
+      "evidence": "return client.post(\"https://service.example.invalid/events\", json={})",
+      "recommendation": "Pass timeout=5.0 to the HTTP request.",
+      "proposed_diff_fix": null
+    }
+  ],
+  "limitations": []
+}

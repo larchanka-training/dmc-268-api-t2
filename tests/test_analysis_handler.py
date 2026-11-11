@@ -15,7 +15,7 @@ import pytest_asyncio
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from test_contracts import SCHEMAS, _validator
 from test_postgres_integration import (
     PostgresHarness,
@@ -28,12 +28,15 @@ from app.adapters.analysis_handler import PostgresAnalysisHandler
 from app.adapters.outbox_dispatcher import PostgresOutboxDispatcher
 from app.adapters.redis_queue import RedisQueue
 from app.adapters.review_worker import PostgresReviewWorker
+from app.api.review_diff import project_diff
 from app.application.analysis_authority import (
     LiveAnalysisAuthority,
     current_analysis_authority,
 )
+from app.application.github_ports import GithubRequest, GithubSnapshot
 from app.application.ports import (
     BuiltContextPayload,
+    DurableTaskOutcome,
     LeaseLostError,
     QueueTaskEnvelope,
     ReviewChunkResult,
@@ -60,6 +63,8 @@ from app.db.uow import SqlAlchemyUnitOfWork
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 from app.domain.frozen_configuration import admission_policy
 from app.domain.settings import compute_rules_digest
+from app.review.port_adapter import ChunkReviewFailedError
+from app.review.schemas.result import ChunkStatus, ReviewChunkOutcome, Usage
 from app.vcs.github import GithubClient
 from app.vcs.input_guards import InputGuardPolicy
 
@@ -748,6 +753,276 @@ async def test_context_budget_does_not_send_over_limit_payload(
         ],
         "context_quality": "diff_only",
     }
+
+
+def _added_file(name: str, lines: int) -> str:
+    body = "".join(f"+value_{i} = compute_{i}(argument)\n" for i in range(1, lines + 1))
+    return (
+        f"diff --git a/src/{name}.py b/src/{name}.py\n"
+        "new file mode 100644\n"
+        "index 0000000..456abcd\n"
+        "--- /dev/null\n"
+        f"+++ b/src/{name}.py\n"
+        f"@@ -0,0 +1,{lines} @@\n{body}"
+    )
+
+
+# The whole three-file wire estimates ~3 900 tokens; every single file fits 2 500.
+MULTI_FILE_DIFF = DIFF + _added_file("b", 30) + _added_file("c", 30)
+CHUNK_LIMIT = 2500
+MULTI_FILE_PATHS = ["src/a.py", "src/b.py", "src/c.py"]
+
+
+def _paths(payload: BuiltContextPayload) -> list[str]:
+    files = cast(list[dict[str, Any]], payload.payload_body["files"])
+    return [file["diff"]["new_path"] for file in files]
+
+
+class ChunkAwareLlm(DeterministicLlm):
+    """Reports the division finding only for the chunk that carries src/a.py."""
+
+    async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+        self.payloads.append(payload)
+        paths = _paths(payload)
+        return replace(
+            self.result,
+            summary=f"Reviewed {', '.join(paths)}.",
+            findings=self.result.findings if "src/a.py" in paths else [],
+        )
+
+
+async def test_over_budget_diff_is_reviewed_in_bounded_chunks(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) > 1
+    assert all(
+        cast(dict[str, Any], payload.payload_body["budget"])["estimated_input_tokens"]
+        <= CHUNK_LIMIT
+        for payload in llm.payloads
+    )
+    sent = [path for payload in llm.payloads for path in _paths(payload)]
+    assert sorted(sent) == MULTI_FILE_PATHS
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+        chunks = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).all()
+        findings = (
+            await session.scalars(
+                select(Finding).where(
+                    Finding.chunk_result_id.in_([chunk.id for chunk in chunks])
+                )
+            )
+        ).all()
+        publish = await session.scalar(
+            select(func.count())
+            .select_from(OutboxEvent)
+            .where(
+                OutboxEvent.review_job_id == review_id,
+                OutboxEvent.task_kind == "publish",
+            )
+        )
+    assert review is not None and review.status == "COMPLETED"
+    assert {context.id for context in contexts} == {
+        payload.chunk_id for payload in llm.payloads
+    }
+    assert {chunk.context_payload_id for chunk in chunks} == {
+        context.id for context in contexts
+    }
+    assert len(findings) == 1 and findings[0].path == "src/a.py"
+    assert review.coverage is not None and review.coverage["skipped"] == []
+    assert sorted(item["path"] for item in review.coverage["included"]) == (
+        MULTI_FILE_PATHS
+    )
+    assert review.final_summary is not None and all(
+        f"Reviewed {', '.join(_paths(payload))}." in review.final_summary
+        for payload in llm.payloads
+    )
+    assert publish == 1
+
+
+async def test_chunks_beyond_max_chunks_are_visible_token_budget_skips(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+            max_chunks=1,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) == 1
+    reviewed = _paths(llm.payloads[0])
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+    assert review is not None and review.status == "PARTIAL"
+    assert len(contexts) == 1
+    assert review.coverage is not None
+    assert [item["path"] for item in review.coverage["included"]] == reviewed
+    assert sorted(item["path"] for item in review.coverage["skipped"]) == sorted(
+        set(MULTI_FILE_PATHS) - set(reviewed)
+    )
+    assert all(
+        item["reason"] == "token_budget" and item["ranges"]
+        for item in review.coverage["skipped"]
+    )
+
+
+async def test_redelivery_resumes_only_unfinished_chunks(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    class InterruptedLlm(ChunkAwareLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            if len(self.payloads) == 2:  # noqa: PLR2004 -- the second chunk call
+                raise RuntimeError("provider private data")
+            return result
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", event.attempt, event.trace_id
+        )
+    llm = InterruptedLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        with pytest.raises(RuntimeError):
+            await worker.run_once()
+        await queue.enqueue(task)
+        assert await worker.run_once() is True
+    first, interrupted, *resumed = llm.payloads
+    assert resumed[0] == interrupted
+    assert first.chunk_id not in {payload.chunk_id for payload in resumed}
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload).where(ContextPayload.review_job_id == review_id)
+            )
+        ).all()
+        chunks = (
+            await session.scalars(
+                select(ChunkResult).where(ChunkResult.review_job_id == review_id)
+            )
+        ).all()
+    assert review is not None and review.status == "COMPLETED"
+    assert len(contexts) == len(chunks) == 1 + len(resumed)
+
+
+async def test_file_over_budget_is_split_into_valid_line_ranges(
+    postgres: PostgresHarness,
+    redis_client: Redis,
+    stream_prefix: str,
+    review_id: uuid.UUID,
+) -> None:
+
+    factory = async_sessionmaker(postgres.engine)
+    queue = RedisQueue(redis_client, stream_prefix=stream_prefix)
+    await PostgresOutboxDispatcher(factory, queue).dispatch_batch()
+    llm = ChunkAwareLlm()
+    lines = 90  # one hunk that alone estimates well over CHUNK_LIMIT
+    async with httpx.AsyncClient(
+        transport=github_http(_added_file("big", lines))
+    ) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        worker = PostgresReviewWorker(
+            factory, queue, handler, owner="analysis", task_kind="analyze"
+        )
+        assert await worker.run_once() is True
+    assert len(llm.payloads) > 1
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        contexts = (
+            await session.scalars(
+                select(ContextPayload)
+                .where(ContextPayload.review_job_id == review_id)
+                .order_by(ContextPayload.created_at, ContextPayload.id)
+            )
+        ).all()
+    assert review is not None and review.status == "COMPLETED"
+    assert review.coverage is not None and review.coverage["skipped"] == []
+    assert review.coverage["included"] == [
+        {
+            "path": "src/big.py",
+            "ranges": [{"start_line": n, "end_line": n} for n in range(1, lines + 1)],
+        }
+    ]
+    diff = project_diff(contexts)
+    [file] = diff["files"]
+    numbers = [line["new_line"] for hunk in file["hunks"] for line in hunk["lines"]]
+    assert numbers == list(range(1, lines + 1))
 
 
 async def test_github_access_denied_is_safe_terminal_failure(
@@ -1634,6 +1909,60 @@ async def test_failure_audit_uses_durable_execution_attempt(
         assert [event.attempt for event in events] == [1, 2]
 
 
+async def test_chunk_failure_after_cancel_completes_without_lease_lost(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class FailingLlm(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            await super().review(payload)
+            await _mark_cancelled(factory, review_id)
+            raise ChunkReviewFailedError(
+                ReviewChunkOutcome(
+                    schema_version=1,
+                    review_id=str(payload.review_id),
+                    chunk_id=str(payload.chunk_id),
+                    status=ChunkStatus.FAILED,
+                    summary=None,
+                    findings=[],
+                    rejected_findings_count=0,
+                    limitations=[],
+                    usage=Usage(
+                        input_tokens=None,
+                        output_tokens=None,
+                        requests=1,
+                        latency_ms=1,
+                    ),
+                    model="test",
+                    model_digest=None,
+                    provider="test",
+                    prompt_version="v1",
+                    error_code="llm_error",
+                    retryable=False,
+                )
+            )
+
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+        task = QueueTaskEnvelope(
+            1, str(event.id), str(review_id), "analyze", 1, event.trace_id
+        )
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-then-chunk-fail", task_kind="analyze"
+    )
+    assert lease is not None
+    async with httpx.AsyncClient(transport=github_http()) as http:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(http), FailingLlm(), schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+
+
 async def test_local_authority_loss_before_result_persistence_keeps_delivery_pending(
     postgres: PostgresHarness,
     review_id: uuid.UUID,
@@ -1779,3 +2108,173 @@ async def test_input_guards_keep_unusable_files_out_of_llm(
         "static/app.css": "minified",
         "web/client.gen.ts": "generated",
     }
+async def _analyze_task(
+    factory: async_sessionmaker[AsyncSession], review_id: uuid.UUID
+) -> QueueTaskEnvelope:
+    async with factory() as session:
+        event = (
+            await session.scalars(
+                select(OutboxEvent).where(OutboxEvent.review_job_id == review_id)
+            )
+        ).one()
+    return QueueTaskEnvelope(
+        1, str(event.id), str(review_id), "analyze", event.attempt, event.trace_id
+    )
+
+
+async def _mark_cancelled(
+    factory: async_sessionmaker[AsyncSession], review_id: uuid.UUID
+) -> None:
+    async with factory.begin() as session:
+        updated = await session.scalar(
+            update(ReviewJob)
+            .where(ReviewJob.id == review_id, ReviewJob.finished_at.is_(None))
+            .values(status="FAILED", finished_at=func.clock_timestamp())
+            .returning(ReviewJob.id)
+        )
+    assert updated is not None
+
+
+async def test_saved_chunk_then_cancel_skips_the_next_model_call(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    class InterruptedLlm(ChunkAwareLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            if len(self.payloads) == 2:  # noqa: PLR2004 -- second chunk call
+                raise RuntimeError("provider stopped")
+            return result
+
+    factory = async_sessionmaker(postgres.engine)
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-next", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = InterruptedLlm()
+    async with httpx.AsyncClient(transport=github_http(MULTI_FILE_DIFF)) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            GithubClient(client),
+            llm,
+            schemas_dir=SCHEMAS,
+            limit_input_tokens=CHUNK_LIMIT,
+        )
+        with pytest.raises(RuntimeError, match="provider stopped"):
+            await handler.handle(task, lease)
+        async with factory() as session:
+            saved = await session.scalar(
+                select(func.count())
+                .select_from(ChunkResult)
+                .where(ChunkResult.review_job_id == review_id)
+            )
+        assert saved == 1
+        await _mark_cancelled(factory, review_id)
+        calls = len(llm.payloads)
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+        assert len(llm.payloads) == calls
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        chunks = await session.scalar(
+            select(func.count())
+            .select_from(ChunkResult)
+            .where(ChunkResult.review_job_id == review_id)
+        )
+    assert review is not None and review.status == "FAILED"
+    assert review.finished_at is not None
+    assert publication.status == "NOT_READY"
+    assert chunks == 1
+
+
+async def test_model_result_after_cancel_is_not_inserted(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class CancelDuringReview(DeterministicLlm):
+        async def review(self, payload: BuiltContextPayload) -> ReviewChunkResult:
+            result = await super().review(payload)
+            await _mark_cancelled(factory, review_id)
+            return result
+
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-during-review", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = CancelDuringReview()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        handler = PostgresAnalysisHandler(
+            factory, GithubClient(client), llm, schemas_dir=SCHEMAS
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+    assert len(llm.payloads) == 1
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        chunk = await session.scalar(
+            select(ChunkResult.id).where(ChunkResult.review_job_id == review_id)
+        )
+        publish = await session.scalar(
+            select(OutboxEvent.id).where(
+                OutboxEvent.review_job_id == review_id,
+                OutboxEvent.task_kind == "publish",
+            )
+        )
+    assert review is not None and review.status == "FAILED"
+    assert publication.status == "NOT_READY"
+    assert chunk is None
+    assert publish is None
+
+
+async def test_cancel_during_fetch_inserts_nothing(
+    postgres: PostgresHarness, review_id: uuid.UUID
+) -> None:
+    factory = async_sessionmaker(postgres.engine)
+
+    class CancelAfterFetch:
+        def __init__(self, inner: GithubClient) -> None:
+            self._inner = inner
+
+        async def fetch(self, request: GithubRequest) -> GithubSnapshot:
+            snapshot = await self._inner.fetch(request)
+            await _mark_cancelled(factory, review_id)
+            return snapshot
+
+    task = await _analyze_task(factory, review_id)
+    lease = await PostgresTaskLeaseStore(factory).acquire(
+        review_id, owner="cancel-during-fetch", task_kind="analyze"
+    )
+    assert lease is not None
+    llm = DeterministicLlm()
+    async with httpx.AsyncClient(transport=github_http()) as client:
+        handler = PostgresAnalysisHandler(
+            factory,
+            CancelAfterFetch(GithubClient(client)),
+            llm,
+            schemas_dir=SCHEMAS,
+        )
+        assert await handler.handle(task, lease) is DurableTaskOutcome.COMPLETED
+    assert llm.payloads == []
+    async with factory() as session:
+        review = await session.get(ReviewJob, review_id)
+        publication = (
+            await session.scalars(
+                select(Publication).where(Publication.review_job_id == review_id)
+            )
+        ).one()
+        context = await session.scalar(
+            select(ContextPayload.id).where(ContextPayload.review_job_id == review_id)
+        )
+    assert review is not None and review.status == "FAILED"
+    assert publication.status == "NOT_READY"
+    assert context is None

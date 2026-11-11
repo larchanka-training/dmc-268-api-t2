@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from test_github_publisher_postgres import FakeGithub
@@ -18,6 +19,7 @@ from test_publication_dispatcher import publication_command
 
 from app.adapters.redis_queue import RedisQueue
 from app.core.config import Github, Settings
+from app.db.models import ReviewJob
 from app.db.publications import PostgresPublicationStore
 from app.publication_worker import run_once
 
@@ -190,3 +192,79 @@ async def test_continuous_runtime_defers_expired_publication_authority(
     ) as client:
         pending = await client.xpending("dmc268:review-tasks:publish", "review-workers")
         assert pending["pending"] == 1
+
+
+async def test_sigterm_finishes_inflight_publication_without_draining_backlog(
+    cli_services: dict[str, str], payload_data: dict[str, Any]
+) -> None:
+    url = make_url(os.environ["DMC268_TEST_DATABASE_URL"]).set(
+        database=cli_services["POSTGRES__DB"]
+    )
+    engine = create_async_engine(url)
+    try:
+        first = await publication_command(engine, payload_data)
+        async with engine.connect() as connection:
+            change_id = await connection.scalar(
+                select(ReviewJob.change_request_id).where(
+                    ReviewJob.id == uuid.UUID(first.review_id)
+                )
+            )
+        assert change_id is not None
+        second = await publication_command(engine, payload_data, change_id=change_id)
+    finally:
+        await engine.dispose()
+    root = Path(__file__).resolve().parents[1]
+    environment = (
+        os.environ
+        | cli_services
+        | {"PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "tests")))}
+    )
+    script = dedent("""
+        import asyncio
+        import signal
+        import httpx
+        from test_github_publisher_postgres import FakeGithub
+        from app.publication_worker import run
+
+        provider = FakeGithub()
+        async def respond(request):
+            if request.method == "POST":
+                signal.raise_signal(signal.SIGTERM)
+                await asyncio.sleep(0.1)
+            return provider.respond(request)
+        async def probe():
+            await run(
+                once=False, poll_interval=0.01,
+                transport=httpx.MockTransport(respond)
+            )
+            print("PROBE_POSTS=" + str(len(provider.posts)))
+        asyncio.run(probe())
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "PROBE_POSTS=1" in result.stdout
+    assert result.stdout.count('"event": "publication_worker_pass"') == 1
+    assert '"event": "publication_worker_stopped"' in result.stdout
+    assert "private-test-write" not in result.stdout + result.stderr
+    engine = create_async_engine(url)
+    try:
+        store = PostgresPublicationStore(async_sessionmaker(engine))
+        states = [
+            await store.get(uuid.UUID(command.review_id)) for command in (first, second)
+        ]
+        assert sorted(state.status for state in states if state is not None) == [
+            "PENDING",
+            "PUBLISHED",
+        ]
+    finally:
+        await engine.dispose()
+    async with Redis.from_url(cli_services["REDIS__URL"]) as client:
+        pending = await client.xpending("dmc268:review-tasks:publish", "review-workers")
+        assert pending["pending"] == 0

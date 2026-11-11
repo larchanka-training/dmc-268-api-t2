@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from test_publication_deployment import deploy_remote
 
 ROOT = Path(__file__).parents[1]
 
@@ -31,21 +33,20 @@ def test_staging_runs_intake_recovery_and_forwards_read_token() -> None:
     assert "append_optional 'GITHUB__TOKEN'" in runtime["run"]
 
 
-def test_staging_routes_publication_credentials_only_to_api() -> None:
-    """AC-DEPLOY-01: explicit publication configuration reaches only its API host."""
+def test_staging_routes_write_identity_only_to_api_and_publisher() -> None:
+    """AC-DEPLOY-01: write identity is confined to API and opt-in publisher."""
     services = yaml.safe_load((ROOT / "docker-compose.staging.yml").read_text())[
         "services"
     ]
-    assert (
-        services["api"]["environment"]["GITHUB__WRITE_TOKEN"]
-        == "${GITHUB__WRITE_TOKEN:-}"
-    )
-    assert (
-        services["api"]["environment"]["GITHUB__BOT_USER_ID"]
-        == "${GITHUB__BOT_USER_ID:-}"
-    )
+    publisher = services["publication-worker"]
+    assert publisher["profiles"] == ["publication"]
+    assert publisher["command"] == ["python", "-m", "app.publication_worker"]
+    for name in ("api", "publication-worker"):
+        environment = services[name]["environment"]
+        assert environment["GITHUB__WRITE_TOKEN"] == "${GITHUB__WRITE_TOKEN:-}"
+        assert environment["GITHUB__BOT_USER_ID"] == "${GITHUB__BOT_USER_ID:-}"
     for name, service in services.items():
-        if name != "api":
+        if name not in {"api", "publication-worker"}:
             assert "GITHUB__WRITE_TOKEN" not in service.get("environment", {})
             assert "GITHUB__BOT_USER_ID" not in service.get("environment", {})
 
@@ -120,6 +121,28 @@ def test_deploy_force_recreates_api_and_checks_oauth_repo_scope() -> None:
     assert "running web image does not match UI_IMAGE" in workflow
     assert "*'scope=repo'*)" in workflow
     assert "http://127.0.0.1:${WEB_PORT}/api/v1/auth/github/start" in workflow
+
+
+def test_deploy_application_materializes_remote_script_not_bash_s() -> None:
+    """Deploy application must not run the full body via bash -s stdin."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/deploy-staging.yml").read_text(encoding="utf-8")
+    )
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+    run = next(step for step in steps if step.get("name") == "Deploy application")[
+        "run"
+    ]
+    assert "cat > '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "bash '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "status=\\$?" in run
+    assert "rm -f '${DEPLOY_PATH}/.deploy-application.remote.sh'" in run
+    assert "\\$status" in run
+    # Full body must not be attached to bare bash -s (stdin-eaten-by-compose bug).
+    assert "INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash -s\"" not in run
+    remote = run.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
+    assert 'echo "Waiting for PostgreSQL and Redis..."' in remote
+    assert 'echo "Running database migrations..."' in remote
+    assert "compose up -d --force-recreate --no-deps api" in remote
 
 
 @pytest.mark.skipif(
@@ -208,3 +231,83 @@ def test_runtime_secret_survives_compose_env_file(
             check=True,
             timeout=30,
         )
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose is required")
+def test_rendered_recovery_can_resolve_frozen_admission_and_personal_admin() -> None:
+    """Automatic recovery needs only the trusted manifest and credential key."""
+    rendered = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            str(ROOT / "docker-compose.staging.yml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        env={
+            "PATH": os.environ["PATH"],
+            "API_IMAGE": "api:synthetic",
+            "UI_IMAGE": "ui:synthetic",
+            "POSTGRES__USER": "test",
+            "POSTGRES__PASSWORD": "synthetic-db",
+            "POSTGRES__DB": "test",
+            "ANALYSIS_RUNTIME_DIR": "/opt/dmc-268-t2-runtime/analysis-runtime",
+            "ANALYSIS__CONFIG_PATH": "/app/runtime/analysis-runtime.v1.json",
+            "AUTH__CREDENTIAL_KEY": "synthetic-credential-key",
+            "AUTH__JWT_SECRET": "synthetic-browser-secret",
+            "AUTH__GITHUB_CLIENT_SECRET": "synthetic-client-secret",
+            "GITHUB__WRITE_TOKEN": "synthetic-write-token",
+            "LLM__EUROROUTER__API_KEYS": "synthetic-llm-key",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    recovery = json.loads(rendered.stdout)["services"]["webhook-worker"]
+    environment = recovery["environment"]
+    assert environment.get("AUTH__CREDENTIAL_KEY") == "synthetic-credential-key"
+    assert (
+        environment.get("ANALYSIS__CONFIG_PATH")
+        == "/app/runtime/analysis-runtime.v1.json"
+    )
+    assert any(
+        mount["target"] == "/app/runtime"
+        and mount["read_only"] is True
+        and mount["source"] == "/opt/dmc-268-t2-runtime/analysis-runtime"
+        for mount in recovery["volumes"]
+    )
+    for variable in (
+        "AUTH__JWT_SECRET",
+        "AUTH__GITHUB_CLIENT_SECRET",
+        "GITHUB__WRITE_TOKEN",
+        "LLM__EUROROUTER__API_KEYS",
+    ):
+        assert variable not in environment
+
+
+def test_rollout_quiesces_previous_intake_before_new_api_or_migrations(
+    tmp_path: Path,
+) -> None:
+    result, calls = deploy_remote(tmp_path, analysis="false", publication="false")
+    assert result.returncode == 0, result.stderr
+    stops = [i for i, call in enumerate(calls) if " stop webhook-worker" in call]
+    assert stops, (
+        "The old L1-only consumer must not consume newly selected automatic receipts"
+    )
+    migrated = next(i for i, call in enumerate(calls) if "alembic upgrade head" in call)
+    api_started = next(
+        i
+        for i, call in enumerate(calls)
+        if "up -d --force-recreate --no-deps api" in call
+    )
+    recovery_started = next(
+        i
+        for i, call in enumerate(calls)
+        if " up -d " in call and "webhook-worker" in call
+    )
+    assert stops[0] < migrated < api_started < recovery_started

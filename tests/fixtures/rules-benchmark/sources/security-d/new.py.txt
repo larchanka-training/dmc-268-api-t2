@@ -1,0 +1,2 @@
+def handle(client, user, request):
+    return client.records.find({"tenant_id": user.tenant_id})

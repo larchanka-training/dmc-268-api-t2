@@ -1,23 +1,19 @@
 """Authenticated review start boundary."""
 
-import hashlib
-import json
 from collections.abc import Callable, Coroutine
-from copy import deepcopy
-from pathlib import Path
-from typing import Annotated, Any, Never
-from uuid import UUID, uuid4
+from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.routing import APIRoute
-from jsonschema import Draft202012Validator
 from pydantic import AnyUrl, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse, Response
 from structlog.contextvars import get_contextvars
 
+from app.adapters.review_admission import admit_review
 from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identity
 from app.api.errors import ApiError
 from app.api.review_start_dependencies import (
@@ -25,13 +21,6 @@ from app.api.review_start_dependencies import (
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
-from app.application.github_ports import (
-    GithubFailure,
-    GithubPullRequest,
-    GithubRepositoryMismatch,
-    GithubRequest,
-)
-from app.application.ports import StartReviewCommand
 from app.application.review_start_ports import (
     AdmissionResourceNotFoundError,
     ChangeRequestIdentity,
@@ -40,26 +29,14 @@ from app.application.review_start_ports import (
     PullRequestReviewActiveError,
     RepositoryIdentity,
     ReviewAlreadyActiveError,
+    ReviewAdmissionError,
+    ReviewAdmissionRequest,
     ReviewConfigurationResolver,
-    ReviewHeadMismatchError,
-    ReviewQuotaExceededError,
     ReviewStartAuthorizer,
-    SettingsVersionChangedError,
 )
-from app.core import github_runtime
-from app.core.config import get_settings
 from app.db.models import (
-    ChangeRequest,
     Repository,
     RepositoryAccess,
-    RepositorySettings,
-    ReviewJob,
-)
-from app.db.review_starts import (
-    change_identity,
-    find_replay,
-    persist_start,
-    settings_identity,
 )
 from app.db.session import get_session
 from app.domain.frozen_configuration import (
@@ -169,26 +146,6 @@ async def _mutation_body(request: Request) -> StartReviewRequest:
     except ValueError, ValidationError:
         raise ApiError(422, "VALIDATION_FAILED", "Request is invalid.") from None
     return body
-
-
-async def _check_rerun(
-    session: AsyncSession, reference: str | None, change: ChangeRequest
-) -> None:
-    if reference is None:
-        return
-    try:
-        rerun_id = UUID(reference)
-    except ValueError:
-        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.") from None
-    parent = await session.scalar(
-        select(ReviewJob.id).where(
-            ReviewJob.id == rerun_id,
-            ReviewJob.repository_id == change.repository_id,
-            ReviewJob.change_request_id == change.id,
-        )
-    )
-    if parent is None:
-        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
 
 
 def _pull_request_number(value: str) -> int:
@@ -361,7 +318,7 @@ def _validate_configuration(
 
 
 @router.post("/{id}/pull-requests/{number}/reviews", operation_id="startReview")
-async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admission boundaries and snapshots
+async def start_review_http(  # noqa: PLR0913 -- explicit admission boundaries and snapshots
     *,
     id: str,
     number: str,
@@ -395,7 +352,7 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     except ValueError:
         raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.") from None
     repository = await session.scalar(
-        select(Repository)
+        select(Repository.id)
         .join(RepositoryAccess)
         .where(
             Repository.id == repository_id,
@@ -405,22 +362,28 @@ async def start_review_http(  # noqa: PLR0912, PLR0913, PLR0915 -- explicit admi
     if repository is None:
         raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
     body = await _mutation_body(request)
-    request_hash = hashlib.sha256(
-        json.dumps(
-            {"number": pr_number, **body.model_dump()},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    key = hashlib.sha256(request.headers["Idempotency-Key"].encode()).hexdigest()
-    scope = f"startReview:{identity.user_id}:{repository_id}"
     try:
-        replay = await find_replay(
-            session, scope=scope, key=key, request_hash=request_hash
+        review_id, status, created = await admit_review(
+            ReviewAdmissionRequest(
+                actor_id=identity.user_id,
+                repository_id=repository_id,
+                number=pr_number,
+                requested_head_sha=body.requested_head_sha,
+                rerun_of=body.rerun_of,
+                idempotency_key=request.headers["Idempotency-Key"],
+                trace_id=get_contextvars()["request_id"],
+            ),
+            session=session,
+            authorizer=authorizer,
+            resolver=resolver,
         )
-    except IdempotencyConflictError:
+    except ReviewAdmissionError as error:
         raise ApiError(
-            409, "IDEMPOTENCY_CONFLICT", "Idempotency key conflicts with the request."
+            error.status,
+            error.code,
+            error.message,
+            retryable=error.retryable,
+            retry_after=error.retry_after,
         ) from None
     if replay is not None:
         resource_url = f"/api/v1/reviews/{replay[0]}"

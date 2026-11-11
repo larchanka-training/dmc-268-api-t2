@@ -21,6 +21,7 @@ from app.application.ports import LeaseLostError
 from app.core.config import Logging, get_settings
 from app.core.github_runtime import StoredCredentialAuthorizer, github_connection
 from app.core.logging_config import configure_logging
+from app.core.metrics import metrics_server
 from app.core.sentry import configure_sentry
 from app.domain.frozen_configuration import FrozenConfigurationError
 from app.review.configuration import load_runtime_configuration
@@ -146,7 +147,8 @@ def main() -> None:
     configure_logging(Logging(format="json", file_enabled=False))
     try:
         configure_sentry(get_settings())
-        asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
+        with metrics_server(get_settings().metrics):
+            asyncio.run(run(once=args.once, poll_interval=args.poll_interval))
     except Exception as error:
         reason = "runtime_failure"
         if isinstance(error, FrozenConfigurationError) and error.reason in {

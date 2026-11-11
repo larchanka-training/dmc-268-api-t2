@@ -1,0 +1,8 @@
+diff --git a/src/handler.py b/src/handler.py
+index 34d858efc63b926c98d8a93db99c93722ad288f9..5d15823cff439d8ac1b967833c3e03cd0a11923f 100644
+--- a/src/handler.py
++++ b/src/handler.py
+@@ -1,2 +1,2 @@
+ def handle(client, user, request):
+-    return None
++    return client.records.find({"tenant_id": user.tenant_id})

@@ -1,0 +1,8 @@
+def count_errors(paths):
+    total = 0
+    for path in paths:
+        f = open(path)
+        for line in f:
+            if "ERROR" in line:
+                total += 1
+    return total

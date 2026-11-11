@@ -117,3 +117,52 @@ def test_raw_historical_settings_digest_has_independent_vectors() -> None:
         canonical == "21c071ac9afbf4b3b5992a5c34c5b43e03bd8d8c169f1af3b9b5fb5574b66574"
     )
     assert raw != canonical
+
+
+def test_explicit_reflection_policy_roundtrips_without_changing_historical_policy() -> (
+    None
+):
+    historical = admission_policy("0" * 64).model_dump(mode="json")
+    values = historical | {
+        "schema_version": 2,
+        "reflection": {
+            "max_reflections_per_run": 1,
+            "max_reflections_per_chunk": 1,
+            "failure_mode": "fail_open",
+            "verifier_version": "v1",
+            "verifier_digest": "1" * 64,
+        },
+    }
+    assert ModelSettings.from_stored(values).model_dump(mode="json") == values
+    assert ModelSettings.from_stored(historical).model_dump(mode="json") == historical
+    assert "reflection" not in historical
+
+
+def test_reflection_allowance_cannot_exceed_frozen_chunk_count() -> None:
+    values = admission_policy("0" * 64).model_dump(mode="json") | {
+        "schema_version": 2,
+        "reflection": {
+            "max_reflections_per_run": 6,
+            "max_reflections_per_chunk": 1,
+            "failure_mode": "fail_open",
+            "verifier_version": "v1",
+            "verifier_digest": "1" * 64,
+        },
+    }
+    with pytest.raises(ValidationError):
+        ModelSettings.from_stored(values)
+
+
+def test_reflection_per_chunk_limit_rejects_boolean() -> None:
+    values = admission_policy("0" * 64).model_dump(mode="json") | {
+        "schema_version": 2,
+        "reflection": {
+            "max_reflections_per_run": 1,
+            "max_reflections_per_chunk": True,
+            "failure_mode": "fail_open",
+            "verifier_version": "v1",
+            "verifier_digest": "1" * 64,
+        },
+    }
+    with pytest.raises(ValidationError):
+        ModelSettings.from_stored(values)

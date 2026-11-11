@@ -2,6 +2,7 @@
 
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import Text, and_, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -15,6 +16,7 @@ from app.application.publication_ports import (
     PublicationOperationSnapshot,
     PublicationState,
 )
+from app.context.snapshot import valid_snapshot
 from app.db.models import (
     ChangeRequest,
     ChunkResult,
@@ -22,11 +24,29 @@ from app.db.models import (
     Finding,
     Publication,
     Repository,
+    RepositorySettings,
     ReviewJob,
     TaskLease,
 )
 from app.db.publication_models import PublicationOperation
 from app.db.review_events import append_review_event
+from app.domain.frozen_configuration import ModelSettings
+from app.domain.repository_policy import read_review_policy
+from app.domain.settings import compute_repository_settings_digest
+
+
+def _live_lease_conditions(
+    review_job_id: UUID, owner: str, fencing_token: int
+) -> list[ColumnElement[bool]]:
+    """Shared liveness filter: this owner's live publish-kind lease."""
+    kind = literal_column("to_jsonb(task_lease)->>'task_kind'", type_=Text())
+    return [
+        TaskLease.review_job_id == review_job_id,
+        TaskLease.owner == owner,
+        TaskLease.fencing_token == fencing_token,
+        TaskLease.expires_at > func.clock_timestamp(),
+        or_(kind.is_(None), kind == "publish"),
+    ]
 
 
 class PostgresPublicationStore:
@@ -175,18 +195,10 @@ class PostgresPublicationStore:
                 .join(ReviewJob, ReviewJob.id == TaskLease.review_job_id)
                 .join(Publication, Publication.review_job_id == ReviewJob.id)
                 .where(
-                    TaskLease.review_job_id == claim.review_id,
-                    TaskLease.owner == claim.authority.owner,
-                    TaskLease.fencing_token == claim.authority.fencing_token,
-                    TaskLease.expires_at > func.clock_timestamp(),
-                    or_(
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        ).is_(None),
-                        literal_column(
-                            "to_jsonb(task_lease)->>'task_kind'", type_=Text()
-                        )
-                        == "publish",
+                    *_live_lease_conditions(
+                        claim.review_id,
+                        claim.authority.owner,
+                        claim.authority.fencing_token,
                     ),
                     PublicationOperation.id == claim.operation_id,
                     PublicationOperation.state == "IN_FLIGHT",
@@ -196,6 +208,24 @@ class PostgresPublicationStore:
                     ReviewJob.finished_at.is_not(None),
                     Publication.status == "PENDING",
                     Publication.deadline_at > func.clock_timestamp(),
+                )
+            )
+            return current is not None
+
+    async def check_publication_authority(
+        self, authority: PublicationAuthority
+    ) -> bool:
+        """A live publish lease permits claim-free provider reads."""
+        if authority.task_kind != "publish":
+            return False
+        async with self._sessions() as session:
+            current = await session.scalar(
+                select(TaskLease.id).where(
+                    *_live_lease_conditions(
+                        authority.review_job_id,
+                        authority.owner,
+                        authority.fencing_token,
+                    )
                 )
             )
             return current is not None
@@ -517,7 +547,9 @@ class PostgresPublicationStore:
             .exists()
         )
 
-    async def load(self, review_id: UUID) -> PublicationInput | None:
+    async def load(  # noqa: PLR0911 -- explicit frozen-input rejection branches
+        self, review_id: UUID
+    ) -> PublicationInput | None:
         async with self._sessions() as session:
             row = (
                 await session.execute(
@@ -565,6 +597,37 @@ class PostgresPublicationStore:
                 for context in contexts
             ):
                 return None
+            settings = await session.get(
+                RepositorySettings, review.repository_settings_id
+            )
+            if settings is None:
+                return None
+            # Frozen jobs validate raw identity even when the saved policy is NULL.
+            try:
+                threshold = read_review_policy(settings.review_policy).minimum_severity
+                if (
+                    review.frozen_configuration_version is not None
+                    or settings.review_policy is not None
+                ):
+                    policy = ModelSettings.from_stored(review.model_settings)
+                    checksum = compute_repository_settings_digest(
+                        id=settings.id,
+                        repository_id=settings.repository_id,
+                        rules=settings.rules,
+                        ignores=settings.ignores,
+                        output_language=settings.output_language,
+                        surrounding_lines=settings.surrounding_lines,
+                        review_policy=settings.review_policy,
+                    )
+                    if (
+                        review.frozen_configuration_version != 1
+                        or settings.repository_id != review.repository_id
+                        or not valid_snapshot(settings)
+                        or checksum != policy.repository_settings_digest
+                    ):
+                        return None
+            except ValidationError, TypeError, ValueError:
+                return None
             findings = await session.scalars(
                 select(Finding)
                 .join(ChunkResult)
@@ -596,4 +659,5 @@ class PostgresPublicationStore:
                 ),
                 published_before=await self._published_before(session, review),
                 integration_status=repository.integration_status,
+                minimum_severity=threshold,
             )

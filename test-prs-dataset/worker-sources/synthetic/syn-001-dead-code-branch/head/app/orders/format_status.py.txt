@@ -1,0 +1,5 @@
+def format_status(order):
+    if order.is_cancelled:
+        return "Отменён"
+        print("logging cancellation")
+    return "Активен"

@@ -25,6 +25,7 @@ from app.application.review_start_ports import (
     RepositoryIdentity,
 )
 from app.application.use_cases.start_review import compute_config_digest
+from app.context.snapshot import valid_snapshot
 from app.db.models import RepositorySettings, ReviewJob
 from app.domain.frozen_configuration import (
     Digest,
@@ -32,12 +33,15 @@ from app.domain.frozen_configuration import (
     ExecutionSettings,
     FrozenConfigurationError,
     FrozenDTO,
+    ModelPolicy,
     ModelRoute,
     ModelSettings,
+    ModelSettingsV2,
     ProfileRef,
     RepositoryInstructions,
     Selector,
 )
+from app.domain.repository_policy import read_review_policy
 from app.domain.settings import (
     compute_repository_settings_digest,
     compute_rules_digest,
@@ -48,7 +52,12 @@ from app.llm.gateway import Endpoint, LLMGateway, ProviderPool
 from app.llm.ollama import OllamaClient
 from app.llm.openai_compatible import OpenAICompatibleClient
 from app.review.preflight import PreflightIssue, PreflightReport, offline_preflight
-from app.review.prompt import PromptBuilder, PromptConfigError
+from app.review.prompt import (
+    PromptBuilder,
+    PromptConfigError,
+    ReflectionBundle,
+    reflection_bundle,
+)
 from app.review.schemas.context import ContextPayload
 
 
@@ -71,12 +80,26 @@ class ExecutionConfiguration:
     model_digest: str | None
     prompt_version: str
     prompt_digest: str
-    policy: ModelSettings
+    policy: ModelPolicy
     instructions: tuple[str, ...]
     output_language: str
     ignores: tuple[str, ...]
     surrounding_lines: int
     service_settings: ExecutionSettings
+    minimum_severity: Literal["critical", "high", "medium", "low"] = "low"
+    rule_severities: tuple[tuple[str, str], ...] = ()
+    rules_source_state: str | None = None
+    rules_diagnostics: tuple[str, ...] = ()
+    allowed_rule_refs: frozenset[str] | None = None
+    verifier: ReflectionBundle | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.policy, ModelSettingsV2)
+            and self.policy.reflection.max_reflections_per_run > 0
+            and self.verifier is None
+        ):
+            raise FrozenConfigurationError("unsupported_verifier_bundle")
 
     def validate_context(self, payload: ContextPayload) -> None:
         if (
@@ -154,8 +177,8 @@ class ProfileDescriptor(FrozenDTO):
 
 class AdmissionSelection(FrozenDTO):
     primary: ModelRoute
-    policy: ModelSettings
-    prompt_version: Literal["v1", "v2", "v3"]
+    policy: ModelPolicy
+    prompt_version: Literal["v1", "v2", "v3", "v4"]
     prompt_digest: Digest
 
 
@@ -356,6 +379,8 @@ class FrozenConfigurationReader:
             settings = await session.get(RepositorySettings, job.repository_settings_id)
             if settings is None or settings.repository_id != job.repository_id:
                 raise FrozenConfigurationError("repository_settings_mismatch")
+            if not valid_snapshot(settings):
+                raise FrozenConfigurationError("rules_snapshot_mismatch")
             try:
                 policy = ModelSettings.from_stored(job.model_settings)
                 primary = ModelRoute(
@@ -394,6 +419,7 @@ class FrozenConfigurationReader:
                     ignores=settings.ignores,
                     output_language=settings.output_language,
                     surrounding_lines=settings.surrounding_lines,
+                    review_policy=settings.review_policy,
                 )
                 != policy.repository_settings_digest
             ):
@@ -412,6 +438,7 @@ class FrozenConfigurationReader:
                     expected_digest=job.prompt_digest,
                     repository_instructions=instructions,
                 )
+                verifier = reflection_bundle(self._prompts, policy, job.prompt_version)
             except PromptConfigError, ValidationError, KeyError, TypeError:
                 raise FrozenConfigurationError("unsupported_prompt_bundle") from None
             for route in (primary, *policy.routing.fallback):
@@ -444,6 +471,7 @@ class FrozenConfigurationReader:
                 prompt_version=job.prompt_version,
                 prompt_digest=job.prompt_digest,
                 policy=policy,
+                verifier=verifier,
                 instructions=instructions.instructions,
                 output_language=settings.output_language,
                 ignores=tuple(
@@ -453,6 +481,27 @@ class FrozenConfigurationReader:
                 ),
                 surrounding_lines=settings.surrounding_lines,
                 service_settings=service,
+                minimum_severity=read_review_policy(
+                    settings.review_policy
+                ).minimum_severity,
+                allowed_rule_refs=frozenset(
+                    settings.rules_source.get("file", {}).get("allowed_rule_refs", [])
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else None,
+                rules_diagnostics=tuple(
+                    settings.rules_source.get("file", {}).get("diagnostics", [])
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else (),
+                rules_source_state=settings.rules_source.get("file", {}).get("state")
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else None,
+                rule_severities=tuple(
+                    settings.rules_source.get("file", {}).get("severities", {}).items()
+                )
+                if settings.rules_source is not None and job.prompt_version == "v4"
+                else (),
             )
 
 
@@ -517,7 +566,7 @@ class FrozenAdmissionResolver:
         profiles: Mapping[str, RuntimeProfile],
         *,
         primary: ModelRoute,
-        policy: ModelSettings,
+        policy: ModelPolicy,
         prompt_version: str = "v2",
         prompt_digest: str | None = None,
     ) -> None:
@@ -528,6 +577,10 @@ class FrozenAdmissionResolver:
         self._policy = policy
         self._version = prompt_version
         self._digest = prompt_digest
+
+    @property
+    def context_enabled(self) -> bool:
+        return self._version == "v4"
 
     async def resolve(
         self, *, repository: RepositoryIdentity, settings_id: UUID, rules_digest: str
@@ -552,6 +605,7 @@ class FrozenAdmissionResolver:
                 ignores=settings.ignores,
                 output_language=settings.output_language,
                 surrounding_lines=settings.surrounding_lines,
+                review_policy=settings.review_policy,
             )
             try:
                 instructions = RepositoryInstructions(
@@ -567,6 +621,7 @@ class FrozenAdmissionResolver:
                     expected_digest=self._digest,
                     repository_instructions=instructions,
                 )
+                reflection_bundle(self._prompts, self._policy, self._version)
             except PromptConfigError, ValidationError, KeyError, TypeError:
                 raise FrozenConfigurationError("unsupported_prompt_bundle") from None
             policy_values = self._policy.model_dump(mode="json")

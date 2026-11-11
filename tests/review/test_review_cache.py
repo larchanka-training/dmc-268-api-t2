@@ -85,6 +85,54 @@ def test_cached_findings_are_relative_and_restored_at_current_lines() -> None:
     assert restored.summary == "Summary" and restored.schema_version == 2  # noqa: PLR2004
 
 
+def _renamed_body(start: int) -> Any:
+    raw = (
+        "diff --git a/src/old.py b/src/new.py\n"
+        "similarity index 90%\n"
+        "rename from src/old.py\n"
+        "rename to src/new.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/old.py\n"
+        "+++ b/src/new.py\n"
+        f"@@ -{start},2 +{start + 5},2 @@\n"
+        " x = 0\n"
+        "-return value\n"
+        "+return value / 0\n"
+    )
+    return {
+        "metadata": {"title": "PR", "body": None, "output_language": "ru"},
+        "snapshot": {"head_sha": "x"},
+        "files": parse_diff(raw).files,
+        "related_symbols": [],
+    }
+
+
+def test_old_side_finding_in_renamed_file_is_cached_and_restored() -> None:
+    _, anchors_then = cache_identity(_renamed_body(10), DIGEST)
+    _, anchors_now = cache_identity(_renamed_body(70), DIGEST)
+    old_finding = ReviewFinding(
+        **{
+            **_finding(11).__dict__,
+            "path": "src/old.py",
+            "side": FindingSide.OLD,
+        }
+    )
+    new_finding = ReviewFinding(
+        **{**_finding(16).__dict__, "path": "src/new.py"},
+    )
+    result = ReviewChunkResult(2, "S", [], None, 1, [old_finding, new_finding])
+
+    stored = to_cached(result, anchors_then)
+    restored = from_cached(stored, anchors_now)
+
+    assert [f["start_line"] for f in stored["findings"]] == [1, 1]
+    assert restored is not None
+    assert [(f.path, f.side, f.start_line) for f in restored.findings] == [
+        ("src/old.py", FindingSide.OLD, 71),
+        ("src/new.py", FindingSide.NEW, 76),
+    ]
+
+
 def test_cached_finding_for_unknown_path_is_not_restored() -> None:
     _, anchors = cache_identity(_body("src/a.py", 10), DIGEST)
     stored = to_cached(ReviewChunkResult(2, "S", [], None, 1, [_finding(11)]), anchors)

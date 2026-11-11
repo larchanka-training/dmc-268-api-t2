@@ -59,6 +59,10 @@ def cache_identity(
         diff = file["diff"]
         hunks = diff["hunks"]
         old0, new0 = (hunks[0]["old_start"], hunks[0]["new_start"]) if hunks else (0, 0)
+        # A finding on the OLD side of a renamed file carries old_path; on a
+        # same-named file both keys coincide. A current new_path wins a clash.
+        if diff["old_path"]:
+            anchors.setdefault(str(diff["old_path"]), (old0, new0))
         anchors[_path(diff)] = (old0, new0)
         files.append(
             {

@@ -5,7 +5,9 @@ from __future__ import annotations
 # ruff: noqa: RUF001 - publication text is intentionally Russian
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Sequence
+import re
+from collections import Counter
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby
 from typing import Protocol
@@ -32,7 +34,38 @@ from app.application.publication_ports import (
 from app.domain.contract_validation import validate_hunks
 from app.review.schemas.context import FileDiff
 from app.review.schemas.finding import LLMFinding
-from app.review.validation import has_changed_anchor, mask_secrets
+from app.review.validation import has_changed_anchor, mask_secrets, normalize_text
+
+# The publisher always ends an inline comment with its marker tail. Harvest
+# trusts only that tail (RT-12): model text elsewhere in the body may carry
+# forged dmc268 markers, and a forged suppress key would poison the
+# suppression set for a chosen future identity.
+_MARKER_TAIL = re.compile(
+    r"(?:<!-- dmc268-suppress:(\S+) -->\n)?<!-- dmc268-finding:(\S+) -->\Z"
+)
+
+# Identity-only suppression must match the place of the published comment:
+# the regression shift between commits is 6 lines, while an independent
+# same-identity defect in a second function sits 21 lines away. The bound
+# keeps the shifted repeat suppressed and publishes the far one; larger
+# shifts resolve toward publishing — a visible duplicate, never a hidden
+# finding (issue #60 review: ambiguity resolves toward publishing).
+_PLACE_TOLERANCE_LINES = 10
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedAnchor:
+    """Where an earlier-cycle inline comment was anchored on the provider.
+
+    Identity-only suppression (issue #60 review) needs the place, not just
+    the line-free key: the key cannot tell a shifted repeat from a second
+    independent defect sharing path/side/category/title.
+    """
+
+    path: str
+    side: str | None
+    start_line: int | None
+    end_line: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,8 +181,156 @@ def _github_path(item: PersistedFinding, review: PublicationInput) -> str:
     return item.path
 
 
-def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
-    """Render saved analysis without another model call."""
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _strip_comments(text: str) -> str:
+    """RT-12: model text must not carry forged markers into outgoing bodies.
+
+    Dedup state (fingerprints, suppress keys) is computed earlier from the
+    raw stored text and stays unaffected.
+    """
+    return _HTML_COMMENT.sub("", text)
+
+
+def _suppress_key(item: PersistedFinding) -> str:
+    """Line-free identity hash for cross-cycle suppression (issue #53).
+
+    The full fingerprint pins the line range, so a finding moved between
+    commits changes it and would be re-published; the suppress key keeps the
+    same normalized components minus the range and survives pure line shifts.
+    Published inline as a ``dmc268-suppress`` marker next to the fingerprint.
+    """
+    key = "|".join(
+        [
+            item.path,
+            item.side,
+            item.category,
+            normalize_text(item.title),
+        ]
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _request_for(review: PublicationInput) -> GithubRequest:
+    """The provider coordinates of the captured PR (same shape at all call sites)."""
+    return GithubRequest(
+        review.owner,
+        review.name,
+        review.repository_external_id,
+        review.number,
+        review.head_sha,
+        review.base_sha,
+    )
+
+
+def _anchor_gap(item: PersistedFinding, anchor: PublishedAnchor) -> int | None:
+    """Lines between the finding's range and the published anchor's range.
+
+    ``None`` when the anchor carries no usable coordinates (the provider may
+    return nulls for outdated comments) — such a match is ambiguous and must
+    resolve toward publishing.
+    """
+    if anchor.end_line is None:
+        return None
+    start = anchor.start_line if anchor.start_line is not None else anchor.end_line
+    end = anchor.end_line
+    if item.end_line < start:
+        return start - item.end_line
+    if end < item.start_line:
+        return item.start_line - end
+    return 0
+
+
+def _same_place(
+    item: PersistedFinding, review: PublicationInput, anchor: PublishedAnchor
+) -> bool:
+    """Whether the finding sits where the earlier comment was anchored.
+
+    Same provider path, same diff side, and the ranges within
+    _PLACE_TOLERANCE_LINES of each other (issue #60 review).
+    """
+    expected_side = "LEFT" if item.side == "OLD" else "RIGHT"
+    if anchor.side is not None and anchor.side != expected_side:
+        return False
+    if anchor.path != _github_path(item, review):
+        return False
+    gap = _anchor_gap(item, anchor)
+    return gap is not None and gap <= _PLACE_TOLERANCE_LINES
+
+
+def _match_suppression_slots(
+    ranked: list[PersistedFinding],
+    published: Mapping[str, int],
+    published_anchors: Mapping[str, list[PublishedAnchor]],
+    review: PublicationInput,
+) -> tuple[list[PersistedFinding], list[PersistedFinding]]:
+    """Split ranked findings into suppressed repeats and fresh ones (#53, #60).
+
+    An earlier-cycle comment occupies one slot of its identity. Exact
+    fingerprint repeats claim slots first — the range is pinned, so the match
+    is unambiguous. Identity-only candidates then fill a slot only where the
+    published comment was anchored near the same place in the file: the
+    identity key is line-free and cannot tell a shifted repeat from a second
+    independent defect, so a candidate far from every unfilled anchor stays
+    fresh — ambiguity resolves toward publishing (issue #60 review).
+    """
+    suppressed: list[PersistedFinding] = []
+    slots_used: Counter[str] = Counter()
+    remaining: list[PersistedFinding] = []
+    for item in ranked:
+        if item.fingerprint in published:
+            suppressed.append(item)
+            slots_used[_suppress_key(item)] += 1
+        else:
+            remaining.append(item)
+    fresh: list[PersistedFinding] = []
+    used_anchors: dict[str, set[int]] = {}
+    for item in remaining:
+        key = _suppress_key(item)
+        used = used_anchors.setdefault(key, set())
+        anchor_slot = next(
+            (
+                index
+                for index, anchor in enumerate(published_anchors.get(key, ()))
+                if index not in used and _same_place(item, review, anchor)
+            ),
+            None,
+        )
+        if (
+            key in published
+            and slots_used[key] < published[key]
+            and anchor_slot is not None
+        ):
+            suppressed.append(item)
+            slots_used[key] += 1
+            used.add(anchor_slot)
+        else:
+            fresh.append(item)
+    return suppressed, fresh
+
+
+def prepare_github_review(
+    review: PublicationInput,
+    *,
+    published: Mapping[str, int] | None = None,
+    published_anchors: Mapping[str, list[PublishedAnchor]] | None = None,
+) -> PreparedGithubReview:
+    """Render saved analysis without another model call.
+
+    ``published`` counts identities the bot already posted in earlier review
+    cycles (full fingerprints and line-free suppress keys, one entry per
+    earlier inline comment): those findings are not posted again as inline
+    comments, they are only named as already noted in the review body
+    (issue #53). Suppression is slot-matched (issue #53 review): exact
+    fingerprint repeats claim their identity's slots first, and ranked
+    same-identity candidates fill a slot only near the published comment's
+    anchor (``published_anchors``, issue #60 review) — a far candidate is a
+    second independent defect and posts inline, so ambiguity resolves toward
+    publishing.
+    """
+    published = published or {}
+    published_anchors = published_anchors or {}
     expected = {
         "provider": "github",
         "base_repository_id": review.repository_external_id,
@@ -172,8 +353,10 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         for item in review.findings
         if severity.get(item.severity, 4) <= severity[review.minimum_severity]
     )
-    summary = review.summary
-    risks = "\n".join(f"- {item.severity}: {item.title}" for item in eligible)
+    summary = _strip_comments(review.summary)
+    risks = "\n".join(
+        f"- {item.severity}: {_strip_comments(item.title)}" for item in eligible
+    )
     if review.minimum_severity != "low":
         summary = (
             "Проверка завершена. Минимальный уровень серьёзности: "
@@ -191,7 +374,7 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
     for item in eligible:
         if _publishable(item, review):
             unique.setdefault(item.fingerprint, item)
-    publishable = sorted(
+    ranked = sorted(
         unique.values(),
         key=lambda item: (
             severity[item.severity],
@@ -201,16 +384,24 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
             item.end_line,
             item.fingerprint,
         ),
-    )[:20]
+    )
+    # Suppression slots (issue #53/#60 review): see _match_suppression_slots.
+    suppressed, fresh = _match_suppression_slots(
+        ranked, published, published_anchors, review
+    )
+    noted = suppressed[:20]
+    publishable = fresh[:20]
     comments: tuple[dict[str, object], ...] = tuple(
         {
             "path": _github_path(item, review),
             "line": item.end_line,
             "side": "LEFT" if item.side == "OLD" else "RIGHT",
             "body": mask_secrets(
-                f"**{item.severity}: {item.title}**\n\n"
+                f"**{item.severity}: {_strip_comments(item.title)}**\n\n"
                 + (f"Правило: {item.rule_ref}\n\n" if item.rule_ref else "")
-                + f"{item.explanation}\n\n{item.recommendation}\n\n"
+                + f"{_strip_comments(item.explanation)}\n\n"
+                + f"{_strip_comments(item.recommendation)}\n\n"
+                + f"<!-- dmc268-suppress:{_suppress_key(item)} -->\n"
                 f"<!-- dmc268-finding:{item.fingerprint} -->"
             ),
             **(
@@ -224,20 +415,21 @@ def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
         }
         for item in publishable
     )
-    omitted = len(eligible) - len(comments)
+    omitted = len(eligible) - len(comments) - len(noted)
+    already_noted = ""
+    if noted:
+        already_noted = "\n\nУже отмечено в прошлых циклах:\n" + "\n".join(
+            f"- {item.path}: {item.severity}: {_strip_comments(item.title)} "
+            f"<!-- dmc268-finding:{item.fingerprint} -->"
+            for item in noted
+        )
     return PreparedGithubReview(
-        request=GithubRequest(
-            review.owner,
-            review.name,
-            review.repository_external_id,
-            review.number,
-            review.head_sha,
-            review.base_sha,
-        ),
+        request=_request_for(review),
         marker=marker,
         body=mask_secrets(
             f"{marker}\n## Обзор AI-ревью\n\n{summary}\n\n"
             f"Проверенные файлы:\n{files}\n\nРиски:\n{risks}"
+            f"{already_noted}"
             f"\n\nНе опубликованы inline: {omitted}"
             f"\n\nНе проверены:\n{skipped or 'Нет пропущенных файлов.'}"
             f"\n\nКачество контекста: {review.coverage['context_quality']}"
@@ -289,6 +481,10 @@ class GithubPublisher:
 
     async def _require_authority(self, claim: PublicationClaim) -> None:
         if not await self._store.check_authority(claim):
+            raise PublicationAuthorityError("Publication authority is unavailable")
+
+    async def _require_lease(self) -> None:
+        if not await self._store.check_publication_authority(self._authority):
             raise PublicationAuthorityError("Publication authority is unavailable")
 
     @staticmethod
@@ -372,6 +568,66 @@ class GithubPublisher:
                         references[finding.fingerprint] = comment.remote_comment_id
         return references
 
+    @staticmethod
+    def _marker_cycle_id(body: str) -> UUID | None:
+        """Review id of the cycle that published this overview, if ours."""
+        match = re.fullmatch(
+            r"<!-- dmc268-review:v1 review=(\S+) head=\S+ config=\S+ -->",
+            body.split("\n", 1)[0],
+        )
+        if match is None:
+            return None
+        try:
+            return UUID(match.group(1))
+        except ValueError:
+            return None
+
+    async def _published_identities(
+        self,
+        review: PublicationInput,
+        github: GithubPublicationGateway,
+    ) -> tuple[Counter[str], dict[str, list[PublishedAnchor]]]:
+        """Identities and anchors the bot posted in earlier cycles of this PR.
+
+        Full fingerprints (``dmc268-finding:``) and line-free suppress keys
+        (``dmc268-suppress:``), one count per earlier inline comment, so a
+        repeat survives a line shift between commits and a second independent
+        finding of the same identity still posts inline (issue #53 review).
+        Suppress keys also carry the comment's provider anchor (path, side,
+        lines) so identity-only matches are place-checked (issue #60 review).
+        Only the publisher-emitted marker tail is parsed (RT-12): model text
+        elsewhere in the body may carry forged markers. The reads happen
+        before the claim exists, so they carry no operation; the gateway is
+        still lease-fenced to keep expired workers off the provider (the same
+        posture as AC-PUB-15).
+        """
+        request = _request_for(review)
+        identities: Counter[str] = Counter()
+        anchors: dict[str, list[PublishedAnchor]] = {}
+        for item in await github.list_reviews(request):
+            if item.author_id != self._bot_user_id:
+                continue
+            if self._marker_cycle_id(item.body) == review.review_id:
+                continue
+            for comment in await github.list_review_comments(
+                request, item.remote_review_id
+            ):
+                if comment.author_id != self._bot_user_id:
+                    continue
+                match = _MARKER_TAIL.search(comment.body)
+                if match:
+                    identities.update(token for token in match.groups() if token)
+                    if match.group(1) is not None:
+                        anchors.setdefault(match.group(1), []).append(
+                            PublishedAnchor(
+                                path=comment.path,
+                                side=comment.side,
+                                start_line=comment.start_line,
+                                end_line=comment.line,
+                            )
+                        )
+        return identities, anchors
+
     async def publish(  # noqa: PLR0911, PLR0912, PLR0915 - explicit durable outcome branches
         self,
         *,
@@ -394,7 +650,31 @@ class GithubPublisher:
         review = await self._store.load(review_job_id)
         if review is None:
             raise LookupError("Frozen publication input is unavailable")
-        prepared = prepare_github_review(review)
+        denial_reason: str | None = None
+        noted: Counter[str]
+        anchors: dict[str, list[PublishedAnchor]] = {}
+        if review.integration_status != "healthy":
+            # AC6: no new provider attempts for an unhealthy repository —
+            # the claim-free suppression read included.
+            noted = Counter()
+        else:
+            try:
+                noted, anchors = await self._published_identities(
+                    review,
+                    self._github.with_authority(self._require_lease),
+                )
+            except GithubFailure as error:
+                # The claim-free read precedes begin(): transient failures stay
+                # retryable claim-free, but a bot denial (AC6) must not loop —
+                # it parks durably once the claim exists below.
+                if error.reason_code != "VCS_ACCESS_DENIED":
+                    raise
+                denial_reason = error.reason_code
+                noted = Counter()
+                anchors = {}
+        prepared = prepare_github_review(
+            review, published=noted, published_anchors=anchors
+        )
         payload_hash = self._payload_hash(prepared)
         claim = await self._store.begin(
             review_job_id,
@@ -410,6 +690,12 @@ class GithubPublisher:
             blocked: dict[str, object] = {"reason_code": "INTEGRATION_UNHEALTHY"}
             await self._store.save(claim, status="SKIPPED", provider_metadata=blocked)
             return {"status": "SKIPPED", **blocked}
+        if denial_reason is not None:
+            return await self._unknown_overview(
+                claim,
+                None,
+                reason_code=denial_reason,
+            )
         try:
             await github.check_pull(prepared.request)
         except GithubFailure as error:
@@ -501,16 +787,19 @@ class GithubPublisher:
         review = await self._store.load(review_job_id)
         if operation is None or review is None:
             raise PublicationAuthorityError("Reconciliation input is unavailable")
-        prepared = prepare_github_review(review)
+        github = self._github.with_authority(
+            lambda: self._require_reconciliation_authority(review_job_id)
+        )
+        await self._require_reconciliation_authority(review_job_id)
+        noted, anchors = await self._published_identities(review, github)
+        prepared = prepare_github_review(
+            review, published=noted, published_anchors=anchors
+        )
         if (
             operation.marker != prepared.marker
             or operation.payload_hash != self._payload_hash(prepared)
         ):
             raise PublicationAuthorityError("Reconciliation payload is unavailable")
-        github = self._github.with_authority(
-            lambda: self._require_reconciliation_authority(review_job_id)
-        )
-        await self._require_reconciliation_authority(review_job_id)
         reviews = await github.list_reviews(prepared.request)
         matching = [
             item

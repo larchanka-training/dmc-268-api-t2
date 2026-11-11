@@ -21,8 +21,14 @@ OLD-coordinate coverage check.
 
 The Overview contains the summary, checked files, risks, skipped files and
 context quality. At most 20 unique fingerprints become inline comments, ordered
-by severity and location. Text is masked again before publication. This limit
-does not discard findings from the retained analysis or hide omitted comments.
+by severity and location. Findings already published by earlier cycles of
+the same PR are excluded from inline comments and are listed under «Уже
+отмечено в прошлых циклах» instead (at most 20 listed, ordered the same way);
+the omitted count excludes those listed as already noted; suppressed repeats
+beyond the 20-item already-noted list count as not published inline, since
+they are named nowhere else. Text is masked again
+before publication. These limits do not discard findings from the retained
+analysis or hide omitted comments.
 
 Before HTTP, the store persists a review marker and payload hash and serializes
 operations by ChangeRequest. An unresolved operation cannot be replaced by a
@@ -43,7 +49,43 @@ Proof uses the review marker, configured bot ID, captured commit, review state,
 and each comment's fingerprint, path, side and range. Provider IDs are retained
 in publication metadata. Human text with the same marker is not bot output.
 Repeated delivery of a finished cycle returns its retained outcome without HTTP.
-Fingerprint deduplication covers a review payload; a new analysis is a new cycle.
+Fingerprint deduplication covers a review payload. A new analysis starts a new
+cycle, but a cycle suppresses repeats of identities the bot already published
+in earlier cycles of the same PR: before the publish claim is taken, the
+publisher reads earlier-cycle reviews and comments under the live publish
+lease and collects both markers — full fingerprints (`dmc268-finding:`) and
+line-free identity keys (`dmc268-suppress:`, SHA-256 over normalized
+path/side/category/title) — as counts, one slot per earlier inline comment.
+Only the publisher-emitted trailing marker lines are trusted (RT-12): model
+text elsewhere in a comment body may carry forged markers and never reaches
+outgoing bodies anyway, because model text is stripped of HTML comments at
+render time. Exact fingerprint repeats claim an identity's slots first — the
+pinned range makes the match unambiguous. Identity-only candidates then fill a
+slot only where the earlier comment was anchored on the provider (same path,
+same side, within 10 lines of its anchor): the identity key is line-free and
+cannot tell a shifted repeat from a second independent defect, so a candidate
+far from every unfilled anchor — the same category and title appearing in a
+second function, or a new finding whose published look-alike left the ranked
+set (a fragment re-analysis) — posts inline. Suppression still covers the
+usual line shift between commits (the regression scenario moves the finding 6
+lines); a larger shift resolves toward publishing: a visible duplicate is
+preferred over a hidden finding. Comments published before the suppress
+marker existed match by full fingerprint only. The current cycle's own
+comments never enter this set.
+
+Reconciliation re-derives the same suppression set before the payload check, so
+a parked outcome stays verifiable. If earlier-cycle comments change between
+publish and reconciliation (for example a comment was deleted manually), the
+set no longer matches and reconciliation refuses with «Reconciliation payload is
+unavailable»; the outcome stays `UNKNOWN` until resolved manually.
+
+If the claim-free suppression read itself is denied by the provider (bot lost
+access, `VCS_ACCESS_DENIED`), the publisher still takes the claim, then parks a
+durable `UNKNOWN` and flags the repository `bot_denied` — the same AC6 posture
+as a post-claim denial; no review or comment is posted. Transient read failures
+stay claim-free: the task fails for a retry with no durable decision. An
+unhealthy repository skips the suppression read entirely — no provider request
+at all.
 
 `GithubPublisher.reconcile(review_job_id=...)` is a **read-only GitHub operation**
 under a fresh publish lease with a higher fencing token. It can confirm presence

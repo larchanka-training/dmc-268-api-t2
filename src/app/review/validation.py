@@ -55,7 +55,7 @@ class ValidationOutcome:
 
 def fingerprint(finding: LLMFindingV1) -> str:
     """Hash of normalized path/side/range/category/title (SD §7)."""
-    title = _normalize(finding.title)
+    title = normalize_text(finding.title)
     key = "|".join(
         [
             finding.path,
@@ -139,13 +139,14 @@ def mask_secrets(text: str) -> str:
     return text
 
 
-def _normalize(text: str) -> str:
+def normalize_text(text: str) -> str:
+    """Shared text normalization for fingerprints and suppression keys."""
     return " ".join(text.lower().split())
 
 
 def _has_evidence(finding: LLMFindingV1) -> bool:
-    evidence = _normalize(finding.evidence)
-    return bool(evidence) and evidence != _normalize(finding.title)
+    evidence = normalize_text(finding.evidence)
+    return bool(evidence) and evidence != normalize_text(finding.title)
 
 
 def _hits_changed_lines(finding: LLMFindingV1, payload: ContextPayload) -> bool:

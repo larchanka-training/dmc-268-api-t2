@@ -138,7 +138,6 @@ class PostgresAnalysisAttemptStore:
             retry_at = now + timedelta(seconds=min(20.0, max(1.0, backoff)))
             if job.finished_at is not None:
                 return False
-            retry_at = now + timedelta(seconds=min(20.0, max(1.0, delay_s)))
             if (
                 job.analysis_attempts >= policy.retry.worker_max_attempts
                 or job.analysis_deadline_at is None

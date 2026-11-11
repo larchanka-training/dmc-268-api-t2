@@ -61,10 +61,10 @@ may set `include_globs`, `exclude_migrations`, `max_patch_bytes`,
   `rerun_of` = latest finished COMPLETED/PARTIAL review). Idempotency scope
   `systemFollowUp:{review_id}` turns repeated terminal deliveries into replays.
   Failures are logged and never block the analysis ACK.
-* **Cross-cycle repeats (#53).** The publication store loads fingerprints that
-  earlier cycles of the PR posted (`provider_metadata.comment_ids` of
-  `PUBLISHED`/`PARTIAL` publications); they are not posted again and the
-  overview reports "Уже отмечены в предыдущих ревью: N".
+* **Cross-cycle repeats (#53)** do not depend on this flag: the publisher
+  always suppresses findings that earlier cycles already posted, by fingerprint
+  and line-free suppress key harvested from the bot's own comments, and names
+  them under "Уже отмечено в прошлых циклах" (`app/application/github_publication.py`).
 * **Webhook redelivery** stays deduplicated by `(provider_name, delivery_id)` in
   PostgreSQL; the webhook never calls the LLM.
 

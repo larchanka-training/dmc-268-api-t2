@@ -653,10 +653,10 @@ def validate_admission_configuration(
     settings_digest: str,
     instructions: tuple[str, ...],
     prompt_root: Path,
-) -> ModelSettings:
+) -> ModelPolicy:
     """Frozen admission identity for a new start; ValueError when unusable.
 
-    Shared by HTTP starts and the system follow-up start."""
+    Shared by HTTP and automatic starts and the system follow-up start."""
     try:
         if (
             not isinstance(config, FrozenAnalysisConfiguration)
@@ -682,6 +682,7 @@ def validate_admission_configuration(
             expected_digest=config.prompt_digest,
             repository_instructions=RepositoryInstructions(instructions=instructions),
         )
+        reflection_bundle(prompt_root, policy, config.prompt_version)
         return policy
     except ValidationError, ValueError, TypeError, PromptConfigError:
         raise ValueError("review configuration is unavailable") from None

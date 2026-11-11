@@ -17,9 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.application.github_ports import GithubFailure, GithubRequest
 from app.application.webhook_ports import InboxUnavailable, WebhookDelivery
 from app.db.models import Repository, RepositorySettings, WebhookReceipt
-from app.vcs.input_guards import REPOSITORY_OVERRIDES
 from app.db.review_starts import settings_identity
 from app.domain.repository_policy import AutomaticReviewIntent, read_review_policy
+from app.vcs.input_guards import REPOSITORY_OVERRIDES
 
 _MAX_ATTEMPTS = 3
 

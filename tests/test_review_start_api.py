@@ -2393,6 +2393,48 @@ async def test_concurrent_refresh_to_same_head_with_new_base_is_not_found(
 )
 async def test_newer_head_start_while_pr_review_is_active(  # noqa: PLR0913, PLR0917 -- explicit fixture and parameter boundaries
     app: FastAPI,
+    client: httpx.AsyncClient,
+    scope: StartScope,
+    configured: FakeStartGithub,
+    postgres: PostgresHarness,
+    one_active: bool,
+    status: HTTPStatus,
+) -> None:
+    """Spec PR #42 §3.2: with incremental review, one active analysis per PR."""
+    app.dependency_overrides[get_one_active_per_pr] = lambda: one_active
+    first = await client.post(
+        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
+    )
+    assert first.status_code == HTTPStatus.ACCEPTED
+    newer = "c" * 40
+    configured.pull_request = replace(configured.pull_request, head_sha=newer)
+
+    response = await client.post(
+        scope.url,
+        json={"requested_head_sha": newer},
+        headers={**HEADERS, "Idempotency-Key": "two"},
+    )
+
+    assert response.status_code == status
+    async with async_sessionmaker(postgres.engine)() as session:
+        jobs = (
+            await session.scalars(
+                select(models.ReviewJob.requested_head_sha).where(
+                    models.ReviewJob.repository_id == scope.repository
+                )
+            )
+        ).all()
+    if one_active:
+        assert response.json()["code"] == "REVIEW_ALREADY_ACTIVE"
+        assert response.json()["message"] == (
+            "A review of this pull request is already active."
+        )
+        assert_schema(response, "Error")
+        assert jobs == [HEAD]
+    else:
+        assert sorted(jobs) == sorted([HEAD, newer])
+
+
 def _cancel_headers(key: str = "cancel") -> dict[str, str]:
     return {**HEADERS, "Idempotency-Key": key}
 
@@ -2547,42 +2589,6 @@ async def test_second_cancel_returns_ok_without_another_event(
     scope: StartScope,
     configured: FakeStartGithub,
     postgres: PostgresHarness,
-    one_active: bool,
-    status: HTTPStatus,
-) -> None:
-    """Spec PR #42 §3.2: with incremental review, one active analysis per PR."""
-    app.dependency_overrides[get_one_active_per_pr] = lambda: one_active
-    first = await client.post(
-        scope.url, json={"requested_head_sha": HEAD}, headers=HEADERS
-    )
-    assert first.status_code == HTTPStatus.ACCEPTED
-    newer = "c" * 40
-    configured.pull_request = replace(configured.pull_request, head_sha=newer)
-
-    response = await client.post(
-        scope.url,
-        json={"requested_head_sha": newer},
-        headers={**HEADERS, "Idempotency-Key": "two"},
-    )
-
-    assert response.status_code == status
-    async with async_sessionmaker(postgres.engine)() as session:
-        jobs = (
-            await session.scalars(
-                select(models.ReviewJob.requested_head_sha).where(
-                    models.ReviewJob.repository_id == scope.repository
-                )
-            )
-        ).all()
-    if one_active:
-        assert response.json()["code"] == "REVIEW_ALREADY_ACTIVE"
-        assert response.json()["message"] == (
-            "A review of this pull request is already active."
-        )
-        assert_schema(response, "Error")
-        assert jobs == [HEAD]
-    else:
-        assert sorted(jobs) == sorted([HEAD, newer])
 ) -> None:
     review_id = await _queued_review(client, scope)
     first = await client.post(

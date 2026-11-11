@@ -40,8 +40,6 @@ class PublicationInput:
     coverage: dict[str, Any]
     contexts: tuple[dict[str, Any], ...]
     findings: tuple[PersistedFinding, ...]
-    # Fingerprints already posted inline by earlier review cycles of this PR.
-    published_before: frozenset[str] = frozenset()
     integration_status: str = "healthy"
     minimum_severity: Literal["critical", "high", "medium", "low"] = "low"
 

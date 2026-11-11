@@ -161,7 +161,6 @@ async def _refresh_saved_change(  # noqa: PLR0913, PLR0917 -- explicit optimisti
     saved.description = live.description
 
 
-async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- atomic admission with optional materialization
 async def _verify_effective_settings(
     session: AsyncSession,
     command: StartReviewCommand,

@@ -157,28 +157,13 @@ def test_prepare_review_reports_empty_findings_and_skipped_coverage_honestly(
     assert "diff_only" in prepared.body
 
 
-def test_prepare_review_suppresses_findings_published_by_earlier_cycles(
-    payload_data: dict[str, Any],
-) -> None:
-    """#53 / spec §4.2: a fingerprint already posted on this PR is not re-posted."""
-    review = replace(
-        publication_input(payload_data), published_before=frozenset({"finding-39"})
-    )
-
-    prepared = prepare_github_review(review)
-
-    assert prepared.comments == ()
-    assert "Уже отмечены в предыдущих ревью: 1" in prepared.body
-    assert "Не опубликованы inline: 0" in prepared.body
-
-
 def test_prepare_review_without_earlier_cycles_keeps_overview_unchanged(
     payload_data: dict[str, Any],
 ) -> None:
     prepared = prepare_github_review(publication_input(payload_data))
 
     assert len(prepared.comments) == 1
-    assert "Уже отмечены" not in prepared.body
+    assert "Уже отмечено" not in prepared.body
 
 
 def test_prepare_review_groups_guard_skips_by_reason(

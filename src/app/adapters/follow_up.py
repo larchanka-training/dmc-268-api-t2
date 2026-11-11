@@ -33,7 +33,7 @@ from app.application.review_start_ports import (
     ReviewStartAuthorizer,
     SettingsVersionChangedError,
 )
-from app.core.metrics import count
+from app.core.metric_events import count
 from app.db.models import ChangeRequest, Repository, RepositorySettings, ReviewJob
 from app.db.review_starts import change_identity, persist_start, settings_identity
 from app.domain.enums import ReviewStatus
@@ -133,6 +133,7 @@ class SystemFollowUp:
                 ignores=settings.ignores,
                 output_language=settings.output_language,
                 surrounding_lines=settings.surrounding_lines,
+                review_policy=settings.review_policy,
             )
             instructions = tuple(
                 project_historical_empty_settings(settings.rules, "instructions")[

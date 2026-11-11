@@ -2011,7 +2011,7 @@ async def test_local_authority_loss_before_result_persistence_keeps_delivery_pen
         assert job is not None and job.finished_at is None
 
 
-def _added_file(path: str, *lines: str) -> str:
+def _new_file_with(path: str, *lines: str) -> str:
     body = "".join(f"+{line}\n" for line in lines)
     return (
         f"diff --git a/{path} b/{path}\n"
@@ -2027,16 +2027,18 @@ def _added_file(path: str, *lines: str) -> str:
 GUARDED_DIFF = "".join(
     (
         DIFF,
-        _added_file("data/big.py", *(f"x{n} = {' 1 +' * 500} 1" for n in range(600))),
+        _new_file_with(
+            "data/big.py", *(f"x{n} = {' 1 +' * 500} 1" for n in range(600))
+        ),
         "diff --git a/logo.png b/logo.png\n"
         "new file mode 100644\n"
         "index 0000000..2222222\n"
         "Binary files /dev/null and b/logo.png differ\n",
-        _added_file("package-lock.json", *(f'"d{n}": "1",' for n in range(2500))),
-        _added_file("migrations/versions/0001_init.py", "op.drop_table('t')"),
-        _added_file("api/user.pb.go", "package api"),
-        _added_file("static/app.css", "a{b:c}" * 300),
-        _added_file("web/client.gen.ts", "export const api = 1"),
+        _new_file_with("package-lock.json", *(f'"d{n}": "1",' for n in range(2500))),
+        _new_file_with("migrations/versions/0001_init.py", "op.drop_table('t')"),
+        _new_file_with("api/user.pb.go", "package api"),
+        _new_file_with("static/app.css", "a{b:c}" * 300),
+        _new_file_with("web/client.gen.ts", "export const api = 1"),
     )
 )
 
@@ -2108,6 +2110,8 @@ async def test_input_guards_keep_unusable_files_out_of_llm(
         "static/app.css": "minified",
         "web/client.gen.ts": "generated",
     }
+
+
 async def _analyze_task(
     factory: async_sessionmaker[AsyncSession], review_id: uuid.UUID
 ) -> QueueTaskEnvelope:

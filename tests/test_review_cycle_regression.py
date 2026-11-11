@@ -9,9 +9,6 @@ Cycle 2 models a real new commit: the PR head moves to a fresh SHA before the
 second cycle publishes, so the cycle semantics are exercised on a new push,
 not a re-delivery of the old head.
 
-Cross-cycle repeats (#53): without incremental review the same finding on an
-unchanged line is published again (markers are review-scoped); with it, a
-fingerprint an earlier cycle posted is suppressed. Both modes are pinned.
 Cross-cycle suppression (issue #53): a repeat of a finding the bot already
 published in an earlier cycle is not posted again as an inline comment; the
 new review names it as "already noted" in its body. Suppression reads
@@ -132,11 +129,9 @@ def _publisher(
     )
 
 
-@pytest.mark.parametrize("suppress_repeats", [False, True])
 async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicates(
     publication_engine: AsyncEngine,
     payload_data: dict[str, object],
-    suppress_repeats: bool,
 ) -> None:
     engine = publication_engine
     store, authority = await setup_publication(engine, payload_data)
@@ -192,10 +187,7 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
         **provider.metadata,
         "head": {"sha": new_head, "ref": "topic", "repo": {"id": 101}},
     }
-    store_2 = PostgresPublicationStore(
-        async_sessionmaker(engine), suppress_repeats=suppress_repeats
-    )
-    publisher_2 = _publisher(store_2, provider, authority_2)
+    publisher_2 = _publisher(store, provider, authority_2)
 
     outcome_2 = await publisher_2.publish(review_job_id=review_2)
     assert outcome_2["status"] == "PUBLISHED", f"outcome_2={outcome_2}"
@@ -205,14 +197,6 @@ async def test_new_cycle_publishes_its_own_review_and_redelivery_never_duplicate
     assert provider.posts[1]["commit_id"] != head_sha
     assert f"review={review_2}" in provider.posts[1]["body"]
     assert review_1 != review_2
-    if suppress_repeats:
-        # #53 accepted: the unchanged-line finding is not posted again.
-        assert provider.posts[1]["comments"] == []
-        assert "Уже отмечены в предыдущих ревью: " in provider.posts[1]["body"]
-    else:
-        # Without incremental review the cross-cycle repeat still lands in the
-        # new review; the old review is never edited or merged into.
-        assert provider.posts[1]["comments"] == provider.posts[0]["comments"]
     # Cross-cycle suppression (#53): the unchanged-line repeat is not posted
     # again as an inline comment; the new review names it as already noted.
     # The old review is never edited or merged into.

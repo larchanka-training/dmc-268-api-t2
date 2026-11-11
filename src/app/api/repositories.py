@@ -29,11 +29,6 @@ from app.api.auth import (
 from app.api.errors import ApiError
 from app.application.github_ports import GithubFailure, GithubRepositoryReader
 from app.core.config import Settings, get_settings
-from app.core.github_runtime import (
-    CredentialUnavailableError,
-    stored_github_token,
-    user_github_client,
-)
 from app.core.github_runtime import github_connection
 from app.db.models import (
     Repository,
@@ -42,6 +37,7 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.domain.settings import compute_rules_digest
+from app.vcs.github import GithubClient
 
 router = APIRouter(prefix="/api/v1/repositories")
 _MAX_LIMIT = 100
@@ -59,13 +55,6 @@ async def get_repository_reader(
 ) -> AsyncIterator[GithubRepositoryReader]:
     """Use only the verified browser user's stored OAuth credential."""
     try:
-        token = await stored_github_token(settings, session, principal.user_id)
-    except CredentialUnavailableError:
-        raise ApiError(
-            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
-        ) from None
-    async with user_github_client(token) as client:
-        yield client
         async with personal_github_connection(
             principal.user_id, settings, session
         ) as reader:

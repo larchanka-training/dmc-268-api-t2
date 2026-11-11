@@ -28,7 +28,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.application.ports import ReviewChunkResult, ReviewFinding, TokenUsage
-from app.core.metrics import count
+from app.core.metric_events import count
 from app.domain.enums import FindingCategory, FindingSeverity, FindingSide
 
 # path -> (old side, new side) start of the file's first hunk

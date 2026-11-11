@@ -34,9 +34,8 @@ from app.application.publication_ports import (
 from app.domain.contract_validation import validate_hunks
 from app.review.schemas.context import FileDiff
 from app.review.schemas.finding import LLMFinding
-from app.review.validation import has_changed_anchor, mask_secrets
-from app.vcs.input_guards import FileSkipReason
 from app.review.validation import has_changed_anchor, mask_secrets, normalize_text
+from app.vcs.input_guards import FileSkipReason
 
 # The publisher always ends an inline comment with its marker tail. Harvest
 # trusts only that tail (RT-12): model text elsewhere in the body may carry
@@ -218,8 +217,6 @@ def _skipped_overview(skipped: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def prepare_github_review(review: PublicationInput) -> PreparedGithubReview:
-    """Render saved analysis without another model call."""
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
@@ -411,15 +408,6 @@ def prepare_github_review(
     for item in eligible:
         if _publishable(item, review):
             unique.setdefault(item.fingerprint, item)
-    # Cross-cycle repeats (#53): never re-post a fingerprint an earlier cycle posted.
-    repeated = {key for key in unique if key in review.published_before}
-    for key in repeated:
-        del unique[key]
-    repeats = (
-        f"\n\nУже отмечены в предыдущих ревью: {len(repeated)}" if repeated else ""
-    )
-    severity = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    publishable = sorted(
     ranked = sorted(
         unique.values(),
         key=lambda item: (
@@ -461,7 +449,6 @@ def prepare_github_review(
         }
         for item in publishable
     )
-    omitted = len(review.findings) - len(comments) - len(repeated)
     omitted = len(eligible) - len(comments) - len(noted)
     already_noted = ""
     if noted:
@@ -476,7 +463,6 @@ def prepare_github_review(
         body=mask_secrets(
             f"{marker}\n## Обзор AI-ревью\n\n{summary}\n\n"
             f"Проверенные файлы:\n{files}\n\nРиски:\n{risks}"
-            f"\n\nНе опубликованы inline: {omitted}{repeats}"
             f"{already_noted}"
             f"\n\nНе опубликованы inline: {omitted}"
             f"\n\nНе проверены:\n{skipped or 'Нет пропущенных файлов.'}"

@@ -160,7 +160,6 @@ class CompareReader(Protocol):
     ) -> str | None: ...
 
 
-class GithubRepositoryReader(Protocol):
 @dataclass(frozen=True, slots=True)
 class RepositoryRevision:
     owner: str

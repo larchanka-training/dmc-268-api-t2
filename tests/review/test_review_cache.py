@@ -1,5 +1,6 @@
 """Exact review cache identity: line-number free, context and config bound."""
 
+from dataclasses import replace
 from typing import Any
 
 from app.application.ports import ReviewChunkResult, ReviewFinding, TokenUsage
@@ -110,16 +111,8 @@ def _renamed_body(start: int) -> Any:
 def test_old_side_finding_in_renamed_file_is_cached_and_restored() -> None:
     _, anchors_then = cache_identity(_renamed_body(10), DIGEST)
     _, anchors_now = cache_identity(_renamed_body(70), DIGEST)
-    old_finding = ReviewFinding(
-        **{
-            **_finding(11).__dict__,
-            "path": "src/old.py",
-            "side": FindingSide.OLD,
-        }
-    )
-    new_finding = ReviewFinding(
-        **{**_finding(16).__dict__, "path": "src/new.py"},
-    )
+    old_finding = replace(_finding(11), path="src/old.py", side=FindingSide.OLD)
+    new_finding = replace(_finding(16), path="src/new.py")
     result = ReviewChunkResult(2, "S", [], None, 1, [old_finding, new_finding])
 
     stored = to_cached(result, anchors_then)

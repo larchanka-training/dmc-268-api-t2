@@ -14,12 +14,9 @@ from app.application.github_ports import (
     GithubFailure,
     GithubPort,
     GithubPullRequestReader,
-)
-from app.application.review_start_ports import RepositoryIdentity
-    GithubPort,
-    GithubPullRequestReader,
     RepositoryFileReader,
 )
+from app.application.review_start_ports import RepositoryIdentity
 from app.core.config import Settings
 from app.db.models import GithubIdentity
 from app.vcs.github import GithubClient

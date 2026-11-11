@@ -21,6 +21,7 @@ from test_publications_postgres import (
     publication_engine as publication_engine,  # noqa: PLC0414 - pytest fixture export
 )
 
+from app.application.github_ports import GithubFailure
 from app.application.github_publication import GithubPublisher
 from app.application.publication_ports import (
     PublicationAuthority,
@@ -561,7 +562,12 @@ async def test_publisher_rechecks_live_authority_after_preflight(
             ).publish(review_job_id=authority.review_job_id)
 
     assert provider.posts == []
-    assert provider.requests == [("GET", "/repos/larchanka-training/demo/pulls/42")]
+    # The claim-free suppression read precedes the preflight (issue #53);
+    # once the preflight observed the expiry, no further provider call starts.
+    assert provider.requests == [
+        ("GET", "/repos/larchanka-training/demo/pulls/42/reviews"),
+        ("GET", "/repos/larchanka-training/demo/pulls/42"),
+    ]
 
 
 async def test_publisher_preserves_confirmed_partial_publication(
@@ -732,12 +738,16 @@ async def test_provider_read_failure_does_not_lose_publication_decision(
     """AC-PUB-12: failed reconciliation reads preserve an UNKNOWN decision."""
     store, authority = await setup_publication(publication_engine, payload_data)
     provider = FakeGithub()
+    preflight_served = False
 
     def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal preflight_served
+        preflight = request.method == "GET" and request.url.path.endswith("/pulls/42")
         if request.method == "GET" and (
-            (failure_at == "preflight" and request.url.path.endswith("/pulls/42"))
+            (failure_at == "preflight" and preflight)
             or (
                 failure_at == "before"
+                and preflight_served
                 and request.url.path.endswith("/reviews")
                 and not provider.posts
             )
@@ -749,6 +759,8 @@ async def test_provider_read_failure_does_not_lose_publication_decision(
             or (failure_at == "comments" and request.url.path.endswith("/comments"))
         ):
             return httpx.Response(503, json={"message": "provider-secret"})
+        if preflight:
+            preflight_served = True
         return provider.respond(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
@@ -764,6 +776,38 @@ async def test_provider_read_failure_does_not_lose_publication_decision(
     state = await store.get(authority.review_job_id)
     assert state is not None and state.status == "UNKNOWN"
     assert "provider-secret" not in str(state.provider_metadata)
+
+
+async def test_suppression_read_failure_keeps_publication_claim_free(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+) -> None:
+    """A failed claim-free suppression read starts neither claim nor write.
+
+    The suppression read (issue #53) precedes begin(): no durable publication
+    decision exists yet, so a provider failure fails the task for a retry
+    instead of parking an UNKNOWN outcome.
+    """
+    store, authority = await setup_publication(publication_engine, payload_data)
+    provider = FakeGithub()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/reviews"):
+            return httpx.Response(503, json={"message": "provider-secret"})
+        return provider.respond(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(GithubFailure):
+            await GithubPublisher(
+                store,
+                GithubClient(http),
+                authority=authority,
+                bot_user_id="9002",
+            ).publish(review_job_id=authority.review_job_id)
+
+    assert provider.posts == []
+    state = await store.get(authority.review_job_id)
+    assert state is not None and state.status == "PENDING"
 
 
 async def _seed_access(engine: AsyncEngine, review_id: UUID) -> tuple[UUID, UUID]:

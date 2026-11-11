@@ -54,7 +54,7 @@ from app.db.repositories import (
     SqlAlchemyReviewJobRepository,
 )
 from app.db.review_events import append_review_event
-from app.db.task_leases import lock_owned_lease
+from app.db.task_leases import lock_owned_lease, lock_review_job
 from app.db.worker_tasks import PostgresWorkerTasks
 from app.domain.contract_validation import validate_hunks, validate_ranges
 from app.domain.enums import ReviewReasonCode, ReviewStatus
@@ -198,6 +198,8 @@ class PostgresAnalysisHandler:
             return await self._execute(task, lease)
         except FrozenConfigurationError as failure:
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -226,6 +228,8 @@ class PostgresAnalysisHandler:
             ):
                 return None
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -245,6 +249,8 @@ class PostgresAnalysisHandler:
             ):
                 return None
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -255,6 +261,8 @@ class PostgresAnalysisHandler:
             return DurableTaskOutcome.COMPLETED
         except _AnalysisFailureError as failure:
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 status = (
                     ReviewStatus.SKIPPED
                     if failure.reason == ReviewReasonCode.PR_STALE_OR_CLOSED
@@ -272,11 +280,28 @@ class PostgresAnalysisHandler:
                 )
             return DurableTaskOutcome.COMPLETED
 
-    async def _execute(  # noqa: PLR0912, PLR0915 — one bounded Level 1 capture
+    async def _already_finished(self, review_id: uuid.UUID) -> bool:
+        """True once Stop or another finish committed finished_at."""
+        async with self._factory.begin() as session:
+            finished_at = await session.scalar(
+                select(ReviewJob.finished_at).where(ReviewJob.id == review_id)
+            )
+        return finished_at is not None
+
+    async def _locked_finished(
+        self, session: AsyncSession, review_id: uuid.UUID
+    ) -> bool:
+        current = await lock_review_job(session, review_id)
+        return current is None or current.finished_at is not None
+
+    async def _execute(  # noqa: PLR0911, PLR0912, PLR0915 — one bounded Level 1 capture
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
     ) -> DurableTaskOutcome | None:
+        # Stop may have committed before this delivery reached call authority.
+        if await self._already_finished(lease.review_job_id):
+            return DurableTaskOutcome.COMPLETED
         decision = await PostgresAnalysisAttemptStore(self._factory).begin(
             task=task, lease=lease
         )
@@ -317,8 +342,12 @@ class PostgresAnalysisHandler:
             reserved = execution.configuration.policy.limits.max_output_tokens
             max_chunks = execution.configuration.policy.limits.max_chunks
         assert llm is not None
+        if await self._already_finished(lease.review_job_id):
+            return DurableTaskOutcome.COMPLETED
         await self._ensure_call_authority(task, lease)
         async with self._factory.begin() as session:
+            if await self._locked_finished(session, lease.review_job_id):
+                return DurableTaskOutcome.COMPLETED
             stored = (
                 await session.scalars(
                     select(ContextPayload)
@@ -392,6 +421,8 @@ class PostgresAnalysisHandler:
                 )
                 self._validate_context(context)
             return await self._infer(task, lease, saved, llm)
+        if await self._already_finished(lease.review_job_id):
+            return DurableTaskOutcome.COMPLETED
         await self._ensure_call_authority(task, lease)
         with sentry_sdk.start_span(op="review.diff", name="Diff"):
             try:
@@ -402,6 +433,9 @@ class PostgresAnalysisHandler:
                 raise _AnalysisFailureError(
                     ReviewReasonCode(failure.reason_code)
                 ) from None
+            # Fetch is not aborted. A cancel that committed during it inserts nothing.
+            if await self._already_finished(lease.review_job_id):
+                return DurableTaskOutcome.COMPLETED
             self._check_snapshot(
                 captured.metadata["snapshot"], request, expected_source
             )
@@ -413,6 +447,8 @@ class PostgresAnalysisHandler:
                 ) from None
         if not parsed.files:
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(session, task, lease, ReviewStatus.SKIPPED)
                 await self._save_snapshot(
                     session,
@@ -483,6 +519,8 @@ class PostgresAnalysisHandler:
                     "context_quality": "diff_only",
                 }
                 async with self._factory.begin() as session:
+                    if await self._locked_finished(session, lease.review_job_id):
+                        return DurableTaskOutcome.COMPLETED
                     await self._transition(session, task, lease, ReviewStatus.SKIPPED)
                     await self._save_snapshot(
                         session, lease, body["snapshot"], coverage
@@ -493,6 +531,8 @@ class PostgresAnalysisHandler:
         created_at = utcnow()
         with sentry_sdk.start_span(op="review.db", name="Context commit"):
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session, task, lease, ReviewStatus.PARSING_CONTEXT
                 )
@@ -539,7 +579,7 @@ class PostgresAnalysisHandler:
         ):
             raise _AnalysisFailureError(ReviewReasonCode.PR_STALE_OR_CLOSED)
 
-    async def _infer(
+    async def _infer(  # noqa: PLR0911 -- stop checks return before the next write
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
@@ -554,6 +594,8 @@ class PostgresAnalysisHandler:
         if not contexts:
             # Every chunk already has a result but the run never ended.
             async with self._factory.begin() as session:
+                if await self._locked_finished(session, lease.review_job_id):
+                    return DurableTaskOutcome.COMPLETED
                 await self._transition(
                     session,
                     task,
@@ -564,9 +606,14 @@ class PostgresAnalysisHandler:
             return DurableTaskOutcome.COMPLETED
         for index, context in enumerate(contexts):
             files = cast(list[dict[str, Any]], context.payload_body["files"])
+            if await self._already_finished(lease.review_job_id):
+                return DurableTaskOutcome.COMPLETED
             await self._ensure_call_authority(task, lease)
             with sentry_sdk.start_span(op="review.llm", name="LLM"):
+                # Do not close the provider call. Stop only skips the insert after it.
                 result = await llm.review(context)
+            if await self._already_finished(lease.review_job_id):
+                return DurableTaskOutcome.COMPLETED
             authority = current_analysis_authority.get()
             if authority is not None:
                 authority.check()
@@ -574,6 +621,8 @@ class PostgresAnalysisHandler:
                 # Raw format repair belongs exclusively to ReviewService. Invalid
                 # backend results fail defensively without another provider call.
                 async with self._factory.begin() as session:
+                    if await self._locked_finished(session, lease.review_job_id):
+                        return DurableTaskOutcome.COMPLETED
                     await self._transition(
                         session,
                         task,
@@ -585,6 +634,8 @@ class PostgresAnalysisHandler:
                 return DurableTaskOutcome.COMPLETED
             with sentry_sdk.start_span(op="review.db", name="Result commit"):
                 async with self._factory.begin() as session:
+                    if await self._locked_finished(session, lease.review_job_id):
+                        return DurableTaskOutcome.COMPLETED
                     locked = await lock_owned_lease(session, lease)
                     if locked is None:
                         raise LeaseLostError("Analysis lease is no longer current")

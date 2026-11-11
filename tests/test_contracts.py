@@ -659,6 +659,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/reviews/{id}/events", "get"),
         ("/api/v1/reviews/{id}/events/stream", "get"),
         ("/api/v1/reviews/{id}/publication-retries", "post"),
+        ("/api/v1/reviews/{id}/cancellation", "post"),
         ("/api/v1/webhooks/github", "post"),
         ("/healthcheck", "get"),
         ("/readiness", "get"),
@@ -710,3 +711,15 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
     accepted_ref = start_responses["202"]["content"]["application/json"]["schema"]
     assert replay_ref["$ref"].endswith("/StartReviewReplayResponse")
     assert accepted_ref["$ref"].endswith("/StartReviewResponse")
+
+    cancel = document["paths"]["/api/v1/reviews/{id}/cancellation"]["post"]
+    assert cancel["operationId"] == "cancelReview"
+    assert "requestBody" not in cancel
+    assert cancel["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/CancelReviewResponse")
+    assert "USER_CANCELLED" in document["components"]["schemas"]["ReasonCode"]["enum"]
+    assert (
+        "REVIEW_NOT_CANCELLABLE"
+        in document["components"]["schemas"]["ErrorCode"]["enum"]
+    )

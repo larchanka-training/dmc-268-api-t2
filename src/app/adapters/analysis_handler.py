@@ -13,7 +13,7 @@ from typing import Any, Protocol, cast
 import structlog
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from referencing import Registry, Resource
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_authority import current_analysis_authority
@@ -534,6 +534,15 @@ class PostgresAnalysisHandler:
                 await session.execute(
                     select(ContextPayload.payload_body, ReviewJob.requested_head_sha)
                     .join(ReviewJob, ReviewJob.id == ContextPayload.review_job_id)
+                    # Contexts are saved up front for every chunk: only a chunk
+                    # with a stored result was actually reviewed.
+                    .join(
+                        ChunkResult,
+                        and_(
+                            ChunkResult.review_job_id == ContextPayload.review_job_id,
+                            ChunkResult.context_payload_id == ContextPayload.id,
+                        ),
+                    )
                     .join(Publication, Publication.review_job_id == ReviewJob.id)
                     .where(
                         ReviewJob.change_request_id == change_request_id,

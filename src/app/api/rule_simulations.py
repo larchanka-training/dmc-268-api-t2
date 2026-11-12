@@ -26,7 +26,7 @@ from app.core.config import Settings, get_settings
 from app.db.models import Repository, RepositoryAccess
 from app.db.session import get_session
 from app.review.schemas.finding import RelPath
-from app.review.simulation import CodeSimulationError, CodeSimulationService
+from app.review.simulation import CodeSimulationService
 from app.vcs.diff import InvalidDiff, parse_diff
 
 router = APIRouter(prefix="/api/v1/repositories")
@@ -284,10 +284,11 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0917 -- preserve
     # Preliminary permission check only. Future paid admission must recheck access.
     if executor is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
-    result = None
-    with suppress(CodeSimulationError):
+    response = None
+    with suppress(Exception):
         result = await executor.simulate(payload.input, payload.rules)
+        response = JSONResponse(status_code=200, content=result.model_dump(mode="json"))
     # Raise outside the handler so the service/provider exception is not retained.
-    if result is None:
+    if response is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
-    return JSONResponse(status_code=200, content=result.model_dump(mode="json"))
+    return response

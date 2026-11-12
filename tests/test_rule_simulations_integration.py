@@ -1,6 +1,8 @@
 """Test-only execution through the real session/CSRF/PostgreSQL HTTP boundary."""
 
+import asyncio
 import json
+import logging
 import traceback
 from collections.abc import AsyncIterator, Iterator
 from http import HTTPStatus
@@ -20,7 +22,6 @@ from app.api.rule_simulations import get_simulation_executor
 from app.db.base import Base
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
 from app.llm.errors import (
-    LLMGatewayError,
     SchemaValidationError,
     TransientProviderError,
 )
@@ -130,7 +131,7 @@ class FakeLLM(BaseLLMClient):
     def __init__(self) -> None:
         self.answer = json.dumps({"findings": [FINDING]})
         self.requests: list[LLMRequest] = []
-        self.failure: LLMGatewayError | None = None
+        self.failure: BaseException | None = None
 
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, response_model: type[T]
@@ -250,6 +251,66 @@ async def test_model_failure_returns_only_a_safe_http_error(  # noqa: PLR0913, P
             + "".join(traceback.format_exception(api_errors[0]))
         )
     assert await simulation_state(postgres) == before
+
+
+async def test_unexpected_executor_failure_returns_only_a_safe_http_error(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    api_errors: list[Exception],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_details = (
+        "provider-diagnostics-sentinel offline-credential-sentinel "
+        "raw-model-output-sentinel private_source_sentinel private_rules_sentinel"
+    )
+    injected_llm.failure = RuntimeError(private_details)
+    caplog.set_level(logging.DEBUG, logger="app")
+    response = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers | {"X-Request-Id": "stage-a-executor-error"},
+        json={"input": CODE, "rules": RULES},
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.headers["X-Request-Id"] == "stage-a-executor-error"
+    assert response.json() == {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "Service is unavailable.",
+        "request_id": "stage-a-executor-error",
+        "retryable": False,
+        "retry_after": None,
+    }
+    assert len(api_errors) == 1
+    error = api_errors[0]
+    assert error.__context__ is None
+    assert error.__cause__ is None
+    public_details = (
+        response.text
+        + caplog.text
+        + repr(error)
+        + repr(vars(error))
+        + "".join(traceback.format_exception(error))
+    )
+    for private in private_details.split():
+        assert private not in public_details
+
+
+async def test_executor_cancellation_propagates_without_an_http_error(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    api_errors: list[Exception],
+) -> None:
+    cancellation = asyncio.CancelledError()
+    injected_llm.failure = cancellation
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+    assert raised.value is cancellation
+    assert api_errors == []
 
 
 async def test_diff_preserves_verified_sides_paths_ranges_refs_and_rejected_count(

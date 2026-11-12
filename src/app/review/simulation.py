@@ -9,7 +9,7 @@ import re
 from contextlib import suppress
 from typing import TYPE_CHECKING, Literal, overload
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.context.rules import parse_rules
 from app.llm.client import BaseLLMClient, ChatMessage, LLMRequest
@@ -47,7 +47,7 @@ class CodeSimulationOutput(BaseModel):
 
 
 class CodeSimulationResult(CodeSimulationOutput):
-    rejected_count: int = 0
+    rejected_count: int = Field(ge=0)
 
 
 class DiffFinding(CodeFinding):
@@ -61,7 +61,7 @@ class DiffSimulationOutput(BaseModel):
 
 
 class DiffSimulationResult(DiffSimulationOutput):
-    rejected_count: int = 0
+    rejected_count: int = Field(ge=0)
 
 
 class CodeSimulationError(Exception):
@@ -92,8 +92,15 @@ _DIFF_SYSTEM = (
 )
 
 
+_MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+
 def _valid_diff_finding(finding: DiffFinding, parsed: ParsedDiff) -> bool:
-    if finding.start_line > finding.end_line or not finding.evidence.strip():
+    if (
+        finding.start_line > finding.end_line
+        or finding.end_line > _MAX_SAFE_INTEGER
+        or not finding.evidence.strip()
+    ):
         return False
     coordinate = f"{finding.side}_line"
     for file in parsed.files:
@@ -116,13 +123,16 @@ def _valid_diff_finding(finding: DiffFinding, parsed: ParsedDiff) -> bool:
     return False
 
 
-def _mask_finding[T: CodeFinding](finding: T) -> T:
-    return finding.model_copy(
-        update={
-            name: mask_secrets(getattr(finding, name))
-            for name in ("title", "explanation", "evidence")
-        }
-    )
+def _mask_finding[T: CodeFinding](finding: T) -> T | None:
+    with suppress(ValidationError):
+        return type(finding).model_validate(
+            finding.model_dump()
+            | {
+                name: mask_secrets(getattr(finding, name))
+                for name in ("title", "explanation", "evidence")
+            }
+        )
+    return None
 
 
 class CodeSimulationService:
@@ -238,8 +248,13 @@ class CodeSimulationService:
                 for f in call.parsed.findings
                 if f.rule_ref in refs and _valid_diff_finding(f, parsed_diff)
             ]
+            diff_findings = [
+                masked_diff
+                for f in diff_findings
+                if (masked_diff := _mask_finding(f)) is not None
+            ]
             return DiffSimulationResult(
-                findings=[_mask_finding(f) for f in diff_findings],
+                findings=diff_findings,
                 rejected_count=len(call.parsed.findings) - len(diff_findings),
             )
         findings = (
@@ -256,7 +271,10 @@ class CodeSimulationService:
             if code.kind == "code"
             else []
         )
+        findings = [
+            masked for f in findings if (masked := _mask_finding(f)) is not None
+        ]
         return CodeSimulationResult(
-            findings=[_mask_finding(f) for f in findings],
+            findings=findings,
             rejected_count=len(call.parsed.findings) - len(findings),
         )

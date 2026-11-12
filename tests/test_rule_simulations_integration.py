@@ -352,6 +352,50 @@ async def test_code_rejected_finding_is_absent_and_count_is_preserved(
     assert "private_rules_sentinel" not in caplog.text
 
 
+@pytest.mark.parametrize("kind", ["code", "diff"])
+async def test_http_result_keeps_only_safe_masked_findings(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    input_data = dict(CODE if kind == "code" else DIFF)
+    valid = (FINDING if kind == "code" else DIFF_FINDINGS[1]) | {
+        "title": "api_key=private-value",
+        "explanation": "password=private-value",
+    }
+    findings = [
+        valid,
+        valid | {"title": "x" * 194 + " pwd=x"},
+        valid | {"rule_ref": "SEC-99"},
+    ]
+    rejected_count = 2
+    if kind == "diff":
+        input_data["unified_diff"] += (
+            "@@ -9007199254740992 +9007199254740992 @@\n"
+            "-old_eval(value)\n+eval(value)\n"
+        )
+        findings.append(
+            valid | {"start_line": 9007199254740992, "end_line": 9007199254740992}
+        )
+        rejected_count = 3
+    injected_llm.answer = json.dumps({"findings": findings})
+    response = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers,
+        json={"input": input_data, "rules": RULES},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {
+        "findings": [valid | {"title": "api_key=***", "explanation": "password=***"}],
+        "rejected_count": rejected_count,
+    }
+    assert "private-value" not in response.text + caplog.text
+    assert "pwd=x" not in response.text + caplog.text
+
+
 @pytest.mark.parametrize("input_data", [CODE, DIFF], ids=["code", "diff"])
 async def test_empty_model_result_has_no_invented_fields(
     browser: httpx.AsyncClient,

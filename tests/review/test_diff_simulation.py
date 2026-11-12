@@ -95,6 +95,38 @@ async def test_added_line_finding_uses_new_side_and_original_coordinates() -> No
     assert result.rejected_count == 0
 
 
+@pytest.mark.parametrize("side", ["old", "new"])
+@pytest.mark.parametrize("unsafe_start", [False, True], ids=["end-only", "both"])
+async def test_unsafe_coordinates_reject_only_that_finding(
+    side: str, unsafe_start: bool
+) -> None:
+    patch = (
+        "diff --git a/snippet.py b/snippet.py\n"
+        "--- a/snippet.py\n+++ b/snippet.py\n"
+        "@@ -9007199254740991,2 +9007199254740991,2 @@\n"
+        "-safe(value)\n-tail\n+eval(user_input)\n+tail\n"
+    )
+    safe = finding(
+        side=side,
+        start_line=9007199254740991,
+        end_line=9007199254740991,
+        evidence="safe(value)" if side == "old" else "eval(user_input)",
+    )
+    unsafe = safe | {
+        "start_line": 9007199254740992 if unsafe_start else 9007199254740991,
+        "end_line": 9007199254740992,
+        "evidence": "tail",
+    }
+    result = await CodeSimulationService(
+        FakeLLM(json.dumps({"findings": [unsafe, safe]}))
+    ).simulate(diff_input(patch), request_rules())
+
+    assert json.loads(result.model_dump_json()) == {
+        "findings": [safe],
+        "rejected_count": 1,
+    }
+
+
 async def test_unknown_rule_ref_is_rejected() -> None:
     fake = FakeLLM(json.dumps({"findings": [finding(rule_ref="SEC-99")]}))
     result = await CodeSimulationService(fake).simulate(diff_input(), request_rules())

@@ -8,7 +8,7 @@ import json
 from typing import Any
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from test_code_simulation import (
     FakeLLM,
     forbid_external_io,  # noqa: F401 - fixture
@@ -112,4 +112,113 @@ async def test_empty_result_has_no_invented_summary_or_audit_data(
     assert json.loads(result.model_dump_json()) == {
         "findings": [],
         "rejected_count": 0,
+    }
+
+
+async def test_title_over_limit_after_masking_rejects_only_that_finding(
+    simulation_case: tuple[SimulationCodeInput | SimulationDiffInput, dict[str, Any]],
+) -> None:
+    code, item = simulation_case
+    # A one-character secret expands to three asterisks: 200 -> 202.
+    oversized = item | {"title": "x" * 194 + " pwd=x"}
+    last = item | {"title": "Second valid finding"}
+    result = await CodeSimulationService(
+        FakeLLM(json.dumps({"findings": [item, oversized, last]}))
+    ).simulate(code, request_rules())
+
+    assert json.loads(result.model_dump_json()) == {
+        "findings": [item, last],
+        "rejected_count": 1,
+    }
+
+
+async def test_explanation_over_limit_after_masking_rejects_only_that_finding(
+    simulation_case: tuple[SimulationCodeInput | SimulationDiffInput, dict[str, Any]],
+) -> None:
+    code, item = simulation_case
+    oversized = item | {"explanation": "x" * 1994 + " pwd=x"}
+    last = item | {"title": "Second valid finding"}
+    result = await CodeSimulationService(
+        FakeLLM(json.dumps({"findings": [item, oversized, last]}))
+    ).simulate(code, request_rules())
+
+    assert json.loads(result.model_dump_json()) == {
+        "findings": [item, last],
+        "rejected_count": 1,
+    }
+
+
+async def test_evidence_over_limit_after_masking_rejects_only_that_finding(
+    simulation_case: tuple[SimulationCodeInput | SimulationDiffInput, dict[str, Any]],
+) -> None:
+    code, item = simulation_case
+    evidence = "x" * 994 + " pwd=x"
+    if code.kind == "code":
+        code = SimulationCodeInput(
+            kind="code", path="snippet.py", source=f"{evidence}\ntail\n"
+        )
+    else:
+        code = SimulationDiffInput(
+            kind="diff",
+            unified_diff=PATCH.replace("safe(value)", evidence).replace(
+                "eval(user_input)", evidence
+            ),
+        )
+    item = item | {"evidence": "tail"}
+    oversized = item | {"evidence": evidence}
+    last = item | {"title": "Second valid finding"}
+    result = await CodeSimulationService(
+        FakeLLM(json.dumps({"findings": [item, oversized, last]}))
+    ).simulate(code, request_rules())
+
+    assert json.loads(result.model_dump_json()) == {
+        "findings": [item, last],
+        "rejected_count": 1,
+    }
+
+
+@pytest.mark.parametrize("result_model", [CodeSimulationResult, DiffSimulationResult])
+def test_result_requires_rejected_count(
+    result_model: type[CodeSimulationResult | DiffSimulationResult],
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        result_model.model_validate({"findings": []})
+    assert [(e["loc"], e["type"]) for e in raised.value.errors()] == [
+        (("rejected_count",), "missing")
+    ]
+
+
+@pytest.mark.parametrize("result_model", [CodeSimulationResult, DiffSimulationResult])
+def test_result_rejects_negative_rejected_count(
+    result_model: type[CodeSimulationResult | DiffSimulationResult],
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        result_model.model_validate({"findings": [], "rejected_count": -1})
+    assert [(e["loc"], e["type"]) for e in raised.value.errors()] == [
+        (("rejected_count",), "greater_than_equal")
+    ]
+
+
+# Characterize inherited strictness and valid values; no new production behavior.
+@pytest.mark.parametrize("result_model", [CodeSimulationResult, DiffSimulationResult])
+@pytest.mark.parametrize("count", [False, True, 0.0, 1.5, "0", None])
+def test_result_rejected_count_requires_a_strict_integer(
+    result_model: type[CodeSimulationResult | DiffSimulationResult], count: object
+) -> None:
+    with pytest.raises(ValidationError) as raised:
+        result_model.model_validate({"findings": [], "rejected_count": count})
+    assert [(e["loc"], e["type"]) for e in raised.value.errors()] == [
+        (("rejected_count",), "int_type")
+    ]
+
+
+@pytest.mark.parametrize("result_model", [CodeSimulationResult, DiffSimulationResult])
+@pytest.mark.parametrize("count", [0, 1, 100])
+def test_result_accepts_nonnegative_integer_rejected_count(
+    result_model: type[CodeSimulationResult | DiffSimulationResult], count: int
+) -> None:
+    result = result_model.model_validate({"findings": [], "rejected_count": count})
+    assert json.loads(result.model_dump_json()) == {
+        "findings": [],
+        "rejected_count": count,
     }

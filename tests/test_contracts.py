@@ -805,12 +805,65 @@ def test_simulation_rules_error_component_preserves_closed_canonical_error() -> 
         _api_validator("Error").validate(specialized)
 
 
-def test_simulation_operation_documents_only_current_fail_closed_outcomes() -> None:
+def test_simulation_operation_documents_success_and_closed_result_schemas() -> None:
     api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
     path = "/api/v1/repositories/{id}/rule-simulations"
     operation = api["paths"][path]["post"]
     assert operation["operationId"] == "createRuleSimulation"
     assert set(api["paths"][path]) == {"post"}
-    assert set(operation["responses"]) == {"401", "403", "404", "413", "422", "503"}
-    assert "temporarily unavailable" in operation["description"]
+    assert set(operation["responses"]) == {
+        "200",
+        "401",
+        "403",
+        "404",
+        "413",
+        "422",
+        "503",
+    }
+    success = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert success == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/CodeSimulationResult"},
+            {"$ref": "#/components/schemas/DiffSimulationResult"},
+        ]
+    }
+    schemas = api["components"]["schemas"]
+    finding_fields = {
+        "path": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "rule_ref": {"type": "string", "minLength": 1, "maxLength": 32},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "explanation": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 1000},
+    }
+    for kind in ("Code", "Diff"):
+        result = schemas[f"{kind}SimulationResult"]
+        assert result["type"] == "object"
+        assert result["additionalProperties"] is False
+        assert set(result["required"]) == {"findings", "rejected_count"}
+        assert result["properties"] == {
+            "findings": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {"$ref": f"#/components/schemas/{kind}Finding"},
+            },
+            "rejected_count": {"type": "integer", "minimum": 0},
+        }
+        finding = schemas[f"{kind}Finding"]
+        expected = finding_fields | (
+            {"side": {"type": "string", "enum": ["old", "new"]}}
+            if kind == "Diff"
+            else {}
+        )
+        assert finding["type"] == "object"
+        assert finding["additionalProperties"] is False
+        assert set(finding["required"]) == set(expected)
+        assert finding["properties"] == expected
+    description = operation["description"]
+    assert "provided executor" in description
+    assert "disabled by default" in description
+    assert "503 SERVICE_UNAVAILABLE" in description
+    assert "Staging execution is not enabled" in description
+    assert "Idempotent replay and durable admission are not implemented" in description
     assert not any(p.startswith(path + "/") for p in api["paths"])

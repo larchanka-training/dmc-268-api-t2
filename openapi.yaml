@@ -340,12 +340,14 @@ paths:
     post:
       tags: [repositories]
       operationId: createRuleSimulation
-      summary: Validate a Rule Playground draft (temporarily unavailable)
+      summary: Simulate a Rule Playground draft
       description: >-
         Requires local repository access and live personal GitHub admin permission.
-        Execution is temporarily unavailable: a valid request returns canonical
-        503 SERVICE_UNAVAILABLE. Dependency failures can also return 503.
-        No successful simulation or durable admission is currently available.
+        A provided executor can return HTTP 200 with a Code or Diff result.
+        The executor is disabled by default, so a valid request in the normal
+        configuration returns canonical 503 SERVICE_UNAVAILABLE; dependency
+        failures can also return 503. Staging execution is not enabled.
+        Idempotent replay and durable admission are not implemented.
       security: [{ cookieAuth: [], csrfHeader: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryId'
@@ -408,6 +410,14 @@ paths:
                     format: rules-md/1
                     markdown: "# Style\n## STYLE-1: Explain constants\nDocument meaningful constants.\n"
       responses:
+        '200':
+          description: Successful simulation with a provided executor
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/CodeSimulationResult'
+                  - $ref: '#/components/schemas/DiffSimulationResult'
         '401': { $ref: '#/components/responses/AuthenticationRequired' }
         '403': { $ref: '#/components/responses/AccessDenied' }
         '404': { $ref: '#/components/responses/ResourceNotFound' }
@@ -917,6 +927,51 @@ components:
       required: true
       schema: { type: string, minLength: 1 }
   schemas:
+    CodeSimulationResult:
+      type: object
+      additionalProperties: false
+      required: [findings, rejected_count]
+      properties:
+        findings:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/CodeFinding' }
+        rejected_count: { type: integer, minimum: 0 }
+    DiffSimulationResult:
+      type: object
+      additionalProperties: false
+      required: [findings, rejected_count]
+      properties:
+        findings:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/DiffFinding' }
+        rejected_count: { type: integer, minimum: 0 }
+    CodeFinding:
+      type: object
+      additionalProperties: false
+      required: [path, start_line, end_line, rule_ref, title, explanation, evidence]
+      properties:
+        path: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+        rule_ref: { type: string, minLength: 1, maxLength: 32 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        explanation: { type: string, minLength: 1, maxLength: 2000 }
+        evidence: { type: string, minLength: 1, maxLength: 1000 }
+    DiffFinding:
+      type: object
+      additionalProperties: false
+      required: [path, start_line, end_line, rule_ref, title, explanation, evidence, side]
+      properties:
+        path: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+        rule_ref: { type: string, minLength: 1, maxLength: 32 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        explanation: { type: string, minLength: 1, maxLength: 2000 }
+        evidence: { type: string, minLength: 1, maxLength: 1000 }
+        side: { type: string, enum: [old, new] }
     SimulationRequest:
       type: object
       additionalProperties: false

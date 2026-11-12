@@ -26,7 +26,11 @@ from app.core.config import Settings, get_settings
 from app.db.models import Repository, RepositoryAccess
 from app.db.session import get_session
 from app.review.schemas.finding import RelPath
-from app.review.simulation import CodeSimulationService
+from app.review.simulation import (
+    CodeSimulationResult,
+    CodeSimulationService,
+    DiffSimulationResult,
+)
 from app.vcs.diff import InvalidDiff, parse_diff
 
 router = APIRouter(prefix="/api/v1/repositories")
@@ -193,13 +197,17 @@ async def get_simulation_executor() -> CodeSimulationService | None:
 
 @router.post(
     "/{id}/rule-simulations",
-    status_code=503,
+    status_code=200,
     operation_id="createRuleSimulation",
     description=(
-        "Execution is temporarily unavailable. A valid request returns canonical "
-        "503 SERVICE_UNAVAILABLE; dependency failures can also return 503."
+        "A provided executor can return HTTP 200 with a Code or Diff result. "
+        "The executor is disabled by default, so a valid request in the normal "
+        "configuration returns canonical 503 SERVICE_UNAVAILABLE; dependency "
+        "failures can also return 503. Staging execution is not enabled. "
+        "Idempotent replay and durable admission are not implemented."
     ),
     responses={
+        200: {"model": CodeSimulationResult | DiffSimulationResult},
         401: {"description": "AUTHENTICATION_REQUIRED"},
         403: {"description": "ACCESS_DENIED"},
         404: {"description": "RESOURCE_NOT_FOUND"},

@@ -1,4 +1,4 @@
-"""The public, authoritative contract for the temporarily unavailable Playground."""
+"""Public Playground contracts, including success with an injected executor."""
 
 import copy
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
+from openapi_spec_validator import validate
 from pydantic import ValidationError
 
 from app.api.rule_simulations import SimulationRequest
@@ -14,6 +15,39 @@ from app.main import create_app
 
 ROOT = Path(__file__).parents[1]
 PATH = "/api/v1/repositories/{id}/rule-simulations"
+
+# Exact successful HTTP fixture values from test_rule_simulations_integration.py.
+FINDING = {
+    "path": "playground/example.py",
+    "start_line": 2,
+    "end_line": 3,
+    "rule_ref": "SEC-1",
+    "title": "Unsafe evaluation",
+    "explanation": "User input is executed.",
+    "evidence": "eval(private_source_sentinel)",
+}
+DIFF_FINDINGS = [
+    {
+        "path": "before.py",
+        "side": "old",
+        "start_line": 8,
+        "end_line": 9,
+        "rule_ref": "SEC-1",
+        "title": "Unsafe old evaluation",
+        "explanation": "Old input is executed.",
+        "evidence": "old_eval(value)",
+    },
+    {
+        "path": "after.py",
+        "side": "new",
+        "start_line": 20,
+        "end_line": 21,
+        "rule_ref": "SEC-1",
+        "title": "Unsafe new evaluation",
+        "explanation": "New input is executed.",
+        "evidence": "eval(value)",
+    },
+]
 
 
 def document() -> Any:
@@ -202,11 +236,171 @@ def test_422_contract_allows_generic_and_only_specialized_rules_diagnostics() ->
     assert not error.is_valid(specialized)
 
 
-def test_generated_operation_has_no_success_status_and_names_temporary_503() -> None:
+def test_generated_operation_documents_success_and_disabled_by_default_executor() -> (
+    None
+):
     api = create_app().openapi()
     operation = api["paths"][PATH]["post"]
     assert operation["operationId"] == "createRuleSimulation"
-    assert set(operation["responses"]) == {"401", "403", "404", "413", "422", "503"}
+    assert set(operation["responses"]) == {
+        "200",
+        "401",
+        "403",
+        "404",
+        "413",
+        "422",
+        "503",
+    }
+    success = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert success["anyOf"] == [
+        {"$ref": "#/components/schemas/CodeSimulationResult"},
+        {"$ref": "#/components/schemas/DiffSimulationResult"},
+    ]
+    assert "oneOf" not in success
+    assert next(iter(operation["responses"])) == "200"
     assert operation["responses"]["503"]["description"] == "SERVICE_UNAVAILABLE"
     assert operation["responses"]["422"]["description"] == "VALIDATION_FAILED"
-    assert "temporarily unavailable" in operation["description"]
+    description = operation["description"]
+    assert "provided executor" in description
+    assert "disabled by default" in description
+    assert "503 SERVICE_UNAVAILABLE" in description
+    assert "Staging execution is not enabled" in description
+    assert "Idempotent replay and durable admission are not implemented" in description
+
+
+@pytest.fixture(scope="module", params=["static", "generated"])
+def success_api(request: pytest.FixtureRequest) -> Any:
+    return document() if request.param == "static" else create_app().openapi()
+
+
+def success_validator(api: Any) -> Draft202012Validator:
+    schema = api["paths"][PATH]["post"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    return Draft202012Validator({**schema, "components": api["components"]})
+
+
+def test_success_openapi_is_valid_and_all_references_resolve(success_api: Any) -> None:
+    validate(success_api)
+
+    def check_refs(value: Any) -> None:
+        if isinstance(value, dict):
+            if "$ref" in value:
+                ref = value["$ref"]
+                assert ref.startswith("#/")
+                target = success_api
+                for part in ref[2:].split("/"):
+                    target = target[part.replace("~1", "/").replace("~0", "~")]
+            for child in value.values():
+                check_refs(child)
+        elif isinstance(value, list):
+            for child in value:
+                check_refs(child)
+
+    check_refs(success_api)
+
+
+def test_static_and_generated_success_schemas_have_the_same_constraints() -> None:
+    def without_titles(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                k: without_titles(v)
+                for k, v in value.items()
+                if not (k == "title" and isinstance(v, str))
+            }
+        if isinstance(value, list):
+            return [without_titles(v) for v in value]
+        return value
+
+    static = document()["components"]["schemas"]
+    generated = create_app().openapi()["components"]["schemas"]
+    for name in (
+        "CodeSimulationResult",
+        "DiffSimulationResult",
+        "CodeFinding",
+        "DiffFinding",
+    ):
+        assert without_titles(static[name]) == without_titles(generated[name])
+
+
+@pytest.mark.parametrize(
+    "findings",
+    [[FINDING], [DIFF_FINDINGS[0]], [DIFF_FINDINGS[1]], DIFF_FINDINGS, []],
+    ids=["code", "diff-old", "diff-new", "diff-both", "empty"],
+)
+def test_success_contract_accepts_existing_http_results(
+    success_api: Any, findings: list[dict[str, Any]]
+) -> None:
+    success_validator(success_api).validate({"findings": findings, "rejected_count": 0})
+
+
+@pytest.mark.parametrize(
+    "finding", [FINDING, *DIFF_FINDINGS], ids=["code", "old", "new"]
+)
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "missing-rejected-count",
+        "negative-rejected-count",
+        "noninteger-rejected-count",
+        "missing-findings",
+        "extra-result-field",
+        "extra-finding-field",
+        "too-many-findings",
+        "missing-path",
+        "missing-start_line",
+        "missing-end_line",
+        "missing-rule_ref",
+        "missing-title",
+        "missing-explanation",
+        "missing-evidence",
+        "invalid-side",
+        "zero-start-line",
+        "zero-end-line",
+        "empty-rule_ref",
+        "empty-title",
+        "empty-explanation",
+        "empty-evidence",
+        "long-rule_ref",
+        "long-title",
+        "long-explanation",
+        "long-evidence",
+    ],
+)
+def test_success_contract_rejects_invalid_http_results(
+    success_api: Any, finding: dict[str, Any], invalid_case: str
+) -> None:
+    response: dict[str, Any] = {
+        "findings": [copy.deepcopy(finding)],
+        "rejected_count": 1,
+    }
+    validator = success_validator(success_api)
+    validator.validate(response)
+    item = response["findings"][0]
+    if invalid_case == "missing-rejected-count":
+        del response["rejected_count"]
+    elif invalid_case == "negative-rejected-count":
+        response["rejected_count"] = -1
+    elif invalid_case == "noninteger-rejected-count":
+        response["rejected_count"] = 0.5
+    elif invalid_case == "missing-findings":
+        del response["findings"]
+    elif invalid_case == "extra-result-field":
+        response["model_context"] = "private"
+    elif invalid_case == "extra-finding-field":
+        item["confidence"] = 1
+    elif invalid_case == "too-many-findings":
+        response["findings"] *= 101
+    elif invalid_case.startswith("missing-"):
+        del item[invalid_case.removeprefix("missing-")]
+    elif invalid_case == "invalid-side":
+        item["side"] = "both"
+    elif invalid_case.startswith("zero-"):
+        item[invalid_case.removeprefix("zero-").replace("-", "_")] = 0
+    elif invalid_case.startswith("empty-"):
+        item[invalid_case.removeprefix("empty-")] = ""
+    else:
+        field = invalid_case.removeprefix("long-")
+        limits = {"rule_ref": 32, "title": 200, "explanation": 2000, "evidence": 1000}
+        item[field] = "x" * (limits[field] + 1)
+    assert not validator.is_valid(response), invalid_case

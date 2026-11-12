@@ -216,7 +216,7 @@ async def get_simulation_executor() -> CodeSimulationService | None:
         503: {"description": "SERVICE_UNAVAILABLE"},
     },
 )
-async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0917 -- preserve ordered HTTP guards and explicit injected dependencies
+async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917 -- preserve ordered HTTP guards and explicit injected dependencies
     id: str,
     request: Request,
     identity: Annotated[
@@ -289,9 +289,33 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0917 -- preserve
             diagnostics=diagnostics,
             diagnostics_truncated=truncated,
         )
-    # Preliminary permission check only. Future paid admission must recheck access.
     if executor is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
+    try:
+        fresh_external_id = await session.scalar(
+            select(Repository.external_id)
+            .join(RepositoryAccess)
+            .where(
+                Repository.id == repository_id,
+                RepositoryAccess.user_id == identity.user_id,
+            )
+        )
+        await session.rollback()
+    except SQLAlchemyError, OSError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
+    if fresh_external_id is None or fresh_external_id != external_id:
+        raise ApiError(404, "RESOURCE_NOT_FOUND", "Resource was not found.")
+    try:
+        async with personal_github_connection(
+            identity.user_id, settings, session
+        ) as reader:
+            await _require_admin(reader, fresh_external_id)
+    except PersonalCredentialUnavailableError:
+        raise ApiError(
+            503, "SERVICE_UNAVAILABLE", "Service is unavailable.", retryable=True
+        ) from None
     response = None
     with suppress(Exception):
         result = await executor.simulate(payload.input, payload.rules)

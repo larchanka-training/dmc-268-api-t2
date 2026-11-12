@@ -12,14 +12,18 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select
+from sqlalchemy import delete, insert, select, update
 from starlette.responses import JSONResponse
 from test_postgres_integration import PostgresHarness
 from test_rule_simulations_access import SimulationScope, simulation_state
+from test_rule_simulations_body import (
+    isolate_stream_from_sentry,  # noqa: F401 -- shared stream isolation fixture
+)
 
 from app.api.errors import ApiError, api_error_response
 from app.api.rule_simulations import get_simulation_executor
 from app.db.base import Base
+from app.db.models import Repository, RepositoryAccess
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
 from app.llm.errors import (
     SchemaValidationError,
@@ -167,6 +171,118 @@ def injected_llm(auth_app: FastAPI) -> Iterator[FakeLLM]:
         auth_app.dependency_overrides.pop(get_simulation_executor, None)
 
 
+@pytest.mark.parametrize("change", ["access-revoked", "resource-rebound"])
+async def test_local_access_changed_during_body_read_prevents_inference(  # noqa: PLR0913, PLR0917 -- real HTTP race and side-effect observations
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    postgres: PostgresHarness,
+    github_requests: list[httpx.Request],
+    injected_llm: FakeLLM,
+    change: str,
+) -> None:
+    identity_before = (await browser.get("/api/v1/me")).json()
+    cookies_before = dict(browser.cookies)
+    github_before = len(github_requests)
+    async with postgres.engine.connect() as connection:
+        access = dict(
+            (
+                await connection.execute(
+                    select(RepositoryAccess).where(
+                        RepositoryAccess.repository_id == simulation_scope.repository
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    async def body() -> AsyncIterator[bytes]:
+        assert len(github_requests) == github_before + 1
+        async with postgres.engine.begin() as connection:
+            if change == "access-revoked":
+                await connection.execute(
+                    delete(RepositoryAccess).where(RepositoryAccess.id == access["id"])
+                )
+            else:
+                await connection.execute(
+                    update(Repository)
+                    .where(Repository.id == simulation_scope.repository)
+                    .values(external_id=f"{simulation_scope.external_id}-rebound")
+                )
+        yield json.dumps({"input": CODE, "rules": RULES}).encode()
+
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            content=body(),
+        )
+        assert response.status_code == HTTPStatus.NOT_FOUND
+        assert response.json() == {
+            "code": "RESOURCE_NOT_FOUND",
+            "message": "Resource was not found.",
+            "request_id": response.headers["X-Request-Id"],
+            "retryable": False,
+            "retry_after": None,
+        }
+        assert injected_llm.requests == []
+        assert len(github_requests) == github_before + 1
+        assert "Set-Cookie" not in response.headers
+        assert dict(browser.cookies) == cookies_before
+        assert (await browser.get("/api/v1/me")).json() == identity_before
+    finally:
+        async with postgres.engine.begin() as connection:
+            if change == "access-revoked":
+                await connection.execute(insert(RepositoryAccess).values(**access))
+            else:
+                await connection.execute(
+                    update(Repository)
+                    .where(Repository.id == simulation_scope.repository)
+                    .values(external_id=simulation_scope.external_id)
+                )
+
+
+async def test_admin_revoked_during_body_read_prevents_inference(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    provider: dict[str, httpx.Response],
+    github_requests: list[httpx.Request],
+    injected_llm: FakeLLM,
+) -> None:
+    identity_before = (await browser.get("/api/v1/me")).json()
+    cookies_before = dict(browser.cookies)
+    github_before = len(github_requests)
+    path = f"/repositories/{simulation_scope.external_id}"
+
+    async def body() -> AsyncIterator[bytes]:
+        assert len(github_requests) == github_before + 1
+        repository = provider[path].json()
+        repository["permissions"]["admin"] = False
+        provider[path] = httpx.Response(200, json=repository)
+        yield json.dumps({"input": CODE, "rules": RULES}).encode()
+
+    response = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers,
+        content=body(),
+    )
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert response.json() == {
+        "code": "ACCESS_DENIED",
+        "message": "Access is denied.",
+        "request_id": response.headers["X-Request-Id"],
+        "retryable": False,
+        "retry_after": None,
+    }
+    assert injected_llm.requests == []
+    assert [request.url.path for request in github_requests[github_before:]] == [
+        path
+    ] * 2
+    assert "Set-Cookie" not in response.headers
+    assert dict(browser.cookies) == cookies_before
+    assert (await browser.get("/api/v1/me")).json() == identity_before
+
+
 async def test_validated_code_returns_the_verified_service_result(
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
@@ -198,7 +314,7 @@ async def test_validated_code_returns_the_verified_service_result(
     }
     assert [request.url.path for request in github_requests[github_before:]] == [
         f"/repositories/{simulation_scope.external_id}"
-    ]
+    ] * 2
     assert await simulation_state(postgres) == before
 
 
@@ -317,10 +433,12 @@ async def test_diff_preserves_verified_sides_paths_ranges_refs_and_rejected_coun
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
     injected_llm: FakeLLM,
+    github_requests: list[httpx.Request],
 ) -> None:
     injected_llm.answer = json.dumps(
         {"findings": [*DIFF_FINDINGS, DIFF_FINDINGS[0] | {"rule_ref": "SEC-99"}]}
     )
+    github_before = len(github_requests)
     response = await browser.post(
         simulation_scope.url(simulation_scope.repository),
         headers=simulation_scope.headers,
@@ -329,6 +447,9 @@ async def test_diff_preserves_verified_sides_paths_ranges_refs_and_rejected_coun
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {"findings": DIFF_FINDINGS, "rejected_count": 1}
     assert len(injected_llm.requests) == 1
+    assert [request.url.path for request in github_requests[github_before:]] == [
+        f"/repositories/{simulation_scope.external_id}"
+    ] * 2
 
 
 async def test_code_rejected_finding_is_absent_and_count_is_preserved(
@@ -492,8 +613,10 @@ async def test_rejected_request_never_dispatches_even_with_executor(  # noqa: PL
 async def test_normal_application_cannot_enable_execution_over_http(
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
+    github_requests: list[httpx.Request],
     input_data: dict[str, str],
 ) -> None:
+    github_before = len(github_requests)
     response = await browser.post(
         simulation_scope.url(simulation_scope.repository) + "?fake=true&llm=true",
         headers=simulation_scope.headers
@@ -508,3 +631,6 @@ async def test_normal_application_cannot_enable_execution_over_http(
         "retryable": False,
         "retry_after": None,
     }
+    assert [request.url.path for request in github_requests[github_before:]] == [
+        f"/repositories/{simulation_scope.external_id}"
+    ]

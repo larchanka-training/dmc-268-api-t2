@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
+# Failed posts after which a cycle is parked; the backoff spans ~10-20 min by then.
+MAX_FAILED_ATTEMPTS = 10
+
 
 @dataclass(frozen=True, slots=True)
 class CommitStatusTarget:
@@ -25,6 +28,10 @@ class CommitStatusStore(Protocol):
     async def record_failure(
         self, review_id: UUID, *, retry_after_s: float
     ) -> None: ...
+
+    async def park(self, review_id: UUID) -> None:
+        """Stop retrying a cycle: GitHub will not accept its status."""
+        ...
 
 
 class CommitStatusWriter(Protocol):

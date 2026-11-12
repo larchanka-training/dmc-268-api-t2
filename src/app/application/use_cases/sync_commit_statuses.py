@@ -4,7 +4,11 @@ import random
 
 import structlog
 
-from app.application.commit_status_ports import CommitStatusStore, CommitStatusWriter
+from app.application.commit_status_ports import (
+    MAX_FAILED_ATTEMPTS,
+    CommitStatusStore,
+    CommitStatusWriter,
+)
 from app.application.github_ports import GithubFailure
 from app.domain.commit_status import commit_status_for
 
@@ -53,11 +57,24 @@ async def sync_commit_statuses(  # noqa: PLR0913 -- explicit runtime inputs
                 ),
             )
         except GithubFailure as failure:
+            attempt = target.failed_attempts + 1
+            if not failure.retryable or attempt >= MAX_FAILED_ATTEMPTS:
+                # Permanent rejection (e.g. missing statuses:write) never heals
+                # by retrying; parking keeps it off the installation rate limit.
+                structlog.get_logger().error(
+                    "commit_status_abandoned",
+                    review_id=str(target.review_id),
+                    reason_code=failure.reason_code,
+                    retryable=failure.retryable,
+                    attempt=attempt,
+                )
+                await store.park(target.review_id)
+                continue
             structlog.get_logger().warning(
                 "commit_status_deferred",
                 review_id=str(target.review_id),
                 reason_code=failure.reason_code,
-                attempt=target.failed_attempts + 1,
+                attempt=attempt,
             )
             await store.record_failure(
                 target.review_id,

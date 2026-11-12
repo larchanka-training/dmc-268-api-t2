@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from app.application.commit_status_ports import CommitStatusTarget
+from app.application.commit_status_ports import (
+    MAX_FAILED_ATTEMPTS,
+    CommitStatusTarget,
+)
 from app.application.github_ports import GithubFailure
 from app.application.use_cases.sync_commit_statuses import sync_commit_statuses
 from app.domain.commit_status import commit_status_for
@@ -58,6 +61,7 @@ class _Store:
     targets: list[CommitStatusTarget]
     posted: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     failures: list[tuple[uuid.UUID, float]] = field(default_factory=list)
+    parked: list[uuid.UUID] = field(default_factory=list)
 
     async def due(self, *, limit: int) -> list[CommitStatusTarget]:
         return self.targets[:limit]
@@ -69,6 +73,9 @@ class _Store:
         self, review_id: uuid.UUID, *, retry_after_s: float
     ) -> None:
         self.failures.append((review_id, retry_after_s))
+
+    async def park(self, review_id: uuid.UUID) -> None:
+        self.parked.append(review_id)
 
 
 @dataclass
@@ -191,4 +198,40 @@ async def test_one_failed_target_does_not_stop_the_batch() -> None:
     await sync_commit_statuses(store, _Partial(), context=CONTEXT, report_base_url="")
 
     assert store.posted == [(healthy.review_id, "success")]
-    assert [item[0] for item in store.failures] == [failing.review_id]
+    assert store.parked == [failing.review_id]
+    assert store.failures == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GithubFailure("VCS_ACCESS_DENIED", retryable=False),
+        GithubFailure("DIFF_UNTRUSTWORTHY", retryable=False),
+    ],
+)
+async def test_permanent_failure_parks_the_cycle_without_retry(
+    failure: GithubFailure,
+) -> None:
+    target = _target()
+    store = _Store([target])
+
+    await sync_commit_statuses(
+        store, _Github(fail=failure), context=CONTEXT, report_base_url=""
+    )
+
+    assert store.parked == [target.review_id]
+    assert store.failures == []
+
+
+async def test_retryable_failure_parks_once_attempts_are_exhausted() -> None:
+    last, earlier = (
+        _target(failed_attempts=MAX_FAILED_ATTEMPTS - 1),
+        _target(failed_attempts=MAX_FAILED_ATTEMPTS - 2),
+    )
+    store = _Store([last, earlier])
+    github = _Github(fail=GithubFailure("VCS_UNAVAILABLE", retryable=True))
+
+    await sync_commit_statuses(store, github, context=CONTEXT, report_base_url="")
+
+    assert store.parked == [last.review_id]
+    assert [item[0] for item in store.failures] == [earlier.review_id]

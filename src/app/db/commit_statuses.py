@@ -8,7 +8,10 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from app.application.commit_status_ports import CommitStatusTarget
+from app.application.commit_status_ports import (
+    MAX_FAILED_ATTEMPTS,
+    CommitStatusTarget,
+)
 from app.db.commit_status_models import CommitStatus
 from app.db.models import ChunkResult, Finding, Repository, ReviewJob
 
@@ -60,6 +63,8 @@ class PostgresCommitStatusStore:
                     CommitStatus.retry_at.is_(None),
                     CommitStatus.retry_at <= func.clock_timestamp(),
                 ),
+                # Parked cycles (permanent rejection or exhausted retries) stay out.
+                func.coalesce(CommitStatus.failed_attempts, 0) < MAX_FAILED_ATTEMPTS,
                 # A later cycle on the same head owns the status context.
                 ~exists().where(
                     newer.change_request_id == ReviewJob.change_request_id,
@@ -99,5 +104,17 @@ class PostgresCommitStatusStore:
                         "retry_at": retry_at,
                         "updated_at": func.clock_timestamp(),
                     },
+                )
+            )
+
+    async def park(self, review_id: UUID) -> None:
+        values = {"failed_attempts": MAX_FAILED_ATTEMPTS, "retry_at": None}
+        async with self._sessions.begin() as session:
+            await session.execute(
+                insert(CommitStatus)
+                .values(review_job_id=review_id, **values)
+                .on_conflict_do_update(
+                    index_elements=[CommitStatus.review_job_id],
+                    set_={**values, "updated_at": func.clock_timestamp()},
                 )
             )

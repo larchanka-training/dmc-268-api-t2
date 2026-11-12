@@ -8,6 +8,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from test_publications_postgres import HEAD, seed_review
 
+from app.application.commit_status_ports import MAX_FAILED_ATTEMPTS
 from app.db import commit_status_models  # noqa: F401 -- table for create_all
 from app.db.commit_status_models import CommitStatus
 from app.db.commit_statuses import PostgresCommitStatusStore
@@ -153,6 +154,54 @@ async def test_failure_backs_off_and_counts_attempts(
             )
         ).one()
     assert tuple(row) == (0, None)
+
+
+async def test_parked_cycle_is_never_selected_again(
+    publication_engine: AsyncEngine, payload_data: dict[str, Any]
+) -> None:
+    review_id, _ = await seed_review(publication_engine, payload_data)
+    store = _store(publication_engine)
+    await store.record_failure(review_id, retry_after_s=0)
+
+    await store.park(review_id)
+
+    assert await store.due(limit=10) == []
+    async with publication_engine.connect() as connection:
+        row = (
+            await connection.execute(
+                select(CommitStatus.failed_attempts, CommitStatus.retry_at).where(
+                    CommitStatus.review_job_id == review_id
+                )
+            )
+        ).one()
+    assert tuple(row) == (MAX_FAILED_ATTEMPTS, None)
+
+
+async def test_park_without_prior_failure_creates_parked_row(
+    publication_engine: AsyncEngine, payload_data: dict[str, Any]
+) -> None:
+    review_id, _ = await seed_review(publication_engine, payload_data)
+    store = _store(publication_engine)
+
+    await store.park(review_id)
+
+    assert await store.due(limit=10) == []
+
+
+async def test_exhausted_attempts_are_not_selected_after_retry_at(
+    publication_engine: AsyncEngine, payload_data: dict[str, Any]
+) -> None:
+    review_id, _ = await seed_review(publication_engine, payload_data)
+    async with publication_engine.begin() as connection:
+        await connection.execute(
+            insert(CommitStatus).values(
+                review_job_id=review_id,
+                failed_attempts=MAX_FAILED_ATTEMPTS,
+                retry_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+
+    assert await _store(publication_engine).due(limit=10) == []
 
 
 async def test_cycles_older_than_the_window_are_not_backfilled(

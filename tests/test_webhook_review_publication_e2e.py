@@ -223,7 +223,7 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
         assert request.url.host == "api.github.com"
         if request.method == "GET" and request.url.path.endswith("/pulls/7"):
             return httpx.Response(200, json=scenario.pull)
-        if request.method == "POST":
+        if request.method == "POST" and "/statuses/" not in request.url.path:
             assert request.url.path == "/repos/team/settings/pulls/7/reviews"
         return remote.respond(request)
 
@@ -258,6 +258,10 @@ async def test_signed_receipt_reaches_one_published_review_and_authenticated_sse
     )
     assert replay_processed
     assert len(remote.posts) == 1
+    # The critical SQL injection fails the check once; replay does not repeat it.
+    assert [(sha, body["state"]) for sha, body in remote.statuses] == [
+        (scenario.head, "failure")
+    ]
     assert remote.posts[0]["event"] == "COMMENT"
     assert remote.posts[0]["commit_id"] == scenario.head
     assert fingerprint in remote.posts[0]["comments"][0]["body"]

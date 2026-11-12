@@ -401,13 +401,14 @@ POSTGRES__DB=dmc
 | `AUTH__JWT_SECRET` | `AUTH__JWT_SECRET` | Секрет сессии, не короче 32 байт |
 | `AUTH__CREDENTIAL_KEY` | `AUTH__CREDENTIAL_KEY` | Ключ Fernet для сохранённых учётных данных |
 
-Три незасекреченных значения — GitHub Actions Variables с теми же именами, что у контейнера. Пустое значение не попадает в env-файл, и деплой из-за этого не падает.
+Четыре незасекреченных значения — GitHub Actions Variables с теми же именами, что у контейнера. Пустое значение не попадает в env-файл, и деплой из-за этого не падает.
 
 | Variable | Переменная контейнера | Назначение |
 |---|---|---|
 | `AUTH__GITHUB_CLIENT_ID` | `AUTH__GITHUB_CLIENT_ID` | Client id GitHub OAuth App |
 | `AUTH__GITHUB_REDIRECT_URI` | `AUTH__GITHUB_REDIRECT_URI` | `https://dmc268-t2.ddns.net/api/v1/auth/github/callback` |
 | `AUTH__FRONTEND_ORIGINS` | `AUTH__FRONTEND_ORIGINS` | JSON-список, `["https://dmc268-t2.ddns.net"]` |
+| `FRONTEND__BASE_URL` | `FRONTEND__BASE_URL` | `https://dmc268-t2.ddns.net`; только `publication-worker`, ссылка «Details» commit status |
 
 OAuth/browser-поля получает только `api`; единственное исключение —
 `AUTH__CREDENTIAL_KEY` для recovery, описанное ниже. Вход остаётся недоступен,

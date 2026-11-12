@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.db.base import Base
 from app.db import models as db_models  # noqa: F401
 from app.db import publication_models as publication_models  # noqa: F401
+from app.db import commit_status_models as commit_status_models  # noqa: F401
 
 config = context.config
 

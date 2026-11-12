@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import FrozenInstanceError, replace
 from typing import Any
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from app.application import github_ports
+from app.core.circuit_breaker import CircuitBreaker
 from app.vcs import github as github_module
 from app.vcs.github import GithubClient, GithubFailure, GithubRequest
 
@@ -18,6 +20,7 @@ MERGE_BASE = "c" * 40
 _TWO_READS = 2
 _MINUTE_SECONDS = 60
 _HOUR_SECONDS = 3600
+_BREAKER_RESET_SECONDS = 30
 
 
 def test_github_gateway_contract_lives_in_application_layer() -> None:
@@ -508,3 +511,143 @@ async def test_fetch_accepts_empty_diff_for_identical_trees() -> None:
         snapshot = await GithubClient(http).fetch(_request())
 
     assert snapshot.raw_diff == ""
+
+
+async def test_open_breaker_fails_fast_without_provider_requests() -> None:
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(502)
+
+    breaker = CircuitBreaker(failure_threshold=2, reset_timeout_s=30)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = GithubClient(http, breaker=breaker).with_authority(_allow)
+        for _ in range(2):
+            with pytest.raises(GithubFailure, match="VCS_UNAVAILABLE"):
+                await client.check_pull(_request())
+        with pytest.raises(GithubFailure) as rejected:
+            await client.check_pull(_request())
+
+    assert calls == _TWO_READS
+    assert rejected.value.reason_code == "VCS_UNAVAILABLE"
+    assert rejected.value.retryable is True
+    assert rejected.value.retry_after == _BREAKER_RESET_SECONDS
+
+
+async def test_provider_rejections_do_not_open_the_breaker() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    breaker = CircuitBreaker(failure_threshold=1, reset_timeout_s=30)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(GithubFailure, match="VCS_ACCESS_DENIED"):
+            await GithubClient(http, breaker=breaker).check_pull(_request())
+
+    assert breaker.state == "closed"
+
+
+async def _allow() -> None:
+    return None
+
+
+async def test_commit_status_posts_state_for_the_pinned_head() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(201, json={"id": 1, "state": "pending"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        await GithubClient(http).create_commit_status(
+            "team",
+            "project",
+            HEAD,
+            state="pending",
+            description="AI-ревью выполняется",
+            context="dmc268/ai-review",
+            target_url="https://ui.example/reviews/1",
+        )
+
+    assert seen == [
+        (
+            "POST",
+            f"/repos/team/project/statuses/{HEAD}",
+            {
+                "state": "pending",
+                "description": "AI-ревью выполняется",
+                "context": "dmc268/ai-review",
+                "target_url": "https://ui.example/reviews/1",
+            },
+        )
+    ]
+
+
+async def test_commit_status_omits_absent_target_url() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(201, json={"id": 1})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        await GithubClient(http).create_commit_status(
+            "team",
+            "project",
+            HEAD,
+            state="success",
+            description="ok",
+            context="dmc268/ai-review",
+            target_url=None,
+        )
+
+    assert "target_url" not in bodies[0]
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "retryable"),
+    [(502, "VCS_UNAVAILABLE", True), (404, "VCS_ACCESS_DENIED", False)],
+)
+async def test_commit_status_maps_provider_failures(
+    status: int, reason: str, retryable: bool
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"message": "nope"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(GithubFailure) as failure:
+            await GithubClient(http).create_commit_status(
+                "team",
+                "project",
+                HEAD,
+                state="failure",
+                description="x",
+                context="dmc268/ai-review",
+                target_url=None,
+            )
+
+    assert (failure.value.reason_code, failure.value.retryable) == (reason, retryable)
+
+
+@pytest.mark.parametrize(
+    ("owner", "sha", "state"),
+    [("../x", HEAD, "pending"), ("team", "not-a-sha", "pending"), ("team", HEAD, "ok")],
+)
+async def test_commit_status_rejects_invalid_input_before_http(
+    owner: str, sha: str, state: str
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(GithubFailure, match="DIFF_UNTRUSTWORTHY"):
+            await GithubClient(http).create_commit_status(
+                owner,
+                "project",
+                sha,
+                state=state,
+                description="x",
+                context="dmc268/ai-review",
+                target_url=None,
+            )

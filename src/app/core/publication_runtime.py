@@ -7,6 +7,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.publication_handler import PublicationTaskHandler
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings
 from app.db.publications import PostgresPublicationStore
 from app.vcs.github import GithubClient
@@ -36,6 +37,7 @@ async def github_publisher_connection(
     settings: Settings,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> AsyncIterator[GithubClient]:
     validate_publication_settings(settings)
     token = settings.github.write_token.get_secret_value()
@@ -50,7 +52,7 @@ async def github_publisher_connection(
         follow_redirects=False,
         transport=transport,
     ) as client:
-        yield GithubClient(client)
+        yield GithubClient(client, breaker=breaker)
 
 
 @asynccontextmanager

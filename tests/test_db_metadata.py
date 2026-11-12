@@ -4,6 +4,7 @@ from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import configure_mappers
 
 from app.db import (
+    commit_status_models,  # noqa: F401 - register commit status metadata
     models,
     publication_models,  # noqa: F401 - register publication metadata
 )
@@ -47,6 +48,7 @@ def test_expected_core_tables_are_registered() -> None:
         "quota_usage",
         "webhook_receipt",
         "idempotency_record",
+        "commit_status",
     }
     assert set(Base.metadata.tables) == expected
 

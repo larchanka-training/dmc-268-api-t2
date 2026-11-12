@@ -15,24 +15,44 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from app.adapters.redis_queue import RedisQueue
+    from app.core.circuit_breaker import CircuitBreaker
     from app.core.config import Settings
 
 
-async def run_once(
+async def run_once(  # noqa: PLR0913 -- explicit runtime inputs
     sessions: async_sessionmaker[AsyncSession],
     queue: RedisQueue,
     *,
     settings: Settings,
     owner: str,
     transport: httpx.AsyncBaseTransport | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> bool:
     from app.adapters.publication_dispatcher import (  # noqa: PLC0415
         PostgresPublicationDispatcher,
     )
     from app.adapters.review_worker import PostgresReviewWorker  # noqa: PLC0415
     from app.application.ports import DurableTaskOutcome  # noqa: PLC0415
-    from app.core.publication_runtime import make_publication_handler  # noqa: PLC0415
+    from app.application.use_cases.sync_commit_statuses import (  # noqa: PLC0415
+        sync_commit_statuses,
+    )
+    from app.core.publication_runtime import (  # noqa: PLC0415
+        github_publisher_connection,
+        make_publication_handler,
+    )
+    from app.db.commit_statuses import PostgresCommitStatusStore  # noqa: PLC0415
 
+    # Statuses use the same write identity; their own failures back off per review.
+    async with github_publisher_connection(
+        settings, transport=transport, breaker=breaker
+    ) as github:
+        await sync_commit_statuses(
+            PostgresCommitStatusStore(sessions),
+            github,
+            context=settings.github.status_context,
+            report_base_url=settings.frontend.base_url,
+        )
+    # No breaker here: a fast-failed pre-POST read would park the review UNKNOWN.
     async with make_publication_handler(
         settings, sessions, DurableTaskOutcome.COMPLETED, transport=transport
     ) as handler:
@@ -62,6 +82,7 @@ async def run(
     from app.application.publication_ports import (  # noqa: PLC0415
         PublicationAuthorityError,
     )
+    from app.core.circuit_breaker import CircuitBreaker  # noqa: PLC0415
     from app.core.config import get_settings  # noqa: PLC0415
     from app.core.logging_config import configure_logging  # noqa: PLC0415
 
@@ -84,6 +105,8 @@ async def run(
             retry=Retry(NoBackoff(), 0),
         ) as client:
             owner = f"publication-{uuid.uuid4()}"
+            # One breaker per process: it must outlive each pass's HTTP client.
+            breaker = CircuitBreaker()
             while not stopping.is_set():
                 try:
                     acknowledged = await run_once(
@@ -92,6 +115,7 @@ async def run(
                         settings=settings,
                         owner=owner,
                         transport=transport,
+                        breaker=breaker,
                     )
                 except (
                     PublicationRecoveryRequiredError,

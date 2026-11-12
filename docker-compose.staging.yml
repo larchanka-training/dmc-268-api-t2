@@ -157,6 +157,8 @@ services:
       SENTRY__DSN: ${SENTRY__DSN:-}
       GITHUB__WRITE_TOKEN: ${GITHUB__WRITE_TOKEN:-}
       GITHUB__BOT_USER_ID: ${GITHUB__BOT_USER_ID:-}
+      # Commit status report link (/reviews/<id>); empty omits the link.
+      FRONTEND__BASE_URL: ${FRONTEND__BASE_URL:-}
     depends_on:
       db:
         condition: service_healthy

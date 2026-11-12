@@ -13,6 +13,7 @@ from app.application.analysis_authority import (
     current_analysis_authority,
 )
 from app.application.ports import LeaseLostError, QueueTaskEnvelope, TaskLeaseSnapshot
+from app.core.circuit_breaker import BreakerRegistry
 from app.db.analysis_authority import lock_analysis
 from app.db.llm_accounting import PostgresReviewRunBudget
 from app.domain.frozen_configuration import RepositoryInstructions
@@ -48,6 +49,8 @@ class FrozenAnalysisExecutionFactory:
         self._profiles = MappingProxyType(dict(profiles))
         self._http = http
         self._reader = FrozenConfigurationReader(factory, prompt_root, self._profiles)
+        # Per-review gateways are rebuilt; provider circuits span this process.
+        self._breakers = BreakerRegistry()
 
     async def create(
         self,
@@ -94,7 +97,9 @@ class FrozenAnalysisExecutionFactory:
             self._factory, task=task, lease=lease, analysis_attempt=analysis_attempt
         )
         service = ReviewService(
-            build_frozen_gateway(config, self._profiles, self._http),
+            build_frozen_gateway(
+                config, self._profiles, self._http, breakers=self._breakers
+            ),
             prompts,
             FindingValidator(),
             counter,

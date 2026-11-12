@@ -218,9 +218,14 @@ class FakeGithub:
         # Head the fake reports for records it creates; tests moving the PR
         # head (new push) set this to the new SHA.
         self.head = HEAD
+        self.statuses: list[tuple[str, dict[str, Any]]] = []
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         self.requests.append((request.method, request.url.path))
+        if request.method == "POST" and "/statuses/" in request.url.path:
+            sha = request.url.path.rsplit("/", 1)[-1]
+            self.statuses.append((sha, json.loads(request.content)))
+            return httpx.Response(201, json={"id": len(self.statuses)})
         if request.method == "POST":
             payload = json.loads(request.content)
             self.posts.append(payload)

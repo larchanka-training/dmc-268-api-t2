@@ -16,9 +16,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from test_github_publisher_postgres import FakeGithub
 from test_publication_dispatcher import publication_command
+from test_publications_postgres import HEAD
 
 from app.adapters.redis_queue import RedisQueue
-from app.core.config import Github, Settings
+from app.core.config import Frontend, Github, Settings
+from app.db import commit_status_models  # noqa: F401 -- table for create_all
 from app.db.models import ReviewJob
 from app.db.publications import PostgresPublicationStore
 from app.publication_worker import run_once
@@ -61,6 +63,42 @@ async def test_runtime_publishes_persisted_command_and_acks_without_llm_configur
     pending = await redis_client.xpending(f"{stream_prefix}:publish", "review-workers")
     assert pending["pending"] == 0
     assert await redis_client.xlen(f"{stream_prefix}:analyze") == 0
+
+
+async def test_runtime_sets_commit_status_with_report_link(
+    publication_engine: AsyncEngine,
+    payload_data: dict[str, Any],
+    redis_client: Redis,
+    stream_prefix: str,
+) -> None:
+    command = await publication_command(publication_engine, payload_data)
+    provider = FakeGithub()
+    settings = Settings(
+        github=Github(
+            write_token=SecretStr("test-publication-write"), bot_user_id="9002"
+        ),
+        frontend=Frontend(base_url="https://ui.example"),
+    )
+
+    await run_once(
+        async_sessionmaker(publication_engine),
+        RedisQueue(redis_client, stream_prefix=stream_prefix),
+        settings=settings,
+        owner="publisher-runtime",
+        transport=httpx.MockTransport(provider.respond),
+    )
+
+    assert provider.statuses == [
+        (
+            HEAD,
+            {
+                "state": "success",
+                "description": "Критических замечаний нет",
+                "context": "dmc268/ai-review",
+                "target_url": f"https://ui.example/reviews/{command.review_id}",
+            },
+        )
+    ]
 
 
 async def test_continuous_runtime_parks_unknown_without_retry_or_ack(

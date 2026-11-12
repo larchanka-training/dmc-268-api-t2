@@ -29,7 +29,7 @@ async def test_downgrade_refuses_permanent_receipt_job_binding(
     assert "Cannot downgrade with retained automatic review bindings" in output
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0021"
+        == "0022"
     )
     assert (
         await database.connection.fetchval(
@@ -75,7 +75,8 @@ async def test_binding_downgrade_cannot_race_past_a_committing_writer(
 ) -> None:
     database = migration_database
     _, job = await _seed_legacy(database)
-    database.migrate("upgrade", "head")
+    # Race only the 0021 binding guard, not later revisions' own locks.
+    database.migrate("upgrade", "0021")
     identifier = uuid4()
     await database.connection.execute(
         "INSERT INTO webhook_receipt(id,provider_name,delivery_id,received_at) "

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from app.application.analysis_authority import current_analysis_authority
 from app.application.analysis_ports import AccountingIdentityError, ReviewRunBudgetPort
 from app.application.ports import LeaseLostError
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.metrics import llm_attempt
 from app.llm.budget import RunBudget
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
@@ -59,6 +60,8 @@ class ProviderPool:
     endpoints: list[Endpoint]
     timeout_s: float
     profile_ref: str | None = None
+    # Process-wide: outlives this per-review gateway, unlike endpoint cooldowns.
+    breaker: CircuitBreaker | None = None
     _next: int = field(default=0, init=False)
 
     def next_available(self, now: float) -> Endpoint | None:
@@ -111,6 +114,10 @@ class LLMGateway:
             ):
                 endpoint = pool.next_available(self._clock())
                 if endpoint is None:
+                    break
+                if pool.breaker is not None and not pool.breaker.allow():
+                    logger.warning("llm_provider_circuit_open", provider=pool.name)
+                    saw_retryable = True
                     break
                 authority = current_analysis_authority.get()
                 if authority is not None:
@@ -202,6 +209,7 @@ class LLMGateway:
                         raise
                 except RateLimitedError as exc:
                     _log_failure(pool.name, attempts, exc)
+                    _record(pool, failed=True)
                     endpoint.cooldown_until = self._clock() + max(
                         exc.retry_after or 0.0, self._backoff(attempts)
                     )
@@ -210,12 +218,14 @@ class LLMGateway:
                     continue
                 except AuthError as exc:
                     _log_failure(pool.name, attempts, exc)
+                    _record(pool, failed=False)
                     endpoint.disabled = True
                     last_error = exc
                     saw_retryable |= exc.retryable
                     continue
                 except TransientProviderError as exc:
                     _log_failure(pool.name, attempts, exc)
+                    _record(pool, failed=True)
                     last_error = exc
                     saw_retryable = True
                     transient_failures += 1
@@ -224,7 +234,9 @@ class LLMGateway:
                     continue
                 except LLMGatewayError as exc:  # not retried: the caller decides
                     _log_failure(pool.name, attempts, exc)
+                    _record(pool, failed=False)
                     raise
+                _record(pool, failed=False)
                 if isinstance(budget, RunBudget):
                     assert reservation is not None
                     budget.settle(
@@ -268,6 +280,16 @@ class LLMGateway:
     def _backoff(self, attempt: int) -> float:
         delay = min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2.0**attempt)
         return delay * self._rng.uniform(0.5, 1.0)
+
+
+def _record(pool: ProviderPool, *, failed: bool) -> None:
+    """Only overload signals count; any provider answer proves availability."""
+    if pool.breaker is None:
+        return
+    if failed:
+        pool.breaker.record_failure()
+    else:
+        pool.breaker.record_success()
 
 
 def _log_failure(provider: str, attempt: int, error: LLMGatewayError) -> None:

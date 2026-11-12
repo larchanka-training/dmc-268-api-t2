@@ -26,6 +26,7 @@ from app.application.review_start_ports import (
 )
 from app.application.use_cases.start_review import compute_config_digest
 from app.context.snapshot import valid_snapshot
+from app.core.circuit_breaker import BreakerRegistry
 from app.db.models import RepositorySettings, ReviewJob
 from app.domain.frozen_configuration import (
     Digest,
@@ -509,6 +510,8 @@ def build_frozen_gateway(
     config: ExecutionConfiguration,
     profiles: Mapping[str, RuntimeProfile],
     http: httpx.AsyncClient,
+    *,
+    breakers: BreakerRegistry | None = None,
 ) -> LLMGateway:
     """Use saved ordered routes and limits; transport cannot alter identities."""
     pools = []
@@ -551,6 +554,9 @@ def build_frozen_gateway(
                 ],
                 timeout_s=config.service_settings.request_timeout_s,
                 profile_ref=route.profile_ref,
+                breaker=(
+                    breakers.get(route.profile_ref) if breakers is not None else None
+                ),
             )
         )
     return LLMGateway(pools)

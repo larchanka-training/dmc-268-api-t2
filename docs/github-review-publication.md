@@ -202,6 +202,49 @@ The old pinned-#29 event-writer patch has been removed: its changes now live in
 these modules and are checked against the merged dependency, not a scratch-only
 copy. The UI nginx companion PR #24 was merged on 14 October.
 
+## Commit status and merge gate
+
+Each publication worker pass first mirrors recent review cycles (created within
+24 hours) to a GitHub commit status on the reviewed head, using the same write
+credential. The context is `GITHUB__STATUS_CONTEXT` (default `dmc268/ai-review`);
+`target_url` is `FRONTEND__BASE_URL/reviews/<review_id>` and is omitted when the
+base URL is empty.
+
+| Review status | Commit status |
+| --- | --- |
+| `QUEUED` … `LLM_PROCESSING` | `pending` |
+| `COMPLETED`/`PARTIAL` with a `critical` finding | `failure` |
+| `COMPLETED`/`PARTIAL` without, or `SKIPPED` | `success` |
+| `FAILED` | `error` |
+
+The status depends only on the retained analysis, not on the publication
+outcome. `commit_status` keeps the last state GitHub accepted; a final state is
+never re-sent, and only the newest cycle for a head owns the context. A failed
+POST is retried on a later pass after 5s·2ⁿ (cap 300s, jitter), never earlier
+than the provider `Retry-After`. Statuses are idempotent writes, unlike reviews.
+
+To block merges, mark the context as a required status check in the target
+branch protection rule. The bot token needs `Commit statuses: write` (fine-grained)
+or `repo:status` (classic) in addition to pull request write access. The Checks
+API is not used: it requires a GitHub App installation token.
+
+## Retry and circuit breaking
+
+- Webhook intake: duplicate `X-GitHub-Delivery` values are accepted once
+  (`uq_webhook_receipt_provider_delivery`) and answered `202` without new work.
+  A retryable capture failure waits 30s·2ⁿ⁻¹ (cap 600s), at least `Retry-After`.
+- Analysis: a retryable LLM/VCS failure is deferred 2s·2ⁿ⁻¹ per attempt (cap
+  20s) within the analysis deadline and attempt limit.
+- GitHub: the webhook and analysis workers, and the publication worker's
+  commit status sync, each keep one in-process circuit breaker (5 consecutive
+  5xx/429/transport failures open it for 30s, then one probe). While open, calls
+  fail fast as retryable `VCS_UNAVAILABLE` with `retry_after`. Review publication
+  is deliberately not guarded: a fast-failed pre-POST read would park the cycle
+  in `UNKNOWN`; its ambiguity rules above are unchanged.
+- LLM: each provider profile has a process-wide breaker that outlives per-review
+  gateways. An open primary is skipped in favour of the fallback; if every
+  provider is open the call fails fast as retryable `LLMUnavailableError`.
+
 ## SSE contract
 
 `GET /api/v1/reviews/{review_id}/events/stream` is additive. The existing

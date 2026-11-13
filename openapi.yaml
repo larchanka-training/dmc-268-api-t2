@@ -336,6 +336,105 @@ paths:
         '409':
           $ref: '#/components/responses/SettingsVersionConflict'
         '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/repositories/{id}/rule-simulations:
+    post:
+      tags: [repositories]
+      operationId: createRuleSimulation
+      summary: Simulate a Rule Playground draft
+      description: >-
+        Requires local repository access and live personal GitHub admin permission.
+        A provided executor can return HTTP 200 with a Code or Diff result.
+        The executor is disabled by default, so a valid request in the normal
+        configuration returns canonical 503 SERVICE_UNAVAILABLE; dependency
+        failures can also return 503. Staging execution is not enabled.
+        Idempotent replay and durable admission are not implemented.
+      security: [{ cookieAuth: [], csrfHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryId'
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string }
+          description: Exactly one raw Origin header matching the configured allowlist; missing, repeated or denied values return 403.
+        - name: X-CSRF-Token
+          in: header
+          required: true
+          schema: { type: string }
+          description: Exactly one raw X-CSRF-Token header matching the active session token from /api/v1/me; failure returns 403.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            allOf:
+              - { pattern: '\S' }
+              - { pattern: '^[^,]*$' }
+          description: >-
+            Preliminary transport gate only: exactly one raw value, nonblank
+            after a whitespace check, with no comma-combined form. Invalid input
+            returns 422. No value normalization, UUID format, freshness, HMAC,
+            persistence or idempotent replay is implemented.
+      requestBody:
+        required: true
+        description: >-
+          Content-Type must have exactly one raw header: application/json,
+          optionally with a single charset=utf-8 or charset="utf-8" parameter.
+          Media type and charset are ASCII case-insensitive; SP/HTAB around
+          components is allowed. Missing, repeated or comma-combined headers,
+          other charsets, extra or duplicate parameters return 422.
+          Strict JSON objects with required fields and no extra properties at
+          any DTO level; values are not coerced. Malformed JSON/UTF-8 and invalid
+          DTO, paths, source, diff or rules return 422. The streamed HTTP body
+          is limited to 262144 bytes (413), regardless of Content-Length.
+          String byte limits apply to decoded UTF-8, not JSON character counts.
+          No canonical identity or duplicate-member rejection is implemented.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SimulationRequest' }
+            examples:
+              code:
+                value:
+                  input:
+                    kind: code
+                    path: src/example.py
+                    source: "print('Hello')\n"
+                  rules:
+                    format: rules-md/1
+                    markdown: "# Security\n## SEC-1: Validate input\nCheck the input.\n"
+              diff:
+                value:
+                  input:
+                    kind: diff
+                    unified_diff: "diff --git a/src/example.py b/src/example.py\n--- a/src/example.py\n+++ b/src/example.py\n@@ -1 +1 @@\n-return 1\n+return 2\n"
+                  rules:
+                    format: rules-md/1
+                    markdown: "# Style\n## STYLE-1: Explain constants\nDocument meaningful constants.\n"
+      responses:
+        '200':
+          description: Successful simulation with a provided executor
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/CodeSimulationResult'
+                  - $ref: '#/components/schemas/DiffSimulationResult'
+        '401': { $ref: '#/components/responses/AuthenticationRequired' }
+        '403': { $ref: '#/components/responses/AccessDenied' }
+        '404': { $ref: '#/components/responses/ResourceNotFound' }
+        '413':
+          description: SIMULATION_INPUT_TOO_LARGE (HTTP body exceeds 262144 bytes)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Input, transport headers or rules validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/SimulationRulesValidationError'
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /api/v1/repositories/{id}/rules-preview:
     get:
       tags: [repositories]
@@ -828,6 +927,126 @@ components:
       required: true
       schema: { type: string, minLength: 1 }
   schemas:
+    CodeSimulationResult:
+      type: object
+      additionalProperties: false
+      required: [findings, rejected_count]
+      properties:
+        findings:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/CodeFinding' }
+        rejected_count: { type: integer, minimum: 0 }
+    DiffSimulationResult:
+      type: object
+      additionalProperties: false
+      required: [findings, rejected_count]
+      properties:
+        findings:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/DiffFinding' }
+        rejected_count: { type: integer, minimum: 0 }
+    CodeFinding:
+      type: object
+      additionalProperties: false
+      required: [path, start_line, end_line, rule_ref, title, explanation, evidence]
+      properties:
+        path: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+        rule_ref: { type: string, minLength: 1, maxLength: 32 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        explanation: { type: string, minLength: 1, maxLength: 2000 }
+        evidence: { type: string, minLength: 1, maxLength: 1000 }
+    DiffFinding:
+      type: object
+      additionalProperties: false
+      required: [path, start_line, end_line, rule_ref, title, explanation, evidence, side]
+      properties:
+        path: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+        rule_ref: { type: string, minLength: 1, maxLength: 32 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        explanation: { type: string, minLength: 1, maxLength: 2000 }
+        evidence: { type: string, minLength: 1, maxLength: 1000 }
+        side: { type: string, enum: [old, new] }
+    SimulationRequest:
+      type: object
+      additionalProperties: false
+      required: [input, rules]
+      properties:
+        input:
+          oneOf:
+            - $ref: '#/components/schemas/SimulationCodeInput'
+            - $ref: '#/components/schemas/SimulationDiffInput'
+          discriminator:
+            propertyName: kind
+            mapping:
+              code: '#/components/schemas/SimulationCodeInput'
+              diff: '#/components/schemas/SimulationDiffInput'
+        rules: { $ref: '#/components/schemas/SimulationRules' }
+    SimulationCodeInput:
+      type: object
+      additionalProperties: false
+      required: [kind, path, source]
+      properties:
+        kind: { type: string, const: code }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^(?!/)(?!.:)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*[\x00-\x1f\x7f])(?!.*/$).+$'
+          x-max-utf8-bytes: 512
+          description: >-
+            Already normalized repository-relative path using slash separators;
+            no empty, dot or parent segments, drive prefix, backslash or ASCII
+            controls/DEL. Invalid paths are rejected, never rewritten or read
+            from the filesystem. At most 512 decoded UTF-8 bytes, server-enforced.
+        source:
+          type: string
+          pattern: '\S'
+          x-max-utf8-bytes: 65536
+          x-max-logical-lines: 500
+          description: >-
+            Nonblank supplied source; at most 65536 decoded UTF-8 bytes and 500
+            Python splitlines() logical lines. CRLF is one boundary and a final
+            newline adds no empty line. Both limits are enforced by the server.
+    SimulationDiffInput:
+      type: object
+      additionalProperties: false
+      required: [kind, unified_diff]
+      properties:
+        kind: { type: string, const: diff }
+        unified_diff:
+          type: string
+          pattern: '\S'
+          x-max-utf8-bytes: 131072
+          x-max-files: 50
+          x-max-changed-lines: 2000
+          description: >-
+            Nonblank valid Git unified diff with at least one parsed added or
+            deleted line. At most 131072 decoded UTF-8 bytes, 50 raw files and
+            2000 raw added plus deleted lines before policy filtering, enforced
+            by the existing server diff parser. Paths and hunk coordinates must
+            pass that parser; metadata-only and binary-only input is rejected.
+    SimulationRules:
+      type: object
+      additionalProperties: false
+      required: [format, markdown]
+      properties:
+        format: { type: string, const: rules-md/1 }
+        markdown:
+          type: string
+          x-max-utf8-bytes: 65536
+          description: >-
+            Supplied draft parsed by the existing rules-md/1 parser without
+            database instructions or implicit repository settings. At most 65536
+            decoded UTF-8 bytes and 65536 characters in selected canonical
+            instructions, enforced by the server. Must parse without diagnostics
+            and contain at least one active criterion. Rules failures return the
+            specialized safe diagnostics error; this schema does not encode the
+            Markdown grammar or these semantic limits.
     ConnectRepositoryRequest:
       type: object
       additionalProperties: false
@@ -863,7 +1082,39 @@ components:
       enum: [NOT_READY, PENDING, PUBLISHED, PARTIAL, FAILED, UNKNOWN, SKIPPED]
     ErrorCode:
       type: string
-      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, BOT_ACCESS_REQUIRED, INTEGRATION_UNHEALTHY, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, REVIEW_NOT_CANCELLABLE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE, EVENT_REPLAY_UNAVAILABLE]
+      enum: [AUTHENTICATION_REQUIRED, ACCESS_DENIED, BOT_ACCESS_REQUIRED, INTEGRATION_UNHEALTHY, RESOURCE_NOT_FOUND, SETTINGS_VERSION_CONFLICT, LEGACY_SETTINGS_UNSUPPORTED, IDEMPOTENCY_CONFLICT, PR_HEAD_MISMATCH, REVIEW_ALREADY_ACTIVE, REVIEW_NOT_CANCELLABLE, PUBLICATION_RETRY_NOT_ALLOWED, DIFF_EXPIRED, VALIDATION_FAILED, SIMULATION_INPUT_TOO_LARGE, QUOTA_EXCEEDED, SERVICE_UNAVAILABLE, UPSTREAM_RATE_LIMITED, UPSTREAM_UNAVAILABLE, EVENT_REPLAY_UNAVAILABLE]
+    SimulationRulesValidationError:
+      type: object
+      additionalProperties: false
+      description: |
+        Rules-only validation error. Diagnostic components do not document the
+        simulation API success or admission contract, which remains pending.
+      required: [code, message, request_id, retryable, retry_after, diagnostics, diagnostics_truncated]
+      properties:
+        code: { const: VALIDATION_FAILED }
+        message: { const: 'Request is invalid.' }
+        request_id: { type: string }
+        retryable: { const: false }
+        retry_after: { const: null }
+        diagnostics:
+          type: array
+          maxItems: 20
+          description: Ordered safe diagnostics; serialized JSON is at most 8192 UTF-8 bytes, enforced by the server.
+          items: { $ref: '#/components/schemas/SimulationRuleDiagnostic' }
+        diagnostics_truncated: { type: boolean }
+    SimulationRuleDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, line, message]
+      properties:
+        code:
+          type: string
+          enum: [RULES_DUPLICATE_REF, RULES_INVALID_SECTION, RULES_INVALID_SEVERITY, RULES_INVALID_IGNORE, RULES_UNCLOSED_FENCE, RULES_TOO_LARGE, RULES_CANONICAL_LIMIT, RULES_NO_ACTIVE_CRITERIA, RULES_INVALID]
+        line: { type: [integer, 'null'], minimum: 1 }
+        message:
+          type: string
+          maxLength: 160
+          description: Static public text; never contains rules, source or internal diagnostics.
     Error:
       type: object
       additionalProperties: false

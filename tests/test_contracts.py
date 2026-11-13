@@ -696,6 +696,7 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         ("/api/v1/repositories/{id}/settings", "get"),
         ("/api/v1/repositories/{id}/settings", "put"),
         ("/api/v1/repositories/{id}/rules-preview", "get"),
+        ("/api/v1/repositories/{id}/rule-simulations", "post"),
         ("/api/v1/repositories/{id}/pull-requests/{number}/reviews", "post"),
         ("/api/v1/repositories/{id}/reviews", "get"),
         ("/api/v1/repositories/{id}/analytics", "get"),
@@ -770,3 +771,146 @@ def test_openapi_is_valid_and_contains_exact_required_route_surface() -> None:
         "REVIEW_NOT_CANCELLABLE"
         in document["components"]["schemas"]["ErrorCode"]["enum"]
     )
+
+
+def test_simulation_rule_diagnostic_component_is_closed_and_allowlisted() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    schema = api["components"]["schemas"]["SimulationRuleDiagnostic"]
+    Draft202012Validator.check_schema(schema)
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]["code"]["enum"]) == {
+        "RULES_DUPLICATE_REF",
+        "RULES_INVALID_SECTION",
+        "RULES_INVALID_SEVERITY",
+        "RULES_INVALID_IGNORE",
+        "RULES_UNCLOSED_FENCE",
+        "RULES_TOO_LARGE",
+        "RULES_CANONICAL_LIMIT",
+        "RULES_NO_ACTIVE_CRITERIA",
+        "RULES_INVALID",
+    }
+    validator = _api_validator("SimulationRuleDiagnostic")
+    valid = {
+        "code": "RULES_DUPLICATE_REF",
+        "line": 7,
+        "message": "Rule references must be unique.",
+    }
+    validator.validate(valid)
+    validator.validate(valid | {"line": None})
+    for invalid in (
+        valid | {"code": "private-unknown"},
+        valid | {"line": 0},
+        valid | {"line": -1},
+        valid | {"line": True},
+        valid | {"line": "7"},
+        valid | {"message": "x" * 161},
+        valid | {"raw": "private-secret"},
+        {"code": "RULES_INVALID", "message": "Rules could not be validated."},
+    ):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+
+def test_simulation_rules_error_component_preserves_closed_canonical_error() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    schema = api["components"]["schemas"]["SimulationRulesValidationError"]
+    Draft202012Validator.check_schema(schema)
+    assert schema["additionalProperties"] is False
+    canonical = {
+        "code": "VALIDATION_FAILED",
+        "message": "Request is invalid.",
+        "request_id": "req_example",
+        "retryable": False,
+        "retry_after": None,
+    }
+    diagnostics: list[dict[str, object]] = [
+        {
+            "code": "RULES_DUPLICATE_REF",
+            "line": 7,
+            "message": "Rule references must be unique.",
+        }
+    ]
+    specialized = canonical | {
+        "diagnostics": diagnostics,
+        "diagnostics_truncated": False,
+    }
+    validator = _api_validator("SimulationRulesValidationError")
+    validator.validate(specialized)
+    for invalid in (
+        canonical,
+        specialized | {"raw": "private-secret"},
+        specialized | {"diagnostics": diagnostics * 21},
+        specialized | {"retryable": True},
+        specialized | {"retry_after": 1},
+        specialized | {"code": "SERVICE_UNAVAILABLE"},
+        specialized | {"message": "private-secret"},
+    ):
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+    _api_validator("Error").validate(canonical)
+    with pytest.raises(ValidationError):
+        _api_validator("Error").validate(specialized)
+
+
+def test_simulation_operation_documents_success_and_closed_result_schemas() -> None:
+    api = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+    path = "/api/v1/repositories/{id}/rule-simulations"
+    operation = api["paths"][path]["post"]
+    assert operation["operationId"] == "createRuleSimulation"
+    assert set(api["paths"][path]) == {"post"}
+    assert set(operation["responses"]) == {
+        "200",
+        "401",
+        "403",
+        "404",
+        "413",
+        "422",
+        "503",
+    }
+    success = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert success == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/CodeSimulationResult"},
+            {"$ref": "#/components/schemas/DiffSimulationResult"},
+        ]
+    }
+    schemas = api["components"]["schemas"]
+    finding_fields = {
+        "path": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "rule_ref": {"type": "string", "minLength": 1, "maxLength": 32},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "explanation": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 1000},
+    }
+    for kind in ("Code", "Diff"):
+        result = schemas[f"{kind}SimulationResult"]
+        assert result["type"] == "object"
+        assert result["additionalProperties"] is False
+        assert set(result["required"]) == {"findings", "rejected_count"}
+        assert result["properties"] == {
+            "findings": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {"$ref": f"#/components/schemas/{kind}Finding"},
+            },
+            "rejected_count": {"type": "integer", "minimum": 0},
+        }
+        finding = schemas[f"{kind}Finding"]
+        expected = finding_fields | (
+            {"side": {"type": "string", "enum": ["old", "new"]}}
+            if kind == "Diff"
+            else {}
+        )
+        assert finding["type"] == "object"
+        assert finding["additionalProperties"] is False
+        assert set(finding["required"]) == set(expected)
+        assert finding["properties"] == expected
+    description = operation["description"]
+    assert "provided executor" in description
+    assert "disabled by default" in description
+    assert "503 SERVICE_UNAVAILABLE" in description
+    assert "Staging execution is not enabled" in description
+    assert "Idempotent replay and durable admission are not implemented" in description
+    assert not any(p.startswith(path + "/") for p in api["paths"])

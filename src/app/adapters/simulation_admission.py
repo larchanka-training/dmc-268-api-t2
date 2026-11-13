@@ -352,11 +352,13 @@ class RedisSimulationAdmission:
         if self._hmac_secret is None or self._hmac_config_id is None:
             return "UNAVAILABLE"
         try:
-            response = await self._client.eval(
+            response: object = await self._client.eval(
                 _RELEASE, 1, self._state_key, owner_token, self._hmac_config_id
             )
         except RedisError:
             return "UNAVAILABLE"
-        if response == "INVALID_STATE":
-            return "INVALID_STATE"
-        return "RELEASED" if response == "RELEASED" else "NOT_OWNER"
+        match response:
+            case "RELEASED" | "NOT_OWNER" | "INVALID_STATE" as status:
+                return status
+            case _:
+                return "UNAVAILABLE"

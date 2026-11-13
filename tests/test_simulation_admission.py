@@ -5,6 +5,8 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -26,6 +28,8 @@ _USER_LIMIT = 3
 _REPOSITORY_LIMIT = 10
 _OWNER_TOKEN_HEX_LENGTH = 64
 _PHYSICAL_TTL_MS = 60_000
+_SECOND_CONNECTION = 2
+_TWO_ADMISSIONS = 2
 if not _REDIS_URL:
     pytest.skip("requires disposable Redis", allow_module_level=True)
 
@@ -78,6 +82,237 @@ async def admissions(
     finally:
         await first.aclose()
         await second.aclose()
+
+
+async def _resp_frame(reader: asyncio.StreamReader) -> bytes:
+    """Read one RESP2 frame without changing the real Redis reply."""
+    line = await reader.readuntil(b"\r\n")
+    if line[:1] == b"$" and int(line[1:-2]) >= 0:
+        return line + await reader.readexactly(int(line[1:-2]) + 2)
+    if line[:1] == b"*" and int(line[1:-2]) >= 0:
+        parts = [await _resp_frame(reader) for _ in range(int(line[1:-2]))]
+        return line + b"".join(parts)
+    assert line[:1] in (b"+", b"-", b":", b"$", b"*")
+    return line
+
+
+@dataclass
+class _ReplyGate:
+    mode: str | None = None
+    committed: asyncio.Event = field(default_factory=asyncio.Event)
+    disconnected: asyncio.Event = field(default_factory=asyncio.Event)
+    eval_connections: list[int] = field(default_factory=list)
+    connections: int = 0
+
+
+@pytest.fixture
+async def gated_admission(  # noqa: PLR0915 -- real socket proxy lifecycle and cleanup
+    state_key: str,
+) -> AsyncIterator[tuple[RedisSimulationAdmission, _ReplyGate]]:
+    """Real Redis behind a proxy that interrupts exactly one EVAL reply.
+
+    The complete upstream reply proves EVAL finished. Only a partial RESP frame
+    reaches redis-py, exercising its actual socket reader, timeout and cleanup.
+    No Redis method or connection implementation is replaced.
+    """
+    assert _REDIS_URL is not None
+    parts = urlsplit(_REDIS_URL)
+    gate = _ReplyGate()
+    handlers: list[asyncio.Task[None]] = []
+
+    async def forward(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.append(task)
+        gate.connections += 1
+        connection_id = gate.connections
+        upstream_writer = None
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(
+                parts.hostname, parts.port or 6379
+            )
+            while True:
+                command = await _resp_frame(reader)
+                is_eval = command.split(b"\r\n", 3)[2] == b"EVAL"
+                if is_eval:
+                    gate.eval_connections.append(connection_id)
+                upstream_writer.write(command)
+                await upstream_writer.drain()
+                response = await _resp_frame(upstream_reader)
+                if is_eval and gate.mode is not None:
+                    mode, gate.mode = gate.mode, None
+                    writer.write(response[:3])  # Interrupt inside a RESP frame.
+                    await writer.drain()
+                    gate.committed.set()
+                    if mode != "disconnect":
+                        # Timeout/cancellation must close the client socket.
+                        assert await reader.read() == b""
+                    gate.disconnected.set()
+                    return
+                writer.write(response)
+                await writer.drain()
+        except asyncio.IncompleteReadError, ConnectionResetError:
+            pass
+        finally:
+            for stream in (writer, upstream_writer):
+                if stream is not None:
+                    stream.close()
+                    with suppress(OSError):
+                        await stream.wait_closed()
+
+    server = await asyncio.start_server(forward, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    credentials = parts.netloc.rsplit("@", 1)[0] + "@" if parts.username else ""
+    url = urlunsplit(parts._replace(netloc=f"{credentials}127.0.0.1:{port}"))
+    admission = RedisSimulationAdmission(
+        url, hmac_secret=b"test-only-secret-material-32bytes!", state_key=state_key
+    )
+    # A second command must reuse this pool's only connection object safely.
+    admission._client.connection_pool.max_connections = 1
+    try:
+        yield admission, gate
+    finally:
+        await admission.aclose()
+        server.close()
+        await server.wait_closed()
+        for handler in handlers:
+            if not handler.done():
+                handler.cancel()
+        outcomes = await asyncio.gather(*handlers, return_exceptions=True)
+        assert all(
+            outcome is None or isinstance(outcome, asyncio.CancelledError)
+            for outcome in outcomes
+        ), outcomes
+
+
+@pytest.mark.parametrize("loss", ["disconnect", "timeout"])
+async def test_acquire_committed_but_reply_lost_denies_without_retry_or_refund(
+    loss: str,
+    redis_client: Redis,
+    state_key: str,
+    gated_admission: tuple[RedisSimulationAdmission, _ReplyGate],
+) -> None:
+    admission, gate = gated_admission
+    gate.mode = loss
+    result = await asyncio.wait_for(
+        admission.acquire(_USER, _REPOSITORY, b"lost-acquire"), 3
+    )
+    assert gate.committed.is_set()
+    await asyncio.wait_for(gate.disconnected.wait(), 3)
+    assert result.status == "UNAVAILABLE"
+    assert result.lease is None
+    assert len(gate.eval_connections) == 1
+    raw = await redis_client.get(state_key)
+    assert raw is not None
+    state = json.loads(raw)
+    assert state["lease"] is not None
+    assert len(state["admissions"]) == len(state["consumed_keys"]) == 1
+    assert state["consumed_keys"][0]["at_ms"] == state["admissions"][0]["at_ms"]
+    # Fresh ECHO must not receive the interrupted EVAL's residual RESP frame.
+    assert await admission._client.echo("fresh-after-acquire") == "fresh-after-acquire"
+    assert gate.connections == _SECOND_CONNECTION
+    duplicate = await admission.acquire(_USER, _REPOSITORY, b"lost-acquire")
+    assert duplicate.status == "DUPLICATE"
+    assert duplicate.lease is None
+    assert gate.eval_connections == [1, 2]  # Second EVAL is this explicit call.
+    assert await redis_client.get(state_key) == raw
+
+
+@pytest.mark.parametrize("loss", ["disconnect", "timeout"])
+async def test_release_committed_but_reply_lost_preserves_history_and_new_owner(
+    loss: str,
+    redis_client: Redis,
+    state_key: str,
+    gated_admission: tuple[RedisSimulationAdmission, _ReplyGate],
+) -> None:
+    admission, gate = gated_admission
+    old = await admission.acquire(_USER, _REPOSITORY, b"lost-release")
+    assert old.lease is not None
+    before = await redis_client.get(state_key)
+    assert before is not None
+    gate.mode = loss
+    result = await asyncio.wait_for(admission.release(old.lease.owner_token), 3)
+    assert gate.committed.is_set()
+    await asyncio.wait_for(gate.disconnected.wait(), 3)
+    assert result == "UNAVAILABLE"
+    assert gate.eval_connections == [1, 1]  # Acquire, then exactly one release.
+    released = await redis_client.get(state_key)
+    assert released is not None
+    assert json.loads(released) == {**json.loads(before), "lease": None}
+    assert await admission._client.echo("fresh-after-release") == "fresh-after-release"
+    assert gate.connections == _SECOND_CONNECTION
+    assert (
+        await admission.acquire(_USER, _REPOSITORY, b"lost-release")
+    ).status == "DUPLICATE"
+    assert await redis_client.get(state_key) == released
+    new = await admission.acquire(_USER, _REPOSITORY, b"new-owner")
+    assert new.lease is not None
+    assert new.lease.owner_token != old.lease.owner_token
+    new_state = await redis_client.get(state_key)
+    assert new_state is not None
+    assert len(json.loads(new_state)["admissions"]) == _TWO_ADMISSIONS
+    assert len(json.loads(new_state)["consumed_keys"]) == _TWO_ADMISSIONS
+    assert await admission.release(old.lease.owner_token) == "NOT_OWNER"
+    assert await redis_client.get(state_key) == new_state
+    assert await admission.release(new.lease.owner_token) == "RELEASED"
+    assert gate.eval_connections == [1, 1, 2, 2, 2, 2]
+
+
+@pytest.mark.parametrize("operation", ["acquire", "release"])
+async def test_cancellation_during_redis_reply_propagates_and_discards_connection(
+    operation: str,
+    redis_client: Redis,
+    state_key: str,
+    gated_admission: tuple[RedisSimulationAdmission, _ReplyGate],
+) -> None:
+    admission, gate = gated_admission
+    owner = None
+    before = None
+    if operation == "release":
+        acquired = await admission.acquire(_USER, _REPOSITORY, b"cancelled-operation")
+        assert acquired.lease is not None
+        owner = acquired.lease.owner_token
+        before = await redis_client.get(state_key)
+        assert before is not None
+    prior_evals = len(gate.eval_connections)
+    gate.mode = "cancellation"
+    task = asyncio.create_task(
+        admission.release(owner)
+        if owner is not None
+        else admission.acquire(_USER, _REPOSITORY, b"cancelled-operation")
+    )
+    try:
+        await asyncio.wait_for(gate.committed.wait(), 3)
+        # EVAL finished upstream; redis-py is still reading a partial reply.
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(gate.disconnected.wait(), 3)
+        assert len(gate.eval_connections) == prior_evals + 1
+        raw = await redis_client.get(state_key)
+        assert raw is not None
+        state = json.loads(raw)
+        assert len(state["admissions"]) == len(state["consumed_keys"]) == 1
+        if before is not None:
+            assert state == {**json.loads(before), "lease": None}
+        else:
+            assert state["lease"] is not None
+        assert (
+            await admission._client.echo("fresh-after-cancel") == "fresh-after-cancel"
+        )
+        assert gate.connections == _SECOND_CONNECTION
+        duplicate = await admission.acquire(_USER, _REPOSITORY, b"cancelled-operation")
+        assert duplicate.status == "DUPLICATE"
+        assert duplicate.lease is None
+        assert len(gate.eval_connections) == prior_evals + 2
+        assert gate.eval_connections[-1] == _SECOND_CONNECTION
+        assert await redis_client.get(state_key) == raw
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("_round", range(20))

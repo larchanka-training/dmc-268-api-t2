@@ -16,6 +16,38 @@ _RESP2 = 2
 
 
 @pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [],
+        "",
+        "unexpected",
+        1,
+        False,
+        b"RELEASED",
+        ["RELEASED"],
+        {"status": "NOT_OWNER"},
+        ["INVALID_STATE", "extra"],
+    ],
+)
+async def test_unknown_release_outcome_is_unavailable(
+    response: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def eval_response(*args: object, **kwargs: object) -> object:
+        return response
+
+    monkeypatch.setattr(Redis, "eval", eval_response)
+    admission = RedisSimulationAdmission(
+        "redis://127.0.0.1:1/0", hmac_secret=b"test-only-secret-material-32bytes!"
+    )
+    try:
+        assert await admission.release("a" * 64) == "UNAVAILABLE"
+    finally:
+        await admission.aclose()
+
+
+@pytest.mark.parametrize(
     "query",
     [
         "",

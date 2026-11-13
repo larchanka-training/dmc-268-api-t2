@@ -1,5 +1,6 @@
 """Offline integration of Code simulation with the real provider adapter."""
 
+import asyncio
 import json
 import math
 import socket
@@ -17,7 +18,8 @@ from app.llm.openai_compatible import OpenAICompatibleClient
 from app.llm.tokens import ConservativeTokenCounter
 from app.review.simulation import CodeSimulationError, CodeSimulationService
 
-_BASE_URL = "https://provider.invalid/v1"
+_BASE_URL = "https://api.eurouter.ai/api/v1"
+_MODEL = "mistral-small-4"
 _API_KEY = "offline-credential-sentinel"
 _TIMEOUT_LIMIT_S = 30
 _SOURCE = "eval(private_source_sentinel)\n"
@@ -56,12 +58,18 @@ async def adapter_service(
     outcome: str | httpx.Response | Exception,
     *,
     max_input_tokens: int = 8192,
+    entered: asyncio.Event | None = None,
+    finish: asyncio.Event | None = None,
 ) -> AsyncIterator[tuple[CodeSimulationService, list[httpx.Request]]]:
     sent: list[httpx.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx.Request) -> httpx.Response:
         sent.append(request)
         assert len(sent) == 1, "simulation must not repeat a provider request"
+        if entered is not None:
+            entered.set()
+        if finish is not None:
+            await finish.wait()
         if isinstance(outcome, Exception):
             raise outcome
         if isinstance(outcome, httpx.Response):
@@ -71,12 +79,14 @@ async def adapter_service(
             json={"choices": [{"message": {"content": outcome}}]},
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False
+    ) as http:
         adapter = OpenAICompatibleClient(
-            name="offline-test",
+            name="eurorouter",
             http=http,
             base_url=_BASE_URL,
-            model="offline-model",
+            model=_MODEL,
             api_key=_API_KEY,
         )
         yield CodeSimulationService(adapter, max_input_tokens=max_input_tokens), sent
@@ -198,7 +208,11 @@ async def test_provider_failure_is_safe_and_makes_only_one_request(
 ) -> None:
     async with adapter_service(outcome) as (service, sent):
         with pytest.raises(CodeSimulationError) as error:
-            await service.simulate(code_input(), _RULES)
+            await service.simulate(
+                code_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() + 1,
+            )
 
     assert len(sent) == 1
     assert str(error.value) == error_code
@@ -240,7 +254,7 @@ async def test_provider_receives_closed_schema_and_bounded_request() -> None:
     request = sent[0]
     assert request.headers["authorization"] == f"Bearer {_API_KEY}"
     body = json.loads(request.content)
-    assert body["model"] == "offline-model"
+    assert body["model"] == _MODEL
     assert body["temperature"] == 0.0
     assert body["max_tokens"] == 2048  # noqa: PLR2004 -- agreed output cap
     timeouts = request.extensions["timeout"]
@@ -337,3 +351,60 @@ async def test_oversized_rules_fail_instead_of_silently_dropping_criteria() -> N
             await service.simulate(code_input(), rules)
 
     assert sent == []
+
+
+async def test_code_deadline_bounds_outbound_eurorouter_timeout() -> None:
+    started = asyncio.get_running_loop().time()
+    deadline = started + 0.5
+    async with adapter_service(json.dumps({"findings": [_FINDING]})) as (service, sent):
+        result = await service.simulate(code_input(), _RULES, deadline=deadline)
+
+    assert [finding.model_dump() for finding in result.findings] == [_FINDING]
+    assert result.rejected_count == 0
+    assert len(sent) == 1
+    assert all(
+        0 < timeout <= deadline - started
+        for timeout in sent[0].extensions["timeout"].values()
+    )
+    assert json.loads(sent[0].content)["model"] == _MODEL
+    assert str(sent[0].url) == f"{_BASE_URL}/chat/completions"
+
+
+async def test_expired_code_deadline_prevents_provider_http() -> None:
+    async with adapter_service('{"findings":[]}') as (service, sent):
+        with pytest.raises(CodeSimulationError, match=r"^provider_timeout$"):
+            await service.simulate(
+                code_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() - 1,
+            )
+
+    assert sent == []
+
+
+async def test_code_transport_cancellation_propagates_without_second_dispatch() -> None:
+    entered, finish = asyncio.Event(), asyncio.Event()
+    async with adapter_service('{"findings":[]}', entered=entered, finish=finish) as (
+        service,
+        sent,
+    ):
+        task = asyncio.create_task(
+            service.simulate(
+                code_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() + 30,
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            finish.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert len(sent) == 1

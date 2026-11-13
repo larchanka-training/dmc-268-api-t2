@@ -69,6 +69,7 @@ jobs:
       UI_SHA: ${{ inputs.ui_sha }}
       ANALYSIS_ENABLED: ${{ vars.STAGING_ANALYSIS_ENABLED || 'false' }}
       PUBLICATION_ENABLED: ${{ vars.STAGING_PUBLICATION_ENABLED || 'false' }}
+      SIMULATION_ENABLED: ${{ vars.STAGING_SIMULATION_ENABLED || 'false' }}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6a). Until Ollama is
       # deployed to staging, the chain is Eurorouter only.
       LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
@@ -162,6 +163,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          case "${SIMULATION_ENABLED:-false}" in
+            true|false) ;;
+            *)
+              echo "::error::STAGING_SIMULATION_ENABLED must be true or false" >&2
+              exit 1
+              ;;
+          esac
 
           case "${PUBLICATION_ENABLED:-false}" in
             true|false) ;;
@@ -415,6 +424,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          case "${SIMULATION_ENABLED:-false}" in
+            true|false) ;;
+            *)
+              echo "::error::STAGING_SIMULATION_ENABLED must be true or false" >&2
+              exit 1
+              ;;
+          esac
+
           case "${PUBLICATION_ENABLED:-false}" in
             true|false) ;;
             *)
@@ -437,8 +454,14 @@ jobs:
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
             printf 'WEB_PORT=%s\n' "${WEB_PORT}"
+            simulation_enabled=false
+            if [[ "${ENV_NAME:-}" == staging && "${SIMULATION_ENABLED:-false}" == true ]]; then
+              simulation_enabled=true
+            fi
+            printf 'SIMULATION__ENABLED=%s\n' "${simulation_enabled}"
             if [[ "${ENV_NAME:-}" == staging ]]; then
               printf 'ANALYSIS_RUNTIME_DIR=/opt/dmc-268-t2-runtime/analysis-runtime\n'
+              printf 'SIMULATION__MANIFEST_PATH=/app/runtime/analysis-runtime.v1.json\n'
             else
               printf 'ANALYSIS_RUNTIME_DIR=./analysis-runtime\n'
             fi

@@ -33,6 +33,8 @@ services:
       LOGGING__FILE_ENABLED: "false"
       SENTRY__DSN: ${SENTRY__DSN:-}
       ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
+      SIMULATION__ENABLED: ${SIMULATION__ENABLED:-false}
+      SIMULATION__MANIFEST_PATH: ${SIMULATION__MANIFEST_PATH:-}
       # Legacy gateway settings remain available. Frozen analysis selects its
       # model/policy from ANALYSIS__CONFIG_PATH; deployment checks consistency.
       LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}

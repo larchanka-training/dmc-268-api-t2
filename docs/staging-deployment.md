@@ -224,6 +224,52 @@ Nginx:
 http://213.199.63.63/
 ```
 
+### Rule Playground: configuration wiring (E1-A)
+
+Repository Variable `STAGING_SIMULATION_ENABLED` независимо управляет доставкой
+флага Playground в API. На E1-A оставьте её отсутствующей или равной `false`;
+изменение конфигурации не является разрешением включить симуляцию.
+
+| Variable | Staging API `SIMULATION__ENABLED` | Develop API |
+|---|---|---|
+| отсутствует / пустая | `false` | `false` |
+| `false` | `false` | `false` |
+| `true` | `true` | `false` |
+| любое другое непустое значение | deployment отклонён до записи env | deployment отклонён до записи env |
+
+Принимаются только строчные `true` и `false`: validation и env writer проверяют
+значение без вывода исходного содержимого. `STAGING_ANALYSIS_ENABLED` и
+`STAGING_PUBLICATION_ENABLED` не управляют Playground и сохраняют свои Compose
+profiles. Флаг и manifest path передаются только сервису `api`.
+
+Для staging writer всегда явно записывает
+`SIMULATION__MANIFEST_PATH=/app/runtime/analysis-runtime.v1.json`, независимо
+от analysis и simulation flags. Путь не вычисляется из `ANALYSIS__CONFIG_PATH`.
+Это тот же файл `/opt/dmc-268-t2-runtime/analysis-runtime/analysis-runtime.v1.json`
+на VPS в существующем `/app/runtime:ro` mount. Копия manifest, новый источник
+выбора модели, сервис или Docker volume не добавляются.
+
+Существующая доставка manifest сохраняется: источник — commit выбранного
+`API_IMAGE`, включая UI-only deployment с сохранённым API image; SHA-256
+manifest и installer проверяются, установка атомарная, root:root `0644`,
+схема валидируется выбранным image даже при выключенном analysis. Develop writer
+не записывает simulation manifest path; общий Compose передаёт пустое значение
+и `SIMULATION__ENABLED=false`. UI-only deployment применяет тот же явный флаг,
+сам по себе Playground не включает.
+
+E1-A не доставляет `SIMULATION__HMAC_SECRET_B64`. Даже при случайном `true`
+отсутствующий secret оставляет execution unavailable: simulation возвращает
+canonical `503 SERVICE_UNAVAILABLE`, simulation LLM/Redis clients не создаются,
+inference не выполняется. При disabled runtime manifest и simulation credentials
+не читаются, secret не требуется; `/healthcheck` и остальные API продолжают
+работать. При enabled runtime missing/invalid manifest также блокирует execution.
+Проверка manifest самим deployment остаётся отдельным существующим gate.
+
+Безопасная доставка стабильного HMAC secret и её проверка относятся к E1-B.
+Не генерируйте secret в workflow и не добавляйте его значение в документацию
+или логи. Redis admission state, persistence/recovery и операционное разрешение
+на activation требуют отдельных согласованных этапов; E1-A их не выполняет.
+
 ### API
 
 FastAPI запускается из immutable GHCR image:

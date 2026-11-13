@@ -151,9 +151,16 @@ def _request_timeout(deadline: float | None) -> float:
 
 
 class CodeSimulationService:
-    def __init__(self, client: BaseLLMClient, *, max_input_tokens: int = 8192) -> None:
+    def __init__(
+        self,
+        client: BaseLLMClient,
+        *,
+        max_input_tokens: int = 8192,
+        max_output_tokens: int = 2048,
+    ) -> None:
         self._client = client
         self._max_input_tokens = max_input_tokens
+        self._max_output_tokens = max_output_tokens
 
     @overload
     async def simulate(
@@ -254,7 +261,7 @@ class CodeSimulationService:
                 ),
                 ChatMessage(role="user", content=data),
             ],
-            max_output_tokens=2048,
+            max_output_tokens=self._max_output_tokens,
             timeout_s=30.0,
             output_schema_json=json.dumps(output_model.model_json_schema()),
         )

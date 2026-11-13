@@ -276,6 +276,12 @@ class ReviewCache(ReviewCachePolicy):
         return ReviewCachePolicy.model_validate(self.model_dump(exclude={"enabled"}))
 
 
+class Simulation(BaseModel):
+    """Rule Playground opt-in (SIMULATION__*); does not activate execution."""
+
+    enabled: bool = False
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the application."""
 
@@ -305,6 +311,7 @@ class Settings(BaseSettings):
     input_guards: InputGuards = Field(default_factory=InputGuards)
     incremental: Incremental = Field(default_factory=Incremental)
     review_cache: ReviewCache = Field(default_factory=ReviewCache)
+    simulation: Simulation = Field(default_factory=Simulation)
 
 
 @lru_cache

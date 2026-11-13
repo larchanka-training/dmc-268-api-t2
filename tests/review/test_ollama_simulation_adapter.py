@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -219,4 +220,5 @@ async def test_prompt_budget_prevents_ollama_dispatch(
 
 
 async def test_normal_application_keeps_executor_unavailable() -> None:
-    assert await get_simulation_executor() is None
+    request = Request({"type": "http", "app": FastAPI()})
+    assert await get_simulation_executor(request) is None

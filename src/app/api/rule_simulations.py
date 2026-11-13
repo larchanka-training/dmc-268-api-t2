@@ -1,11 +1,11 @@
-"""Rule simulation boundary; execution requires an explicit dependency override."""
+"""Rule simulation HTTP boundary with application-owned execution dependencies."""
 
 import asyncio
 import json
 import re
 from contextlib import suppress
 from ntpath import splitdrive
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -23,6 +23,7 @@ from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identit
 from app.api.errors import ApiError
 from app.api.repository_settings import _require_admin
 from app.application.simulation_execution import SimulationExecutionCoordinator
+from app.application.simulation_runtime import SimulationRuntime
 from app.context.rules import ParsedRules, parse_rules
 from app.core.config import Settings, get_settings
 from app.db.models import Repository, RepositoryAccess
@@ -201,15 +202,35 @@ class SimulationExecutor(Protocol):
     ) -> CodeSimulationResult | DiffSimulationResult: ...
 
 
-async def get_simulation_executor() -> SimulationExecutor | None:
-    """Unavailable by default; no production provider is composed here."""
+async def get_simulation_executor(request: Request) -> SimulationExecutor | None:
+    """Borrow only a complete application-owned execution pair."""
+    runtime = cast(
+        SimulationRuntime | None, getattr(request.app.state, "simulation_runtime", None)
+    )
+    if (
+        runtime is not None
+        and runtime.accepting
+        and runtime.executor is not None
+        and runtime.coordinator is not None
+    ):
+        return runtime.executor
     return None
 
 
-async def get_simulation_coordinator() -> (
-    SimulationExecutionCoordinator[JSONResponse] | None
-):
-    """Disabled; an override must retain one coordinator until aclose succeeds."""
+async def get_simulation_coordinator(
+    request: Request,
+) -> SimulationExecutionCoordinator[JSONResponse] | None:
+    """Borrow the same retained coordinator for every HTTP request."""
+    runtime = cast(
+        SimulationRuntime | None, getattr(request.app.state, "simulation_runtime", None)
+    )
+    if (
+        runtime is not None
+        and runtime.accepting
+        and runtime.executor is not None
+        and runtime.coordinator is not None
+    ):
+        return runtime.coordinator
     return None
 
 

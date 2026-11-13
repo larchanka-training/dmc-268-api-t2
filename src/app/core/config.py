@@ -277,9 +277,11 @@ class ReviewCache(ReviewCachePolicy):
 
 
 class Simulation(BaseModel):
-    """Rule Playground opt-in (SIMULATION__*); does not activate execution."""
+    """Rule Playground opt-in runtime (SIMULATION__*), validated in lifespan."""
 
     enabled: bool = False
+    manifest_path: Path | None = None
+    hmac_secret_b64: SecretStr | None = None
 
 
 class Settings(BaseSettings):

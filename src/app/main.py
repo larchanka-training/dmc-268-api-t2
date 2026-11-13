@@ -2,12 +2,14 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import cast
 
 import structlog
 from fastapi import FastAPI
 
 from app.api import api_router
 from app.api.errors import ApiError, api_error_response
+from app.application.simulation_runtime import SimulationRuntime
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.core.metrics import MetricsMiddleware, metrics_server, queue_metrics
@@ -22,11 +24,23 @@ logger = structlog.get_logger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown."""
 
-    with metrics_server(get_settings().metrics):
-        async with queue_metrics(get_settings()):
-            yield
-
-    await engine.dispose()
+    runtime = cast(
+        SimulationRuntime | None, getattr(app.state, "simulation_runtime", None)
+    )
+    if runtime is None or runtime.closed:
+        runtime = SimulationRuntime(get_settings())
+        app.state.simulation_runtime = runtime
+        await runtime.start(get_settings())
+    try:
+        with metrics_server(get_settings().metrics):
+            async with queue_metrics(get_settings()):
+                try:
+                    yield
+                finally:
+                    runtime.accepting = False
+    finally:
+        await runtime.aclose()
+        await engine.dispose()
 
 
 def create_app() -> FastAPI:

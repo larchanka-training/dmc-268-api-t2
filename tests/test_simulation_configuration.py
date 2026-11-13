@@ -10,11 +10,13 @@ import httpx
 import pytest
 from pydantic import ValidationError
 from redis.asyncio import Redis
+from starlette.requests import Request
 
 from app.api.rule_simulations import get_simulation_coordinator, get_simulation_executor
 from app.core.config import LLM, Settings, Simulation
 from app.domain.frozen_configuration import FrozenConfigurationError
 from app.llm.openai_compatible import OpenAICompatibleClient
+from app.main import create_app
 from app.review.simulation_configuration import prepare_simulation_configuration
 
 INPUT_CAP = 8192
@@ -386,13 +388,14 @@ def test_manifest_token_budgets_cannot_expand_playground_caps(
     )
 
 
-async def test_feature_flag_does_not_activate_default_http_dependencies(
+async def test_feature_flag_does_not_activate_http_dependencies_before_lifespan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SIMULATION__ENABLED", "true")
     assert Settings().simulation.enabled is True
-    assert await get_simulation_executor() is None
-    assert await get_simulation_coordinator() is None
+    request = Request({"type": "http", "app": create_app()})
+    assert await get_simulation_executor(request) is None
+    assert await get_simulation_coordinator(request) is None
 
 
 def test_single_operation_cannot_exceed_manifest_run_token_caps(

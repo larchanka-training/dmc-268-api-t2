@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 from test_rule_simulations_access import SimulationScope
 from test_rule_simulations_body import (
@@ -166,9 +166,11 @@ async def test_provider_or_coordinator_timeout_returns_canonical_503(  # noqa: P
 async def test_normal_runtime_stays_disabled_with_canonical_503(
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
+    auth_app: FastAPI,
 ) -> None:
-    assert await get_simulation_executor() is None
-    assert await get_simulation_coordinator() is None
+    request = Request({"type": "http", "app": auth_app})
+    assert await get_simulation_executor(request) is None
+    assert await get_simulation_coordinator(request) is None
     response = await browser.post(
         simulation_scope.url(simulation_scope.repository),
         headers=simulation_scope.headers,

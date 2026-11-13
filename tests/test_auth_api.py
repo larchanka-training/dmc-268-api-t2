@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from http import HTTPStatus
 from pathlib import Path
+from typing import Self
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -257,6 +258,134 @@ async def login(
     return await browser.get(
         "/api/v1/auth/github/callback", params={"state": state, "code": "private-code"}
     )
+
+
+def freeze_jwt_clock(monkeypatch: pytest.MonkeyPatch, timestamp: float) -> None:
+    """Control only the verifier's wall clock; PostgreSQL keeps its real clock."""
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls.fromtimestamp(timestamp, tz)
+
+    monkeypatch.setattr(jwt.api_jwt, "datetime", FrozenDatetime)
+
+
+@pytest.mark.parametrize("backward_seconds", [2, 3])
+async def test_active_session_survives_small_backward_clock_step(
+    browser: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    backward_seconds: int,
+) -> None:
+    await login(browser)
+    token = str(browser.cookies.get("dmc_session"))
+    original_datetime = datetime
+    natural_control = await browser.get("/api/v1/me")
+    assert natural_control.status_code == HTTPStatus.OK
+    # Inspect issuance time only; the HTTP verifier still performs every check.
+    claims = jwt.decode(token, options={"verify_signature": False})
+    freeze_jwt_clock(monkeypatch, claims["iat"])
+    control = await browser.get("/api/v1/me")
+    assert control.status_code == HTTPStatus.OK
+
+    # The same genuinely issued cookie and PostgreSQL session after a clock step.
+    freeze_jwt_clock(monkeypatch, claims["iat"] - backward_seconds)
+    response = await browser.get("/api/v1/me")
+    assert browser.cookies.get("dmc_session") == token
+    assert "set-cookie" not in response.headers
+    monkeypatch.setattr(jwt.api_jwt, "datetime", original_datetime)
+    restored = await browser.get("/api/v1/me")
+    assert restored.status_code == HTTPStatus.OK
+    assert restored.json() == natural_control.json()
+    assert browser.cookies.get("dmc_session") == token
+    assert "set-cookie" not in restored.headers
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == control.json()
+
+
+@pytest.mark.parametrize(
+    ("claim", "offset"),
+    [("iat", 60), ("iat", 3.001), ("nbf", 3.001), ("exp", -3), ("exp", -60)],
+)
+async def test_me_rejects_jwt_time_outside_three_second_tolerance(
+    browser: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    claim: str,
+    offset: float,
+) -> None:
+    await login(browser)
+    original_cookie = browser.cookies.get("dmc_session")
+    claims = jwt.decode(
+        str(browser.cookies.get("dmc_session")), options={"verify_signature": False}
+    )
+    # Keep NumericDate claims integral; move the clock for subsecond boundaries.
+    now = claims["iat"] + 10
+    claims[claim] = now + int(offset)
+    freeze_jwt_clock(monkeypatch, now - (offset - int(offset)))
+    token = jwt.encode(claims, "test-signing-key-32-bytes-minimum!!", algorithm="HS256")
+    response = await browser.get(
+        "/api/v1/me", headers={"Cookie": f"dmc_session={token}"}
+    )
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert response.json()["code"] == "AUTHENTICATION_REQUIRED"
+    assert "set-cookie" not in response.headers
+    assert browser.cookies.get("dmc_session") == original_cookie
+
+
+@pytest.mark.parametrize("fault", ["signature", "issuer", "audience"])
+async def test_me_rejects_invalid_jwt_security_claims_with_controlled_clock(
+    browser: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    await login(browser)
+    original_cookie = browser.cookies.get("dmc_session")
+    claims = jwt.decode(
+        str(browser.cookies.get("dmc_session")), options={"verify_signature": False}
+    )
+    freeze_jwt_clock(monkeypatch, claims["iat"] - 2)
+    secret = "test-signing-key-32-bytes-minimum!!"
+    if fault == "signature":
+        secret = "other-test-signing-key-32-bytes-minimum!!"
+    elif fault == "issuer":
+        claims["iss"] = "other-issuer"
+    else:
+        claims["aud"] = "other-audience"
+    token = jwt.encode(claims, secret, algorithm="HS256")
+    response = await browser.get(
+        "/api/v1/me", headers={"Cookie": f"dmc_session={token}"}
+    )
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert response.json()["code"] == "AUTHENTICATION_REQUIRED"
+    assert "set-cookie" not in response.headers
+    assert browser.cookies.get("dmc_session") == original_cookie
+
+
+@pytest.mark.parametrize("state", ["revoked", "expired"])
+async def test_me_requires_active_database_session_with_controlled_jwt_clock(
+    browser: httpx.AsyncClient,
+    postgres: PostgresHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    await login(browser)
+    original_cookie = browser.cookies.get("dmc_session")
+    claims = jwt.decode(
+        str(browser.cookies.get("dmc_session")), options={"verify_signature": False}
+    )
+    freeze_jwt_clock(monkeypatch, claims["iat"] - 2)
+    column = "revoked_at" if state == "revoked" else "expires_at"
+    async with postgres.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE auth_session SET {column} = "
+                "clock_timestamp() - interval '1 minute' WHERE id=:sid"
+            ),
+            {"sid": uuid.UUID(claims["sid"])},
+        )
+    response = await browser.get("/api/v1/me")
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert response.json()["code"] == "AUTHENTICATION_REQUIRED"
+    assert "set-cookie" not in response.headers
+    assert browser.cookies.get("dmc_session") == original_cookie
 
 
 @pytest.mark.parametrize(

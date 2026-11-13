@@ -11,7 +11,28 @@ import pytest
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
 from test_rule_simulations_access import SimulationScope
-from test_rule_simulations_integration import CODE, DIFF, DIFF_FINDINGS, FINDING, RULES
+from test_rule_simulations_body import (
+    isolate_stream_from_sentry,  # noqa: F401 -- module-local stream isolation
+)
+from test_rule_simulations_integration import (
+    CODE,
+    DIFF,
+    DIFF_FINDINGS,
+    FINDING,
+    RULES,
+    api_errors,  # noqa: F401 -- dependency of the module-local auth_app fixture
+    http_admission,  # noqa: F401 -- real disposable Redis admission fixture
+    no_simulation_writes,  # noqa: F401 -- autouse guard stays local to this module
+)
+from test_rule_simulations_integration import (
+    auth_app as auth_app,  # noqa: PLC0414 -- pytest fixture export
+)
+from test_rule_simulations_integration import (
+    execution_budget as execution_budget,  # noqa: PLC0414 -- pytest fixture export
+)
+from test_rule_simulations_integration import (
+    shared_coordinator as shared_coordinator,  # noqa: PLC0414 -- pytest fixture export
+)
 
 from app.api.rule_simulations import (
     SimulationExecutor,
@@ -22,7 +43,7 @@ from app.application.simulation_execution import SimulationExecutionCoordinator
 from app.llm.openai_compatible import OpenAICompatibleClient
 from app.review.simulation import CodeSimulationService
 
-pytest_plugins = ("test_rule_simulations_integration",)
+pytest_plugins = ("test_rule_simulations_access",)
 
 
 class OfflineProvider:

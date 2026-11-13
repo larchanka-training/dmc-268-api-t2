@@ -17,6 +17,7 @@ from app.application.review_start_ports import (
     AutomaticReceiptClaimLostError,
     ChangeRequestIdentity,
     IdempotencyConflictError,
+    PullRequestReviewActiveError,
     RepositoryIdentity,
     ReviewAlreadyActiveError,
     ReviewHeadMismatchError,
@@ -195,6 +196,7 @@ async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- one fenced aggreg
     expected_settings: str,
     new_change: GithubPullRequest | None = None,
     saved_change: ChangeRequestIdentity | None = None,
+    one_active_per_pr: bool = False,
     source_settings_id: UUID | None = None,
     automatic: AutomaticReceiptContext | None = None,
 ) -> tuple[UUID, str, bool]:
@@ -293,13 +295,15 @@ async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- one fenced aggreg
             )
             if parent is None:
                 raise AdmissionResourceNotFoundError
+        # One active analysis per PR needs an exclusive row lock: under a
+        # shared lock two starts for different heads both see no active run.
         change = await uow.session.scalar(
             select(ChangeRequest)
             .where(
                 ChangeRequest.id == command.change_request_id,
                 ChangeRequest.repository_id == repository_id,
             )
-            .with_for_update(read=True)
+            .with_for_update(read=not one_active_per_pr)
         )
         if change is None or change.current_status != "open":
             raise AdmissionResourceNotFoundError
@@ -349,6 +353,13 @@ async def persist_start(  # noqa: PLR0912, PLR0913, PLR0915 -- one fenced aggreg
                 await uow.commit()
                 return equivalent, status, False
             raise ReviewAlreadyActiveError
+        if one_active_per_pr and await uow.session.scalar(
+            select(ReviewJob.id).where(
+                ReviewJob.change_request_id == command.change_request_id,
+                ReviewJob.finished_at.is_(None),
+            )
+        ):
+            raise PullRequestReviewActiveError
         await _check_quotas(
             uow.session, repository_id, command.initiator_user_id, settings, window
         )

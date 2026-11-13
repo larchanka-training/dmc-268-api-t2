@@ -9,16 +9,19 @@ from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import sentry_sdk
+import structlog
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from referencing import Registry, Resource
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.analysis_authority import current_analysis_authority
 from app.application.github_ports import (
+    CompareReader,
+    GitattributesReader,
     GithubFailure,
     GithubPort,
     GithubRequest,
@@ -36,6 +39,7 @@ from app.application.ports import (
     TokenUsage,
 )
 from app.context.enrichment import enrich_context
+from app.core.metric_events import count, record_skipped_files
 from app.db.analysis_attempts import PostgresAnalysisAttemptStore
 from app.db.models import (
     ChangeRequest,
@@ -61,11 +65,18 @@ from app.domain.enums import ReviewReasonCode, ReviewStatus
 from app.domain.frozen_configuration import FrozenConfigurationError
 from app.domain.settings import project_historical_empty_settings
 from app.llm.tokens import ConservativeTokenCounter
+from app.review.cache import ReviewResultCache
 from app.review.chunking import ChunkLimits, plan_chunks
 from app.review.execution import FrozenAnalysisExecutionFactory
+from app.review.incremental import (
+    IncrementalPolicy,
+    omit_reviewed,
+    reviewed_fragments,
+)
 from app.review.port_adapter import ChunkReviewFailedError, LlmGatewayAdapter
 from app.review.schemas.context import FileDiff
 from app.vcs.diff import InvalidDiff, ParsedDiff, parse_diff
+from app.vcs.input_guards import InputGuardPolicy
 
 # Coverage reasons that mean the run reviewed less than the admitted diff.
 # Chunk diff budget is shrunk by 1/4 while a chunk prompt overflows, down to this.
@@ -77,6 +88,12 @@ class _AnalysisFailureError(Exception):
     def __init__(self, reason: ReviewReasonCode) -> None:
         self.reason = reason
         super().__init__(reason.value)
+
+
+class TerminalFollowUp(Protocol):
+    """Runs once an analysis is terminal, e.g. the system follow-up start."""
+
+    async def after_terminal(self, review_id: uuid.UUID) -> object: ...
 
 
 class PostgresAnalysisHandler:
@@ -99,8 +116,16 @@ class PostgresAnalysisHandler:
         reserved_output_tokens: int = 4_000,
         max_chunks: int = 5,
         execution_factory: FrozenAnalysisExecutionFactory | None = None,
+        input_guards: InputGuardPolicy | None = None,
+        incremental: IncrementalPolicy | None = None,
+        follow_up: TerminalFollowUp | None = None,
+        cache: ReviewResultCache | None = None,
     ) -> None:
         self._factory = session_factory
+        self._input_guards = input_guards
+        self._incremental = incremental
+        self._follow_up = follow_up
+        self._cache = cache
         self._github = github
         self._llm = llm
         self._execution_factory = execution_factory
@@ -189,7 +214,24 @@ class PostgresAnalysisHandler:
             safe_details=details,
         )
 
-    async def handle(  # noqa: PLR0911 -- explicit expected terminal/retry outcomes
+    async def handle(
+        self,
+        task: QueueTaskEnvelope,
+        lease: TaskLeaseSnapshot,
+    ) -> DurableTaskOutcome | None:
+        outcome = await self._handle(task, lease)
+        if outcome is DurableTaskOutcome.COMPLETED and self._follow_up is not None:
+            try:
+                await self._follow_up.after_terminal(lease.review_job_id)
+            except Exception as error:  # the follow-up never blocks the ACK
+                structlog.get_logger().warning(
+                    "review_follow_up_failed",
+                    review_id=str(lease.review_job_id),
+                    error_type=type(error).__name__,
+                )
+        return outcome
+
+    async def _handle(  # noqa: PLR0911 -- explicit expected terminal/retry outcomes
         self,
         task: QueueTaskEnvelope,
         lease: TaskLeaseSnapshot,
@@ -407,10 +449,22 @@ class PostgresAnalysisHandler:
             settings_id = settings.id
             context_enabled = review.prompt_version == "v4"
             language = settings.output_language
-            ignores = list(
-                project_historical_empty_settings(settings.ignores, "globs")["globs"]
+            ignore_settings = project_historical_empty_settings(
+                settings.ignores, "globs"
             )
+            ignores = list(ignore_settings["globs"])
+            try:
+                guards = (
+                    self._input_guards.for_repository(ignore_settings)
+                    if self._input_guards is not None
+                    else None
+                )
+            except ValueError:
+                raise _AnalysisFailureError(
+                    ReviewReasonCode.DIFF_UNTRUSTWORTHY
+                ) from None
             expected_source = change.source_repository_external_id
+            cycle = (review.id, review.change_request_id, review.config_digest)
 
         if stored:
             for context in saved:
@@ -420,7 +474,7 @@ class PostgresAnalysisHandler:
                     expected_source,
                 )
                 self._validate_context(context)
-            return await self._infer(task, lease, saved, llm)
+            return await self._infer(task, lease, saved, llm, cycle[2])
         if await self._already_finished(lease.review_job_id):
             return DurableTaskOutcome.COMPLETED
         await self._ensure_call_authority(task, lease)
@@ -439,12 +493,23 @@ class PostgresAnalysisHandler:
             self._check_snapshot(
                 captured.metadata["snapshot"], request, expected_source
             )
+            if guards is not None and isinstance(self._github, GitattributesReader):
+                guards = guards.with_gitattributes(
+                    await self._read_gitattributes(self._github, request)
+                )
             try:
-                parsed = parse_diff(captured.raw_diff, ignore_globs=ignores)
+                parsed = parse_diff(
+                    captured.raw_diff, ignore_globs=ignores, guards=guards
+                )
             except InvalidDiff:
                 raise _AnalysisFailureError(
                     ReviewReasonCode.DIFF_UNTRUSTWORTHY
                 ) from None
+        if self._incremental is not None:
+            reviewed, prior_head = await self._prior_reviews(self._incremental, *cycle)
+            count("delta_mode", mode=await self._delta_mode(request, prior_head))
+            parsed = omit_reviewed(parsed, reviewed)
+        record_skipped_files(lease.review_job_id, parsed.skipped)
         if not parsed.files:
             async with self._factory.begin() as session:
                 if await self._locked_finished(session, lease.review_job_id):
@@ -454,7 +519,7 @@ class PostgresAnalysisHandler:
                     session,
                     lease,
                     captured.metadata["snapshot"],
-                    parsed.coverage,
+                    parsed.review_coverage,
                 )
             return DurableTaskOutcome.COMPLETED
         with sentry_sdk.start_span(op="review.context", name="Context"):
@@ -485,7 +550,9 @@ class PostgresAnalysisHandler:
                 body["related_symbols"] = []
                 body["coverage"]["context_quality"] = "degraded"
                 body["budget"]["estimated_input_tokens"] = 0
-            contexts, coverage = [context], body["coverage"]
+            # Wire coverage strips guard ``detail``; the stored run keeps it.
+            contexts = [context]
+            coverage = {**body["coverage"], "skipped": parsed.skipped}
             # The real gateway also knows the rendered prompt: system prompt and
             # few-shots add to the diff, so the wire estimate alone is not enough.
             prompt_fits = (
@@ -505,7 +572,8 @@ class PostgresAnalysisHandler:
                 if not contexts and _estimate(context) <= limit:
                     # The diff fits; only the fixed prompt does not. That is a
                     # configuration failure for the gateway (prompt_too_large).
-                    contexts, coverage = [context], body["coverage"]
+                    contexts = [context]
+                    coverage = {**body["coverage"], "skipped": parsed.skipped}
             if not contexts:
                 coverage = {
                     "included": [],
@@ -552,13 +620,85 @@ class PostgresAnalysisHandler:
                     session, task, lease, ReviewStatus.LLM_PROCESSING
                 )
 
-        return await self._infer(task, lease, contexts, llm)
+        return await self._infer(task, lease, contexts, llm, cycle[2])
 
     def _validate_context(self, context: BuiltContextPayload) -> None:
         self._context_validator.validate(context.to_wire())
         validate_ranges(context.to_wire())
         for file in cast(list[dict[str, Any]], context.payload_body["files"]):
             validate_hunks(file["diff"]["hunks"])
+
+    async def _prior_reviews(
+        self,
+        policy: IncrementalPolicy,
+        review_id: uuid.UUID,
+        change_request_id: uuid.UUID,
+        config_digest: str,
+    ) -> tuple[frozenset[str], str | None]:
+        """Fragments of prior reviews of this PR whose results reached the PR,
+        under the same frozen configuration (another model, prompt or rules
+        digest reviews again), and the head of the latest of them.
+
+        An unpublished result (e.g. skipped as stale after a mid-flight push)
+        never reached the author, so its fragments are reviewed again."""
+        async with self._factory() as session:
+            rows = (
+                await session.execute(
+                    select(ContextPayload.payload_body, ReviewJob.requested_head_sha)
+                    .join(ReviewJob, ReviewJob.id == ContextPayload.review_job_id)
+                    # Contexts are saved up front for every chunk: only a chunk
+                    # with a stored result was actually reviewed.
+                    .join(
+                        ChunkResult,
+                        and_(
+                            ChunkResult.review_job_id == ContextPayload.review_job_id,
+                            ChunkResult.context_payload_id == ContextPayload.id,
+                        ),
+                    )
+                    .join(Publication, Publication.review_job_id == ReviewJob.id)
+                    .where(
+                        ReviewJob.change_request_id == change_request_id,
+                        ReviewJob.id != review_id,
+                        ReviewJob.config_digest == config_digest,
+                        ReviewJob.status.in_(
+                            [ReviewStatus.COMPLETED, ReviewStatus.PARTIAL]
+                        ),
+                        Publication.status.in_(["PUBLISHED", "PARTIAL"]),
+                    )
+                    .order_by(ReviewJob.finished_at.desc())
+                    .limit(policy.max_prior_reviews)
+                )
+            ).all()
+        reviewed = reviewed_fragments(body for body, _ in rows)
+        return reviewed, rows[0][1] if rows else None
+
+    async def _delta_mode(self, request: GithubRequest, prior_head: str | None) -> str:
+        """``full`` without a prior review; ``force_push`` when the prior head is
+        not an ancestor of the new one (or that cannot be shown)."""
+        if prior_head is None:
+            return "full"
+        if not isinstance(self._github, CompareReader):
+            return "incremental"
+        try:
+            status = await self._github.compare_status(request, prior_head)
+        except GithubFailure:
+            status = None  # a metric label never retries the analysis
+        return "incremental" if status in {"ahead", "identical"} else "force_push"
+
+    @staticmethod
+    async def _read_gitattributes(
+        github: GitattributesReader, request: GithubRequest
+    ) -> str | None:
+        """Linguist flags only refine skips: a permanent failure leaves defaults."""
+        try:
+            return await github.fetch_gitattributes(request)
+        except GithubFailure as failure:
+            if failure.retryable:
+                raise
+            structlog.get_logger().warning(
+                "gitattributes_unavailable", reason_code=failure.reason_code
+            )
+            return None
 
     def _check_snapshot(
         self,
@@ -585,11 +725,13 @@ class PostgresAnalysisHandler:
         lease: TaskLeaseSnapshot,
         contexts: list[BuiltContextPayload],
         llm: LlmGatewayPort,
+        config_digest: str,
     ) -> DurableTaskOutcome:
         """Review pending chunks in plan order.
 
         Each earlier chunk result is durable on its own, so a redelivery resumes
-        the rest; the last one lands atomically with the terminal status.
+        the rest; the last one lands atomically with the terminal status. With
+        a result cache, each chunk is looked up by its own content identity.
         """
         if not contexts:
             # Every chunk already has a result but the run never ended.
@@ -611,7 +753,7 @@ class PostgresAnalysisHandler:
             await self._ensure_call_authority(task, lease)
             with sentry_sdk.start_span(op="review.llm", name="LLM"):
                 # Do not close the provider call. Stop only skips the insert after it.
-                result = await llm.review(context)
+                result = await self._review_chunk(llm, context, files, config_digest)
             if await self._already_finished(lease.review_job_id):
                 return DurableTaskOutcome.COMPLETED
             authority = current_analysis_authority.get()
@@ -651,6 +793,26 @@ class PostgresAnalysisHandler:
                             late=deadline is not None and deadline <= locked[2],
                         )
         return DurableTaskOutcome.COMPLETED
+
+    async def _review_chunk(
+        self,
+        llm: LlmGatewayPort,
+        context: BuiltContextPayload,
+        files: list[dict[str, Any]],
+        config_digest: str,
+    ) -> ReviewChunkResult:
+        async def call() -> ReviewChunkResult:
+            count("llm_calls_total")
+            return await llm.review(context)
+
+        if self._cache is None:
+            return await call()
+        return await self._cache.review(
+            context.payload_body,
+            config_digest,
+            call,
+            lambda candidate: self._valid_result(candidate, files),
+        )
 
     async def _save_chunk_result(
         self,

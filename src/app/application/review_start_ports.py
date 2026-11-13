@@ -19,6 +19,10 @@ class ReviewAlreadyActiveError(Exception):
     """An equivalent unfinished review already exists."""
 
 
+class PullRequestReviewActiveError(Exception):
+    """Incremental review admits one unfinished review per pull request."""
+
+
 class SettingsVersionChangedError(Exception):
     """Current settings changed after configuration resolution."""
 

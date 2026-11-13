@@ -17,6 +17,7 @@ from app.adapters.review_admission import admit_review
 from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identity
 from app.api.errors import ApiError
 from app.api.review_start_dependencies import (
+    get_one_active_per_pr,
     get_review_configuration_resolver,
     get_review_start_authorizer,
 )
@@ -114,6 +115,7 @@ async def start_review_http(  # noqa: PLR0913 -- explicit admission boundaries a
     resolver: Annotated[
         ReviewConfigurationResolver, Depends(get_review_configuration_resolver)
     ],
+    one_active_per_pr: Annotated[bool, Depends(get_one_active_per_pr)],
 ) -> JSONResponse:
     if (
         not isinstance(identity, VerifiedMutationIdentity)
@@ -158,6 +160,7 @@ async def start_review_http(  # noqa: PLR0913 -- explicit admission boundaries a
             session=session,
             authorizer=authorizer,
             resolver=resolver,
+            one_active_per_pr=one_active_per_pr,
         )
     except ReviewAdmissionError as error:
         raise ApiError(

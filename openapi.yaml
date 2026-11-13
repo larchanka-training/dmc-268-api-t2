@@ -982,6 +982,18 @@ components:
             minLength: 1
             pattern: '^(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*\x00)(?!.*/$)(?!!).*\S.*$'
             description: Normalized repository-relative POSIX pattern; data only, never a shell argument.
+        include_globs:
+          type: array
+          uniqueItems: true
+          description: Paths reviewed even when a default input guard pattern matches.
+          items:
+            type: string
+            minLength: 1
+            pattern: '^(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*\x00)(?!.*/$)(?!!).*\S.*$'
+        exclude_migrations: { type: boolean, description: Skip migration paths; migrations are reviewed by default }
+        max_patch_bytes: { type: integer, minimum: 1 }
+        minified_line_length: { type: integer, minimum: 1 }
+        minified_avg_line_length: { type: integer, minimum: 1 }
     RepositorySettingsReplacement:
       type: object
       additionalProperties: false

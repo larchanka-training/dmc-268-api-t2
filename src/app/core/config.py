@@ -9,6 +9,10 @@ from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.review.cache import ReviewCachePolicy
+from app.review.incremental import IncrementalPolicy
+from app.vcs.input_guards import InputGuardPolicy
+
 ProviderName = Literal["eurorouter", "ollama"]
 
 
@@ -239,6 +243,39 @@ class LLM(BaseModel):
                 raise LLMConfigError(msg)
 
 
+class InputGuards(InputGuardPolicy):
+    """Pre-LLM file guards (INPUT_GUARDS__* env); off until rolled out."""
+
+    enabled: bool = False
+
+    def policy(self) -> InputGuardPolicy | None:
+        if not self.enabled:
+            return None
+        return InputGuardPolicy.model_validate(self.model_dump(exclude={"enabled"}))
+
+
+class Incremental(IncrementalPolicy):
+    """Incremental review (INCREMENTAL__* env); off until rolled out."""
+
+    enabled: bool = False
+
+    def policy(self) -> IncrementalPolicy | None:
+        if not self.enabled:
+            return None
+        return IncrementalPolicy.model_validate(self.model_dump(exclude={"enabled"}))
+
+
+class ReviewCache(ReviewCachePolicy):
+    """Exact review result cache (REVIEW_CACHE__* env); off until rolled out."""
+
+    enabled: bool = False
+
+    def policy(self) -> ReviewCachePolicy | None:
+        if not self.enabled:
+            return None
+        return ReviewCachePolicy.model_validate(self.model_dump(exclude={"enabled"}))
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the application."""
 
@@ -265,6 +302,9 @@ class Settings(BaseSettings):
     sentry: Sentry = Field(default_factory=Sentry)
     metrics: Metrics = Field(default_factory=Metrics)
     llm: LLM = Field(default_factory=LLM)
+    input_guards: InputGuards = Field(default_factory=InputGuards)
+    incremental: Incremental = Field(default_factory=Incremental)
+    review_cache: ReviewCache = Field(default_factory=ReviewCache)
 
 
 @lru_cache

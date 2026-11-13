@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -35,6 +35,7 @@ from app.domain.contract_validation import validate_hunks
 from app.review.schemas.context import FileDiff
 from app.review.schemas.finding import LLMFinding
 from app.review.validation import has_changed_anchor, mask_secrets, normalize_text
+from app.vcs.input_guards import FileSkipReason
 
 # The publisher always ends an inline comment with its marker tail. Harvest
 # trusts only that tail (RT-12): model text elsewhere in the body may carry
@@ -179,6 +180,41 @@ def _github_path(item: PersistedFinding, review: PublicationInput) -> str:
             if path == item.path:
                 return str(diff["new_path"] or diff["old_path"])
     return item.path
+
+
+_SKIP_LABELS = {
+    FileSkipReason.REMOVED: "удалённые файлы",
+    FileSkipReason.PURE_RENAME: "переименования без изменений",
+    FileSkipReason.BINARY: "бинарные файлы",
+    FileSkipReason.TOO_LARGE: "слишком большие файлы",
+    FileSkipReason.IGNORED: "исключены настройками репозитория",
+    FileSkipReason.LOCKFILE: "lock-файлы",
+    FileSkipReason.MIGRATION: "миграции",
+    FileSkipReason.GENERATED: "сгенерированный код",
+    FileSkipReason.BUNDLE: "сборки и бандлы",
+    FileSkipReason.VENDORED: "сторонний код",
+    FileSkipReason.MINIFIED: "минифицированный код",
+    FileSkipReason.ALREADY_REVIEWED: "без изменений с прошлого ревью",
+}
+_LISTED_PATHS_PER_REASON = 10
+
+
+def _skipped_overview(skipped: list[dict[str, Any]]) -> str:
+    """Input-guard skips grouped by reason; other skips keep one line each."""
+    lines = [
+        f"- {item['path']}: {item['reason']}"
+        for item in skipped
+        if "detail" not in item
+    ]
+    for reason in FileSkipReason:
+        paths = [item["path"] for item in skipped if item.get("detail") == reason]
+        if not paths:
+            continue
+        listed = ", ".join(paths[:_LISTED_PATHS_PER_REASON])
+        rest = len(paths) - _LISTED_PATHS_PER_REASON
+        more = f" и ещё {rest}" if rest > 0 else ""
+        lines.append(f"- {_SKIP_LABELS[reason]} ({len(paths)}): {listed}{more}")
+    return "\n".join(lines)
 
 
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -367,9 +403,7 @@ def prepare_github_review(
             risks = "На выбранном уровне серьёзности замечаний нет."
     elif not risks:
         risks = "Замечаний не обнаружено в проверенной части изменений."
-    skipped = "\n".join(
-        f"- {item['path']}: {item['reason']}" for item in review.coverage["skipped"]
-    )
+    skipped = _skipped_overview(review.coverage["skipped"])
     unique: dict[str, PersistedFinding] = {}
     for item in eligible:
         if _publishable(item, review):

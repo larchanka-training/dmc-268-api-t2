@@ -9,6 +9,13 @@ from unidiff import PatchSet  # type: ignore[import-untyped]
 from unidiff.errors import UnidiffParseError  # type: ignore[import-untyped]
 
 from app.domain.contract_validation import validate_hunks
+from app.vcs.input_guards import (
+    FileSkipReason,
+    InputGuardPolicy,
+    content_reason,
+    metadata_reason,
+    path_reason,
+)
 
 
 class InvalidDiff(ValueError):  # noqa: N818 - public parser exception
@@ -229,14 +236,86 @@ class ParsedDiff:
             included.append({"path": path, "ranges": ranges})
         return {
             "included": included,
-            "skipped": self.skipped,
+            "skipped": [
+                {key: value for key, value in item.items() if key != "detail"}
+                for item in self.skipped
+            ],
             "context_quality": "diff_only",
         }
 
+    @property
+    def review_coverage(self) -> dict[str, Any]:
+        """Coverage for ReviewJob storage: skips keep their guard ``detail``."""
+        return {**self.coverage, "skipped": self.skipped}
 
-def parse_diff(  # noqa: PLR0912 - bounded patch-to-context mapping
-    raw_diff: str, *, ignore_globs: Sequence[str] = ()
+
+def _skipped_entry(
+    path: str, hunks: list[dict[str, Any]], *, is_deleted: bool
+) -> dict[str, Any]:
+    return {
+        "path": path,
+        "ranges": [
+            {
+                "start_line": line["old_line"] if is_deleted else line["new_line"],
+                "end_line": line["old_line"] if is_deleted else line["new_line"],
+            }
+            for hunk in hunks
+            for line in hunk["lines"]
+            if line["kind"] == ("deleted" if is_deleted else "added")
+        ],
+        "reason": "policy",
+    }
+
+
+def _guard_reason(  # noqa: PLR0913 - one patch and its resolved identity
+    guards: InputGuardPolicy,
+    patch: Any,
+    *,
+    path: str,
+    old_path: str | None,
+    new_path: str | None,
+    hunks: list[dict[str, Any]],
+    ignore_globs: Sequence[str],
+) -> FileSkipReason | None:
+    """Cheapest checks first: diff metadata, then the path, then the text."""
+    return (
+        metadata_reason(
+            guards,
+            is_deleted=patch.is_removed_file,
+            is_pure_rename=(
+                not patch
+                and old_path is not None
+                and new_path is not None
+                and old_path != new_path
+            ),
+            is_binary=patch.is_binary_file,
+            patch_bytes=len(str(patch).encode("utf-8")),
+        )
+        or path_reason(guards, path, ignore_globs)
+        or content_reason(guards, path, hunks)
+    )
+
+
+def _changed_lines(files: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for file in files
+        for hunk in file["diff"]["hunks"]
+        for line in hunk["lines"]
+        if line["kind"] != "context"
+    )
+
+
+def parse_diff(  # noqa: PLR0912, PLR0915 - bounded patch-to-context mapping
+    raw_diff: str,
+    *,
+    ignore_globs: Sequence[str] = (),
+    guards: InputGuardPolicy | None = None,
 ) -> ParsedDiff:
+    """Map a raw diff to context files.
+
+    ``guards`` enables the input guards; ``None`` keeps the legacy filter.
+    """
     for glob in ignore_globs:
         if glob.startswith("!") or not glob.strip():
             raise InvalidDiff("invalid ignore glob")
@@ -251,9 +330,12 @@ def parse_diff(  # noqa: PLR0912 - bounded patch-to-context mapping
         raise InvalidDiff("malformed unified diff") from exc
     if raw_diff.strip() and not patches:
         raise InvalidDiff("missing Git diff headers")
-    if len(patches) > _MAX_FILES:
+    # With guards, admission limits apply to the files that survive them.
+    if guards is None and len(patches) > _MAX_FILES:
         raise InvalidDiff("diff file limit exceeded")
-    if (
+    if guards is not None and len(patches) > guards.max_raw_files:
+        raise InvalidDiff("diff raw file limit exceeded")
+    if guards is None and (
         sum(
             1
             for patch in patches
@@ -331,32 +413,32 @@ def parse_diff(  # noqa: PLR0912 - bounded patch-to-context mapping
             for side in ("old", "new")
         ):
             raise InvalidDiff("invalid hunk start")
-        if path is not None and (
+        if guards is not None and path is not None:
+            reason = _guard_reason(
+                guards,
+                patch,
+                path=path,
+                old_path=old_path,
+                new_path=new_path,
+                hunks=hunks,
+                ignore_globs=ignore_globs,
+            )
+            if reason is not None:
+                skipped.append(
+                    {
+                        **_skipped_entry(path, hunks, is_deleted=is_deleted),
+                        "detail": reason.value,
+                    }
+                )
+                continue
+        elif path is not None and (
             patch.is_binary_file
             or _default_policy(path)
             or _generated(hunks)
             or _minified_js(path, hunks)
             or any(PurePosixPath(path).full_match(glob) for glob in ignore_globs)
         ):
-            skipped.append(
-                {
-                    "path": path,
-                    "ranges": [
-                        {
-                            "start_line": line["old_line"]
-                            if is_deleted
-                            else line["new_line"],
-                            "end_line": line["old_line"]
-                            if is_deleted
-                            else line["new_line"],
-                        }
-                        for hunk in hunks
-                        for line in hunk["lines"]
-                        if line["kind"] == ("deleted" if is_deleted else "added")
-                    ],
-                    "reason": "policy",
-                }
-            )
+            skipped.append(_skipped_entry(path, hunks, is_deleted=is_deleted))
             continue
         files.append(
             {
@@ -382,4 +464,9 @@ def parse_diff(  # noqa: PLR0912 - bounded patch-to-context mapping
                 "whole_file": None,
             }
         )
+    if guards is not None:
+        if len(files) > _MAX_FILES:
+            raise InvalidDiff("diff file limit exceeded")
+        if _changed_lines(files) > _MAX_CHANGED_LINES:
+            raise InvalidDiff("diff line limit exceeded")
     return ParsedDiff(files=files, skipped=skipped, raw_file_count=len(patches))

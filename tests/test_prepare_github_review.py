@@ -157,6 +157,58 @@ def test_prepare_review_reports_empty_findings_and_skipped_coverage_honestly(
     assert "diff_only" in prepared.body
 
 
+def test_prepare_review_without_earlier_cycles_keeps_overview_unchanged(
+    payload_data: dict[str, Any],
+) -> None:
+    prepared = prepare_github_review(publication_input(payload_data))
+
+    assert len(prepared.comments) == 1
+    assert "Уже отмечено" not in prepared.body
+
+
+def test_prepare_review_groups_guard_skips_by_reason(
+    payload_data: dict[str, Any],
+) -> None:
+    """DoD 7: the overview lists what was not reviewed, grouped by reason."""
+    review = publication_input(payload_data)
+    locks = [f"pkg{n}/package-lock.json" for n in range(12)]
+    review = replace(
+        review,
+        coverage={
+            **review.coverage,
+            "skipped": [
+                *(
+                    {"path": p, "ranges": [], "reason": "policy", "detail": "lockfile"}
+                    for p in locks
+                ),
+                {
+                    "path": "api/user.pb.go",
+                    "ranges": [],
+                    "reason": "policy",
+                    "detail": "generated",
+                },
+                {"path": "src/large.py", "ranges": [], "reason": "token_budget"},
+                {
+                    "path": "src/same.py",
+                    "ranges": [],
+                    "reason": "policy",
+                    "detail": "already_reviewed",
+                },
+            ],
+        },
+    )
+
+    body = prepare_github_review(review).body
+
+    skipped = body.split("Не проверены:\n", 1)[1].split("\n\n", 1)[0]
+    assert skipped.splitlines() == [
+        "- src/large.py: token_budget",
+        "- lock-файлы (12): " + ", ".join(locks[:10]) + " и ещё 2",
+        "- сгенерированный код (1): api/user.pb.go",
+        "- без изменений с прошлого ревью (1): src/same.py",
+    ]
+
+
 def test_prepare_review_maps_multiline_range_without_losing_start(
     payload_data: dict[str, Any],
 ) -> None:

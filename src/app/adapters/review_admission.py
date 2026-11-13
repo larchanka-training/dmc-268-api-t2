@@ -9,7 +9,6 @@ from typing import Never
 from uuid import UUID, uuid4
 
 from jsonschema import Draft202012Validator
-from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -26,6 +25,7 @@ from app.application.review_start_ports import (
     ChangeRequestIdentity,
     FrozenAnalysisConfiguration,
     IdempotencyConflictError,
+    PullRequestReviewActiveError,
     RepositoryIdentity,
     ReviewAdmissionError,
     ReviewAdmissionRequest,
@@ -54,19 +54,16 @@ from app.db.review_starts import (
     persist_start,
     settings_identity,
 )
-from app.domain.frozen_configuration import (
-    ModelPolicy,
-    ModelRoute,
-    ModelSettings,
-    RepositoryInstructions,
-)
+from app.domain.frozen_configuration import ModelPolicy
 from app.domain.settings import (
     compute_repository_settings_digest,
     compute_rules_digest,
     project_historical_empty_settings,
 )
-from app.review.configuration import FrozenConfigurationError
-from app.review.prompt import PromptBuilder, PromptConfigError, reflection_bundle
+from app.review.configuration import (
+    FrozenConfigurationError,
+    validate_admission_configuration,
+)
 
 _RULES_CACHE: OrderedDict[tuple[str, ...], RepositoryFile] = OrderedDict()
 _SETTINGS_VALIDATOR = Draft202012Validator(
@@ -85,6 +82,11 @@ _ADMISSION_ERRORS: dict[type[Exception], tuple[int, str, str]] = {
         409,
         "REVIEW_ALREADY_ACTIVE",
         "An equivalent review is already active.",
+    ),
+    PullRequestReviewActiveError: (
+        409,
+        "REVIEW_ALREADY_ACTIVE",
+        "A review of this pull request is already active.",
     ),
     SettingsVersionChangedError: (
         409,
@@ -276,37 +278,13 @@ def _validate_configuration(
     instructions: tuple[str, ...],
 ) -> ModelPolicy:
     try:
-        if (
-            not isinstance(config, FrozenAnalysisConfiguration)
-            or type(config.frozen_configuration_version) is not int
-            or config.frozen_configuration_version != 1
-        ):
-            raise ValueError("unsupported admission configuration")
-        policy = ModelSettings.from_stored(config.model_settings)
-        ModelRoute(
-            profile_ref=policy.routing.primary_profile_ref,
-            model_ref=config.model_ref,
-            model_digest=config.model_digest,
+        return validate_admission_configuration(
+            config,
+            settings_digest=settings_digest,
+            instructions=instructions,
+            prompt_root=Path(__file__).resolve().parents[3] / ".agents/reviewer",
         )
-        if (
-            policy.repository_settings_digest != settings_digest
-            or config.model_digest is not None
-            or any(route.model_digest is not None for route in policy.routing.fallback)
-        ):
-            raise ValueError("unsupported admission identity")
-        PromptBuilder.load(
-            Path(__file__).resolve().parents[3] / ".agents/reviewer",
-            config.prompt_version,
-            expected_digest=config.prompt_digest,
-            repository_instructions=RepositoryInstructions(instructions=instructions),
-        )
-        reflection_bundle(
-            Path(__file__).resolve().parents[3] / ".agents/reviewer",
-            policy,
-            config.prompt_version,
-        )
-        return policy
-    except ValidationError, ValueError, TypeError, PromptConfigError:
+    except ValueError:
         raise ReviewAdmissionError(
             503,
             "SERVICE_UNAVAILABLE",
@@ -321,7 +299,10 @@ async def admit_review(  # noqa: PLR0912, PLR0915 -- captured read/provider/lock
     session: AsyncSession,
     authorizer: ReviewStartAuthorizer,
     resolver: ReviewConfigurationResolver,
+    one_active_per_pr: bool = False,
 ) -> tuple[UUID, str, bool]:
+    """``one_active_per_pr`` (incremental review): refuse a start while any run
+    of the same PR is still active, not only an equivalent one."""
     if admission.automatic is not None:
         bound = await find_automatic_replay(session, admission.automatic)
         if bound is not None:
@@ -579,6 +560,7 @@ async def admit_review(  # noqa: PLR0912, PLR0915 -- captured read/provider/lock
             expected_settings=expected_settings,
             new_change=new_change,
             saved_change=saved_change,
+            one_active_per_pr=one_active_per_pr,
             source_settings_id=source_settings_id,
             automatic=admission.automatic,
         )

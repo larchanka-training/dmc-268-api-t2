@@ -508,3 +508,68 @@ async def test_fetch_accepts_empty_diff_for_identical_trees() -> None:
         snapshot = await GithubClient(http).fetch(_request())
 
     assert snapshot.raw_diff == ""
+
+
+async def test_gitattributes_are_read_from_pinned_base_commit() -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text="*.gen.ts linguist-generated\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        text = await GithubClient(http).fetch_gitattributes(_request())
+
+    assert text == "*.gen.ts linguist-generated\n"
+    assert [str(request.url) for request in seen] == [
+        f"https://api.github.com/repos/team/project/contents/.gitattributes?ref={BASE}"
+    ]
+    assert seen[0].headers["accept"] == "application/vnd.github.raw"
+
+
+async def test_missing_gitattributes_is_not_an_access_failure() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        assert await GithubClient(http).fetch_gitattributes(_request()) is None
+
+
+async def test_gitattributes_rate_limit_stays_retryable() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"retry-after": "5"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(GithubFailure) as failure:
+            await GithubClient(http).fetch_gitattributes(_request())
+
+    assert failure.value.reason_code == "VCS_RATE_LIMITED"
+    assert failure.value.retryable
+
+
+@pytest.mark.parametrize("status", ["ahead", "behind", "diverged", "identical"])
+async def test_compare_status_reports_ancestry_of_prior_head(status: str) -> None:
+    seen: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"status": status})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        result = await GithubClient(http).compare_status(_request(), MERGE_BASE)
+
+    assert result == status
+    assert seen == [
+        f"https://api.github.com/repos/team/project/compare/{MERGE_BASE}...{HEAD}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [httpx.Response(404, json={}), httpx.Response(200, json={"status": "weird"})],
+)
+async def test_unknown_prior_head_ancestry_is_none(reply: httpx.Response) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: reply)
+    ) as http:
+        assert await GithubClient(http).compare_status(_request(), MERGE_BASE) is None

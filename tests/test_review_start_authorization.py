@@ -114,14 +114,14 @@ async def browser_start(
             policy=admission_policy("0" * 64),
         )
     )
-    active: set[int] = set()
+    active: dict[int, asyncio.Task[Any] | None] = {}
     opened: set[httpx.MockTransport] = set()
 
     def checkout(dbapi: Any, record: Any, proxy: Any) -> None:
-        active.add(id(record))
+        active[id(record)] = asyncio.current_task()
 
     def checkin(dbapi: Any, record: Any) -> None:
-        active.discard(id(record))
+        active.pop(id(record), None)
 
     snapshot = github_transport()
 
@@ -135,7 +135,10 @@ async def browser_start(
     browser = BrowserStart(scope, client, provider, [])
 
     async def respond(request: httpx.Request) -> httpx.Response:
-        assert not active, "PostgreSQL connection held during GitHub HTTP"
+        # Concurrent requests may legitimately use this engine during our HTTP call.
+        assert asyncio.current_task() not in active.values(), (
+            "PostgreSQL connection held during GitHub HTTP"
+        )
         browser.requests.append(request)
         expected = (
             _PERSONAL_TOKEN

@@ -224,6 +224,282 @@ Nginx:
 http://213.199.63.63/
 ```
 
+### Rule Playground: configuration wiring (E1-A)
+
+Repository Variable `STAGING_SIMULATION_ENABLED` независимо управляет доставкой
+флага Playground в API. На E1-A оставьте её отсутствующей или равной `false`;
+изменение конфигурации не является разрешением включить симуляцию.
+
+| Variable | Staging API `SIMULATION__ENABLED` | Develop API |
+|---|---|---|
+| отсутствует / пустая | `false` | `false` |
+| `false` | `false` | `false` |
+| `true` | `true` | `false` |
+| любое другое непустое значение | deployment отклонён до записи env | deployment отклонён до записи env |
+
+Принимаются только строчные `true` и `false`: validation и env writer проверяют
+значение без вывода исходного содержимого. `STAGING_ANALYSIS_ENABLED` и
+`STAGING_PUBLICATION_ENABLED` не управляют Playground и сохраняют свои Compose
+profiles. Флаг и manifest path передаются только сервису `api`.
+
+Для staging writer всегда явно записывает
+`SIMULATION__MANIFEST_PATH=/app/runtime/analysis-runtime.v1.json`, независимо
+от analysis и simulation flags. Путь не вычисляется из `ANALYSIS__CONFIG_PATH`.
+Это тот же файл `/opt/dmc-268-t2-runtime/analysis-runtime/analysis-runtime.v1.json`
+на VPS в существующем `/app/runtime:ro` mount. На E1-A копия manifest, новый
+источник выбора модели, сервис или Docker volume не добавлялись.
+
+Существующая доставка manifest сохраняется: источник — commit выбранного
+`API_IMAGE`, включая UI-only deployment с сохранённым API image; SHA-256
+manifest и installer проверяются, установка атомарная, root:root `0644`,
+схема валидируется выбранным image даже при выключенном analysis. Develop writer
+не записывает simulation manifest path; общий Compose передаёт пустое значение
+и `SIMULATION__ENABLED=false`. UI-only deployment применяет тот же явный флаг,
+сам по себе Playground не включает.
+
+E1-A не доставляет `SIMULATION__HMAC_SECRET_B64`. Даже при случайном `true`
+отсутствующий secret оставляет execution unavailable: simulation возвращает
+canonical `503 SERVICE_UNAVAILABLE`, simulation LLM/Redis clients не создаются,
+inference не выполняется. При disabled runtime manifest и simulation credentials
+не читаются, secret не требуется; `/healthcheck` и остальные API продолжают
+работать. При enabled runtime missing/invalid manifest также блокирует execution.
+Проверка manifest самим deployment остаётся отдельным существующим gate.
+
+Безопасная доставка стабильного HMAC secret и её проверка относятся к E1-B.
+Не генерируйте secret в workflow и не добавляйте его значение в документацию
+или логи. Redis admission state, persistence/recovery и операционное разрешение
+на activation требуют отдельных согласованных этапов; E1-A их не выполняет.
+
+### Rule Playground: dedicated admission Redis (E1-B2A, локальная архитектура)
+
+E1-B2A реализует вариант B: review queue остаётся на существующем `redis`,
+а admission Playground получает отдельный service `simulation-redis`.
+Это локальное изменение конфигурации и runtime wiring; staging Redis и Playground
+на этом этапе не запускаются. E1-B2B/E1-B2C и activation автоматически не начинаются.
+
+Вместо предложенного в E1-B1 отдельного overlay используется явно запрошенный
+Compose profile `simulation` в `docker-compose.staging.yml`. Это уточнение способа
+подключения сохраняет изоляцию варианта B. Profile не добавлен в deployment
+`COMPOSE_PROFILES` и не связан с `SIMULATION__ENABLED`. Обычный `docker compose up`
+без этого profile не запускает новый service; API не имеет обязательного
+`depends_on` на него. Develop и staging с прежними profiles сохраняют прежний
+набор запущенных services. Наличие определения profile само по себе не разрешает
+его запуск в staging.
+
+| Потребитель | Endpoint | Storage |
+|---|---|---|
+| Review queue, analysis worker, outbox-dispatcher, publication-worker | прежний `REDIS__URL=redis://redis:6379/0` | существующий service `redis`, без изменения mounts/settings |
+| Один application-owned simulation coordinator через отдельный admission client/pool | только явный `SIMULATION__REDIS_URL`; будущий согласованный endpoint `redis://simulation-redis:6379/0` | отдельный external volume `simulation-redis-data`, mount `/data` |
+
+`SIMULATION__REDIS_URL` отсутствует в настройках по умолчанию; в env example он
+оставлен пустым. Compose передаёт его только `api` через
+`${SIMULATION__REDIS_URL:-}`. Текущий deployment writer URL не доставляет.
+Disabled runtime не требует URL и не создаёт simulation connections. Enabled
+runtime без URL, с некорректным URL или с тем же нормализованным endpoint, что у
+review queue, остаётся unavailable. Другая Redis DB, credentials или TLS scheme
+не считаются отдельной instance. DNS aliases требуют отдельной операторской
+проверки идентичности endpoint до activation; offline URL validation не доказывает
+физическую изоляцию произвольных адресов. Redis credentials скрыты в настройках;
+URL и исходные ошибки подключения не выводятся в runtime diagnostics.
+
+Проверенный dedicated URL используется для одного application-owned admission
+pool. Per-request connections, retry и shared fallback не добавляются. Inference
+возможен только после Redis `ACQUIRED`; missing/invalid admission state и
+недоступный dedicated Redis приводят к canonical `503 SERVICE_UNAVAILABLE`.
+Review queue продолжает использовать прежний Redis, а `/healthcheck` остаётся
+проверкой живости без обращений к зависимостям. Это разделение Redis процессов;
+общие VPS, Docker daemon и сеть всё ещё требуют capacity/availability planning.
+Webhook/analysis/publication workers, PostgreSQL outbox, Redis Lua и HTTP
+authorization не изменяются. Existing Redis data и volumes не удаляются.
+
+Контракт `simulation-redis`:
+
+| Настройка | Значение |
+|---|---|
+| Image | `redis:8-alpine`; digest/version pinning перед rollout ещё требуется |
+| Activation / restart | только profile `simulation`; `restart: "no"` |
+| Volume | external `${COMPOSE_PROJECT_NAME:-dmc-268-t2-staging}_simulation-redis-data` → `/data` |
+| AOF | `appendonly yes`, `appendfsync always`, `no-appendfsync-on-rewrite no` |
+| Повреждённая или усечённая AOF history | `aof-load-truncated no`; без automatic repair |
+| Eviction | явный `maxmemory-policy noeviction` |
+| Healthcheck | `redis-cli ping`; не подтверждает полноту history или recovery readiness |
+| Network | только существующая внутренняя Compose network `backend`; host port отсутствует |
+
+External volume должен быть заранее подготовлен и идентифицирован оператором:
+его отсутствие означает отказ запуска, а не создание пустого storage. Для staging
+ожидаемое имя — `dmc-268-t2-staging_simulation-redis-data`. На B2A provisioning
+не выполняется; команды создания volume/state и включения staging здесь намеренно
+не приводятся. Существующие `redis`, его volume/settings и backup scripts
+сохраняются. `scripts/backup-redis.sh` обслуживает только shared service `redis`;
+новый service автоматически в backup coverage не входит.
+
+`appendfsync always` выбран для низкой частоты admission операций. Поддержка,
+latency и error behavior проверяются только в disposable Compose projects;
+локальный drill не подтверждает latency или durability VPS. AOF не гарантирует
+абсолютную сохранность подтверждённых writes при любой storage/host failure.
+`noeviction` не защищает от OOM killer, disk loss или повреждения истории.
+
+Valid Redis schema, matching HMAC identity и отсутствие TTL не доказывают полноту
+admission history. Старый, но валидный snapshot способен потерять consumed record
+и повторно разрешить использованный idempotency key. Exactly-once не заявляется.
+При неизвестной полноте history выполнение должно оставаться запрещённым;
+нужны отдельные операторские recovery/disposition и внешний recovery fence,
+который нельзя восстановить как старый ready marker из того же Redis dataset.
+Startup, request и deployment не выполняют automatic bootstrap при потере state,
+reset history или замену ошибочного state пустым JSON.
+
+Консервативный операционный fallback при невозможности доказать сохранность
+истории: подтвердить остановку всех simulation writers/dispatchers и держать
+Playground выключенным в течение полного 24-часового окна после **последнего
+возможного inference**, с запасом на clock uncertainty. Установить эту границу
+по incident/deployment evidence; возраст snapshot и истечение 90-секундного lease
+её не заменяют. Неизвестные remote outcomes требуют отдельного reconciliation:
+24 часа не доказывают завершение внешнего inference. Затем возможно только
+отдельно согласованное контролируемое provisioning по операторской recovery
+процедуре. Это ручной fallback, а не автоматическая процедура или разрешение
+перезаписать existing state в B2A.
+
+После локального E1-B2B Playground остаётся disabled. Безопасная доставка HMAC,
+подтверждённое provisioning на staging и history provenance, внешний recovery
+fence с restart/reconnect checks, deployment/activation gates, VPS capacity и
+memory limits, pinned Redis image policy, backup/off-host copy и проверенный
+restore остаются нереализованными gates. Default-disabled wiring и AOF не
+заменяют эти проверки. Никаких реальных HMAC secrets, Redis state или GitHub
+Secrets/Variables на данном этапе не создаётся и не изменяется.
+
+### Rule Playground: operator-only initial provisioning (E1-B2B)
+
+E1-B2B добавляет локальную утилиту
+`scripts/provision_simulation_admission.py`. Её не вызывают API startup,
+request handlers, Compose или deployment workflow. **Этот этап не разрешает
+запуск simulation profile, создание staging state, подключение реальных GitHub
+Secrets/Variables или activation.** Команды ниже описывают будущую отдельную
+операторскую операцию после разрешения; локальные tests используют только
+disposable Docker instances и synthetic данные.
+
+HMAC берётся только из существующего `SIMULATION__HMAC_SECRET_B64` в environment.
+По умолчанию secret отсутствует; disabled API его не требует. Runtime и utility
+используют один pure decoder: strict canonical base64 без whitespace, после
+decode строго **32–1024 bytes**, с точным повторным encode. Невалидное значение
+даёт только фиксированную причину `invalid_simulation_secret`. Config identity
+получается через существующий `RedisSimulationAdmission.hmac_config_id`; новый
+fingerprint algorithm и новые idempotency rules не вводятся. Утилита не генерирует
+secret, не выполняет rotation и не принимает secret или Redis credentials через
+CLI arguments. Значения нельзя хранить в Git, shell history, ticket, stdout/stderr
+или logs. Используйте approved защищённый environment injection без shell tracing;
+не вставляйте secret в командную строку. Этот этап не добавляет secret delivery.
+
+Utility читает только переданный process environment; `.env` автоматически не
+загружается. Нужен явный `SIMULATION__REDIS_URL`. `REDIS__URL` используется только
+для запрета совпадения endpoint и никогда как fallback. Дополнительно запрещены
+известные shared defaults `redis:6379` и `localhost:6379`, включая нормализуемые
+IP/host aliases. DB number, TLS и credentials не разделяют Redis instances.
+Произвольные DNS aliases, Docker project/service, physical volume и отсутствие
+других writers оператор обязан независимо проверить до подтверждения.
+
+Из project root, в подготовленной Python/uv environment:
+
+```bash
+uv run python scripts/provision_simulation_admission.py --check
+```
+
+Без mode flag выполняется тот же read-only check. Он использует PING,
+CONFIG GET, INFO persistence, TYPE, PTTL и EVAL_RO; Redis ACL должен разрешать
+эти чтения. Effective policy должна быть `appendonly=yes`, `appendfsync=always`,
+`no-appendfsync-on-rewrite=no`, `maxmemory-policy=noeviction`; INFO должен
+подтвердить включённый AOF и успешный последний AOF write status. Никаких
+CONFIG SET, admission acquire/release, provider requests или queue probe нет.
+Проверка не меняет configuration, history или TTL.
+
+Одна JSON-строка содержит доступность Redis, effective persistence policy,
+eviction policy, наличие/тип ключа, PTTL, `hmac_identity=match|mismatch|unknown`
+и `structure=valid|invalid|absent`. Никакого JSON history, HMAC digests, config ID,
+исходного Idempotency-Key, URL или credentials в выводе нет. Ошибки init, I/O,
+argument parsing и cleanup подавляются до фиксированной безопасной причины;
+success печатается только после cleanup.
+
+Структуру проверяет **исходный Lua loader adapter**, переиспользованный через
+Redis `EVAL_RO`, без изменения adapter/Lua и без независимой Python schema
+validation. Redis должен поддерживать EVAL_RO (текущий service — Redis 8).
+Loader проверяет exact v3 contract, bounds, arrays/числовые токены, history,
+HMAC identity и отсутствие physical TTL. Отдельное bounded JSON-декодирование
+в Lua даёт только диагностическое сравнение HMAC identity, не решение о schema.
+Отказ ACL/EVAL_RO или ошибка чтения означает отсутствие успешного inspection;
+fallback на более permissive validator нет. Metadata/policy reads не являются
+единым atomic snapshot: writers и configuration changes должны быть закрыты
+оператором. Structural check сам не выполняет acquire.
+
+Exit `0` у `--check` означает успешную диагностику с допустимыми policies:
+state может быть **отсутствующим**, что явно отражено `structure=absent`.
+Существующий invalid state, HMAC mismatch, TTL, unsafe persistence/eviction
+или ошибка дают exit `1`. Даже `structure=valid` и exit `0` — только structural
+validation. Во всех JSON results: `activation_authorized=false`,
+`history_continuity=unproven`. Это констатация ограничений, не recovery-ready flag.
+
+Для первичного создания нужны **оба** operator attestations:
+
+```bash
+uv run python scripts/provision_simulation_admission.py \
+  --create \
+  --confirm-new-instance-no-history \
+  --confirm-exclusive-dedicated-instance
+```
+
+`--confirm-new-instance-no-history` означает: оператор по независимому approved
+change record, inventory и deployment/incident history доказал, что это новый,
+никогда не использовавшийся storage для admission, не restore, replacement после
+утраты state, reset или повторная инициализация. Evidence хранится вне Redis;
+пустая DB, отсутствие ключа и нулевые Redis counters **не доказывают первичность**.
+При неизвестном происхождении этот flag запрещён, utility без подтверждения
+отказывает. Утилита не может сама проверить правдивость external attestation и
+не превращает его в доказательство непрерывности history после восстановления.
+
+`--confirm-exclusive-dedicated-instance` означает: endpoint и volume независимо
+идентифицированы, instance dedicated, simulation выключена, все потенциальные
+writers/dispatchers и конкурирующие deployment/config changes остановлены.
+Дополнительно CLI требует буквально `SIMULATION__ENABLED=false`, отсутствие
+state key, `DBSIZE=0`, пустой INFO keyspace во всех DB и нулевые
+`expired_keys`/`evicted_keys`. INFO commandstats должен содержать только
+разрешённые read-only/control команды (inspection, authentication, healthcheck);
+наблюдаемые writes и неизвестные команды дают `prior_use_or_unknown_command`.
+Utility эти mutating команды не вызывает. Missing loss stats также дают отказ. Следы прежних
+данных, TTL, существующий state любого типа/schema/HMAC или отсутствие любого
+подтверждения блокируют запись. После restart/reset counters могут обнулиться — они
+лишь дополнительный отказ, не provenance proof.
+
+Единственная mutation — `SET dmc268:rule-playground:admission <initial-v3> NX`,
+без EX/PX/physical TTL и без retry. Initial state содержит ровно
+`schema_version=3`, `lease=null`, пустые `admissions`/`consumed_keys` и config ID
+adapter. После успешного NX утилита сравнивает фактические bytes с initial state
+и требует `PTTL=-1`. Конкурентный winner или любое уже существующее состояние
+означают отказ. Повторный `--create` отказывает даже при полностью совпадающем
+state; history не обнуляется. SET при заранее обнаруженном existing key не
+выполняется. Delete/flush/unlink, repair, v1/v2 migration и HMAC reset отсутствуют.
+
+При ошибке записи/ответа/readback результат `creation_unconfirmed`, exit `1`:
+write мог уже состояться. При иной ошибке, включая cleanup, также exit `1` без
+success. **Не повторять create как recovery**, не удалять ключ и не менять HMAC;
+сохранить evidence, оставить simulation выключенной, выполнить отдельный
+операторский disposition. Утилита ничего не откатывает и не объявляет restore
+безопасным. Exit `0`/`status=created` подтверждает только initial creation.
+
+### Обязательный recovery gate E1-B2C
+
+**Нельзя считать Redis готовым к платному inference только потому, что schema
+v3, HMAC identity и TTL корректны.** Валидный старый snapshot может не содержать
+последних admissions и consumed keys. Он может пройти `--check`, но повторный
+bootstrap будет отвергнут; activation не разрешается. Даже подтверждённый
+initial bootstrap не разрешает будущий restart/reconnect/restore автоматически.
+
+Если отсутствует независимое доказательство непрерывности истории после
+восстановления, execution должен оставаться запрещённым до отдельного
+операторского disposition. Окончательный внешний recovery fence, его runtime
+checks на restart/reconnect/epoch и race/fault tests — отдельный **E1-B2C**.
+На B2B такого runtime fence ещё нет; CLI не заменяет его. До этого этапа
+сохраняйте `SIMULATION__ENABLED=false` и не включайте
+`STAGING_SIMULATION_ENABLED`. No automatic restore, no HMAC rotation, no history
+deletion, no startup reset; exactly-once не заявляется.
+
 ### API
 
 FastAPI запускается из immutable GHCR image:

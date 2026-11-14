@@ -3,15 +3,19 @@
 import asyncio
 import json
 import logging
+import os
 import traceback
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from http import HTTPStatus
+from typing import Any
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, ValidationError
+from redis.asyncio import Redis
 from sqlalchemy import delete, insert, select, update
 from starlette.responses import JSONResponse
 from test_postgres_integration import PostgresHarness
@@ -19,9 +23,22 @@ from test_rule_simulations_access import SimulationScope, simulation_state
 from test_rule_simulations_body import (
     isolate_stream_from_sentry,  # noqa: F401 -- shared stream isolation fixture
 )
+from test_simulation_execution import Admission
 
+from app.adapters.simulation_admission import (
+    AdmissionResult,
+    RedisSimulationAdmission,
+    ReleaseResult,
+)
 from app.api.errors import ApiError, api_error_response
-from app.api.rule_simulations import get_simulation_executor
+from app.api.rule_simulations import (
+    SimulationCodeInput,
+    SimulationDiffInput,
+    SimulationRules,
+    get_simulation_coordinator,
+    get_simulation_executor,
+)
+from app.application.simulation_execution import SimulationExecutionCoordinator
 from app.db.base import Base
 from app.db.models import Repository, RepositoryAccess
 from app.llm.client import BaseLLMClient, LLMCallResult, LLMRequest
@@ -30,7 +47,11 @@ from app.llm.errors import (
     TransientProviderError,
 )
 from app.main import create_app
-from app.review.simulation import CodeSimulationService
+from app.review.simulation import (
+    CodeSimulationResult,
+    CodeSimulationService,
+    DiffSimulationResult,
+)
 
 pytest_plugins = ("test_rule_simulations_access",)
 
@@ -136,12 +157,26 @@ class FakeLLM(BaseLLMClient):
         self.answer = json.dumps({"findings": [FINDING]})
         self.requests: list[LLMRequest] = []
         self.failure: BaseException | None = None
+        self.deadlines: list[float] = []
+        self.entered = asyncio.Event()
+        self.finish: asyncio.Event | None = None
+        self.ignore_cancellation = False
+        self.completed = asyncio.Event()
 
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, response_model: type[T]
     ) -> LLMCallResult[T]:
-        assert not self.requests, "simulation must not repeat a model call"
         self.requests.append(request)
+        self.entered.set()
+        if self.finish is not None:
+            while not self.finish.is_set():
+                try:
+                    await self.finish.wait()
+                except asyncio.CancelledError:
+                    if not self.ignore_cancellation:
+                        self.completed.set()
+                        raise
+        self.completed.set()
         if self.failure is not None:
             raise self.failure
         try:
@@ -160,10 +195,113 @@ class FakeLLM(BaseLLMClient):
         )
 
 
+class ObservedRedisAdmission(RedisSimulationAdmission):
+    def __init__(self, url: str, state_key: str) -> None:
+        super().__init__(
+            url,
+            state_key=state_key,
+            hmac_secret=b"c25a-test-only-secret-material-32bytes!",
+        )
+        self.url = url
+        self.state_key = state_key
+        self.acquisitions: list[tuple[UUID, UUID, bytes]] = []
+        self.releases: list[str] = []
+
+    async def acquire(
+        self, user_id: UUID, repository_id: UUID, idempotency_key: bytes
+    ) -> AdmissionResult:
+        self.acquisitions.append((user_id, repository_id, idempotency_key))
+        return await super().acquire(user_id, repository_id, idempotency_key)
+
+    async def release(self, owner_token: str) -> ReleaseResult:
+        self.releases.append(owner_token)
+        return await super().release(owner_token)
+
+    async def state(self) -> dict[str, Any]:
+        async with Redis.from_url(self.url, decode_responses=True) as client:
+            raw = await client.get(self.state_key)
+            assert raw is not None
+            return json.loads(raw)  # type: ignore[no-any-return]
+
+    async def seed(self, state: dict[str, Any]) -> None:
+        async with Redis.from_url(self.url, decode_responses=True) as client:
+            await client.set(self.state_key, json.dumps(state))
+
+
 @pytest.fixture
-def injected_llm(auth_app: FastAPI) -> Iterator[FakeLLM]:
+async def http_admission() -> AsyncIterator[ObservedRedisAdmission]:
+    url = os.environ.get("DMC268_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("requires disposable Redis")
+    key = f"dmc268:test:c25a:{uuid4().hex}"
+    admission = ObservedRedisAdmission(url, key)
+    async with Redis.from_url(url, decode_responses=True) as client:
+        await client.set(
+            key,
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "hmac_config_id": admission.hmac_config_id,
+                    "lease": None,
+                    "admissions": [],
+                    "consumed_keys": [],
+                }
+            ),
+        )
+        try:
+            yield admission
+        finally:
+            await admission.aclose()
+            await client.delete(key)
+
+
+@pytest.fixture
+def execution_budget() -> float:
+    return 30.0
+
+
+@pytest.fixture
+async def shared_coordinator(
+    auth_app: FastAPI,
+    http_admission: ObservedRedisAdmission,
+    execution_budget: float,
+) -> AsyncIterator[SimulationExecutionCoordinator[JSONResponse]]:
+    coordinator = SimulationExecutionCoordinator[JSONResponse](
+        http_admission, timeout_s=execution_budget, cleanup_timeout_s=0.05
+    )
+    auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
+    try:
+        yield coordinator
+    finally:
+        assert await coordinator.aclose()
+        auth_app.dependency_overrides.pop(get_simulation_coordinator, None)
+
+
+class HttpExecutor:
+    def __init__(self, fake: FakeLLM) -> None:
+        self.fake = fake
+        self.service = CodeSimulationService(fake)
+
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float,
+    ) -> CodeSimulationResult | DiffSimulationResult:
+        self.fake.deadlines.append(deadline)
+        assert 0 < deadline - asyncio.get_running_loop().time() <= 30.0  # noqa: PLR2004 -- coordinator budget cap
+        return await self.service.simulate(code, rules)
+
+
+@pytest.fixture
+async def injected_llm(
+    auth_app: FastAPI,
+    shared_coordinator: SimulationExecutionCoordinator[JSONResponse],
+    http_admission: ObservedRedisAdmission,
+) -> AsyncIterator[FakeLLM]:
     fake = FakeLLM()
-    service = CodeSimulationService(fake)
+    service = HttpExecutor(fake)
     auth_app.dependency_overrides[get_simulation_executor] = lambda: service
     try:
         yield fake
@@ -178,6 +316,7 @@ async def test_local_access_changed_during_body_read_prevents_inference(  # noqa
     postgres: PostgresHarness,
     github_requests: list[httpx.Request],
     injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
     change: str,
 ) -> None:
     identity_before = (await browser.get("/api/v1/me")).json()
@@ -226,6 +365,7 @@ async def test_local_access_changed_during_body_read_prevents_inference(  # noqa
             "retry_after": None,
         }
         assert injected_llm.requests == []
+        assert http_admission.acquisitions == []
         assert len(github_requests) == github_before + 1
         assert "Set-Cookie" not in response.headers
         assert dict(browser.cookies) == cookies_before
@@ -242,12 +382,13 @@ async def test_local_access_changed_during_body_read_prevents_inference(  # noqa
                 )
 
 
-async def test_admin_revoked_during_body_read_prevents_inference(
+async def test_admin_revoked_during_body_read_prevents_inference(  # noqa: PLR0913, PLR0917 -- HTTP and external side-effect observations
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
     provider: dict[str, httpx.Response],
     github_requests: list[httpx.Request],
     injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
 ) -> None:
     identity_before = (await browser.get("/api/v1/me")).json()
     cookies_before = dict(browser.cookies)
@@ -275,6 +416,7 @@ async def test_admin_revoked_during_body_read_prevents_inference(
         "retry_after": None,
     }
     assert injected_llm.requests == []
+    assert http_admission.acquisitions == []
     assert [request.url.path for request in github_requests[github_before:]] == [
         path
     ] * 2
@@ -299,6 +441,7 @@ async def test_validated_code_returns_the_verified_service_result(
     )
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {"findings": [FINDING], "rejected_count": 0}
+    assert len(injected_llm.deadlines) == 1
     assert response.headers["X-Request-Id"]
     assert "Set-Cookie" not in response.headers
     assert len(injected_llm.requests) == 1
@@ -539,6 +682,7 @@ async def test_empty_model_result_has_no_invented_fields(
     "gate",
     [
         "session",
+        "invalid-session",
         "origin",
         "csrf",
         "local-access",
@@ -550,22 +694,28 @@ async def test_empty_model_result_has_no_invented_fields(
         "strict-diff",
         "diff-parser",
         "rules",
+        "invalid-json",
+        "body-user",
+        "body-repository",
     ],
 )
-async def test_rejected_request_never_dispatches_even_with_executor(  # noqa: PLR0913, PLR0917, PLR0912 -- table of existing ordered HTTP gates
+async def test_rejected_request_never_dispatches_even_with_executor(  # noqa: PLR0913, PLR0917, PLR0912, PLR0915 -- table of ordered HTTP gates
     browser: httpx.AsyncClient,
     simulation_scope: SimulationScope,
     provider: dict[str, httpx.Response],
     github_requests: list[httpx.Request],
     injected_llm: FakeLLM,
     gate: str,
+    http_admission: ObservedRedisAdmission,
 ) -> None:
     headers = dict(simulation_scope.headers)
     repository = simulation_scope.repository
     payload = {"input": CODE, "rules": RULES}
     status, code = HTTPStatus.UNPROCESSABLE_CONTENT, "VALIDATION_FAILED"
-    if gate == "session":
+    if gate in {"session", "invalid-session"}:
         browser.cookies.clear()
+        if gate == "invalid-session":
+            browser.cookies.set("dmc_session", "invalid")
         status, code = HTTPStatus.UNAUTHORIZED, "AUTHENTICATION_REQUIRED"
     elif gate == "origin":
         headers["Origin"] = "https://evil.test"
@@ -595,7 +745,11 @@ async def test_rejected_request_never_dispatches_even_with_executor(  # noqa: PL
         payload = {"input": {"kind": "diff", "unified_diff": "broken"}, "rules": RULES}
     elif gate == "rules":
         payload = {"input": CODE, "rules": RULES | {"markdown": ""}}
+    if gate in {"body-user", "body-repository"}:
+        payload["user_id" if gate == "body-user" else "repository_id"] = str(uuid4())  # type: ignore[assignment]
     body = b" " * 262145 if gate == "body-limit" else json.dumps(payload).encode()
+    if gate == "invalid-json":
+        body = b"not json"
     github_before = len(github_requests)
     response = await browser.post(
         simulation_scope.url(repository), headers=headers, content=body
@@ -603,7 +757,9 @@ async def test_rejected_request_never_dispatches_even_with_executor(  # noqa: PL
     assert response.status_code == status
     assert response.json()["code"] == code
     assert injected_llm.requests == []
-    if gate in {"session", "origin", "csrf", "local-access"}:
+    assert http_admission.acquisitions == []
+    assert (await http_admission.state())["admissions"] == []
+    if gate in {"session", "invalid-session", "origin", "csrf", "local-access"}:
         assert len(github_requests) == github_before
     else:
         assert len(github_requests) == github_before + 1
@@ -634,3 +790,407 @@ async def test_normal_application_cannot_enable_execution_over_http(
     assert [request.url.path for request in github_requests[github_before:]] == [
         f"/repositories/{simulation_scope.external_id}"
     ]
+
+
+@pytest.mark.parametrize("missing", ["coordinator", "executor", "both"])
+async def test_executor_without_coordinator_cannot_bypass_admission(  # noqa: PLR0913, PLR0917
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    auth_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    if missing in {"coordinator", "both"}:
+        auth_app.dependency_overrides.pop(get_simulation_coordinator)
+    if missing in {"executor", "both"}:
+        auth_app.dependency_overrides.pop(get_simulation_executor)
+    redis_calls: list[object] = []
+
+    def tripwire(*args: Any, **kwargs: Any) -> Any:
+        redis_calls.append((args, kwargs))
+        raise AssertionError("disabled runtime contacted Redis")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "app.adapters.simulation_admission.create_admission_client", tripwire
+        )
+        patch.setattr(Redis, "execute_command", tripwire)
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+    assert redis_calls == []
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json() == {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "Service is unavailable.",
+        "request_id": response.headers["X-Request-Id"],
+        "retryable": False,
+        "retry_after": None,
+    }
+    assert injected_llm.requests == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "BUSY",
+        "DUPLICATE",
+        "RATE_USER",
+        "RATE_REPOSITORY",
+        "RATE_GLOBAL",
+        "INVALID_STATE",
+        "UNAVAILABLE",
+    ],
+)
+async def test_admission_denial_is_one_safe_http_503(  # noqa: PLR0913, PLR0917
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    auth_app: FastAPI,
+    api_errors: list[Exception],
+    status: str,
+) -> None:
+    admission = Admission(AdmissionResult(status))  # type: ignore[arg-type]
+    coordinator = SimulationExecutionCoordinator[JSONResponse](admission)
+    auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
+    raw_key = b" Exact-Case-\xff "
+    headers = exact_key_headers(simulation_scope, raw_key)
+    actor = (await browser.get("/api/v1/me")).json()["user"]["id"]
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=headers,
+            json={"input": CODE, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert response.json() == {
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Service is unavailable.",
+            "request_id": response.headers["X-Request-Id"],
+            "retryable": False,
+            "retry_after": None,
+        }
+        assert injected_llm.requests == []
+        assert admission.acquisitions == [
+            (UUID(actor), simulation_scope.repository, raw_key)
+        ]
+        assert admission.releases == []
+        assert api_errors[0].__context__ is None
+        assert api_errors[0].__cause__ is None
+    finally:
+        assert await coordinator.aclose()
+        auth_app.dependency_overrides.pop(get_simulation_coordinator, None)
+
+
+async def test_result_serialization_cannot_outlive_the_execution_budget(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    auth_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    clock = loop.time
+
+    class BudgetResult(CodeSimulationResult):
+        def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+            value = super().model_dump(**kwargs)
+            # Deterministic serialization overrun, without WSL wall-clock sleeps.
+            monkeypatch.setattr(loop, "time", lambda: clock() + 31)
+            return value
+
+    class BudgetExecutor(HttpExecutor):
+        async def simulate(
+            self,
+            code: SimulationCodeInput | SimulationDiffInput,
+            rules: SimulationRules,
+            *,
+            deadline: float,
+        ) -> CodeSimulationResult | DiffSimulationResult:
+            result = await super().simulate(code, rules, deadline=deadline)
+            return BudgetResult.model_validate(result.model_dump())
+
+    auth_app.dependency_overrides[get_simulation_executor] = lambda: BudgetExecutor(
+        injected_llm
+    )
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+    finally:
+        monkeypatch.setattr(loop, "time", clock)
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+    assert len(injected_llm.requests) == 1
+
+
+def exact_key_headers(scope: SimulationScope, key: bytes) -> httpx.Headers:
+    return httpx.Headers(
+        [
+            (k.encode("ascii"), v.encode("ascii"))
+            for k, v in scope.headers.items()
+            if k != "Idempotency-Key"
+        ]
+        + [(b"Idempotency-Key", key)]
+    )
+
+
+@pytest.mark.parametrize("other_key", [b"Exact-Case-\xff", b" exact-case-\xff "])
+async def test_exact_key_suppresses_repeated_and_changed_body_without_replay(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
+    other_key: bytes,
+) -> None:
+    key = b" Exact-Case-\xff "
+    actor = UUID((await browser.get("/api/v1/me")).json()["user"]["id"])
+    url = simulation_scope.url(simulation_scope.repository)
+    response = await browser.post(
+        url,
+        headers=exact_key_headers(simulation_scope, key),
+        json={"input": CODE, "rules": RULES},
+    )
+    assert response.status_code == HTTPStatus.OK
+    assert len(injected_llm.requests) == 1
+    initial = await http_admission.state()
+    assert initial["lease"] is None
+    assert len(initial["admissions"]) == len(initial["consumed_keys"]) == 1
+    for source in (CODE, CODE | {"source": "changed_body_sentinel\n"}):
+        response = await browser.post(
+            url,
+            headers=exact_key_headers(simulation_scope, key),
+            json={"input": source, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert response.json() == {
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Service is unavailable.",
+            "request_id": response.headers["X-Request-Id"],
+            "retryable": False,
+            "retry_after": None,
+        }
+        assert len(injected_llm.requests) == 1
+        assert await http_admission.state() == initial
+    response = await browser.post(
+        url,
+        headers=exact_key_headers(simulation_scope, other_key),
+        json={"input": CODE, "rules": RULES},
+    )
+    assert response.status_code == HTTPStatus.OK
+    assert len(injected_llm.requests) == 2  # noqa: PLR2004 -- two distinct admitted keys
+    assert http_admission.acquisitions == [
+        (actor, simulation_scope.repository, k) for k in (key, key, key, other_key)
+    ]
+    state = await http_admission.state()
+    assert state["lease"] is None
+    assert len(state["admissions"]) == len(state["consumed_keys"]) == 2  # noqa: PLR2004
+    assert len(http_admission.releases) == 2  # noqa: PLR2004
+    assert all(
+        record["user_id"] == actor.hex
+        and record["repository_id"] == simulation_scope.repository.hex
+        for record in state["admissions"]
+    )
+    for private in (
+        "Exact-Case",
+        "private_source_sentinel",
+        "private_rules_sentinel",
+        "changed_body_sentinel",
+    ):
+        assert private not in json.dumps(state)
+
+
+@pytest.mark.parametrize("ending", ["exception", "timeout", "cancel"])
+@pytest.mark.parametrize("execution_budget", [0.1])
+async def test_http_failure_keeps_lease_key_and_allowance(  # noqa: PLR0913, PLR0917
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
+    ending: str,
+    api_errors: list[Exception],
+) -> None:
+    if ending == "exception":
+        injected_llm.failure = RuntimeError(
+            "private_source_sentinel offline-credential-sentinel"
+        )
+    else:
+        injected_llm.finish = asyncio.Event()
+    task = asyncio.create_task(
+        browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+    )
+    await asyncio.wait_for(injected_llm.entered.wait(), 2)
+    if ending == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert api_errors == []
+    else:
+        response = await task
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+        assert api_errors[0].__context__ is None
+        assert api_errors[0].__cause__ is None
+    assert len(injected_llm.requests) == 1
+    assert http_admission.releases == []
+    state = await http_admission.state()
+    assert state["lease"] is not None
+    assert len(state["admissions"]) == len(state["consumed_keys"]) == 1
+    duplicate = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers,
+        json={"input": CODE | {"source": "changed"}, "rules": RULES},
+    )
+    assert duplicate.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert len(injected_llm.requests) == 1
+    assert await http_admission.state() == state
+    # Expire only the lease; consumption/rate history remains authoritative.
+    state["lease"]["expires_at_ms"] = 1
+    await http_admission.seed(state)
+    injected_llm.failure = None
+    injected_llm.finish = None
+    for key in ("second", "third"):
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers | {"Idempotency-Key": key},
+            json={"input": CODE, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.OK
+    before = await http_admission.state()
+    assert len(before["admissions"]) == len(before["consumed_keys"]) == 3  # noqa: PLR2004
+    denied = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers | {"Idempotency-Key": "fourth"},
+        json={"input": CODE, "rules": RULES},
+    )
+    assert denied.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert len(injected_llm.requests) == 3  # noqa: PLR2004
+    assert await http_admission.state() == before
+
+
+@pytest.mark.parametrize("execution_budget", [0.1])
+async def test_late_success_cannot_become_http_200_or_lose_pending_work(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
+    shared_coordinator: SimulationExecutionCoordinator[JSONResponse],
+) -> None:
+    injected_llm.finish = asyncio.Event()
+    injected_llm.ignore_cancellation = True
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert not await shared_coordinator.aclose()
+        # The same instance retains pending work; another key cannot dispatch.
+        again = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers | {"Idempotency-Key": "another"},
+            json={"input": CODE, "rules": RULES},
+        )
+        assert again.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert len(injected_llm.requests) == len(http_admission.acquisitions) == 1
+    finally:
+        injected_llm.finish.set()
+        await asyncio.wait_for(injected_llm.completed.wait(), 2)
+        await asyncio.sleep(0)
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert http_admission.releases == []
+    state = await http_admission.state()
+    assert state["lease"] is not None
+    assert len(state["admissions"]) == len(state["consumed_keys"]) == 1
+
+
+async def test_real_redis_unavailable_never_dispatches(  # noqa: PLR0913, PLR0917
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    auth_app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+    api_errors: list[Exception],
+) -> None:
+    admission = RedisSimulationAdmission(
+        "redis://127.0.0.1:1/0", hmac_secret=b"c25a-test-only-secret-material-32bytes!"
+    )
+    coordinator = SimulationExecutionCoordinator[JSONResponse](admission)
+    auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": CODE, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+        assert injected_llm.requests == []
+        assert "127.0.0.1" not in response.text + caplog.text
+        assert api_errors[0].__context__ is None
+    finally:
+        assert await coordinator.aclose()
+        await admission.aclose()
+
+
+@pytest.mark.parametrize(
+    "denial", ["BUSY", "RATE_USER", "RATE_REPOSITORY", "RATE_GLOBAL", "INVALID_STATE"]
+)
+async def test_real_redis_denial_does_not_dispatch_retry_or_change_state(  # noqa: PLR0913, PLR0917
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    injected_llm: FakeLLM,
+    http_admission: ObservedRedisAdmission,
+    denial: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state = await http_admission.state()
+    actor = UUID((await browser.get("/api/v1/me")).json()["user"]["id"])
+    async with Redis.from_url(http_admission.url) as client:
+        seconds, micros = await client.time()
+    now = seconds * 1000 + micros // 1000
+    if denial == "BUSY":
+        state["lease"] = {"owner_token": "a" * 64, "expires_at_ms": now + 90000}
+    elif denial == "INVALID_STATE":
+        state["private_redis_detail"] = "redis_credentials_sentinel"
+    else:
+        count = {"RATE_USER": 3, "RATE_REPOSITORY": 10, "RATE_GLOBAL": 20}[denial]
+        state["admissions"] = [
+            {
+                "at_ms": now,
+                "user_id": actor.hex if denial == "RATE_USER" else uuid4().hex,
+                "repository_id": simulation_scope.repository.hex
+                if denial != "RATE_GLOBAL"
+                else uuid4().hex,
+            }
+            for _ in range(count)
+        ]
+    await http_admission.seed(state)
+    response = await browser.post(
+        simulation_scope.url(simulation_scope.repository),
+        headers=simulation_scope.headers,
+        json={"input": CODE, "rules": RULES},
+    )
+    assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert response.json() == {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "Service is unavailable.",
+        "request_id": response.headers["X-Request-Id"],
+        "retryable": False,
+        "retry_after": None,
+    }
+    assert len(http_admission.acquisitions) == 1
+    assert http_admission.releases == []
+    assert injected_llm.requests == []
+    assert await http_admission.state() == state
+    assert "redis_credentials_sentinel" not in response.text + caplog.text

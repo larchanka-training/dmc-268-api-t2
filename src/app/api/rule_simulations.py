@@ -1,10 +1,11 @@
-"""Rule simulation boundary; execution requires an explicit dependency override."""
+"""Rule simulation HTTP boundary with application-owned execution dependencies."""
 
+import asyncio
 import json
 import re
 from contextlib import suppress
 from ntpath import splitdrive
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -21,6 +22,8 @@ from app.adapters.personal_github import (
 from app.api.auth import VerifiedMutationIdentity, get_verified_mutation_identity
 from app.api.errors import ApiError
 from app.api.repository_settings import _require_admin
+from app.application.simulation_execution import SimulationExecutionCoordinator
+from app.application.simulation_runtime import SimulationRuntime
 from app.context.rules import ParsedRules, parse_rules
 from app.core.config import Settings, get_settings
 from app.db.models import Repository, RepositoryAccess
@@ -28,7 +31,6 @@ from app.db.session import get_session
 from app.review.schemas.finding import RelPath
 from app.review.simulation import (
     CodeSimulationResult,
-    CodeSimulationService,
     DiffSimulationResult,
 )
 from app.vcs.diff import InvalidDiff, parse_diff
@@ -184,14 +186,51 @@ def _validate_simulation_headers(request: Request) -> None:
         is None
     ):
         raise ApiError(422, "VALIDATION_FAILED", "Request is invalid.")
-    # Transport gate only; key identity, replay and storage are not implemented.
+    # Validate once; dispatch below uses the original ASGI header bytes.
     keys = request.headers.getlist("idempotency-key")
     if len(keys) != 1 or not keys[0].strip() or "," in keys[0]:
         raise ApiError(422, "VALIDATION_FAILED", "Request is invalid.")
 
 
-async def get_simulation_executor() -> CodeSimulationService | None:
-    """Unavailable by default; no production provider is composed here."""
+class SimulationExecutor(Protocol):
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float,
+    ) -> CodeSimulationResult | DiffSimulationResult: ...
+
+
+async def get_simulation_executor(request: Request) -> SimulationExecutor | None:
+    """Borrow only a complete application-owned execution pair."""
+    runtime = cast(
+        SimulationRuntime | None, getattr(request.app.state, "simulation_runtime", None)
+    )
+    if (
+        runtime is not None
+        and runtime.accepting
+        and runtime.executor is not None
+        and runtime.coordinator is not None
+    ):
+        return runtime.executor
+    return None
+
+
+async def get_simulation_coordinator(
+    request: Request,
+) -> SimulationExecutionCoordinator[JSONResponse] | None:
+    """Borrow the same retained coordinator for every HTTP request."""
+    runtime = cast(
+        SimulationRuntime | None, getattr(request.app.state, "simulation_runtime", None)
+    )
+    if (
+        runtime is not None
+        and runtime.accepting
+        and runtime.executor is not None
+        and runtime.coordinator is not None
+    ):
+        return runtime.coordinator
     return None
 
 
@@ -200,11 +239,13 @@ async def get_simulation_executor() -> CodeSimulationService | None:
     status_code=200,
     operation_id="createRuleSimulation",
     description=(
-        "A provided executor can return HTTP 200 with a Code or Diff result. "
-        "The executor is disabled by default, so a valid request in the normal "
+        "A provided executor and configured admission coordinator can return "
+        "HTTP 200 with a Code or Diff result. "
+        "Execution is disabled by default, so a valid request in the normal "
         "configuration returns canonical 503 SERVICE_UNAVAILABLE; dependency "
         "failures can also return 503. Staging execution is not enabled. "
-        "Idempotent replay and durable admission are not implemented."
+        "Duplicate keys suppress new dispatch; result replay is not implemented. "
+        "Redis admission is not a durable exactly-once execution guarantee."
     ),
     responses={
         200: {"model": CodeSimulationResult | DiffSimulationResult},
@@ -224,7 +265,11 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917 --
     ],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
-    executor: Annotated[CodeSimulationService | None, Depends(get_simulation_executor)],
+    executor: Annotated[SimulationExecutor | None, Depends(get_simulation_executor)],
+    coordinator: Annotated[
+        SimulationExecutionCoordinator[JSONResponse] | None,
+        Depends(get_simulation_coordinator),
+    ],
 ) -> Response:
     try:
         repository_id = UUID(id)
@@ -289,7 +334,7 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917 --
             diagnostics=diagnostics,
             diagnostics_truncated=truncated,
         )
-    if executor is None:
+    if executor is None or coordinator is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")
     try:
         fresh_external_id = await session.scalar(
@@ -318,8 +363,26 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917 --
         ) from None
     response = None
     with suppress(Exception):
-        result = await executor.simulate(payload.input, payload.rules)
-        response = JSONResponse(status_code=200, content=result.model_dump(mode="json"))
+
+        async def execute(deadline: float) -> JSONResponse:
+            result = await executor.simulate(
+                payload.input, payload.rules, deadline=deadline
+            )
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError
+            content = result.model_dump(mode="json")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError
+            return JSONResponse(status_code=200, content=content)
+
+        key = next(
+            value for name, value in request.headers.raw if name == b"idempotency-key"
+        )
+        outcome = await coordinator.execute(
+            identity.user_id, repository_id, key, execute
+        )
+        if outcome.status == "SUCCESS" and outcome.value is not None:
+            response = outcome.value
     # Raise outside the handler so the service/provider exception is not retained.
     if response is None:
         raise ApiError(503, "SERVICE_UNAVAILABLE", "Service is unavailable.")

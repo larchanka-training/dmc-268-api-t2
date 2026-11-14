@@ -165,7 +165,8 @@ def test_transport_contract_requires_session_origin_csrf_and_preliminary_key() -
     assert set(headers) == {"Origin", "X-CSRF-Token", "Idempotency-Key"}
     assert all(p["required"] for p in headers.values())
     key = headers["Idempotency-Key"]
-    assert "transport gate only" in key["description"]
+    assert "exact raw bytes" in key["description"]
+    assert "result replay" in key["description"]
     validator = Draft202012Validator(key["schema"])
     for value in ("not-a-uuid", " old key ", "018e4a00-0000-7000-8000-000000000000"):
         validator.validate(value)
@@ -265,7 +266,10 @@ def test_generated_operation_documents_success_and_disabled_by_default_executor(
     assert "disabled by default" in description
     assert "503 SERVICE_UNAVAILABLE" in description
     assert "Staging execution is not enabled" in description
-    assert "Idempotent replay and durable admission are not implemented" in description
+    assert "configured admission coordinator" in description
+    assert "Duplicate keys suppress new dispatch" in description
+    assert "result replay is not implemented" in description
+    assert "durable exactly-once" in description
 
 
 @pytest.fixture(scope="module", params=["static", "generated"])
@@ -404,3 +408,14 @@ def test_success_contract_rejects_invalid_http_results(
         limits = {"rule_ref": 32, "title": 200, "explanation": 2000, "evidence": 1000}
         item[field] = "x" * (limits[field] + 1)
     assert not validator.is_valid(response), invalid_case
+
+
+def test_static_and_generated_execution_descriptions_agree() -> None:
+    static = document()["paths"][PATH]["post"]["description"]
+    generated = create_app().openapi()["paths"][PATH]["post"]["description"]
+    for text in (static, generated):
+        assert "configured admission coordinator" in text
+        assert "disabled by default" in text
+        assert "Duplicate keys suppress new dispatch" in text
+        assert "result replay is not implemented" in text
+        assert "durable exactly-once" in text

@@ -81,12 +81,14 @@ async def materialize_settings(
     values["id"] = snapshot_id(values)
     values["rules_digest"] = compute_rules_digest(values["rules"])
     await session.execute(
-        insert(RepositorySettings)
-        .values(**values)
-        .on_conflict_do_nothing(index_elements=["id"])
+        insert(RepositorySettings).values(**values).on_conflict_do_nothing()
     )
     await session.commit()
     stored = await session.get(RepositorySettings, values["id"], populate_existing=True)
-    if stored is None or not valid_snapshot(stored):
+    if (
+        stored is None
+        or not valid_snapshot(stored)
+        or any(getattr(stored, key) != value for key, value in values.items())
+    ):
         raise FrozenConfigurationError("invalid_rules_snapshot")
     return values

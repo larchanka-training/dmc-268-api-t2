@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, overload
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.context.rules import parse_rules
+from app.context.rules import ParsedRules, parse_rules
 from app.llm.client import BaseLLMClient, ChatMessage, LLMRequest
 from app.llm.errors import LLMGatewayError
 from app.llm.tokens import ConservativeTokenCounter
@@ -162,42 +162,24 @@ class CodeSimulationService:
         self._max_input_tokens = max_input_tokens
         self._max_output_tokens = max_output_tokens
 
-    @overload
-    async def simulate(
-        self,
-        code: SimulationCodeInput,
-        rules: SimulationRules,
-        *,
-        deadline: float | None = None,
-    ) -> CodeSimulationResult: ...
-
-    @overload
-    async def simulate(
-        self,
-        code: SimulationDiffInput,
-        rules: SimulationRules,
-        *,
-        deadline: float | None = None,
-    ) -> DiffSimulationResult: ...
-
-    @overload
-    async def simulate(
+    def validate_prompt(
         self,
         code: SimulationCodeInput | SimulationDiffInput,
         rules: SimulationRules,
-        *,
-        deadline: float | None = None,
-    ) -> CodeSimulationResult | DiffSimulationResult: ...
+    ) -> None:
+        """Check the authoritative complete prompt before consuming admission."""
+        self._prepare(code, rules)
 
-    async def simulate(
+    def _prepare(
         self,
         code: SimulationCodeInput | SimulationDiffInput,
         rules: SimulationRules,
-        *,
-        deadline: float | None = None,
-    ) -> CodeSimulationResult | DiffSimulationResult:
-        if deadline is not None:
-            deadline = min(deadline, asyncio.get_running_loop().time() + 30.0)
+    ) -> tuple[
+        LLMRequest,
+        type[CodeSimulationOutput | DiffSimulationOutput],
+        ParsedDiff | None,
+        ParsedRules,
+    ]:
         parsed_rules = parse_rules(rules.markdown, db_instructions=())
         if (
             parsed_rules.state != "valid"
@@ -271,6 +253,45 @@ class CodeSimulationService:
         )
         if input_tokens > self._max_input_tokens:
             raise CodeSimulationError("prompt_too_large")
+        return request, output_model, parsed_diff, parsed_rules
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationCodeInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult: ...
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> DiffSimulationResult: ...
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult | DiffSimulationResult: ...
+
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult | DiffSimulationResult:
+        if deadline is not None:
+            deadline = min(deadline, asyncio.get_running_loop().time() + 30.0)
+        request, output_model, parsed_diff, parsed_rules = self._prepare(code, rules)
         request = request.model_copy(update={"timeout_s": _request_timeout(deadline)})
         call = None
         error_code = "invalid_llm_output"

@@ -355,8 +355,11 @@ async def test_partial_client_initialization_fails_closed_and_reclaims_http(
 async def test_shutdown_disables_simulation_before_queue_metrics_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    redis_url = os.environ.get("DMC268_TEST_REDIS_URL")
+    if not redis_url:
+        pytest.skip("requires disposable Redis")
     enable_configuration(monkeypatch)
-    monkeypatch.setenv("REDIS__URL", os.environ["DMC268_TEST_REDIS_URL"])
+    monkeypatch.setenv("REDIS__URL", redis_url)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]

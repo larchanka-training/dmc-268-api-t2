@@ -193,6 +193,12 @@ def _validate_simulation_headers(request: Request) -> None:
 
 
 class SimulationExecutor(Protocol):
+    def validate_prompt(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+    ) -> None: ...
+
     async def simulate(
         self,
         code: SimulationCodeInput | SimulationDiffInput,
@@ -367,6 +373,7 @@ async def create_rule_simulation(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917 --
         ) from None
     response = None
     with suppress(Exception):
+        executor.validate_prompt(payload.input, payload.rules)
 
         async def execute(deadline: float) -> JSONResponse:
             result = await executor.simulate(

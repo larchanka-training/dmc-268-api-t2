@@ -163,7 +163,7 @@ class SimulationExecutionCoordinator[T]:
                 task.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=self._cleanup_timeout_s)
-        return not self._running and all(task.done() for task in tasks)
+        return not self._running and all(task.done() for task in self._tasks)
 
     def _observe(self, task: asyncio.Task[object]) -> None:
         if not task.cancelled():
@@ -217,14 +217,10 @@ class SimulationExecutionCoordinator[T]:
             try:
                 released = await self._admission.release(owner_token)
             except Exception:
-                self._closed = True
-                if self.ledger is not None:
-                    await self.ledger.block()
+                await self._deny(deadline)
                 raise
             if released not in ("RELEASED", "NOT_OWNER"):
-                self._closed = True
-                if self.ledger is not None:
-                    await self.ledger.block()
+                await self._deny(deadline)
             return released
 
         task = self._start(release)
@@ -280,17 +276,13 @@ class SimulationExecutionCoordinator[T]:
                     user_id, repository_id, idempotency_key
                 )
             except Exception:
-                self._closed = True
-                if self.ledger is not None:
-                    await self.ledger.block()
+                await self._deny()
                 raise
             if not _valid_admission(acquired) or acquired.status in (
                 "UNAVAILABLE",
                 "INVALID_STATE",
             ):
-                self._closed = True
-                if self.ledger is not None:
-                    await self.ledger.block()
+                await self._deny()
             return acquired
 
         task = self._start(acquire)

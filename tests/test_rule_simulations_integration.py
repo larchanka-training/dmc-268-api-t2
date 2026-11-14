@@ -286,6 +286,13 @@ class HttpExecutor:
         self.fake = fake
         self.service = CodeSimulationService(fake)
 
+    def validate_prompt(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+    ) -> None:
+        self.service.validate_prompt(code, rules)
+
     async def simulate(
         self,
         code: SimulationCodeInput | SimulationDiffInput,
@@ -296,6 +303,75 @@ class HttpExecutor:
         self.fake.deadlines.append(deadline)
         assert 0 < deadline - asyncio.get_running_loop().time() <= 30.0  # noqa: PLR2004 -- coordinator budget cap
         return await self.service.simulate(code, rules)
+
+
+@pytest.mark.parametrize("kind", ["code", "diff"])
+async def test_oversized_prompt_does_not_admit_or_block_other_users(
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    auth_app: FastAPI,
+    http_admission: ObservedRedisAdmission,
+    kind: str,
+) -> None:
+    fake = FakeLLM()
+    fake.answer = '{"findings":[]}'
+    service = CodeSimulationService(fake, max_input_tokens=8192)
+    claims: list[bytes] = []
+
+    class ObservedLedger(IsolatedSimulationLedger):
+        async def claim(
+            self, user_id: UUID, repository_id: UUID, idempotency_key: bytes
+        ) -> Any:
+            claims.append(idempotency_key)
+            return await super().claim(user_id, repository_id, idempotency_key)
+
+    coordinator = SimulationExecutionCoordinator[JSONResponse](
+        http_admission, ledger=ObservedLedger()
+    )
+    auth_app.dependency_overrides[get_simulation_executor] = lambda: service
+    auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
+    # The reviewer's valid 24,010-byte source exceeds the configured 8192-token
+    # budget even before accounting for the authoritative template and schema.
+    source = "x = '" + "a" * 24003 + "'\n"
+    assert len(source.encode()) == 24010  # noqa: PLR2004 -- reviewer reproduction
+    input_data = (
+        CODE | {"source": source}
+        if kind == "code"
+        else {
+            "kind": "diff",
+            "unified_diff": (
+                "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+                "@@ -1 +1 @@\n-old\n+" + source
+            ),
+        }
+    )
+    try:
+        response = await browser.post(
+            simulation_scope.url(simulation_scope.repository),
+            headers=simulation_scope.headers,
+            json={"input": input_data, "rules": RULES},
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert fake.requests == []
+        assert http_admission.acquisitions == []
+        assert claims == []
+
+        async def other_user(deadline: float) -> JSONResponse:
+            result = await service.simulate(
+                SimulationCodeInput.model_validate(CODE),
+                SimulationRules.model_validate(RULES),
+                deadline=deadline,
+            )
+            return JSONResponse(result.model_dump())
+
+        outcome = await coordinator.execute(uuid4(), uuid4(), b"other-user", other_user)
+        assert outcome.status == "SUCCESS"
+        assert len(fake.requests) == 1
+        assert claims == [b"other-user"]
+    finally:
+        assert await coordinator.aclose()
+        auth_app.dependency_overrides.pop(get_simulation_executor, None)
+        auth_app.dependency_overrides.pop(get_simulation_coordinator, None)
 
 
 @pytest.fixture

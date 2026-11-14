@@ -663,3 +663,119 @@ async def test_closed_coordinator_does_not_admit_even_after_drain() -> None:
     result = await coordinator.execute(USER, REPOSITORY, KEY, Executor())
     assert result.status == "UNAVAILABLE"
     assert admission.acquisitions == []
+
+
+@pytest.mark.parametrize("incident", ["UNAVAILABLE", "INVALID_STATE", "exception"])
+async def test_shutdown_retains_acquire_incident_deny_until_durable(
+    incident: str,
+) -> None:
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            entered.set()
+            await finish.wait()
+            durable.set()
+
+    class IncidentAdmission(Admission):
+        async def acquire(self, *args: object) -> AdmissionResult:
+            if incident == "exception":
+                raise OSError("Redis unavailable")
+            return AdmissionResult(incident)  # type: ignore[arg-type]
+
+    coordinator = SimulationExecutionCoordinator[str](
+        IncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.01
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        assert await coordinator.aclose() is False
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()
+
+
+@pytest.mark.parametrize("incident", ["UNAVAILABLE", "INVALID_STATE", "exception"])
+async def test_shutdown_retains_release_incident_deny_until_durable(
+    incident: str,
+) -> None:
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            entered.set()
+            await finish.wait()
+            durable.set()
+
+    class IncidentAdmission(Admission):
+        async def release(self, owner_token: str) -> ReleaseResult:
+            if incident == "exception":
+                raise OSError("Redis unavailable")
+            return incident  # type: ignore[return-value]
+
+    coordinator = SimulationExecutionCoordinator[str](
+        IncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.01
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        assert await coordinator.aclose() is False
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()
+
+
+async def test_shutdown_retains_deny_started_by_cancelled_release() -> None:
+    releasing = asyncio.Event()
+    denying = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class LateIncidentAdmission(Admission):
+        async def release(self, owner_token: str) -> ReleaseResult:
+            releasing.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return "UNAVAILABLE"
+            return "RELEASED"
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            denying.set()
+            await finish.wait()
+            durable.set()
+
+    coordinator = SimulationExecutionCoordinator[str](
+        LateIncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.1
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(releasing.wait(), 1)
+    # Shutdown's wait extends past the release cleanup deadline. Its cancellation
+    # reveals the Redis incident and creates a new deny operation during close.
+    await asyncio.sleep(0.05)
+    try:
+        assert await coordinator.aclose() is False
+        assert denying.is_set()
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()

@@ -21,6 +21,7 @@ def runtime_environment(
     flag: str | None = None,
     analysis: str = "false",
     publication: str = "false",
+    hmac: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     writer = workflow_step("Write runtime environment")["run"]
     writer = writer.split("} | sshpass -e ssh", 1)[0] + "}\n"
@@ -31,6 +32,8 @@ def runtime_environment(
     }
     if flag is not None:
         environment["SIMULATION_ENABLED"] = flag
+    if hmac is not None:
+        environment["SIMULATION_HMAC_SECRET_B64"] = hmac
     return subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-euc", writer],
         env=environment,
@@ -179,7 +182,7 @@ def test_compose_receives_explicit_simulation_path_with_analysis_disabled(
     "analysis,publication",
     [("false", "false"), ("true", "false"), ("false", "true"), ("true", "true")],
 )
-def test_environment_matrix_preserves_profiles_and_never_delivers_hmac(
+def test_environment_matrix_preserves_profiles_without_optional_hmac(
     target: str,
     flag: str | None,
     analysis: str,
@@ -207,7 +210,7 @@ def test_environment_matrix_preserves_profiles_and_never_delivers_hmac(
     assert "SIMULATION__HMAC_SECRET_B64" not in entries
 
 
-def test_default_services_stay_unchanged_and_hmac_is_never_forwarded() -> None:
+def test_default_services_stay_unchanged_and_hmac_is_api_only() -> None:
     raw = yaml.safe_load((ROOT / "docker-compose.staging.yml").read_text())
     assert set(compose_config(profiles="analysis,publication")["services"]) == {
         "api",
@@ -221,12 +224,30 @@ def test_default_services_stay_unchanged_and_hmac_is_never_forwarded() -> None:
     }
     assert set(compose_config()["volumes"]) == {"db-data"}
     for name, service in raw["services"].items():
-        assert "SIMULATION__HMAC_SECRET_B64" not in service.get("environment", {})
         if name != "api":
             assert not any(
                 key.startswith("SIMULATION__") for key in service.get("environment", {})
             )
-    assert "HMAC" not in (ROOT / ".github/workflows/deploy-staging.yml").read_text()
+    assert raw["services"]["api"]["environment"].get("SIMULATION__HMAC_SECRET_B64") == (
+        "${SIMULATION__HMAC_SECRET_B64:-}"
+    )
+
+
+def test_disabled_operator_hmac_delivery_is_staging_only() -> None:
+    secret = "c3ludGhldGljLXN0YWJsZS1obWFjLW1hdGVyaWFsLTMyIQ=="
+    for target in ("staging", "develop"):
+        result = runtime_environment(target=target, hmac=secret)
+        assert result.returncode == 0, result.stderr
+        assert secret not in result.stderr
+        entries = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        assert entries["SIMULATION__ENABLED"] == "false"
+        if target == "staging":
+            assert json.loads(entries["SIMULATION__HMAC_SECRET_B64"]) == secret
+        else:
+            assert "SIMULATION__HMAC_SECRET_B64" not in entries
+    assert workflow_step("Write runtime environment")["env"][
+        "SIMULATION_HMAC_SECRET_B64"
+    ] == ("${{ secrets.STAGING_SIMULATION_HMAC_SECRET_B64 }}")
 
 
 def test_pr_and_feature_branch_cannot_publish_or_deploy() -> None:
@@ -243,3 +264,18 @@ def test_pr_and_feature_branch_cannot_publish_or_deploy() -> None:
         ci["jobs"]["publish"]["if"] == "github.event_name == 'push' && "
         "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')"
     )
+
+
+def test_dedicated_url_is_delivered_for_operator_use_without_starting_profile() -> None:
+    for target in ("staging", "develop"):
+        result = runtime_environment(target=target)
+        assert result.returncode == 0
+        entries = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        if target == "staging":
+            assert (
+                entries.get("SIMULATION__REDIS_URL")
+                == "redis://simulation-redis:6379/0"
+            )
+        else:
+            assert "SIMULATION__REDIS_URL" not in entries
+        assert entries["COMPOSE_PROFILES"] == ""

@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ""
+      simulation_activation_approved:
+        description: Confirm prepared staging storage, dedicated identity, backups and no unresolved recovery incidents
+        required: false
+        type: boolean
+        default: false
   workflow_run:
     workflows: ["API CI"]
     types:
@@ -70,6 +75,7 @@ jobs:
       ANALYSIS_ENABLED: ${{ vars.STAGING_ANALYSIS_ENABLED || 'false' }}
       PUBLICATION_ENABLED: ${{ vars.STAGING_PUBLICATION_ENABLED || 'false' }}
       SIMULATION_ENABLED: ${{ vars.STAGING_SIMULATION_ENABLED || 'false' }}
+      SIMULATION_ACTIVATION_APPROVED: ${{ inputs.simulation_activation_approved && 'true' || 'false' }}
       # LLM gateway (docs/llm-gateway-review-pipeline.md §6a). Until Ollama is
       # deployed to staging, the chain is Eurorouter only.
       LLM_PRIMARY_PROVIDER: ${{ vars.STAGING_LLM_PRIMARY_PROVIDER || 'eurorouter' }}
@@ -408,6 +414,7 @@ jobs:
           SSH_USER: ${{ secrets.VPS_DMC268_U }}
           SSHPASS: ${{ secrets.VPS_DMC268_P }}
           POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          SIMULATION_HMAC_SECRET_B64: ${{ secrets.STAGING_SIMULATION_HMAC_SECRET_B64 }}
           EUROROUTER_API_KEYS: ${{ secrets.STAGING_EUROROUTER_API_KEYS || secrets.AI_DMC268_T2 }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK__SECRET }}
           GITHUB_API_TOKEN: ${{ secrets.STAGING_GITHUB_READ_TOKEN }}
@@ -450,6 +457,11 @@ jobs:
             fi
           }
 
+          runtime_env_file="${ENV_FILE:-.env.staging}"
+          if [[ "${ENV_NAME:-}" == staging && "${SIMULATION_ENABLED:-false}" == true ]]; then
+            runtime_env_file="${runtime_env_file}.simulation-candidate"
+          fi
+
           {
             printf 'API_IMAGE=%s\n' "${API_IMAGE}"
             printf 'UI_IMAGE=%s\n' "${UI_IMAGE}"
@@ -462,6 +474,8 @@ jobs:
             if [[ "${ENV_NAME:-}" == staging ]]; then
               printf 'ANALYSIS_RUNTIME_DIR=/opt/dmc-268-t2-runtime/analysis-runtime\n'
               printf 'SIMULATION__MANIFEST_PATH=/app/runtime/analysis-runtime.v1.json\n'
+              printf 'SIMULATION__REDIS_URL=redis://simulation-redis:6379/0\n'
+              append_optional 'SIMULATION__HMAC_SECRET_B64' "${SIMULATION_HMAC_SECRET_B64:-}"
             else
               printf 'ANALYSIS_RUNTIME_DIR=./analysis-runtime\n'
             fi
@@ -506,7 +520,22 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "umask 077 && cat > '${DEPLOY_PATH}/${ENV_FILE}'"
+            "umask 077 && cat > '${DEPLOY_PATH}/${runtime_env_file}'"
+
+      - name: Transfer simulation readiness tools
+        if: env.ENV_NAME == 'staging'
+        env:
+          SSH_USER: ${{ secrets.VPS_DMC268_U }}
+          SSHPASS: ${{ secrets.VPS_DMC268_P }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+          sshpass -e ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            "install -d -m 0755 '${DEPLOY_PATH}/simulation-ops'"
+          sshpass -e scp "${ssh_options[@]}" \
+            scripts/simulation_readiness.py scripts/provision_simulation_admission.py \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/simulation-ops/"
 
       - name: Deploy application
         env:
@@ -571,11 +600,49 @@ jobs:
             -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no \
             "${SSH_USER}@${SSH_HOST}" \
-            "cat > '${DEPLOY_PATH}/.deploy-application.remote.sh' && chmod 700 '${DEPLOY_PATH}/.deploy-application.remote.sh' && DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash '${DEPLOY_PATH}/.deploy-application.remote.sh'; status=\$?; rm -f '${DEPLOY_PATH}/.deploy-application.remote.sh'; exit \"\$status\"" \
+            "cat > '${DEPLOY_PATH}/.deploy-application.remote.sh' && chmod 700 '${DEPLOY_PATH}/.deploy-application.remote.sh' && DEPLOY_PATH='${DEPLOY_PATH}' ENV_FILE='${ENV_FILE}' WEB_PORT='${WEB_PORT}' ENV_NAME='${ENV_NAME}' COMPOSE_PROJECT='${COMPOSE_PROJECT}' SIMULATION_ENABLED='${SIMULATION_ENABLED}' SIMULATION_ACTIVATION_APPROVED='${SIMULATION_ACTIVATION_APPROVED}' MANIFEST_SHA256='${MANIFEST_SHA256:-}' INSTALLER_SHA256='${INSTALLER_SHA256:-}' bash '${DEPLOY_PATH}/.deploy-application.remote.sh'; status=\$?; rm -f '${DEPLOY_PATH}/.deploy-application.remote.sh'; exit \"\$status\"" \
             <<'REMOTE'
           set -euo pipefail
 
           cd "${DEPLOY_PATH}"
+
+          simulation_activation=false
+          if [[ "${ENV_NAME}" == staging && "${SIMULATION_ENABLED:-false}" == true ]]; then
+            simulation_activation=true
+            if [[ "${COMPOSE_PROJECT}" != dmc-268-t2-staging || "${SIMULATION_ACTIVATION_APPROVED:-false}" != true ]]; then
+              echo "ERROR: explicit staging storage/identity/recovery approval required" >&2
+              exit 1
+            fi
+            docker volume inspect "${COMPOSE_PROJECT}_simulation-redis-data" >/dev/null
+            active_env_file="${ENV_FILE}"
+            candidate_env_file="${ENV_FILE}.simulation-candidate"
+            ENV_FILE="${candidate_env_file}"
+            test -f "${ENV_FILE}"
+            promoted=false
+            previous_env_file=""
+            cleanup_simulation_activation() {
+              status=$?
+              trap - EXIT
+              if [[ "${status}" != 0 && "${promoted}" == true ]]; then
+                compose stop api >/dev/null 2>&1 || true
+                if [[ -n "${previous_env_file}" ]]; then
+                  mv -f -- "${previous_env_file}" "${active_env_file}"
+                else
+                  rm -f -- "${active_env_file}"
+                fi
+              fi
+              rm -f -- "${candidate_env_file}"
+              if [[ -n "${previous_env_file}" ]]; then
+                rm -f -- "${previous_env_file}"
+              fi
+              exit "${status}"
+            }
+            trap cleanup_simulation_activation EXIT
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            grep -qx 'SIMULATION__ENABLED=true' "${ENV_FILE}"
+          fi
 
           # -p pins the Compose project name per environment (staging vs
           # develop). Without it both deployments would fall back to the
@@ -624,6 +691,10 @@ jobs:
             rm -f analysis-runtime.selected.json install-analysis-manifest.py
           fi
 
+          if [[ "${simulation_activation}" == true ]]; then
+            compose --profile simulation up -d --wait --wait-timeout 60 simulation-redis
+          fi
+
           compose up -d db redis
 
           echo "Waiting for PostgreSQL and Redis..."
@@ -656,6 +727,16 @@ jobs:
 
           echo "Running database migrations..."
           compose run --rm --no-deps --interactive=false -T api alembic upgrade head </dev/null
+
+          if [[ "${simulation_activation}" == true ]]; then
+            selected_api_image="$(sed -n 's/^API_IMAGE=//p' "${ENV_FILE}" | tail -n1)"
+            compose run --rm --no-deps --interactive=false -T \
+              -e DEPLOY_ENV=staging -e SIMULATION_ACTIVATION_APPROVED=true \
+              -e SIMULATION_EXPECTED_IMAGE_SHA="${selected_api_image##*:sha-}" \
+              -e SIMULATION_MANIFEST_SHA256="${MANIFEST_SHA256}" \
+              -v "${DEPLOY_PATH}/simulation-ops:/app/scripts:ro" \
+              api python -m scripts.simulation_readiness </dev/null
+          fi
 
           runtime_profiles="$(sed -n 's/^COMPOSE_PROFILES=//p' "${ENV_FILE}" | tail -n1)"
           profile_enabled() {
@@ -728,6 +809,15 @@ jobs:
           fi
 
           echo "Starting API..."
+          if [[ "${simulation_activation}" == true ]]; then
+            if [[ -f "${active_env_file}" ]]; then
+              previous_env_file="$(mktemp "${active_env_file}.simulation-previous.XXXXXX")"
+              cp -- "${active_env_file}" "${previous_env_file}"
+            fi
+            mv -f -- "${candidate_env_file}" "${active_env_file}"
+            promoted=true
+            ENV_FILE="${active_env_file}"
+          fi
           # Force recreate so Compose cannot leave a stale api service running
           # pre-scope OAuth code after env already pins a newer API_IMAGE.
           compose up -d --force-recreate --no-deps api

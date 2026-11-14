@@ -35,6 +35,7 @@ services:
       ANALYSIS__CONFIG_PATH: ${ANALYSIS__CONFIG_PATH:-}
       SIMULATION__ENABLED: ${SIMULATION__ENABLED:-false}
       SIMULATION__MANIFEST_PATH: ${SIMULATION__MANIFEST_PATH:-}
+      SIMULATION__REDIS_URL: ${SIMULATION__REDIS_URL:-}
       # Legacy gateway settings remain available. Frozen analysis selects its
       # model/policy from ANALYSIS__CONFIG_PATH; deployment checks consistency.
       LLM__PRIMARY_PROVIDER: ${LLM__PRIMARY_PROVIDER:-eurorouter}
@@ -225,8 +226,37 @@ services:
     networks:
       - backend
 
+  simulation-redis:
+    image: redis:8-alpine
+    profiles: [simulation]
+    restart: "no"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --no-appendfsync-on-rewrite
+      - "no"
+      - --aof-load-truncated
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - simulation-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks:
+      - backend
+
 volumes:
   db-data:
+  simulation-redis-data:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-dmc-268-t2-staging}_simulation-redis-data
 
 networks:
   backend:

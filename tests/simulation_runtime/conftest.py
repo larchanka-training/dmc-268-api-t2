@@ -12,6 +12,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from redis.asyncio import Redis
+from simulation_redis_fixtures import (
+    dedicated_simulation_redis_url,  # noqa: F401 -- explicit local fixture
+)
 from starlette.types import Message
 from test_auth_api import (
     auth_app,  # noqa: F401 -- explicit local fixtures
@@ -35,10 +38,12 @@ from app.core.config import Settings, get_settings
 
 @pytest.fixture(autouse=True)
 def runtime_environment(
+    dedicated_simulation_redis_url: str,  # noqa: F811 -- fixture injection
     isolated_runtime_environment: None,  # noqa: F811 -- explicit local fixture injection
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     enable_configuration(monkeypatch)
+    monkeypatch.setenv("SIMULATION__REDIS_URL", dedicated_simulation_redis_url)
     monkeypatch.setenv("REDIS__URL", os.environ["DMC268_TEST_REDIS_URL"])
 
 
@@ -113,9 +118,11 @@ def no_external_http(
 
 
 @pytest.fixture
-async def admission_state() -> AsyncIterator[Redis]:
+async def admission_state(
+    dedicated_simulation_redis_url: str,  # noqa: F811 -- fixture injection
+) -> AsyncIterator[Redis]:
     async with Redis.from_url(
-        os.environ["DMC268_TEST_REDIS_URL"], decode_responses=True
+        dedicated_simulation_redis_url, decode_responses=True
     ) as client:
         await client.delete(STATE_KEY)
         try:

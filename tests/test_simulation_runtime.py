@@ -15,7 +15,10 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import Depends
-from redis.asyncio import Redis
+from redis.asyncio import ConnectionPool, Redis
+from simulation_redis_fixtures import (
+    dedicated_simulation_redis_url,  # noqa: F401 -- explicit local fixture
+)
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -90,6 +93,12 @@ MANIFEST = Path(__file__).resolve().parents[1] / "deploy/analysis-runtime.stagin
 
 def enable_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIMULATION__ENABLED", "true")
+    monkeypatch.setenv(
+        "SIMULATION__REDIS_URL",
+        os.environ.get(
+            "DMC268_TEST_SIMULATION_REDIS_URL", "redis://simulation-redis:6379/0"
+        ),
+    )
     monkeypatch.setenv(
         "SIMULATION__HMAC_SECRET_B64", base64.b64encode(b"s" * 32).decode()
     )
@@ -168,11 +177,13 @@ async def test_invalid_stable_secret_keeps_runtime_unavailable(
 
 async def test_valid_lifespan_composes_one_direct_provider_after_redis_admission(
     monkeypatch: pytest.MonkeyPatch,
+    dedicated_simulation_redis_url: str,  # noqa: F811 -- fixture injection
 ) -> None:
 
     enable_configuration(monkeypatch)
-    redis_url = os.environ["DMC268_TEST_REDIS_URL"]
-    monkeypatch.setenv("REDIS__URL", redis_url)
+    redis_url = dedicated_simulation_redis_url
+    monkeypatch.setenv("SIMULATION__REDIS_URL", redis_url)
+    monkeypatch.setenv("REDIS__URL", os.environ["DMC268_TEST_REDIS_URL"])
     monkeypatch.setenv("HTTPS_PROXY", "http://unapproved-proxy.invalid:9999")
     requests: list[httpx.Request] = []
 
@@ -302,7 +313,11 @@ async def test_partial_client_initialization_fails_closed_and_reclaims_http(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     enable_configuration(monkeypatch)
-    monkeypatch.setenv("REDIS__URL", "invalid-redis-url")
+
+    def fail_pool(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("synthetic pool initialization failure")
+
+    monkeypatch.setattr(ConnectionPool, "__init__", fail_pool)
     clients: list[httpx.AsyncClient] = []
     original = httpx.AsyncClient.__init__
 

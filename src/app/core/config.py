@@ -1,9 +1,11 @@
 """Application settings loaded from environment variables / .env file."""
 
 from functools import lru_cache
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
+from socket import inet_aton
 from typing import Annotated, Literal, Self
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus, unquote, urlsplit
 
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -282,6 +284,50 @@ class Simulation(BaseModel):
     enabled: bool = False
     manifest_path: Path | None = None
     hmac_secret_b64: SecretStr | None = None
+    redis_url: SecretStr | None = None
+
+    def dedicated_redis_url(self, shared_url: str) -> str:
+        """Reject missing/ambiguous endpoints without exposing credentials.
+
+        DB, credentials and TLS do not isolate Redis instances. DNS aliases
+        still require operator identity verification before activation.
+        """
+        if self.redis_url is None:
+            raise ValueError("simulation_redis_unavailable")
+        url = self.redis_url.get_secret_value()
+        try:
+            if _redis_endpoint(url) == _redis_endpoint(shared_url):
+                raise ValueError
+        except ValueError:
+            raise ValueError("simulation_redis_unavailable") from None
+        return url
+
+
+def _redis_endpoint(url: str) -> tuple[str, int]:
+    uri = urlsplit(url)
+    if (
+        uri.scheme not in {"redis", "rediss"}
+        or not uri.hostname
+        or uri.query
+        or uri.fragment
+        or any(char.isspace() or ord(char) < 32 for char in url)  # noqa: PLR2004
+        or (uri.path not in {"", "/"} and not uri.path[1:].isascii())
+        or (uri.path not in {"", "/"} and not uri.path[1:].isdecimal())
+        or not 0 < (uri.port or 6379) < 65536  # noqa: PLR2004
+    ):
+        raise ValueError
+    host = unquote(uri.hostname).lower().rstrip(".")
+    try:
+        address = ip_address(host)
+    except ValueError:
+        try:
+            address = ip_address(inet_aton(host))
+        except OSError:
+            return host, uri.port or 6379
+    if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    host = "localhost" if address.is_loopback else str(address)
+    return host, uri.port or 6379
 
 
 class Settings(BaseSettings):

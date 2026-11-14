@@ -33,8 +33,10 @@ class SimulationRuntime:
         if (
             settings.simulation.enabled
             and settings.simulation.hmac_secret_b64 is not None
+            and settings.simulation.redis_url is not None
         ):
             try:
+                settings.simulation.dedicated_redis_url(settings.redis.url)
                 encoded = settings.simulation.hmac_secret_b64.get_secret_value()
                 secret = base64.b64decode(encoded, validate=True)
                 if (
@@ -63,7 +65,8 @@ class SimulationRuntime:
                 transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False),
             )
             self.admission = RedisSimulationAdmission(
-                settings.redis.url, hmac_secret=self._hmac_secret
+                settings.simulation.dedicated_redis_url(settings.redis.url),
+                hmac_secret=self._hmac_secret,
             )
             client = OpenAICompatibleClient(
                 name=config.provider,

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -526,3 +527,32 @@ async def test_configured_secret_is_stable_across_restart_with_existing_state(
             await simulate(browser, simulation_scope, "after-restart")
         ).status_code == 200
         assert len(provider_io.requests) == 2
+
+
+@pytest.mark.parametrize("endpoint", ["missing", "shared", "unreachable"])
+async def test_dedicated_redis_failure_is_canonical_503_without_provider_dispatch(
+    auth_app: FastAPI,
+    browser: httpx.AsyncClient,
+    simulation_scope: SimulationScope,
+    provider_io: ProviderIO,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+
+    # Reserve a local port without listening: a deterministic offline refusal.
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        if endpoint == "missing":
+            monkeypatch.delenv("SIMULATION__REDIS_URL")
+        elif endpoint == "shared":
+            monkeypatch.setenv("SIMULATION__REDIS_URL", os.environ["REDIS__URL"])
+        else:
+            monkeypatch.setenv(
+                "SIMULATION__REDIS_URL",
+                f"redis://127.0.0.1:{unavailable.getsockname()[1]}/0",
+            )
+        get_settings.cache_clear()
+        async with auth_app.router.lifespan_context(auth_app):
+            assert_unavailable(await simulate(browser, simulation_scope))
+            assert (await browser.get("/healthcheck")).status_code == 200
+            assert provider_io.requests == []

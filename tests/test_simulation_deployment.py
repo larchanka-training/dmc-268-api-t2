@@ -207,9 +207,9 @@ def test_environment_matrix_preserves_profiles_and_never_delivers_hmac(
     assert "SIMULATION__HMAC_SECRET_B64" not in entries
 
 
-def test_e1a_does_not_forward_hmac_or_change_service_inventory() -> None:
+def test_default_services_stay_unchanged_and_hmac_is_never_forwarded() -> None:
     raw = yaml.safe_load((ROOT / "docker-compose.staging.yml").read_text())
-    assert set(raw["services"]) == {
+    assert set(compose_config(profiles="analysis,publication")["services"]) == {
         "api",
         "web",
         "worker",
@@ -219,7 +219,7 @@ def test_e1a_does_not_forward_hmac_or_change_service_inventory() -> None:
         "db",
         "redis",
     }
-    assert set(raw["volumes"]) == {"db-data"}
+    assert set(compose_config()["volumes"]) == {"db-data"}
     for name, service in raw["services"].items():
         assert "SIMULATION__HMAC_SECRET_B64" not in service.get("environment", {})
         if name != "api":

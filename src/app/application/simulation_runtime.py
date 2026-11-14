@@ -1,7 +1,6 @@
 """Application-owned Playground composition; constructed only inside lifespan."""
 
 import asyncio
-import base64
 
 import httpx
 from starlette.responses import JSONResponse
@@ -9,15 +8,13 @@ from starlette.responses import JSONResponse
 from app.adapters.simulation_admission import RedisSimulationAdmission
 from app.application.simulation_execution import SimulationExecutionCoordinator
 from app.core.config import Settings
+from app.core.simulation_hmac import decode_simulation_hmac
 from app.llm.openai_compatible import OpenAICompatibleClient
 from app.review.simulation import CodeSimulationService
 from app.review.simulation_configuration import (
     SimulationConfiguration,
     prepare_simulation_configuration,
 )
-
-_MIN_SECRET_BYTES = 32
-_MAX_SECRET_BYTES = 1024
 
 
 class SimulationRuntime:
@@ -37,14 +34,9 @@ class SimulationRuntime:
         ):
             try:
                 settings.simulation.dedicated_redis_url(settings.redis.url)
-                encoded = settings.simulation.hmac_secret_b64.get_secret_value()
-                secret = base64.b64decode(encoded, validate=True)
-                if (
-                    not _MIN_SECRET_BYTES <= len(secret) <= _MAX_SECRET_BYTES
-                    or base64.b64encode(secret).decode() != encoded
-                ):
-                    raise ValueError("invalid_simulation_secret")
-                self._hmac_secret = secret
+                self._hmac_secret = decode_simulation_hmac(
+                    settings.simulation.hmac_secret_b64.get_secret_value()
+                )
                 self.configuration = prepare_simulation_configuration(
                     settings, manifest_path=settings.simulation.manifest_path
                 )

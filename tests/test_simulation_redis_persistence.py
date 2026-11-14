@@ -22,6 +22,7 @@ from redis.asyncio import Redis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
+from simulation_ledger_stub import IsolatedSimulationLedger
 
 from app.adapters.redis_queue import RedisQueue
 from app.adapters.simulation_admission import STATE_KEY, RedisSimulationAdmission
@@ -242,7 +243,9 @@ async def test_missing_invalid_and_mismatched_state_are_never_replaced(
         calls += 1
         return "forbidden"
 
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     try:
         async with Redis.from_url(redis_project.url(), decode_responses=True) as client:
             for raw in [
@@ -268,7 +271,10 @@ async def test_missing_invalid_and_mismatched_state_are_never_replaced(
                 result = await coordinator.execute(
                     uuid4(), uuid4(), b"synthetic-negative", inference
                 )
-                assert result.status == "INVALID_STATE"
+                # A detected mandatory-component fault latches this coordinator.
+                assert result.status == (
+                    "INVALID_STATE" if raw is None else "UNAVAILABLE"
+                )
                 assert await client.get(STATE_KEY) == raw
                 assert await client.pttl(STATE_KEY) == (-2 if raw is None else -1)
             assert calls == 0
@@ -300,7 +306,9 @@ async def test_dedicated_failure_leaves_review_queue_operational(
         admission = RedisSimulationAdmission(
             dedicated_url, hmac_secret=b"synthetic-persistence-hmac-key-32!"
         )
-        coordinator = SimulationExecutionCoordinator[str](admission)
+        coordinator = SimulationExecutionCoordinator[str](
+            admission, ledger=IsolatedSimulationLedger()
+        )
         calls = 0
 
         async def inference(deadline: float) -> str:
@@ -399,7 +407,9 @@ async def test_persistence_write_failure_never_acknowledges_unsafe_write(
     admission = RedisSimulationAdmission(
         url, hmac_secret=b"synthetic-persistence-hmac-key-32!"
     )
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     calls = 0
 
     async def inference(deadline: float) -> str:

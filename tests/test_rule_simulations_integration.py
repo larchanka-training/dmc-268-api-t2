@@ -16,6 +16,7 @@ import pytest_asyncio
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, ValidationError
 from redis.asyncio import Redis
+from simulation_ledger_stub import IsolatedSimulationLedger
 from sqlalchemy import delete, insert, select, update
 from starlette.responses import JSONResponse
 from test_postgres_integration import PostgresHarness
@@ -267,7 +268,10 @@ async def shared_coordinator(
     execution_budget: float,
 ) -> AsyncIterator[SimulationExecutionCoordinator[JSONResponse]]:
     coordinator = SimulationExecutionCoordinator[JSONResponse](
-        http_admission, timeout_s=execution_budget, cleanup_timeout_s=0.05
+        http_admission,
+        ledger=IsolatedSimulationLedger(),
+        timeout_s=execution_budget,
+        cleanup_timeout_s=0.05,
     )
     auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
     try:
@@ -854,7 +858,9 @@ async def test_admission_denial_is_one_safe_http_503(  # noqa: PLR0913, PLR0917
     status: str,
 ) -> None:
     admission = Admission(AdmissionResult(status))  # type: ignore[arg-type]
-    coordinator = SimulationExecutionCoordinator[JSONResponse](admission)
+    coordinator = SimulationExecutionCoordinator[JSONResponse](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
     raw_key = b" Exact-Case-\xff "
     headers = exact_key_headers(simulation_scope, raw_key)
@@ -1125,7 +1131,9 @@ async def test_real_redis_unavailable_never_dispatches(  # noqa: PLR0913, PLR091
     admission = RedisSimulationAdmission(
         "redis://127.0.0.1:1/0", hmac_secret=b"c25a-test-only-secret-material-32bytes!"
     )
-    coordinator = SimulationExecutionCoordinator[JSONResponse](admission)
+    coordinator = SimulationExecutionCoordinator[JSONResponse](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     auth_app.dependency_overrides[get_simulation_coordinator] = lambda: coordinator
     try:
         response = await browser.post(

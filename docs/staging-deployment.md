@@ -500,6 +500,64 @@ checks на restart/reconnect/epoch и race/fault tests — отдельный *
 `STAGING_SIMULATION_ENABLED`. No automatic restore, no HMAC rotation, no history
 deletion, no startup reset; exactly-once не заявляется.
 
+### Rule Playground: PostgreSQL authoritative ledger (E1-B2C2, R1′)
+
+Для учебного staging принят R1′: PostgreSQL сохраняет одноразовые dispatch
+claims и rolling-hour квоты 3/user, 10/repository, 20/global; Redis остаётся
+дополнительным admission gate со своими прежними лимитами, lease и HMAC.
+Этот контракт заменяет прежний абсолютный physical-send fence из C1;
+новый egress service не вводится. **Playground остаётся disabled** до отдельного
+code review, полного GitHub CI и операторских activation gates.
+
+Migration `0022` добавляет только `simulation_dispatch_claim` и singleton
+`simulation_dispatch_control`. После Redis `ACQUIRED` короткая transaction на
+writable PostgreSQL primary выбирает `READ COMMITTED`, `synchronous_commit=on`,
+берёт общую transaction-scoped advisory lock, проверяет dedup/квоты и commits
+claim. Только caller, получивший подтверждение commit в пределах исходного
+execution deadline, может начать одну отправку. Во время GitHub/LLM HTTP ledger
+не удерживает connection/transaction; request session для этого не используется.
+
+Operation identity повторяет Redis v3 contract: HMAC-SHA256 с domain
+`dmc268:rule-simulation:dispatch:v1`, 8-byte big-endian length-prefix для каждого
+поля, trusted UUID bytes пользователя/репозитория и точные Idempotency-Key bytes.
+Code/Diff используют один тип операции. Configuration identity закрепляется
+в control row; смена HMAC блокирует claims. Raw key, secret, код, правила, diff,
+provider credential и HTTP bodies не сохраняются.
+
+`DISPATCH_AUTHORIZED` уже означает consumed/possibly sent. Успех записывает
+`COMPLETED`, ошибка/timeout/cancellation/late result — `UNKNOWN`, если запись
+успела завершиться; после crash или потерянного ответа может остаться
+`DISPATCH_AUTHORIZED`. Все три состояния сохраняют dedup и расход квоты.
+Terminal update не выдаёт разрешения; UNKNOWN не переоткрывается. Нет replay,
+resume, refund, fallback или retry inference/claim после неизвестного commit.
+Claims хранятся **бессрочно**: PostgreSQL dedup консервативнее Redis 24h.
+Автоматического удаления нет; очистка вернула бы право повторной отправки и
+потеряла quota/audit history, поэтому требует отдельной миграции и review.
+Downgrade с retained claims запрещён.
+
+Обнаруженный сбой обязательного admission store закрывает новые permissions
+локально и записывает общий deny latch, когда PostgreSQL доступен; runtime не
+снимает его автоматически. Bounded deny cleanup сохраняет ownership ресурсов
+при shutdown. Если PostgreSQL недоступен и latch нельзя надёжно записать,
+локальный deny не является распределённым incident broadcast: оператор обязан
+остановить Playground на **всех** instances и проверить непрерывность истории
+до восстановления. Runtime не восстанавливает отсутствующую control row.
+
+При сохранённом PostgreSQL ledger Redis rollback не возвращает использованный
+ключ или authoritative quota. Уже committed claim может отправиться позднее
+после незамеченного Redis restart: это допустимое окно R1′. HTTP timeout/cancel
+не доказывает remote termination; после неизвестного HTTP outcome второй
+application dispatch того же claim запрещён. Exactly-once remote inference
+не гарантируется. Нужны durable WAL/storage и один writable primary; время квот
+берётся из PostgreSQL, корректность часов остаётся операторским условием.
+
+PostgreSQL rollback/restore с неизвестной полнотой ledger требует остановки
+всех старых/paused senders, сохранения incident evidence вне restore domain и
+отдельного операторского восстановления. Ни restored control row, ни deploy,
+ни Redis provisioning не доказывают continuity. Автоматического rearm или
+операторской recovery-команды в B2C2 нет. Redis state/HMAC/feature flag и
+GitHub Secrets/Variables этим изменением не создаются и не активируются.
+
 ### API
 
 FastAPI запускается из immutable GHCR image:

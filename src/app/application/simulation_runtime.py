@@ -3,9 +3,11 @@
 import asyncio
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from starlette.responses import JSONResponse
 
 from app.adapters.simulation_admission import RedisSimulationAdmission
+from app.adapters.simulation_dispatch_ledger import PostgresSimulationDispatchLedger
 from app.application.simulation_execution import SimulationExecutionCoordinator
 from app.core.config import Settings
 from app.core.simulation_hmac import decode_simulation_hmac
@@ -26,6 +28,8 @@ class SimulationRuntime:
         self.accepting = False
         self.http: httpx.AsyncClient | None = None
         self.admission: RedisSimulationAdmission | None = None
+        self.ledger: PostgresSimulationDispatchLedger | None = None
+        self.ledger_engine: AsyncEngine | None = None
         self.configuration: SimulationConfiguration | None = None
         if (
             settings.simulation.enabled
@@ -60,6 +64,15 @@ class SimulationRuntime:
                 settings.simulation.dedicated_redis_url(settings.redis.url),
                 hmac_secret=self._hmac_secret,
             )
+            self.ledger_engine = create_async_engine(
+                settings.postgres.url,
+                isolation_level="READ COMMITTED",
+                hide_parameters=True,
+            )
+            self.ledger = PostgresSimulationDispatchLedger(
+                async_sessionmaker(self.ledger_engine, expire_on_commit=False),
+                hmac_secret=self._hmac_secret,
+            )
             client = OpenAICompatibleClient(
                 name=config.provider,
                 http=self.http,
@@ -74,7 +87,9 @@ class SimulationRuntime:
             )
             coordinator: SimulationExecutionCoordinator[JSONResponse] = (
                 SimulationExecutionCoordinator(
-                    self.admission, timeout_s=config.execution_timeout_s
+                    self.admission,
+                    ledger=self.ledger,
+                    timeout_s=config.execution_timeout_s,
                 )
             )
         except Exception:
@@ -112,6 +127,10 @@ class SimulationRuntime:
             if self.http is not None:
                 await self.http.aclose()
         finally:
-            if self.admission is not None:
-                await self.admission.aclose()
+            try:
+                if self.admission is not None:
+                    await self.admission.aclose()
+            finally:
+                if self.ledger_engine is not None:
+                    await self.ledger_engine.dispose()
         self.closed = True

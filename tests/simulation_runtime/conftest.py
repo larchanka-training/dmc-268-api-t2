@@ -25,11 +25,15 @@ from test_auth_api import (
 from test_auth_api import (
     auth_settings as base_auth_settings,  # noqa: F401
 )
+from test_migration_upgrade import (
+    migration_database,  # noqa: F401 -- dependency of local ledger fixture
+)
 from test_postgres_integration import postgres  # noqa: F401
 from test_rule_simulations_access import simulation_scope  # noqa: F401
 from test_simulation_runtime import (
     enable_configuration,
     isolated_runtime_environment,  # noqa: F401
+    runtime_ledger_database,  # noqa: F401 -- fresh per-case PostgreSQL ledger
 )
 
 from app.adapters.simulation_admission import STATE_KEY
@@ -120,6 +124,7 @@ def no_external_http(
 @pytest.fixture
 async def admission_state(
     dedicated_simulation_redis_url: str,  # noqa: F811 -- fixture injection
+    runtime_ledger_database: None,  # noqa: F811 -- local fixture injection
 ) -> AsyncIterator[Redis]:
     async with Redis.from_url(
         dedicated_simulation_redis_url, decode_responses=True

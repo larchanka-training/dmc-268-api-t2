@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from redis.asyncio import Redis
+from sqlalchemy import text
 from test_rule_simulations_access import SimulationScope
 from test_simulation_runtime import MANIFEST
 
@@ -348,6 +349,12 @@ async def test_timeout_uses_manifest_budget_and_preserves_unknown_lease(
     provider_io.finish = asyncio.Event()
     async with auth_app.router.lifespan_context(auth_app):
         await provision(admission_state, auth_app)
+        # This case times a stalled provider after authorization, so establish
+        # the ledger pool before starting its deliberately tiny HTTP budget.
+        async with (
+            auth_app.state.simulation_runtime.ledger_engine.connect() as connection
+        ):
+            await connection.execute(text("SELECT 1"))
         assert_unavailable(await simulate(browser, simulation_scope))
         assert len(provider_io.requests) == 1
         assert all(
@@ -537,6 +544,7 @@ async def test_dedicated_redis_failure_is_canonical_503_without_provider_dispatc
     provider_io: ProviderIO,
     monkeypatch: pytest.MonkeyPatch,
     endpoint: str,
+    runtime_ledger_database: None,
 ) -> None:
 
     # Reserve a local port without listening: a deterministic offline refusal.

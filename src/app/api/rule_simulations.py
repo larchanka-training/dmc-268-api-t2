@@ -212,6 +212,8 @@ async def get_simulation_executor(request: Request) -> SimulationExecutor | None
         and runtime.accepting
         and runtime.executor is not None
         and runtime.coordinator is not None
+        and runtime.ledger is not None
+        and runtime.coordinator.ledger is runtime.ledger
     ):
         return runtime.executor
     return None
@@ -229,6 +231,8 @@ async def get_simulation_coordinator(
         and runtime.accepting
         and runtime.executor is not None
         and runtime.coordinator is not None
+        and runtime.ledger is not None
+        and runtime.coordinator.ledger is runtime.ledger
     ):
         return runtime.coordinator
     return None

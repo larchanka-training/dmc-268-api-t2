@@ -21,6 +21,10 @@ from simulation_redis_fixtures import (
 )
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from test_migration_upgrade import (
+    MigrationDatabase,
+    migration_database,  # noqa: F401 -- explicit local fixture, no plugin registration
+)
 
 from app.adapters.simulation_admission import STATE_KEY
 from app.api.rule_simulations import (
@@ -49,6 +53,18 @@ def isolated_runtime_environment(
     monkeypatch.setenv("LOGGING__FILE_ENABLED", "false")
     get_settings.cache_clear()
     yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+async def runtime_ledger_database(
+    migration_database: MigrationDatabase,  # noqa: F811 -- local fixture injection
+    isolated_runtime_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh durable history per case; authentication keeps its separate DB."""
+    migration_database.migrate("upgrade", "head")
+    monkeypatch.setenv("POSTGRES__DB", migration_database.environment["POSTGRES__DB"])
     get_settings.cache_clear()
 
 
@@ -178,6 +194,7 @@ async def test_invalid_stable_secret_keeps_runtime_unavailable(
 async def test_valid_lifespan_composes_one_direct_provider_after_redis_admission(
     monkeypatch: pytest.MonkeyPatch,
     dedicated_simulation_redis_url: str,  # noqa: F811 -- fixture injection
+    runtime_ledger_database: None,
 ) -> None:
 
     enable_configuration(monkeypatch)

@@ -47,6 +47,8 @@ def test_expected_core_tables_are_registered() -> None:
         "quota_usage",
         "webhook_receipt",
         "idempotency_record",
+        "simulation_dispatch_control",
+        "simulation_dispatch_claim",
     }
     assert set(Base.metadata.tables) == expected
 

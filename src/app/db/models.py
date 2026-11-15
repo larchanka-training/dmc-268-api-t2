@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -923,3 +924,50 @@ class ReviewLlmAttempt(Base):
             "ix_review_llm_attempt_review_operation", "review_job_id", "operation_id"
         ),
     )
+
+
+class SimulationDispatchClaim(Base):
+    """Permanent consumed authorization; no payload, raw key, or replay queue."""
+
+    __tablename__ = "simulation_dispatch_claim"
+    __table_args__ = (
+        CheckConstraint("operation_digest ~ '^[0-9a-f]{64}$'", name="digest_format"),
+        CheckConstraint(
+            "state IN ('DISPATCH_AUTHORIZED', 'COMPLETED', 'UNKNOWN')", name="state"
+        ),
+        Index("ix_simulation_dispatch_claim_authorized_at", "authorized_at"),
+        Index("ix_simulation_dispatch_claim_user_time", "user_id", "authorized_at"),
+        Index(
+            "ix_simulation_dispatch_claim_repository_time",
+            "repository_id",
+            "authorized_at",
+        ),
+    )
+
+    operation_digest: Mapped[str] = mapped_column(Text, primary_key=True)
+    # Trusted identities are retained even if the user/repository is later removed.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    repository_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    authorized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("clock_timestamp()"),
+    )
+    state: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="DISPATCH_AUTHORIZED"
+    )
+
+
+class SimulationDispatchControl(Base):
+    """Deny-only singleton shared by API processes; rearm is operator work."""
+
+    __tablename__ = "simulation_dispatch_control"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint("hmac_config_id ~ '^[0-9a-f]{64}$'", name="config_format"),
+    )
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    blocked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    hmac_config_id: Mapped[str | None] = mapped_column(Text, nullable=True)

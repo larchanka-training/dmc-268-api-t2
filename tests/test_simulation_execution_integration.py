@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from redis.asyncio import Redis
+from simulation_ledger_stub import IsolatedSimulationLedger
 from test_simulation_admission import (  # existing real Redis/socket fixtures
     _ReplyGate,
     admissions,  # noqa: F401
@@ -43,7 +44,9 @@ async def test_consumption_and_allowance_survive_every_execution_outcome(
             await finish.wait()
         return "validated-result"
 
-    coordinator = SimulationExecutionCoordinator[str](admissions[0], timeout_s=0.05)
+    coordinator = SimulationExecutionCoordinator[str](
+        admissions[0], ledger=IsolatedSimulationLedger(), timeout_s=0.05
+    )
     request = asyncio.create_task(coordinator.execute(user, repository, key, executor))
     await asyncio.wait_for(entered.wait(), 1)
     if ending == "cancel":
@@ -69,9 +72,9 @@ async def test_consumption_and_allowance_survive_every_execution_outcome(
     state = json.loads(raw)
     assert len(state["admissions"]) == len(state["consumed_keys"]) == 1
     assert (state["lease"] is None) == (ending == "success")
-    duplicate = await SimulationExecutionCoordinator[str](admissions[1]).execute(
-        user, repository, key, executor
-    )
+    duplicate = await SimulationExecutionCoordinator[str](
+        admissions[1], ledger=IsolatedSimulationLedger()
+    ).execute(user, repository, key, executor)
     assert duplicate.status == "DUPLICATE"
     assert calls == 1
     assert await redis_client.get(state_key) == raw
@@ -80,9 +83,9 @@ async def test_consumption_and_allowance_survive_every_execution_outcome(
         state["lease"]["expires_at_ms"] = 1
         await redis_client.set(state_key, json.dumps(state))
     for extra in (b"second", b"third"):
-        result = await SimulationExecutionCoordinator[str](admissions[1]).execute(
-            user, repository, extra, lambda _: asyncio.sleep(0, result="ok")
-        )
+        result = await SimulationExecutionCoordinator[str](
+            admissions[1], ledger=IsolatedSimulationLedger()
+        ).execute(user, repository, extra, lambda _: asyncio.sleep(0, result="ok"))
         assert result.status == "SUCCESS"
     assert (
         await admissions[1].acquire(user, repository, b"fourth")
@@ -109,7 +112,9 @@ async def test_ambiguous_committed_admission_never_dispatches(
         return "must-not-run"
 
     coordinator = SimulationExecutionCoordinator[str](
-        admission, timeout_s=0.1 if loss == "deadline" else 2
+        admission,
+        ledger=IsolatedSimulationLedger(),
+        timeout_s=0.1 if loss == "deadline" else 2,
     )
     request = asyncio.create_task(
         coordinator.execute(user, repository, b"lost", executor)
@@ -160,7 +165,9 @@ async def test_delayed_release_cannot_release_replacement_owner(
             replacement.append(new.lease.owner_token)
             return await first.release(owner_token)
 
-    result = await SimulationExecutionCoordinator[str](DelayedAdmission()).execute(
+    result = await SimulationExecutionCoordinator[str](
+        DelayedAdmission(), ledger=IsolatedSimulationLedger()
+    ).execute(
         user, repository, b"old-owner", lambda _: asyncio.sleep(0, result="verified")
     )
     assert result.status == "SUCCESS"
@@ -189,7 +196,9 @@ async def test_real_release_reply_loss_never_repeats_successful_execution(
         gate.mode = loss
         return "verified-result"
 
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     request = asyncio.create_task(
         coordinator.execute(user, repository, b"key", executor)
     )

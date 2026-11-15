@@ -1,5 +1,6 @@
 """Diff simulation through the real LLM adapter, using MockTransport only."""
 
+import asyncio
 import json
 import math
 import socket
@@ -15,7 +16,8 @@ from app.api.rule_simulations import SimulationDiffInput, SimulationRules
 from app.llm.openai_compatible import OpenAICompatibleClient
 from app.review.simulation import CodeSimulationError, CodeSimulationService
 
-_BASE_URL = "https://provider.invalid/v1"
+_BASE_URL = "https://api.eurouter.ai/api/v1"
+_MODEL = "mistral-small-4"
 _API_KEY = "diff-offline-credential-sentinel"
 _TIMEOUT_LIMIT_S = 30
 _DIFF = (
@@ -54,12 +56,19 @@ def forbid_network(monkeypatch: pytest.MonkeyPatch) -> None:
 @asynccontextmanager
 async def adapter_service(
     outcome: str | httpx.Response | Exception,
+    *,
+    entered: asyncio.Event | None = None,
+    finish: asyncio.Event | None = None,
 ) -> AsyncIterator[tuple[CodeSimulationService, list[httpx.Request]]]:
     sent: list[httpx.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx.Request) -> httpx.Response:
         sent.append(request)
         assert len(sent) == 1, "simulation must not repeat a provider request"
+        if entered is not None:
+            entered.set()
+        if finish is not None:
+            await finish.wait()
         if isinstance(outcome, Exception):
             raise outcome
         if isinstance(outcome, httpx.Response):
@@ -69,12 +78,14 @@ async def adapter_service(
             json={"choices": [{"message": {"content": outcome}}]},
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False
+    ) as http:
         adapter = OpenAICompatibleClient(
-            name="diff-offline-test",
+            name="eurorouter",
             http=http,
             base_url=_BASE_URL,
-            model="offline-model",
+            model=_MODEL,
             api_key=_API_KEY,
         )
         yield CodeSimulationService(adapter), sent
@@ -120,6 +131,8 @@ async def test_diff_wire_schema_requires_side_and_uses_bounded_request() -> None
     assert len(sent) == 1
     request = sent[0]
     body = json.loads(request.content)
+    assert body["model"] == _MODEL
+    assert request.headers["authorization"] == f"Bearer {_API_KEY}"
     assert body["temperature"] == 0.0
     assert body["max_tokens"] == 2048  # noqa: PLR2004 -- inherited output cap
     timeouts = request.extensions["timeout"]
@@ -231,7 +244,11 @@ async def test_diff_provider_failure_is_static_without_retry(
 ) -> None:
     async with adapter_service(outcome) as (service, sent):
         with pytest.raises(CodeSimulationError) as error:
-            await service.simulate(diff_input(), _RULES)
+            await service.simulate(
+                diff_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() + 1,
+            )
 
     assert str(error.value) == error_code
     assert len(sent) == 1
@@ -242,3 +259,86 @@ async def test_diff_provider_failure_is_static_without_retry(
     diagnostics += "".join(traceback.format_exception(error.value)) + caplog.text
     for private in (_DIFF, _RULES.markdown, _API_KEY):
         assert private not in diagnostics
+
+
+async def test_diff_deadline_bounds_outbound_eurorouter_timeout() -> None:
+    started = asyncio.get_running_loop().time()
+    deadline = started + 0.5
+    async with adapter_service(json.dumps({"findings": [_FINDING]})) as (service, sent):
+        result = await service.simulate(diff_input(), _RULES, deadline=deadline)
+
+    assert [finding.model_dump() for finding in result.findings] == [_FINDING]
+    assert result.rejected_count == 0
+    assert len(sent) == 1
+    assert all(
+        0 < timeout <= deadline - started
+        for timeout in sent[0].extensions["timeout"].values()
+    )
+    assert json.loads(sent[0].content)["model"] == _MODEL
+    assert str(sent[0].url) == f"{_BASE_URL}/chat/completions"
+
+
+async def test_expired_diff_deadline_prevents_provider_http() -> None:
+    async with adapter_service('{"findings":[]}') as (service, sent):
+        with pytest.raises(CodeSimulationError, match=r"^provider_timeout$"):
+            await service.simulate(
+                diff_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() - 1,
+            )
+
+    assert sent == []
+
+
+async def test_diff_transport_cancellation_propagates_without_second_dispatch() -> None:
+    entered, finish = asyncio.Event(), asyncio.Event()
+    async with adapter_service('{"findings":[]}', entered=entered, finish=finish) as (
+        service,
+        sent,
+    ):
+        task = asyncio.create_task(
+            service.simulate(
+                diff_input(),
+                _RULES,
+                deadline=asyncio.get_running_loop().time() + 30,
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            finish.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"rule_ref": "SEC-99"},
+        {"start_line": 99, "end_line": 99},
+        {"path": "other.py"},
+        {"evidence": "invented source"},
+    ],
+    ids=["unknown-rule", "outside-diff", "other-path", "evidence"],
+)
+async def test_untrusted_diff_finding_is_rejected_without_second_inference(
+    invalid: dict[str, Any],
+) -> None:
+    async with adapter_service(json.dumps({"findings": [_FINDING | invalid]})) as (
+        service,
+        sent,
+    ):
+        result = await service.simulate(
+            diff_input(), _RULES, deadline=asyncio.get_running_loop().time() + 1
+        )
+
+    assert result.findings == []
+    assert result.rejected_count == 1
+    assert len(sent) == 1

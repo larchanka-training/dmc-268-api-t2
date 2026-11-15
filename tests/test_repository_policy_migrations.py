@@ -29,7 +29,7 @@ async def test_downgrade_refuses_permanent_receipt_job_binding(
     assert "Cannot downgrade with retained automatic review bindings" in output
     assert (
         await database.connection.fetchval("SELECT version_num FROM alembic_version")
-        == "0021"
+        == "0022"
     )
     assert (
         await database.connection.fetchval(

@@ -343,11 +343,13 @@ paths:
       summary: Simulate a Rule Playground draft
       description: >-
         Requires local repository access and live personal GitHub admin permission.
-        A provided executor can return HTTP 200 with a Code or Diff result.
-        The executor is disabled by default, so a valid request in the normal
+        A provided executor and configured admission coordinator can return
+        HTTP 200 with a Code or Diff result.
+        Execution is disabled by default, so a valid request in the normal
         configuration returns canonical 503 SERVICE_UNAVAILABLE; dependency
         failures can also return 503. Staging execution is not enabled.
-        Idempotent replay and durable admission are not implemented.
+        Duplicate keys suppress new dispatch; result replay is not implemented.
+        Redis admission is not a durable exactly-once execution guarantee.
       security: [{ cookieAuth: [], csrfHeader: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryId'
@@ -370,10 +372,12 @@ paths:
               - { pattern: '\S' }
               - { pattern: '^[^,]*$' }
           description: >-
-            Preliminary transport gate only: exactly one raw value, nonblank
+            Requires exactly one raw value, nonblank
             after a whitespace check, with no comma-combined form. Invalid input
-            returns 422. No value normalization, UUID format, freshness, HMAC,
-            persistence or idempotent replay is implemented.
+            returns 422. Admission uses the exact raw bytes without normalization.
+            Duplicate keys suppress new dispatch even if the body changes;
+            result replay is not implemented. Redis admission does not provide
+            a durable exactly-once execution guarantee.
       requestBody:
         required: true
         description: >-

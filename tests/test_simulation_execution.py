@@ -5,6 +5,7 @@ from contextlib import suppress
 from uuid import UUID
 
 import pytest
+from simulation_ledger_stub import IsolatedSimulationLedger
 
 from app.adapters.simulation_admission import AdmissionResult, Lease, ReleaseResult
 from app.application.simulation_execution import SimulationExecutionCoordinator
@@ -56,9 +57,9 @@ class Executor:
 async def test_denied_admission_never_dispatches_or_releases(status: str) -> None:
     admission = Admission(AdmissionResult(status))  # type: ignore[arg-type]
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == status
     assert executor.deadlines == []
     assert admission.releases == []
@@ -68,9 +69,9 @@ async def test_denied_admission_never_dispatches_or_releases(status: str) -> Non
 async def test_confirmed_admission_dispatches_exactly_once() -> None:
     admission = Admission()
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "SUCCESS"
     assert result.value == "verified-result"
     assert len(executor.deadlines) == 1
@@ -93,9 +94,9 @@ async def test_confirmed_admission_dispatches_exactly_once() -> None:
 async def test_malformed_admission_fails_closed(malformed: object) -> None:
     admission = Admission(malformed)
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "INVALID_STATE"
     assert executor.deadlines == []
     assert admission.releases == []
@@ -111,9 +112,9 @@ async def test_deadline_starts_before_admission() -> None:
             return AdmissionResult("ACQUIRED", Lease(OWNER, 1))
 
     started = loop.time()
-    result = await SimulationExecutionCoordinator[str](SlowAdmission()).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        SlowAdmission(), ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "SUCCESS"
     assert started + 29.9 <= executor.deadlines[0] <= started + 30.002
 
@@ -130,9 +131,9 @@ async def test_expired_budget_before_dispatch_never_executes(
             return AdmissionResult("ACQUIRED", Lease(OWNER, 1))
 
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](ExpiringAdmission()).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        ExpiringAdmission(), ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "TIMEOUT"
     assert executor.deadlines == []
 
@@ -149,9 +150,9 @@ async def test_confirmed_but_undispatched_lease_is_released_on_deadline(
             return AdmissionResult("ACQUIRED", Lease(OWNER, 1))
 
     admission = ExpiringAdmission()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, Executor()
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, Executor())
     assert result.status == "TIMEOUT"
     assert result.cleanup == "RELEASED"
     assert admission.releases == [OWNER]
@@ -175,7 +176,9 @@ async def test_execution_deadline_returns_without_waiting_for_ignored_cancel() -
             await finish.wait()
         return "late-private-result"
 
-    coordinator = SimulationExecutionCoordinator[str](admission, timeout_s=0.01)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger(), timeout_s=0.01
+    )
     request = asyncio.create_task(coordinator.execute(USER, REPOSITORY, KEY, stubborn))
     await started.wait()
     try:
@@ -203,9 +206,9 @@ async def test_late_success_is_never_reported_as_success(
         monkeypatch.setattr(loop, "time", lambda: now + 31)
         return "late-private-result"
 
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, late
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, late)
     assert result.status == "TIMEOUT"
     assert result.value is None
     assert admission.releases == []
@@ -221,7 +224,9 @@ async def test_admission_wait_is_part_of_bounded_budget() -> None:
 
     admission = StalledAdmission()
     executor = Executor()
-    coordinator = SimulationExecutionCoordinator[str](admission, timeout_s=0.01)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger(), timeout_s=0.01
+    )
     request = asyncio.create_task(coordinator.execute(USER, REPOSITORY, KEY, executor))
     try:
         done, _ = await asyncio.wait({request}, timeout=0.1)
@@ -236,9 +241,9 @@ async def test_admission_wait_is_part_of_bounded_budget() -> None:
 
 async def test_success_releases_only_confirmed_owner() -> None:
     admission = Admission()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, Executor()
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, Executor())
     assert result.status == "SUCCESS"
     assert result.value == "verified-result"
     assert result.cleanup == "RELEASED"
@@ -257,9 +262,9 @@ async def test_unknown_provider_failure_retains_lease_and_is_private(
         calls += 1
         raise error("PRIVATE prompt source rules response credentials")
 
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, failed
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, failed)
     assert result.status == "EXECUTION_FAILED"
     assert result.value is None
     assert "PRIVATE" not in repr(result)
@@ -279,9 +284,9 @@ async def test_release_denial_preserves_original_success(
 
     admission = DeniedRelease()
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "SUCCESS"
     assert result.value == "verified-result"
     assert result.cleanup == cleanup
@@ -300,9 +305,9 @@ async def test_release_exception_preserves_original_success(
 
     admission = FailedRelease()
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "SUCCESS"
     assert result.value == "verified-result"
     assert result.cleanup == "UNAVAILABLE"
@@ -316,9 +321,9 @@ async def test_malformed_release_has_only_safe_cleanup_code() -> None:
         async def release(self, owner_token: str) -> ReleaseResult:
             return "PRIVATE raw state"  # type: ignore[return-value]
 
-    result = await SimulationExecutionCoordinator[str](BadRelease()).execute(
-        USER, REPOSITORY, KEY, Executor()
-    )
+    result = await SimulationExecutionCoordinator[str](
+        BadRelease(), ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, Executor())
     assert result.status == "SUCCESS"
     assert result.cleanup == "UNAVAILABLE"
     assert "PRIVATE" not in repr(result)
@@ -339,7 +344,9 @@ async def test_cleanup_wait_is_bounded_even_when_release_ignores_cancel() -> Non
             return "NOT_OWNER"
 
     admission = StalledRelease()
-    coordinator = SimulationExecutionCoordinator[str](admission, cleanup_timeout_s=0.01)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger(), cleanup_timeout_s=0.01
+    )
     executor = Executor()
     request = asyncio.create_task(coordinator.execute(USER, REPOSITORY, KEY, executor))
     await started.wait()
@@ -380,7 +387,9 @@ async def test_caller_cancellation_always_propagates(phase: str) -> None:
         return "verified-result"
 
     admission = CancellableAdmission()
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     request = asyncio.create_task(coordinator.execute(USER, REPOSITORY, KEY, execute))
     if phase != "before":
         await asyncio.wait_for(entered.wait(), 0.2)
@@ -406,9 +415,9 @@ async def test_cancel_after_acquired_before_dispatch_releases_known_lease() -> N
 
     admission = CancellingAdmission()
     with pytest.raises(asyncio.CancelledError):
-        await SimulationExecutionCoordinator[str](admission).execute(
-            USER, REPOSITORY, KEY, executor
-        )
+        await SimulationExecutionCoordinator[str](
+            admission, ledger=IsolatedSimulationLedger()
+        ).execute(USER, REPOSITORY, KEY, executor)
     assert executor.deadlines == []
     assert admission.releases == [OWNER]
 
@@ -437,9 +446,9 @@ async def test_cancellation_before_scheduled_executor_starts_releases_lease() ->
     loop.set_task_factory(factory)  # type: ignore[arg-type]
     try:
         with pytest.raises(asyncio.CancelledError):
-            await SimulationExecutionCoordinator[str](admission).execute(
-                USER, REPOSITORY, KEY, executor
-            )
+            await SimulationExecutionCoordinator[str](
+                admission, ledger=IsolatedSimulationLedger()
+            ).execute(USER, REPOSITORY, KEY, executor)
     finally:
         loop.set_task_factory(None)
     assert executor.deadlines == []
@@ -471,7 +480,9 @@ async def test_reentrant_request_cannot_overwrite_task_supervision() -> None:
             )
             return AdmissionResult("ACQUIRED", Lease(OWNER, 1))
 
-    coordinator = SimulationExecutionCoordinator[str](ReentrantAdmission())
+    coordinator = SimulationExecutionCoordinator[str](
+        ReentrantAdmission(), ledger=IsolatedSimulationLedger()
+    )
     await coordinator.execute(USER, REPOSITORY, KEY, executor)
     await asyncio.sleep(0)
     assert nested == ["UNAVAILABLE"]
@@ -485,9 +496,9 @@ async def test_unknown_admission_exception_is_fail_closed_and_private() -> None:
 
     admission = FailedAdmission()
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "UNAVAILABLE"
     assert result.value is None
     assert "PRIVATE" not in repr(result)
@@ -498,13 +509,17 @@ async def test_unknown_admission_exception_is_fail_closed_and_private() -> None:
 @pytest.mark.parametrize("budget", [0, -1, 30.001, float("inf"), float("nan")])
 def test_execution_budget_cannot_exceed_safety_bound(budget: float) -> None:
     with pytest.raises(ValueError, match="invalid_execution_budget"):
-        SimulationExecutionCoordinator[str](Admission(), timeout_s=budget)
+        SimulationExecutionCoordinator[str](
+            Admission(), ledger=IsolatedSimulationLedger(), timeout_s=budget
+        )
 
 
 @pytest.mark.parametrize("budget", [0, -1, 2.001, float("inf"), float("nan")])
 def test_cleanup_budget_cannot_exceed_safety_bound(budget: float) -> None:
     with pytest.raises(ValueError, match="invalid_cleanup_budget"):
-        SimulationExecutionCoordinator[str](Admission(), cleanup_timeout_s=budget)
+        SimulationExecutionCoordinator[str](
+            Admission(), ledger=IsolatedSimulationLedger(), cleanup_timeout_s=budget
+        )
 
 
 async def test_late_exception_is_observed_and_shutdown_is_bounded() -> None:
@@ -528,7 +543,10 @@ async def test_late_exception_is_observed_and_shutdown_is_bounded() -> None:
 
     admission = Admission()
     coordinator = SimulationExecutionCoordinator[str](
-        admission, timeout_s=0.01, cleanup_timeout_s=0.01
+        admission,
+        ledger=IsolatedSimulationLedger(),
+        timeout_s=0.01,
+        cleanup_timeout_s=0.01,
     )
     try:
         result = await coordinator.execute(USER, REPOSITORY, KEY, stubborn)
@@ -556,9 +574,9 @@ async def test_admission_status_must_be_a_plain_status_code() -> None:
 
     admission = Admission(AdmissionResult(ForeignStatus("BUSY")))  # type: ignore[arg-type]
     executor = Executor()
-    result = await SimulationExecutionCoordinator[str](admission).execute(
-        USER, REPOSITORY, KEY, executor
-    )
+    result = await SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    ).execute(USER, REPOSITORY, KEY, executor)
     assert result.status == "INVALID_STATE"
     assert "PRIVATE" not in repr(result)
     assert executor.deadlines == []
@@ -582,7 +600,9 @@ async def test_success_after_caller_cancel_never_releases_uncertain_inference() 
         completed.set()
         return "late-success"
 
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     request = asyncio.create_task(coordinator.execute(USER, REPOSITORY, KEY, executor))
     await asyncio.wait_for(entered.wait(), 0.1)
     try:
@@ -615,7 +635,10 @@ async def test_ignored_admission_cancellation_cannot_dispatch_late_lease() -> No
     admission = StubbornAdmission()
     executor = Executor()
     coordinator = SimulationExecutionCoordinator[str](
-        admission, timeout_s=0.01, cleanup_timeout_s=0.01
+        admission,
+        ledger=IsolatedSimulationLedger(),
+        timeout_s=0.01,
+        cleanup_timeout_s=0.01,
     )
     try:
         result = await asyncio.wait_for(
@@ -633,8 +656,126 @@ async def test_ignored_admission_cancellation_cannot_dispatch_late_lease() -> No
 
 async def test_closed_coordinator_does_not_admit_even_after_drain() -> None:
     admission = Admission()
-    coordinator = SimulationExecutionCoordinator[str](admission)
+    coordinator = SimulationExecutionCoordinator[str](
+        admission, ledger=IsolatedSimulationLedger()
+    )
     assert await coordinator.aclose()
     result = await coordinator.execute(USER, REPOSITORY, KEY, Executor())
     assert result.status == "UNAVAILABLE"
     assert admission.acquisitions == []
+
+
+@pytest.mark.parametrize("incident", ["UNAVAILABLE", "INVALID_STATE", "exception"])
+async def test_shutdown_retains_acquire_incident_deny_until_durable(
+    incident: str,
+) -> None:
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            entered.set()
+            await finish.wait()
+            durable.set()
+
+    class IncidentAdmission(Admission):
+        async def acquire(self, *args: object) -> AdmissionResult:
+            if incident == "exception":
+                raise OSError("Redis unavailable")
+            return AdmissionResult(incident)  # type: ignore[arg-type]
+
+    coordinator = SimulationExecutionCoordinator[str](
+        IncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.01
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        assert await coordinator.aclose() is False
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()
+
+
+@pytest.mark.parametrize("incident", ["UNAVAILABLE", "INVALID_STATE", "exception"])
+async def test_shutdown_retains_release_incident_deny_until_durable(
+    incident: str,
+) -> None:
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            entered.set()
+            await finish.wait()
+            durable.set()
+
+    class IncidentAdmission(Admission):
+        async def release(self, owner_token: str) -> ReleaseResult:
+            if incident == "exception":
+                raise OSError("Redis unavailable")
+            return incident  # type: ignore[return-value]
+
+    coordinator = SimulationExecutionCoordinator[str](
+        IncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.01
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        assert await coordinator.aclose() is False
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()
+
+
+async def test_shutdown_retains_deny_started_by_cancelled_release() -> None:
+    releasing = asyncio.Event()
+    denying = asyncio.Event()
+    finish = asyncio.Event()
+    durable = asyncio.Event()
+
+    class LateIncidentAdmission(Admission):
+        async def release(self, owner_token: str) -> ReleaseResult:
+            releasing.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return "UNAVAILABLE"
+            return "RELEASED"
+
+    class DelayedLedger(IsolatedSimulationLedger):
+        async def block(self) -> None:
+            denying.set()
+            await finish.wait()
+            durable.set()
+
+    coordinator = SimulationExecutionCoordinator[str](
+        LateIncidentAdmission(), ledger=DelayedLedger(), cleanup_timeout_s=0.1
+    )
+    request = asyncio.create_task(
+        coordinator.execute(USER, REPOSITORY, KEY, Executor())
+    )
+    await asyncio.wait_for(releasing.wait(), 1)
+    # Shutdown's wait extends past the release cleanup deadline. Its cancellation
+    # reveals the Redis incident and creates a new deny operation during close.
+    await asyncio.sleep(0.05)
+    try:
+        assert await coordinator.aclose() is False
+        assert denying.is_set()
+        assert not durable.is_set()
+    finally:
+        finish.set()
+        await asyncio.gather(request, return_exceptions=True)
+    assert await coordinator.aclose() is True
+    assert durable.is_set()

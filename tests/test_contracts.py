@@ -912,5 +912,8 @@ def test_simulation_operation_documents_success_and_closed_result_schemas() -> N
     assert "disabled by default" in description
     assert "503 SERVICE_UNAVAILABLE" in description
     assert "Staging execution is not enabled" in description
-    assert "Idempotent replay and durable admission are not implemented" in description
+    assert "configured admission coordinator" in description
+    assert "Duplicate keys suppress new dispatch" in description
+    assert "result replay is not implemented" in description
+    assert "not a durable exactly-once execution guarantee" in description
     assert not any(p.startswith(path + "/") for p in api["paths"])

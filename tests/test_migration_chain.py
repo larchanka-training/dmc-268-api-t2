@@ -9,7 +9,8 @@ def test_publication_and_sse_extend_accepted_intake_and_ownership_migrations() -
     config = Config(str(root / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["0021"]
+    assert scripts.get_heads() == ["0022"]
+    assert scripts.get_revision("0022").down_revision == "0021"
     assert scripts.get_revision("0021").down_revision == "0020"
     assert scripts.get_revision("0020").down_revision == "0019"
     assert scripts.get_revision("0019").down_revision == "0018"

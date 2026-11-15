@@ -1,8 +1,9 @@
 """Bounded, inactive application coordinator; no HTTP/provider composition.
 
 Reuse one coordinator on one event loop and keep its admission/executor resources
-alive until ``aclose()`` returns True. Each instance owns at most one outstanding
-boundary operation; overlapping calls fail closed with UNAVAILABLE. Closing has
+alive until ``aclose()`` returns True. Each instance owns at most one
+execution and retains all outstanding boundary/deny cleanup tasks. Overlapping
+calls fail closed with UNAVAILABLE. Closing has
 its own bounded wait and can return False for work that ignores cancellation.
 The task stays strongly referenced and its eventual exception is retrieved.
 Creating replacement instances per timed-out call would bypass this local bound.
@@ -28,6 +29,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from app.adapters.simulation_admission import AdmissionResult, Lease, ReleaseResult
+from app.adapters.simulation_dispatch_ledger import ClaimStatus
 
 _EXECUTION_BUDGET_S = 30.0
 _CLEANUP_BUDGET_S = 2.0
@@ -53,6 +55,27 @@ type CleanupStatus = Literal[
     "UNAVAILABLE",
     "TIMEOUT",
 ]
+
+
+class _LedgerDeniedError(Exception):
+    def __init__(self, status: ExecutionStatus) -> None:
+        self.status = status
+
+
+class SimulationDispatchLedger(Protocol):
+    async def claim(
+        self, user_id: UUID, repository_id: UUID, idempotency_key: bytes
+    ) -> ClaimStatus: ...
+
+    async def block(self) -> None: ...
+
+    async def finish(
+        self,
+        user_id: UUID,
+        repository_id: UUID,
+        idempotency_key: bytes,
+        state: Literal["COMPLETED", "UNKNOWN"],
+    ) -> None: ...
 
 
 class _DeadlineExceededError(Exception):
@@ -109,6 +132,7 @@ class SimulationExecutionCoordinator[T]:
         self,
         admission: SimulationAdmission,
         *,
+        ledger: SimulationDispatchLedger | None = None,
         timeout_s: float = _EXECUTION_BUDGET_S,
         cleanup_timeout_s: float = _CLEANUP_BUDGET_S,
     ) -> None:
@@ -117,9 +141,11 @@ class SimulationExecutionCoordinator[T]:
         if not 0 < cleanup_timeout_s <= _CLEANUP_BUDGET_S:
             raise ValueError("invalid_cleanup_budget")
         self._admission = admission
+        self.ledger = ledger
         self._timeout_s = timeout_s
         self._cleanup_timeout_s = cleanup_timeout_s
-        self._pending: asyncio.Task[object] | None = None
+        self._tasks: set[asyncio.Task[object]] = set()
+        self._deny_tasks: set[asyncio.Task[object]] = set()
         self._running = False
         self._closed = False
 
@@ -131,23 +157,42 @@ class SimulationExecutionCoordinator[T]:
         result/exception is logged or exposed. Cancellation of aclose propagates.
         """
         self._closed = True
-        task = self._pending
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.wait({task}, timeout=self._cleanup_timeout_s)
-        return not self._running and (task is None or task.done())
+        tasks = {task for task in self._tasks if not task.done()}
+        for task in tasks:
+            if task not in self._deny_tasks and not task.cancelling():
+                task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=self._cleanup_timeout_s)
+        return not self._running and all(task.done() for task in self._tasks)
 
     def _observe(self, task: asyncio.Task[object]) -> None:
         if not task.cancelled():
             task.exception()
-        if self._pending is task:
-            self._pending = None
+        self._tasks.discard(task)
+        self._deny_tasks.discard(task)
 
     def _start[R](self, operation: Callable[[], Awaitable[R]]) -> asyncio.Task[R]:
         task = asyncio.create_task(_invoke(operation))
-        self._pending = task
+        self._tasks.add(task)
         task.add_done_callback(self._observe)
         return task
+
+    async def _deny(self, deadline: float | None = None) -> None:
+        """Retain both a timed-out operation and its bounded deny cleanup."""
+        self._closed = True
+        if self.ledger is None:
+            return
+        task = self._start(self.ledger.block)
+        self._deny_tasks.add(task)
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._cleanup_timeout_s
+        if asyncio.get_running_loop().time() >= deadline:
+            return  # Retained deny task continues without extending caller cleanup.
+        # This safety-only write has its own adapter bound. Neither caller timeout
+        # nor shutdown cancels it; all owners retain resources until it finishes.
+        await asyncio.wait(
+            {task}, timeout=max(0, deadline - asyncio.get_running_loop().time())
+        )
 
     async def _wait[R](self, task: asyncio.Task[R], deadline: float) -> R:
         try:
@@ -162,12 +207,27 @@ class SimulationExecutionCoordinator[T]:
             raise _DeadlineExceededError
         return task.result()
 
-    async def _release(self, owner_token: str) -> CleanupStatus:
-        deadline = asyncio.get_running_loop().time() + self._cleanup_timeout_s
-        task = self._start(lambda: self._admission.release(owner_token))
+    async def _release(
+        self, owner_token: str, *, deadline: float | None = None
+    ) -> CleanupStatus:
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + self._cleanup_timeout_s
+
+        async def release() -> ReleaseResult:
+            try:
+                released = await self._admission.release(owner_token)
+            except Exception:
+                await self._deny(deadline)
+                raise
+            if released not in ("RELEASED", "NOT_OWNER"):
+                await self._deny(deadline)
+            return released
+
+        task = self._start(release)
         try:
             result = await self._wait(task, deadline)
         except _DeadlineExceededError:
+            await self._deny(deadline)
             return "TIMEOUT"
         except Exception:
             return "UNAVAILABLE"
@@ -190,7 +250,7 @@ class SimulationExecutionCoordinator[T]:
         if (
             self._closed
             or self._running
-            or (self._pending is not None and not self._pending.done())
+            or any(not task.done() for task in self._tasks)
         ):
             return ExecutionOutcome("UNAVAILABLE")
         self._running = True
@@ -209,12 +269,27 @@ class SimulationExecutionCoordinator[T]:
         executor: Callable[[float], Awaitable[T]],
     ) -> ExecutionOutcome[T]:
         deadline = asyncio.get_running_loop().time() + self._timeout_s
-        task = self._start(
-            lambda: self._admission.acquire(user_id, repository_id, idempotency_key)
-        )
+
+        async def acquire() -> AdmissionResult:
+            try:
+                acquired = await self._admission.acquire(
+                    user_id, repository_id, idempotency_key
+                )
+            except Exception:
+                await self._deny()
+                raise
+            if not _valid_admission(acquired) or acquired.status in (
+                "UNAVAILABLE",
+                "INVALID_STATE",
+            ):
+                await self._deny()
+            return acquired
+
+        task = self._start(acquire)
         try:
             result = await self._wait(task, deadline)
         except _DeadlineExceededError:
+            await self._deny()
             return ExecutionOutcome("TIMEOUT")
         except Exception:
             return ExecutionOutcome("UNAVAILABLE")
@@ -230,10 +305,16 @@ class SimulationExecutionCoordinator[T]:
         if result.status != "ACQUIRED":
             return ExecutionOutcome(result.status)
         assert result.lease is not None
-        return await self._execute_admitted(result.lease, executor, deadline)
+        return await self._execute_admitted(
+            result.lease, executor, deadline, (user_id, repository_id, idempotency_key)
+        )
 
-    async def _execute_admitted(
-        self, lease: Lease, executor: Callable[[float], Awaitable[T]], deadline: float
+    async def _execute_admitted(  # noqa: PLR0915 -- preserve explicit deadline/ownership outcomes
+        self,
+        lease: Lease,
+        executor: Callable[[float], Awaitable[T]],
+        deadline: float,
+        scope: tuple[UUID, UUID, bytes],
     ) -> ExecutionOutcome[T]:
         if asyncio.get_running_loop().time() >= deadline:
             cleanup = await self._release(lease.owner_token)
@@ -247,20 +328,64 @@ class SimulationExecutionCoordinator[T]:
                 raise asyncio.CancelledError
             if asyncio.get_running_loop().time() >= deadline:
                 raise _DeadlineExceededError
+            if self.ledger is None:
+                raise _LedgerDeniedError("UNAVAILABLE")
+            authorization = await self.ledger.claim(*scope)
+            if authorization != "AUTHORIZED":
+                status: ExecutionStatus = "UNAVAILABLE"
+                if authorization in (
+                    "DUPLICATE",
+                    "RATE_USER",
+                    "RATE_REPOSITORY",
+                    "RATE_GLOBAL",
+                ):
+                    status = authorization
+                raise _LedgerDeniedError(status)
+            if caller is not None and caller.cancelling():
+                raise asyncio.CancelledError
+            if asyncio.get_running_loop().time() >= deadline:
+                raise _DeadlineExceededError
             dispatched = True
-            return await executor(deadline)
+            try:
+                value = await executor(deadline)
+            except Exception, asyncio.CancelledError:
+                await self.ledger.finish(*scope, "UNKNOWN")
+                raise
+            state: Literal["COMPLETED", "UNKNOWN"] = "COMPLETED"
+            if asyncio.get_running_loop().time() >= deadline or (
+                caller is not None and caller.cancelling()
+            ):
+                state = "UNKNOWN"
+            await self.ledger.finish(*scope, state)
+            return value
 
         execution = self._start(dispatch)
         try:
             value = await self._wait(execution, deadline)
+        except _LedgerDeniedError as denied:
+            cleanup = await self._release(lease.owner_token)
+            return ExecutionOutcome(denied.status, cleanup=cleanup)
         except _DeadlineExceededError:
             cleanup = "NOT_ATTEMPTED"
             if not dispatched:
-                cleanup = await self._release(lease.owner_token)
+                cleanup_deadline = (
+                    asyncio.get_running_loop().time() + self._cleanup_timeout_s
+                )
+                await self._deny(cleanup_deadline)
+                await asyncio.wait({execution}, timeout=0)
+                if (
+                    execution.done()
+                    and asyncio.get_running_loop().time() < cleanup_deadline
+                ):
+                    cleanup = await self._release(
+                        lease.owner_token, deadline=cleanup_deadline
+                    )
             return ExecutionOutcome("TIMEOUT", cleanup=cleanup)
         except asyncio.CancelledError:
             if not dispatched:
-                await self._release(lease.owner_token)
+                await asyncio.wait({execution}, timeout=0)
+                if execution.done():
+                    await self._release(lease.owner_token)
             raise
         except Exception:
             return ExecutionOutcome("EXECUTION_FAILED")

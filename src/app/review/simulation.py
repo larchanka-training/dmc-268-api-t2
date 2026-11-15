@@ -4,6 +4,7 @@ Uses supplied source/diff coordinates without manufacturing a PR snapshot.
 No repository settings or source files are loaded here.
 """
 
+import asyncio
 import json
 import re
 from contextlib import suppress
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, overload
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.context.rules import parse_rules
+from app.context.rules import ParsedRules, parse_rules
 from app.llm.client import BaseLLMClient, ChatMessage, LLMRequest
 from app.llm.errors import LLMGatewayError
 from app.llm.tokens import ConservativeTokenCounter
@@ -135,24 +136,50 @@ def _mask_finding[T: CodeFinding](finding: T) -> T | None:
     return None
 
 
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+        raise CodeSimulationError("provider_timeout")
+
+
+def _request_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return 30.0
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise CodeSimulationError("provider_timeout")
+    return min(30.0, remaining)
+
+
 class CodeSimulationService:
-    def __init__(self, client: BaseLLMClient, *, max_input_tokens: int = 8192) -> None:
+    def __init__(
+        self,
+        client: BaseLLMClient,
+        *,
+        max_input_tokens: int = 8192,
+        max_output_tokens: int = 2048,
+    ) -> None:
         self._client = client
         self._max_input_tokens = max_input_tokens
+        self._max_output_tokens = max_output_tokens
 
-    @overload
-    async def simulate(
-        self, code: SimulationCodeInput, rules: SimulationRules
-    ) -> CodeSimulationResult: ...
+    def validate_prompt(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+    ) -> None:
+        """Check the authoritative complete prompt before consuming admission."""
+        self._prepare(code, rules)
 
-    @overload
-    async def simulate(
-        self, code: SimulationDiffInput, rules: SimulationRules
-    ) -> DiffSimulationResult: ...
-
-    async def simulate(
-        self, code: SimulationCodeInput | SimulationDiffInput, rules: SimulationRules
-    ) -> CodeSimulationResult | DiffSimulationResult:
+    def _prepare(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+    ) -> tuple[
+        LLMRequest,
+        type[CodeSimulationOutput | DiffSimulationOutput],
+        ParsedDiff | None,
+        ParsedRules,
+    ]:
         parsed_rules = parse_rules(rules.markdown, db_instructions=())
         if (
             parsed_rules.state != "valid"
@@ -216,7 +243,7 @@ class CodeSimulationService:
                 ),
                 ChatMessage(role="user", content=data),
             ],
-            max_output_tokens=2048,
+            max_output_tokens=self._max_output_tokens,
             timeout_s=30.0,
             output_schema_json=json.dumps(output_model.model_json_schema()),
         )
@@ -226,16 +253,60 @@ class CodeSimulationService:
         )
         if input_tokens > self._max_input_tokens:
             raise CodeSimulationError("prompt_too_large")
+        return request, output_model, parsed_diff, parsed_rules
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationCodeInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult: ...
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> DiffSimulationResult: ...
+
+    @overload
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult | DiffSimulationResult: ...
+
+    async def simulate(
+        self,
+        code: SimulationCodeInput | SimulationDiffInput,
+        rules: SimulationRules,
+        *,
+        deadline: float | None = None,
+    ) -> CodeSimulationResult | DiffSimulationResult:
+        if deadline is not None:
+            deadline = min(deadline, asyncio.get_running_loop().time() + 30.0)
+        request, output_model, parsed_diff, parsed_rules = self._prepare(code, rules)
+        request = request.model_copy(update={"timeout_s": _request_timeout(deadline)})
         call = None
         error_code = "invalid_llm_output"
         try:
-            call = await self._client.generate_structured(request, output_model)
+            async with asyncio.timeout_at(deadline):
+                call = await self._client.generate_structured(request, output_model)
+        except TimeoutError:
+            error_code = "provider_timeout"
         except LLMGatewayError as exc:
             error_code = exc.error_code
         # Raise outside the handler so provider diagnostics/raw output are not
         # retained in the public error's implicit exception context.
         if call is None:
             raise CodeSimulationError(error_code)
+        _check_deadline(deadline)
         refs = frozenset(
             ref
             for instruction in parsed_rules.instructions
@@ -253,10 +324,12 @@ class CodeSimulationService:
                 for f in diff_findings
                 if (masked_diff := _mask_finding(f)) is not None
             ]
-            return DiffSimulationResult(
+            diff_result = DiffSimulationResult(
                 findings=diff_findings,
                 rejected_count=len(call.parsed.findings) - len(diff_findings),
             )
+            _check_deadline(deadline)
+            return diff_result
         findings = (
             [
                 f
@@ -274,7 +347,9 @@ class CodeSimulationService:
         findings = [
             masked for f in findings if (masked := _mask_finding(f)) is not None
         ]
-        return CodeSimulationResult(
+        result = CodeSimulationResult(
             findings=findings,
             rejected_count=len(call.parsed.findings) - len(findings),
         )
+        _check_deadline(deadline)
+        return result

@@ -55,9 +55,10 @@ def deploy(
     tmp_path: Path, **overrides: str
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     active = tmp_path / ".env.staging"
-    active.write_text(
-        "API_IMAGE=api:previous\nUI_IMAGE=ui:previous\nSIMULATION__ENABLED=false\nCOMPOSE_PROFILES=\n"
-    )
+    if not active.exists():
+        active.write_text(
+            "API_IMAGE=api:previous\nUI_IMAGE=ui:previous\nSIMULATION__ENABLED=false\nCOMPOSE_PROFILES=\n"
+        )
     (tmp_path / ".env.staging.simulation-candidate").write_text(
         "API_IMAGE=api:selected\nUI_IMAGE=ui:selected\nSIMULATION__ENABLED=true\nCOMPOSE_PROFILES=\n"
     )
@@ -74,6 +75,12 @@ for service in api webhook-worker worker outbox-dispatcher publication-worker; d
   if [[ "$1" == compose && " $* " == *" stop "* && " $* " == *" ${service} "* ]]; then
     echo exited > "$state_file"
   elif [[ "$1" == start && " $* " == *" cid-${service} "* ]]; then
+    if [[ "$service" == webhook-worker ]]; then
+      case "${WORKER_RECOVERY_FAILURE:-}" in
+        start) exit 47 ;;
+        not-running) exit 0 ;;
+      esac
+    fi
     echo running > "$state_file"
   elif [[ "$1" == compose && " $* " == *" up -d "* &&
           " $* " == *" ${service} "* ]]; then
@@ -119,7 +126,7 @@ done
     )
     trace = tmp_path / "trace"
     service_state = tmp_path / "services"
-    service_state.mkdir()
+    service_state.mkdir(exist_ok=True)
     for service in (
         "api",
         "webhook-worker",
@@ -127,7 +134,9 @@ done
         "outbox-dispatcher",
         "publication-worker",
     ):
-        (service_state / service).write_text("running\n")
+        state_file = service_state / service
+        if not state_file.exists():
+            state_file.write_text("running\n")
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-euc", remote],
         env={
@@ -179,6 +188,7 @@ def test_readiness_failure_never_promotes_candidate_or_starts_api(
     assert not any("--force-recreate --no-deps api" in call for call in calls)
     assert "SIMULATION__ENABLED=false" in (tmp_path / ".env.staging").read_text()
     assert not (tmp_path / ".env.staging.simulation-candidate").exists()
+    assert not (tmp_path / ".env.staging.simulation-rollback").exists()
     for service in (
         "webhook-worker",
         "worker",
@@ -186,6 +196,46 @@ def test_readiness_failure_never_promotes_candidate_or_starts_api(
         "publication-worker",
     ):
         assert (tmp_path / "services" / service).read_text() == "running\n"
+
+
+@pytest.mark.parametrize("failure", ["start", "not-running"])
+def test_failed_worker_recovery_retains_rollback_and_blocks_next_activation(
+    tmp_path: Path, failure: str
+) -> None:
+    previous_env = (
+        "API_IMAGE=api:previous\nUI_IMAGE=ui:previous\n"
+        "SIMULATION__ENABLED=false\nCOMPOSE_PROFILES=\n"
+    )
+    result, calls = deploy(
+        tmp_path,
+        SIMULATION_PREFLIGHT_FAILURE="42",
+        WORKER_RECOVERY_FAILURE=failure,
+    )
+    assert result.returncode != 0
+    assert any("scripts.simulation_readiness" in call for call in calls)
+    assert any(" stop webhook-worker" in call for call in calls)
+    assert "start cid-webhook-worker" in calls
+    assert "failed to restore previous worker cid-webhook-worker" in result.stderr
+    assert (tmp_path / "services/webhook-worker").read_text() == "exited\n"
+    assert (tmp_path / ".env.staging").read_text() == previous_env
+    assert not (tmp_path / ".env.staging.simulation-candidate").exists()
+    assert not any("--force-recreate --no-deps api" in call for call in calls)
+    rollback = tmp_path / ".env.staging.simulation-rollback"
+    assert rollback.is_dir()
+    assert (rollback / "previous-env").read_text() == previous_env
+
+    retry, all_calls = deploy(tmp_path)
+    retry_calls = all_calls[len(calls) :]
+    assert retry.returncode != 0
+    assert ".env.staging.simulation-rollback" in retry.stderr
+    assert "File exists" in retry.stderr
+    assert not any(" stop " in call or " up " in call for call in retry_calls)
+    assert not any(call.startswith("start ") for call in retry_calls)
+    assert not any("scripts.simulation_readiness" in call for call in retry_calls)
+    assert (tmp_path / "services/api").read_text() == "running\n"
+    assert (tmp_path / "services/webhook-worker").read_text() == "exited\n"
+    assert (tmp_path / ".env.staging").read_text() == previous_env
+    assert (rollback / "previous-env").read_text() == previous_env
 
 
 def test_success_promotes_only_after_readiness_then_uses_active_env(

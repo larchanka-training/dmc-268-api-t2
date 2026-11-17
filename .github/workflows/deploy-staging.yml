@@ -658,6 +658,7 @@ jobs:
                   if ! docker start "${worker_id}" >/dev/null ||
                      [[ "$(docker inspect --format='{{.State.Status}}' "${worker_id}")" != running ]]; then
                     echo "ERROR: failed to restore previous worker ${worker_id}" >&2
+                    recovered=false
                     status=1
                   fi
                 done

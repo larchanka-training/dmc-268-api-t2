@@ -550,6 +550,73 @@ PostgreSQL rollback/restore с неизвестной полнотой ledger т
 операторской recovery-команды в B2C2 нет. Redis state/HMAC/feature flag и
 GitHub Secrets/Variables этим изменением не создаются и не активируются.
 
+### Rule Playground: read-only staging audit
+
+`Staging simulation audit` (`staging-simulation-audit.yml`) — отдельный ручной
+`workflow_dispatch`, только `main`; запускать **только после отдельно разрешённого
+merge**, успешного API CI и завершённого Deploy текущего `main`. Создание Draft PR
+не запускает этот audit и не разрешает activation. Он использует существующие
+SSH credentials/закреплённый host key и сериализуется с Deploy через
+`deploy-staging`. Inputs и произвольных shell commands нет.
+
+Ожидаемый image — `ghcr.io/larchanka-training/dmc-268-api-t2:sha-${github.sha}`
+на момент dispatch. При несовпадении сначала сверить завершённый Deploy; audit
+не исправляет staging. Наличие `STAGING_SIMULATION_HMAC_SECRET_B64` передаётся
+только boolean expression; значение Secret не читается и не передаётся на VPS.
+Сравнение Redis/ledger identity использует **уже существующий** runtime HMAC внутри
+API container. Наличие GitHub Secret не доказывает его валидность, неизменность
+или совпадение с runtime.
+
+Audit выполняет Docker metadata reads и `docker exec` в **существующем запущенном**
+API container (`python -B -I -`); не использует Compose run/up/start, временные
+контейнеры, запись remote scripts, migrations, provisioning или provider calls.
+Для dedicated Redis используется IP инспектированного staging container в backend
+network, отличный от shared Redis; это доказывает разные наблюдаемые Docker
+instances, но не проверяет DNS/configured API endpoint, не исключает посторонних
+writers и не доказывает provenance storage. Полная runtime configuration остаётся
+`UNKNOWN`.
+При отсутствии API runtime Redis/SQL inspection остаётся `UNKNOWN`; отсутствующие
+volume/container получают `MISSING`, остановленный container — `BLOCKED`.
+
+Одна JSON-строка содержит только allowlisted статусы, агрегированное число claims,
+revision и численные метрики. Raw Docker/env/SQL/Redis responses, HMAC identity,
+state и исключения не выводятся. Artifacts и workflow summary не создаются.
+`UNKNOWN` — ошибка/недостаточность безопасного inspection, `BLOCKED` — наблюдаемый
+запрет/несоответствие, `READY` относится **только к названной проверке**. Успешный
+job означает получение отчёта, а не готовность activation. Ошибка SSH даёт
+`transport=UNKNOWN`; ни один отчёт не выдаёт `activation_authorized=true`.
+
+Границы evidence:
+
+- `active_env_compose_match` сверяет API image, выбранные simulation/analysis env
+  и байты deployed Compose с текущим main. Полный `deployment_configuration`
+  остаётся `UNKNOWN`: trusted manifest bytes, mount/ownership и полный desired
+  configuration snapshot этим сравнением не подтверждены.
+- `redis_policy` проверяет effective AOF/fsync/truncation/eviction policy и текущий
+  AOF write status. `admission_state` использует canonical adapter loader через
+  `EVAL_RO`, без собственных правил schema validation. Без runtime HMAC structural
+  identity check остаётся `UNKNOWN`. Отсутствие TTL и нулевые expired/evicted
+  counters не подтверждают history continuity и отсутствие прежних incidents.
+- PostgreSQL: только SELECT в read-only repeatable-read transaction с таймаутами;
+  revision `0022`, обе таблицы, singleton/latch, aggregate retained claims и
+  binding contract. `postgres_synchronous_commit` проверяет **одно текущее
+  setting**, а не durability WAL/storage, fsync или полноту восстановленной history.
+- RAM — `MemAvailable`; disk bytes/inodes — filesystem `/opt/dmc-268-t2`.
+  Метрики не покрывают автоматически отдельные Docker/data mounts. Допустимые
+  бюджеты, memory limits, disk/inode запас data filesystems и latency fsync
+  подтверждает оператор; audit не придумывает порогов достаточности.
+- Всегда `MANUAL EVIDENCE REQUIRED`: сохранность HMAC и его история, provenance
+  volume, принятый capacity budget, PostgreSQL backup/restore, off-host backup и
+  restore dedicated Redis, независимое подтверждение recovery incidents/disposition.
+  Штатный `backup-redis.sh` покрывает только shared Redis.
+
+После отдельно разрешённого запуска сохранить safe JSON/run URL в team tracker,
+разобрать каждый `MISSING/BLOCKED/UNKNOWN`, приложить независимые operator evidence.
+Отсутствующий/остановленный Redis нельзя инспектировать изнутри без изменения
+состояния — оставить неизвестные policy/state checks. Не запускать его ради audit.
+Любые provisioning, recovery, secret changes и activation требуют отдельной задачи;
+этот workflow ничего из перечисленного не выполняет.
+
 ### Rule Playground: операторский rollout E3
 
 Эти команды — инструкция для отдельно разрешённой операции на VPS. Локальный

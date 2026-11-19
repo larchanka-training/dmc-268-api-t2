@@ -404,6 +404,7 @@ _PROMPT_IDENTITIES: dict[str, tuple[str, str, Literal[1, 2]]] = {
     "v2": ("review-renderer-v2", "schemas/llm-output/v1.json", 1),
     "v3": ("review-renderer-v3", "schemas/llm-output/v2.json", 2),
     "v4": ("review-renderer-v4", "schemas/llm-output/v2.json", 2),
+    "v5": ("review-renderer-v4", "schemas/llm-output/v2.json", 2),
 }
 
 
@@ -566,7 +567,7 @@ def reflection_bundle(
     root: Path, policy: ModelPolicy, prompt_version: str
 ) -> ReflectionBundle | None:
     if isinstance(policy, ModelSettingsV2):
-        if prompt_version != "v4":
+        if prompt_version not in {"v4", "v5"}:
             raise PromptConfigError("unsupported initial prompt for verifier")
         return ReflectionBundle.load(
             root / "reflection",

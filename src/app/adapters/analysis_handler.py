@@ -447,7 +447,7 @@ class PostgresAnalysisHandler:
                 review.base_sha or change.base_sha,
             )
             settings_id = settings.id
-            context_enabled = review.prompt_version == "v4"
+            context_enabled = review.prompt_version in {"v4", "v5"}
             language = settings.output_language
             ignore_settings = project_historical_empty_settings(
                 settings.ignores, "globs"

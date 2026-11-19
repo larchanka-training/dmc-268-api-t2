@@ -204,7 +204,7 @@ class ReviewService:
                     budget,
                     call_kind="overflow_rebuild",
                     repair_input_limit=smaller
-                    if self._prompts.prompt_version in {"v3", "v4"}
+                    if self._prompts.prompt_version in {"v3", "v4", "v5"}
                     else None,
                 )
         except LLMGatewayError as exc:
@@ -266,7 +266,7 @@ class ReviewService:
             payload,
             rule_refs=rule_refs,
         )
-        if self._frozen is not None and prompt.prompt_version == "v4":
+        if self._frozen is not None and prompt.prompt_version in {"v4", "v5"}:
             severities = dict(self._frozen.rule_severities)
             outcome = ValidationOutcome(
                 accepted=[

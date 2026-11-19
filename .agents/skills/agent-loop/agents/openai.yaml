@@ -1,0 +1,5 @@
+interface:
+  display_name: "Agent Loop"
+  short_description: "Plan→TDD→review→PR multi-agent loop"
+policy:
+  allow_implicit_invocation: false

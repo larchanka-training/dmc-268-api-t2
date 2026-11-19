@@ -5,7 +5,7 @@ Vendored / adapted skill content from [mattpocock/skills](https://github.com/mat
 ## Upstream pin
 
 - Repository: https://github.com/mattpocock/skills
-- Commit: `3cca18b368ae95cdbdebbff572ccafa662551015`
+- Commit: `5863806dd4e15c63174bee4e7515a4256792ecfa`
 
 ## Covered paths in this catalog
 
@@ -22,6 +22,18 @@ Paths relative to `.agents/skills/` (and their upstream sources under that pin):
 `project-code-review/` is project-owned (Team 2) and is **not** covered by the mattpocock/skills MIT notice above.
 
 Team edits (triggers, `disable-model-invocation`, I/O paths, appendices) may differ from upstream; provenance remains the pin + paths listed here.
+
+## Larchanka / larchanka/skills
+
+- Repository: https://github.com/larchanka/skills
+- Commit: `e196913c7a6cbdf6873652a38efd46f5309357b1`
+
+| Local path | Upstream |
+|---|---|
+| `agent-loop/` | `skills/agent-loop` (adapted for Team 2 catalog) |
+| `refactoring/` | `refactoring/SKILL.md` |
+
+Licensed under the MIT License (see upstream `LICENSE` at the pin above). `agent-loop` sub-agent references were adapted; content may differ from upstream.
 
 ## MIT License (mattpocock/skills)
 

@@ -4,25 +4,28 @@ description: Red-green TDD at agreed seams. Follow when user says /tdd, asks for
 disable-model-invocation: true
 ---
 
+
 # Test-Driven Development
 
 TDD is the red → green loop. This skill is the reference that makes that loop produce tests worth keeping: what a good test is, where tests go, the anti-patterns, and the rules of the loop. Every section applies on every cycle: consult them before and during the loop, not after.
 
-When exploring the codebase, read `CONTEXT.md` (if it exists) so test names and interface vocabulary match the project's domain language, and respect ADRs in the area you're touching. Also follow always-on seams and quality commands in `AGENTS.md`.
+When exploring the codebase, read `GLOSSARY.md` (if it exists) so test names and interface vocabulary match the project's domain language, and respect ADRs in the area you're touching.
 
 ## What a good test is
 
 Tests verify behavior through public interfaces, not implementation details. Code can change entirely; tests shouldn't. A good test reads like a specification: "user can checkout with valid cart" tells you exactly what capability exists, and it survives refactors because it doesn't care about internal structure.
 
-See [tests.md](tests.md) for methodology, [tests-ui-typescript.md](tests-ui-typescript.md) / [tests-python-fastapi.md](tests-python-fastapi.md) for stack samples, and [mocking.md](mocking.md) for mocking guidelines.
+See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for mocking guidelines.
 
 ## Seams: where tests go
 
 A **seam** is the public boundary you test at: the interface where you observe behavior without reaching inside. Tests live at seams, never against internals.
 
-**Test only at agreed seams.** Prefer seams already stated in grill outcome, spec Testing Decisions, tickets, or conversation. Write them down once if missing, then proceed — ask the user **once** only when no seam is documented and more than one plausible public boundary exists. Do not re-confirm seams that are already agreed.
+**Test only at pre-agreed seams.** Before writing any test, write down the seams under test and confirm them with the user. No test is written at an unconfirmed seam. You can't test everything, so agreeing the seams up front is how testing effort lands on the critical paths and complex logic instead of every edge case.
 
-You can't test everything, so seams focus effort on critical paths and complex logic instead of every edge case. Coverage at the seam: see [tests.md](tests.md).
+Ask: "What's the public interface, and which seams should we test?" Give each proposed seam a one-line note on what it catches and what it misses.
+
+When the shape of that interface is itself in question (how deep the module is, where the seam belongs, what the interface should expose), use terms already in this skill and in repo `AGENTS.md` / `CONTEXT.md` / `GLOSSARY.md` if present. Do **not** call missing upstream skills (`codebase-design` is not in this catalog).
 
 ## Anti-patterns
 
@@ -34,6 +37,4 @@ You can't test everything, so seams focus effort on critical paths and complex l
 
 - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 - **One slice at a time.** One seam, one test, one minimal implementation per cycle.
-- **Hard stop after each green.** Add exactly **one** next agreed AC test at the seam and run it. If it is **already green**, you overshot: delete speculative production code or split the last change until that test is a **real red**. Do not add further cases or more production code while the next case is green. “I need the full correct handler for this case” is still overshoot if later AC cases would already pass.
-- **Evidence before production edits.** Before changing production code for a case, the turn must show failing test-runner output for **that** case (after fixing any false red from a bad fixture/double).
-- **Refactoring is not part of the loop.** Prefer a separate review pass (AGENTS.md Close / `/project-code-review`), not the red → green implementation cycle.
+- **Refactoring is not part of the loop.** After green, either stop for **Close** ([project-code-review](../project-code-review/SKILL.md) via `AGENTS.md`) or, if the user asked for a dedicated cleanup pass, `/refactoring`. Do not treat refactor as part of red → green.

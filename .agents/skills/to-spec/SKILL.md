@@ -4,24 +4,22 @@ description: "Turn the current conversation into a durable spec or a WIP draft. 
 disable-model-invocation: true
 ---
 
+
 This skill takes the current conversation context and codebase understanding and produces a spec. Do NOT interview the user; just synthesize what you already know.
 
-## Where to publish
-
-Follow **Where to put outputs** in `AGENTS.md`.
-
-- WIP path for this skill: `.scratch/specs/<slug>.md`
-- If unclear whether lasting vs draft: ask once. Default to `.scratch/` when they say "draft" / "WIP".
+The issue tracker and triage label vocabulary should have been provided to you. If not, tell the user to run `/setup-matt-pocock-skills`.
 
 ## Process
 
-1. Explore the repo to understand the current state of the codebase, if you haven't already. Use `CONTEXT.md` / project domain vocabulary throughout the spec, and respect any ADRs in the area you're touching.
+1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the spec, and respect any ADRs in the area you're touching.
 
-2. Sketch out the seams at which you're going to test the feature. Existing seams should be preferred to new ones. Use the highest seam possible. If new seams are needed, propose them at the highest point you can. The fewer seams across the codebase, the better — the ideal number is one.
+2. Sketch out the seams at which you're going to test the feature. Existing seams should be preferred to new ones. Use the highest seam possible. If new seams are needed, propose them at the highest point you can. The fewer seams across the codebase, the better - the ideal number is one.
 
-   Reuse seams already agreed in grill / conversation / tickets. Ask the user **once** only if no seam is documented and more than one plausible public boundary exists. Put the chosen seams under Testing Decisions — do not re-interview after that.
+Check with the user that these seams match their expectations.
 
-3. Write the spec using the template below, then publish it per `AGENTS.md` (tracker or `.scratch/specs/`).
+3. Write the spec using the template below, then publish it to the project issue tracker. Apply the `ready-for-agent` triage label - no need for additional triage.
+
+<spec-template>
 
 ## Problem Statement
 
@@ -35,13 +33,13 @@ The solution to the problem, from the user's perspective.
 
 A LONG, numbered list of user stories. Each user story should be in the format of:
 
-1. As a …, I want …, so that …
+1. As an <actor>, I want a <feature>, so that <benefit>
 
-Example:
-
+<user-story-example>
 1. As a mobile bank customer, I want to see balance on my accounts, so that I can make better informed decisions about my spending
+</user-story-example>
 
-This list of user stories should be extensive and cover all aspects of the feature.
+This list of user stories should be extremely extensive and cover all aspects of the feature.
 
 ## Implementation Decisions
 
@@ -63,8 +61,8 @@ Exception: if a prototype produced a snippet that encodes a decision more precis
 
 A list of testing decisions that were made. Include:
 
-- A description of what makes a good test (only test external behavior, not implementation details; coverage at the seam per `tdd/tests.md`)
-- Which modules / seams will be tested
+- A description of what makes a good test (only test external behavior, not implementation details)
+- Which modules will be tested
 - Prior art for the tests (i.e. similar types of tests in the codebase)
 
 ## Out of Scope
@@ -74,3 +72,5 @@ A description of the things that are out of scope for this spec.
 ## Further Notes
 
 Any further notes about the feature.
+
+</spec-template>

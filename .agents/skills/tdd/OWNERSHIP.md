@@ -2,9 +2,9 @@
 name: tdd
 owner: Engineer 4 (Team 2)
 source: https://github.com/mattpocock/skills
-pinned_sha: 3cca18b368ae95cdbdebbff572ccafa662551015
+pinned_sha: 5863806dd4e15c63174bee4e7515a4256792ecfa
 path_in_source: skills/engineering/tdd
-reviewed_at: 2026-09-13
+reviewed_at: 2026-11-18
 reviewed_by: Engineer 4
 last_eval_at: none (Sprint 1 candidate)
 eval_result: candidate
@@ -15,6 +15,6 @@ notes: >
   Rewritten trigger + disable-model-invocation.
   Seams: reuse if present; ask once only if missing.
   AGENTS Execute phase follows this procedure without a second /tdd.
-  Dropped upstream codebase-design Skill call (not in team catalog).
-  Points review stage at project-code-review / AGENTS Close.
+  Removed upstream codebase-design / code-review Skill calls (not in team catalog).
+  After green: Close via project-code-review, or /refactoring if user asks.
 ```

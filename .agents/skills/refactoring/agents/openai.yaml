@@ -1,0 +1,5 @@
+interface:
+  display_name: "Refactoring"
+  short_description: "Make it right after green — quality gates"
+policy:
+  allow_implicit_invocation: false

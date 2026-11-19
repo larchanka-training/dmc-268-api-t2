@@ -18,7 +18,8 @@ Human-only notes (governance, wiring, SHAs). Day-to-day agent brief is repo-root
 |---|---|
 | **Source of truth** | UI repo `dmc-268-ui-t2` |
 | **API copy rule** | Same files under `.agents/skills/` as UI (plus sync artifacts below) |
-| **Upstream Matt pin** | `3cca18b368ae95cdbdebbff572ccafa662551015` ([mattpocock/skills](https://github.com/mattpocock/skills)) |
+| **Upstream Matt pin** | `5863806dd4e15c63174bee4e7515a4256792ecfa` ([mattpocock/skills](https://github.com/mattpocock/skills)) |
+| **Upstream Larchanka pin** | `e196913c7a6cbdf6873652a38efd46f5309357b1` ([larchanka/skills](https://github.com/larchanka/skills)) — `agent-loop` (adapted), `refactoring` |
 | **Shared catalog sync SHA** | see `.agents/SYNC_SHA.txt` (content checksum of `.agents/skills/**`) |
 | **Sync checker** | `.agents/check-sync.mjs` (owns the hash algorithm) |
 | **Sprint** | 1 candidate convention (not proven prod) |
@@ -39,6 +40,8 @@ Do not re-specify the hash algorithm in prose; the script is the source of truth
 | `to-spec` | Yes | Queued | `disable-model-invocation: true` | Follows `AGENTS.md` outputs |
 | `to-tickets` | Yes | Queued | `disable-model-invocation: true` | Follows `AGENTS.md` outputs |
 | `project-code-review` | Yes | Queued | `disable-model-invocation: true` | `/…` or AGENTS Close axes |
+| `agent-loop` | Yes | Queued | `disable-model-invocation: true` | `/agent-loop` — orchestrated plan→tdd→review→PR |
+| `refactoring` | Yes | Queued | `disable-model-invocation: true` | `/refactoring` — post-green quality gates |
 | `skill-creator` | **No** | — | — | Engineer 4 meta only (skills_talks / personal) |
 
 Promote later = move a queued skill into the ≤2 active set and demote another. Update this matrix and the phase lines in UI `AGENTS.md`.

@@ -1,0 +1,112 @@
+name: Staging simulation prepare
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Initial dedicated Redis operation
+        type: choice
+        options: [create-volume, start-redis]
+        required: true
+      first_storage:
+        description: Confirm this is first storage creation and there is no prior data to recover
+        type: boolean
+        default: false
+      approve_create_volume:
+        description: Authorize creation of the dedicated external volume
+        type: boolean
+        default: false
+      approve_start_redis:
+        description: Authorize first start of the dedicated Redis container
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      SSH_USER: ${{ secrets.VPS_DMC268_U }}
+      SSHPASS: ${{ secrets.VPS_DMC268_P }}
+    steps:
+      - name: Checkout main workflow source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_HOST}" || -z "${SSH_USER}" || -z "${SSHPASS}" ]]; then
+            echo '{"status":"BLOCKED","reason":"ssh_configuration_missing"}'
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${SSH_HOST} ${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Run the approved dedicated Redis operation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          FIRST_STORAGE: ${{ inputs.first_storage }}
+          APPROVE_CREATE_VOLUME: ${{ inputs.approve_create_volume }}
+          APPROVE_START_REDIS: ${{ inputs.approve_start_redis }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${OPERATION}" in
+            create-volume) approval="${APPROVE_CREATE_VOLUME}" ;;
+            start-redis) approval="${APPROVE_START_REDIS}" ;;
+            *)
+              echo '{"status":"BLOCKED","reason":"invalid_operation"}'
+              exit 1
+              ;;
+          esac
+          if [[ "${approval}" != true || ( "${OPERATION}" == create-volume && "${FIRST_STORAGE}" != true ) ]]; then
+            echo '{"status":"BLOCKED","reason":"confirmation_required"}'
+            exit 1
+          fi
+          # Normalize the optional provenance checkbox before building the remote command.
+          first_storage=false
+          if [[ "${FIRST_STORAGE}" == true ]]; then first_storage=true; fi
+          compose_sha="$(sha256sum docker-compose.staging.yml | cut -d ' ' -f 1)"
+          [[ "${compose_sha}" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          status=0
+          report="$(timeout --kill-after=5s 180s sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
+            -- "${SSH_USER}@${SSH_HOST}" \
+            "exec python3 -B -I - '${OPERATION}' '${approval}' '${first_storage}' '${compose_sha}'" \
+            < .github/scripts/staging_simulation_prepare.py 2>/dev/null)" || status=$?
+          prefix='^\{"operation": "'"$OPERATION"'", "status": '
+          blocked='"BLOCKED", "mutation_attempted": (true|false), "reason": "[a-z_]{1,48}"\}$'
+          volume='"mutation_attempted": true, "volume": "dmc-268-t2-staging_simulation-redis-data"'
+          case "$OPERATION" in
+            create-volume) success='"CREATED", '"$volume"', "driver": "local"\}$' ;;
+            start-redis) success='"STARTED_VERIFIED", '"$volume"'\}$' ;;
+          esac
+          if { (( status == 0 )) && [[ "$report" =~ $prefix$success ]]; } ||
+             { (( status == 20 )) && [[ "$report" =~ $prefix$blocked ]]; }; then
+            printf '%s\n' "$report"
+            exit "$status"
+          fi
+          echo '{"status":"BLOCKED","reason":"remote_result_unknown"}'
+          exit 1

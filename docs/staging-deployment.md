@@ -326,7 +326,8 @@ authorization не изменяются. Existing Redis data и volumes не у�
 `Deploy` с activation, `start-redis` и `provision-admission` требуют
 существующий volume. Первое создание выполняется отдельной ручной операцией
 `create-volume` в **Staging simulation prepare** по инструкции E3 ниже.
-`scripts/backup-redis.sh` обслуживает только shared service `redis`.
+`scripts/backup-redis.sh` обслуживает shared service `redis`. Для dedicated Redis
+есть отдельный [ручной RDB backup](backup-restore.md#dedicated-redis-backup).
 
 `appendfsync always` выбран для низкой частоты admission операций. Поддержка,
 latency и error behavior проверяются только в disposable Compose projects;
@@ -608,7 +609,6 @@ job означает получение отчёта, а не готовност
 - Всегда `MANUAL EVIDENCE REQUIRED`: сохранность HMAC и его история, provenance
   volume, принятый capacity budget, PostgreSQL backup/restore, off-host backup и
   restore dedicated Redis, независимое подтверждение recovery incidents/disposition.
-  Штатный `backup-redis.sh` покрывает только shared Redis.
 
 После отдельно разрешённого запуска сохранить safe JSON/run URL в team tracker,
 разобрать каждый `MISSING/BLOCKED/UNKNOWN`, приложить независимые operator evidence.
@@ -709,8 +709,9 @@ push CI с публикацией immutable image и обычный disabled sta
    runtime claim. Никаких ручных UPDATE/unblock/DELETE для прохождения readiness.
    Проверьте PostgreSQL WAL/backup и off-host dedicated Redis backup/restore
    drill в disposable окружении, независимую сохранность HMAC и incident log.
-   `backup-redis.sh` покрывает shared Redis; dedicated backup не возникает
-   автоматически. AOF и PostgreSQL predeploy backup не заменяют эту проверку.
+   Синтетический тест проверяет механику восстановления. Для activation нужны
+   свидетельства по реальным off-host копиям обоих хранилищ и полноте истории
+   ledger. См. [dedicated Redis drill](backup-restore.md#dedicated-redis-disposable-restore-drill).
 7. **Разрешение activation.** После review и operational approval выставьте
    `STAGING_SIMULATION_ENABLED=true`. Это ещё не deploy: автоматические runs с
    enabled flag будут отклонены без ручного input. Запустите `Deploy` от `main`,

@@ -120,6 +120,10 @@ if args[0] == "compose":
 if args[:2] == data.get("error_command"):
     print("synthetic-secret", file=sys.stderr)
     sys.exit(1)
+if data.get("inspection_stderr") and (
+    "inspect" in args[:2] or args[0] == "compose" and "config" in args
+):
+    print("warning: synthetic-secret", file=sys.stderr)
 if args == ["engine", "volumes"]:
     listing = [volume] if data.get("volume") or created else []
     print(json.dumps({
@@ -222,6 +226,8 @@ elif args[0] == "compose" and "run" in args:
     }
     if create:
         report["status"] = "created"
+        if data.get("create_policy_mismatch"):
+            report["persistence"]["appendfsync"] = "everysec"
         if failure := data.get("write_failure"):
             print(json.dumps({"error": failure, "mode": "check"}))
             sys.exit(1)
@@ -496,6 +502,14 @@ def test_start_redis_targets_only_the_initial_dedicated_service(prepare: Any) ->
     )
 
 
+def test_start_accepts_stderr_from_successful_compose_config_and_inspect(
+    prepare: Any,
+) -> None:
+    result, _ = prepare("start-redis", volume=True, inspection_stderr=True)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["status"] == "STARTED_VERIFIED"
+
+
 def test_start_requires_a_running_healthy_dedicated_container(prepare: Any) -> None:
     result, _ = prepare("start-redis", volume=True, redis_health="unhealthy")
     assert result.returncode == BLOCKED_EXIT
@@ -726,6 +740,22 @@ def test_provision_stops_after_failed_or_uncertain_write(
         "status": "BLOCKED",
         "mutation_attempted": True,
         "reason": reason,
+    }
+    assert ["--create" in call for call in calls if "run" in call] == [False, True]
+
+
+def test_provision_preserves_the_policy_mismatch_in_a_create_report(
+    prepare: Any,
+) -> None:
+    result, calls = prepare(
+        "provision-admission", existing_state=False, create_policy_mismatch=True
+    )
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout) == {
+        "operation": "provision-admission",
+        "status": "BLOCKED",
+        "mutation_attempted": True,
+        "reason": "redis_policy_mismatch",
     }
     assert ["--create" in call for call in calls if "run" in call] == [False, True]
 

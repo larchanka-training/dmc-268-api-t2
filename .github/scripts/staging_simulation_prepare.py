@@ -79,23 +79,23 @@ def invoke(
 
 
 def run_docker_command(
-    *args: str, mutation: bool = False, timeout: int = 8, stdin: str | None = None
+    *args: str, allow_stderr: bool = False, timeout: int = 8, stdin: str | None = None
 ) -> str:
     result = invoke(*args, timeout=timeout, stdin=stdin)
     if result.returncode == GNU_TIMEOUT_EXIT:
         raise BlockedError("docker_command_timed_out")
-    if result.returncode or (not mutation and result.stderr):
+    if result.returncode or (result.stderr and not allow_stderr):
         raise BlockedError("docker_command_failed")
     return result.stdout
 
 
 def docker(
-    *args: str, mutation: bool = False, timeout: int = 8, stdin: str | None = None
+    *args: str, allow_stderr: bool = False, timeout: int = 8, stdin: str | None = None
 ) -> str:
     return run_docker_command(
         *DOCKER,
         *args,
-        mutation=mutation,
+        allow_stderr=allow_stderr,
         timeout=timeout,
         stdin=stdin,
     )
@@ -124,7 +124,9 @@ def container(service: str) -> dict[str, Any] | None:
         return None
     if len(ids) != 1:
         raise BlockedError("ambiguous_container")
-    [entry] = json.loads(docker("inspect", "--type", "container", ids[0]))
+    [entry] = json.loads(
+        docker("inspect", "--type", "container", ids[0], allow_stderr=True)
+    )
     labels = entry["Config"]["Labels"]
     if (
         entry["Id"] != ids[0]
@@ -202,7 +204,7 @@ def require_volume_precondition(operation: str) -> None:
 
 
 def inspect_volume() -> dict[str, Any]:
-    [volume] = json.loads(docker("volume", "inspect", VOLUME))
+    [volume] = json.loads(docker("volume", "inspect", VOLUME, allow_stderr=True))
     if (
         volume["Name"] != VOLUME
         or volume["Driver"] != "local"
@@ -225,13 +227,13 @@ def create_volume() -> None:
         "--label",
         f"{label}={token}",
         VOLUME,
-        mutation=True,
+        allow_stderr=True,
     )
     if (inspect_volume()["Labels"] or {}).get(label) != token:
         raise BlockedError("volume_creation_unverified")
 
 
-def compose(*args: str, mutation: bool = False, timeout: int = 8) -> str:
+def compose(*args: str, timeout: int = 8) -> str:
     return docker(
         "compose",
         "-p",
@@ -245,7 +247,7 @@ def compose(*args: str, mutation: bool = False, timeout: int = 8) -> str:
         "--profile",
         "simulation",
         *args,
-        mutation=mutation,
+        allow_stderr=True,
         timeout=timeout,
         stdin=NETWORK_OVERRIDE,
     )
@@ -278,7 +280,9 @@ def require_compose_configuration(expected_hash: str) -> None:
 
 def local_image_id() -> str:
     try:
-        image_id = docker("image", "inspect", "--format", "{{.Id}}", IMAGE).strip()
+        image_id = docker(
+            "image", "inspect", "--format", "{{.Id}}", IMAGE, allow_stderr=True
+        ).strip()
     except BlockedError:
         raise BlockedError("local_redis_image_unavailable") from None
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
@@ -400,7 +404,10 @@ def provisioning_compose(
         or api["Config"]["Image"] != tag
         or env_value(runtime, "GIT_SHA") != match[1]
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", image)
-        or docker("image", "inspect", "--format", "{{.Id}}", tag).strip() != image
+        or docker(
+            "image", "inspect", "--format", "{{.Id}}", tag, allow_stderr=True
+        ).strip()
+        != image
     ):
         raise BlockedError("api_image_mismatch")
 
@@ -419,7 +426,9 @@ def provisioning_compose(
     require_distinct_redis(redis, shared_redis())
     endpoint = redis["NetworkSettings"]["Networks"][NETWORK]
     api_endpoint = api["NetworkSettings"]["Networks"].get(NETWORK, {})
-    network_id = docker("network", "inspect", "--format", "{{.Id}}", NETWORK).strip()
+    network_id = docker(
+        "network", "inspect", "--format", "{{.Id}}", NETWORK, allow_stderr=True
+    ).strip()
     if (
         not re.fullmatch(r"[0-9a-f]{64}", network_id)
         or network_id != endpoint["NetworkID"]
@@ -551,15 +560,15 @@ def create_admission(config: str, cli_hash: str) -> None:
             "--confirm-new-instance-no-history",
             "--confirm-exclusive-dedicated-instance",
         )
-        if (
-            code == 0
-            and result.get("mode") == "create"
-            and result.get("status") == "created"
-        ):
-            require_verified_state(result)
-            return
     except Exception:
         raise BlockedError("creation_unconfirmed") from None
+    if (
+        code == 0
+        and result.get("mode") == "create"
+        and result.get("status") == "created"
+    ):
+        require_verified_state(result)
+        return
     reason = result.get("error")
     if (
         code == 1
@@ -663,7 +672,6 @@ def main() -> int:
                 "--wait-timeout",
                 "60",
                 SERVICE,
-                mutation=True,
                 timeout=70,
             )
             redis = container(SERVICE)

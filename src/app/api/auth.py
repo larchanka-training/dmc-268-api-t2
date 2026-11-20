@@ -56,6 +56,7 @@ async def get_verified_session(
             algorithms=["HS256"],
             issuer="dmc268",
             audience="dmc268-browser",
+            leeway=3,  # Clock skew for iat, nbf and exp; DB expiry stays strict.
             options={"require": ["sub", "sid", "iat", "exp"]},
         )
         user_id, sid = UUID(claims["sub"]), UUID(claims["sid"])

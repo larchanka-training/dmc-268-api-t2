@@ -63,7 +63,9 @@ dataset, including the admission state, without writing to that state. The scrip
 checks the source container's Compose project and service labels and the named
 volume `${COMPOSE_PROJECT}_simulation-redis-data` mounted at `/data`. After capture,
 it checks the received bytes with `redis-check-rdb` in the verified container, syncs
-the temporary file to disk and atomically publishes the validated file. The final file is
+the temporary file to disk and atomically publishes the validated file. Before returning
+success, it syncs the backup directory and its parents through the deployment directory.
+If that sync fails, it reports a failure and attempts to remove the new link. The final file is
 `backups/simulation-redis/simulation-redis-YYYYMMDDTHHMMSSZ.rdb` relative to the
 Compose directory. The timestamp is UTC and the snapshot is mode `0600`. The
 backup directories must be owned by the invoking account with mode `0700`. The

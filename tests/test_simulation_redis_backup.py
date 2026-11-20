@@ -185,3 +185,34 @@ def test_writeback_failure_leaves_no_published_file(deployment: Path) -> None:
     assert result.returncode != 0
     assert "sync-rdb" in result.stderr
     assert not list((deployment / "backups/simulation-redis").iterdir())
+
+
+def test_publication_sync_failure_preserves_only_the_previous_snapshot(
+    deployment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = deployment / "backups/simulation-redis"
+    dest.parent.mkdir(mode=0o700)
+    dest.mkdir(mode=0o700)
+    previous = dest / "simulation-redis-20261119T201530Z.rdb"
+    previous.write_bytes(PAYLOAD)
+    monkeypatch.setenv("FIXTURE_DEPLOYMENT", str(deployment))
+    sync = deployment.parent / "bin/sync"
+    sync.write_text(
+        "#!/bin/sh\n"
+        "for path do\n"
+        '    if [ "$path" = "$FIXTURE_DEPLOYMENT" ] && '
+        f'[ -f "$FIXTURE_DEPLOYMENT/backups/simulation-redis/{SNAPSHOT}" ]; then\n'
+        f"        echo {SECRET} >&2\n"
+        "        exit 1\n"
+        "    fi\n"
+        "done\n"
+    )
+    sync.chmod(0o755)
+
+    result = backup(deployment)
+
+    assert result.returncode != 0
+    assert "sync-publication" in result.stderr
+    assert SECRET not in result.stdout + result.stderr
+    assert list(dest.iterdir()) == [previous]
+    assert previous.read_bytes() == PAYLOAD

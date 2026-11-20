@@ -89,3 +89,10 @@ sync -d -- "${partial}" 2>/dev/null
 stage=publish
 # Both names are in the same directory. link(2) fails if the final name exists.
 ln -T -- "${partial}" "${final}" 2>/dev/null
+
+stage=sync-publication
+# Sync the final directory entry and the parent entries created on the first run.
+if ! sync -- "${dest}" "${root}/backups" "${root}" 2>/dev/null; then
+  rm -f -- "${final}" 2>/dev/null
+  exit 1
+fi

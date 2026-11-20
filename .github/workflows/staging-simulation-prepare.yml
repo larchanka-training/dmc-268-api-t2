@@ -1,0 +1,154 @@
+name: Staging simulation prepare
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Initial dedicated Redis operation
+        type: choice
+        options: [create-volume, start-redis, provision-admission]
+        required: true
+      first_storage:
+        description: Confirm this is first storage creation and there is no prior data to recover
+        type: boolean
+        default: false
+      approve_create_volume:
+        description: Authorize creation of the dedicated external volume
+        type: boolean
+        default: false
+      approve_start_redis:
+        description: Authorize first start of the dedicated Redis container
+        type: boolean
+        default: false
+      approve_provision_admission:
+        description: Authorize initial admission state creation
+        type: boolean
+        default: false
+      confirm_new_instance_no_history:
+        description: Verify new storage from independent records, with no prior history or unresolved recovery incident
+        type: boolean
+        default: false
+      confirm_exclusive_dedicated_instance:
+        description: Verify the dedicated Redis instance and absence of competing writers
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SSH_HOST: ${{ vars.VPS_DMC268_IP_T2 }}
+      SSH_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDP5n14emZsPXXkzPjoTNy4RmHa8CEcvXLe/ILhuajd
+      SSH_USER: ${{ secrets.VPS_DMC268_U }}
+      SSHPASS: ${{ secrets.VPS_DMC268_P }}
+    steps:
+      - name: Checkout main workflow source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_HOST}" || -z "${SSH_USER}" || -z "${SSHPASS}" ]]; then
+            echo '{"status":"BLOCKED","reason":"ssh_configuration_missing"}'
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${SSH_HOST} ${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Run the approved dedicated Redis operation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          FIRST_STORAGE: ${{ inputs.first_storage }}
+          APPROVE_CREATE_VOLUME: ${{ inputs.approve_create_volume }}
+          APPROVE_START_REDIS: ${{ inputs.approve_start_redis }}
+          APPROVE_PROVISION_ADMISSION: ${{ inputs.approve_provision_admission }}
+          CONFIRM_NEW_INSTANCE_NO_HISTORY: ${{ inputs.confirm_new_instance_no_history }}
+          CONFIRM_EXCLUSIVE_DEDICATED_INSTANCE: ${{ inputs.confirm_exclusive_dedicated_instance }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${OPERATION}" in
+            create-volume) approval="${APPROVE_CREATE_VOLUME}" ;;
+            start-redis) approval="${APPROVE_START_REDIS}" ;;
+            provision-admission) approval="${APPROVE_PROVISION_ADMISSION:-false}" ;;
+            *)
+              echo '{"status":"BLOCKED","reason":"invalid_operation"}'
+              exit 1
+              ;;
+          esac
+          if [[ "${approval}" != true || ( "${OPERATION}" == create-volume && "${FIRST_STORAGE}" != true ) ]]; then
+            echo '{"status":"BLOCKED","reason":"confirmation_required"}'
+            exit 1
+          fi
+          provisioning_args=
+          if [[ "${OPERATION}" == provision-admission ]]; then
+            if [[ "${CONFIRM_NEW_INSTANCE_NO_HISTORY:-false}" != true || "${CONFIRM_EXCLUSIVE_DEDICATED_INSTANCE:-false}" != true ]]; then
+              echo '{"status":"BLOCKED","reason":"confirmation_required"}'
+              exit 1
+            fi
+            cli_sha="$(sha256sum scripts/provision_simulation_admission.py | cut -d ' ' -f 1)"
+            [[ "${cli_sha}" =~ ^[0-9a-f]{64}$ ]] || exit 1
+            provisioning_args=" 'true' 'true' '${cli_sha}'"
+          fi
+          # Normalize the optional provenance checkbox before building the remote command.
+          first_storage=false
+          if [[ "${FIRST_STORAGE}" == true ]]; then first_storage=true; fi
+          compose_sha="$(sha256sum docker-compose.staging.yml | cut -d ' ' -f 1)"
+          [[ "${compose_sha}" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          status=0
+          report="$(timeout --kill-after=5s 180s sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
+            -- "${SSH_USER}@${SSH_HOST}" \
+            "exec python3 -B -I - '${OPERATION}' '${approval}' '${first_storage}' '${compose_sha}'${provisioning_args}" \
+            < .github/scripts/staging_simulation_prepare.py 2>/dev/null)" || status=$?
+          prefix='^\{"operation": "'"$OPERATION"'", "status": '
+          blocked='"BLOCKED", "mutation_attempted": (true|false), "reason": "[a-z_]{1,48}"\}$'
+          volume='"mutation_attempted": true, "volume": "dmc-268-t2-staging_simulation-redis-data"'
+          case "$OPERATION" in
+            create-volume) success='"CREATED", '"$volume"', "driver": "local"\}$' ;;
+            start-redis) success='"STARTED_VERIFIED", '"$volume"'\}$' ;;
+            provision-admission)
+              verified='"activation_authorized": false, "history_continuity": "unproven", "state_exists": true, "state_type": "string", "structure": "valid", "hmac_identity": "match", "pttl_ms": -1'
+              success='"PROVISIONED_VERIFIED", "mutation_attempted": true, '"$verified"'\}$'
+              reasons='confirmation_required|invalid_compose_digest|rollback_pending|api_unavailable|playground_not_disabled'
+              reasons+='|invalid_container_listing|ambiguous_container|wrong_container_identity|docker_command_timed_out|docker_command_failed|inspection_failed'
+              reasons+='|compose_digest_mismatch|invalid_cli_digest|cli_digest_mismatch|compose_configuration_mismatch|invalid_simulation_secret|api_environment_mismatch|api_image_mismatch'
+              reasons+='|volume_inventory_warning|invalid_volume_listing|volume_missing|wrong_volume_metadata|redis_unhealthy|wrong_redis_mount|redis_volume_not_exclusive|redis_port_published'
+              reasons+='|shared_redis_not_isolated|redis_instance_not_dedicated|wrong_backend_network|redis_policy_mismatch|redis_aof_unhealthy'
+              reasons+='|invalid_cli_result|hmac_identity_mismatch|invalid_state|invalid_admission_inspection|state_already_exists'
+              reasons+='|prior_key_loss_detected|prior_use_or_unknown_command|instance_not_empty|concurrent_creation_refused|creation_unconfirmed|postflight_unverified'
+              blocked='"BLOCKED", "mutation_attempted": (true|false), "reason": "('"$reasons"')"\}$'
+              ;;
+          esac
+          if { (( status == 0 )) && [[ "$report" =~ $prefix$success ]]; } ||
+             { (( status == 20 )) && [[ "$report" =~ $prefix$blocked ]]; }; then
+            printf '%s\n' "$report"
+            exit "$status"
+          fi
+          if [[ "${OPERATION}" == provision-admission ]]; then
+            echo '{"operation":"provision-admission","status":"UNKNOWN","reason":"creation_unconfirmed"}'
+          else
+            echo '{"status":"BLOCKED","reason":"remote_result_unknown"}'
+          fi
+          exit 1

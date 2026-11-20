@@ -322,12 +322,11 @@ authorization не изменяются. Existing Redis data и volumes не у�
 | Healthcheck | `redis-cli ping`; не подтверждает полноту history или recovery readiness |
 | Network | только существующая внутренняя Compose network `backend`; host port отсутствует |
 
-External volume должен быть заранее подготовлен и идентифицирован оператором:
-его отсутствие означает отказ запуска, а не создание пустого storage. Для staging
-ожидаемое имя — `dmc-268-t2-staging_simulation-redis-data`. Workflow проверяет
-существование volume и не создаёт его. Существующие `redis`, его volume/settings и backup scripts
-сохраняются. `scripts/backup-redis.sh` обслуживает только shared service `redis`;
-новый service автоматически в backup coverage не входит.
+Для staging ожидаемое имя external volume — `dmc-268-t2-staging_simulation-redis-data`.
+`Deploy` с activation, `start-redis` и `provision-admission` требуют
+существующий volume. Первое создание выполняется отдельной ручной операцией
+`create-volume` в **Staging simulation prepare** по инструкции E3 ниже.
+`scripts/backup-redis.sh` обслуживает только shared service `redis`.
 
 `appendfsync always` выбран для низкой частоты admission операций. Поддержка,
 latency и error behavior проверяются только в disposable Compose projects;
@@ -365,10 +364,11 @@ default-disabled wiring и AOF не заменяют его операторск
 E1-B2B добавляет локальную утилиту
 `scripts/provision_simulation_admission.py`. Её не вызывают API startup,
 request handlers, автоматический Compose startup или deployment workflow.
-Явная операторская команда Compose run описана в E3 ниже. **Сам этап B2B не разрешает
-запуск simulation profile, создание staging state, подключение реальных GitHub
-Secrets/Variables или activation.** Команды ниже описывают будущую отдельную
-операторскую операцию после разрешения; локальные tests используют только
+Ручная операция `provision-admission` в **Staging simulation prepare** описана
+в E3 ниже. **Сам этап B2B не разрешает запуск simulation profile, создание
+staging state, подключение реальных GitHub Secrets/Variables или activation.**
+Команды ниже описывают будущую отдельную операторскую операцию после
+разрешения; локальные tests используют только
 disposable Docker instances и synthetic данные.
 
 HMAC берётся только из существующего `SIMULATION__HMAC_SECRET_B64` в environment.
@@ -619,7 +619,7 @@ job означает получение отчёта, а не готовност
 
 ### Rule Playground: операторский rollout E3
 
-Эти команды — инструкция для отдельно разрешённой операции на VPS. Локальный
+Эти шаги описывают отдельно разрешённые операции со staging. Локальный
 Close E3 ничего не разворачивает. PR CI не публикует API image: Draft PR нельзя
 автоматически развернуть. Сначала нужны разрешённый merge в `main`, успешный
 push CI с публикацией immutable image и обычный disabled staging deployment.
@@ -632,23 +632,7 @@ push CI с публикацией immutable image и обычный disabled sta
    часы VPS и единственный writable PostgreSQL primary. Сохраните image digest,
    storage origin, backup inventory и approval в team tracker. Без принятого
    budget и recovery evidence rollout не разрешён. Shared Redis не менять.
-2. **External volume.** Выполните inspection заранее:
-
-   ```bash
-   docker volume inspect dmc-268-t2-staging_simulation-redis-data
-   ```
-
-   Missing volume блокирует workflow. Только при доказанном первом создании
-   никогда не использованного storage и отдельном operator approval допустима
-   ручная команда:
-
-   ```bash
-   docker volume create dmc-268-t2-staging_simulation-redis-data
-   ```
-
-   Это не recovery. Не выполнять `inspect || create`, не подменять исчезнувший
-   volume новым, не удалять существующий volume или admission key.
-3. **Стабильный HMAC.** В защищённой операторской среде подготовьте canonical
+2. **Стабильный HMAC.** В защищённой операторской среде подготовьте canonical
    base64 случайного материала длиной 32..1024 decoded bytes и сохраните его
    независимо от Redis/PostgreSQL backups. Установите через GitHub Secrets UI
    `STAGING_SIMULATION_HMAC_SECRET_B64`; не включайте значение в shell history,
@@ -656,7 +640,54 @@ push CI с публикацией immutable image и обычный disabled sta
    Redeploy доставляет то же значение. После установки выполните отдельно
    разрешённый disabled deployment опубликованного main image. При отсутствии
    Secret обычный disabled deployment также работает, provisioning — нет.
-4. **Первый Redis при disabled simulation.** На staging VPS:
+3. **External volume.** После disabled deployment запустите **Staging simulation
+   audit** на `main`. Запишите в team tracker происхождение storage, результаты
+   inventory и recovery evidence. Подтвердите остановку конкурирующих writers,
+   отсутствие нерешённых recovery/restore incidents и исключите параллельное
+   обслуживание Docker вне workflow на время подготовки.
+
+   Если volume отсутствует и независимые свидетельства подтверждают первое
+   создание storage без истории, в **Actions → Staging simulation prepare → Run
+   workflow** выберите **main** и **create-volume**. Для этого запуска отметьте
+   только `first_storage` и `approve_create_volume`. Дождитесь `CREATED` и
+   сохраните JSON и URL запуска. Существующий volume или неоднозначный результат
+   требуют read-only расследования перед любой записью. Не подменяйте исчезнувший
+   volume новым и не удаляйте существующий volume или admission key.
+4. **Первый Redis при disabled simulation.** После проверки external volume и
+   при отсутствии dedicated container запустите **Staging simulation prepare**
+   на **main** с **start-redis**, отметив только `approve_start_redis`. Workflow
+   проверяет deployed Compose и запускает только `simulation-redis` из локального
+   image с `--pull never`. Workflow проверяет health, RW mount `/data`, изоляцию
+   и политику AOF/eviction. Дождитесь `STARTED_VERIFIED` и сохраните JSON и URL
+   запуска вне restore domain. При `BLOCKED`, в том числе `remote_result_unknown`,
+   остановитесь и сверьте состояние через read-only audit перед новым запуском.
+   `restart: "no"` сохранён; обычный disabled workflow этот service не запускает.
+5. **Operator-only provisioning.** Запишите в team tracker происхождение volume
+   по независимому журналу создания и inventory, отсутствие нерешённых
+   recovery/restore incidents и подтверждение, что все конкурирующие writers
+   остановлены. Держите Playground выключенным и исключите параллельное
+   обслуживание Docker вне workflow до завершения проверки.
+
+   В **Actions → Staging simulation prepare → Run workflow** выберите **main**
+   и **provision-admission**. Отметьте `approve_provision_admission`,
+   `confirm_new_instance_no_history` и `confirm_exclusive_dedicated_instance`
+   только после проверки этих свидетельств. Подтверждения первых двух операций
+   оставьте выключенными. Workflow проверяет локальный image действующего API,
+   совпадение HMAC в runtime, целостность CLI и dedicated Redis. Проверка
+   `--check` может вернуть exit `0` при отсутствии state. Решение о начальной
+   записи требует всех проверок и свидетельств оператора.
+
+   Сохраните JSON и URL запуска. `PROVISIONED_VERIFIED` подтверждает
+   `state_exists=true`, `state_type=string`, `structure=valid`,
+   `hmac_identity=match`, `pttl_ms=-1` и соблюдение persistence policy.
+   Отдельно запустите **Staging simulation audit** и сохраните его результат.
+   При `BLOCKED`, `UNKNOWN`, `creation_unconfirmed` или
+   `postflight_unverified` сохраните состояние Redis и расследуйте результат
+   с владельцем staging через read-only audit. Не повторяйте создание для
+   выяснения исхода предыдущей записи. Автоматический merge/deploy
+   не выполняет provisioning. Activation по-прежнему требует отдельного
+   operational approval и подтверждения истории.
+6. **PostgreSQL inspection и backups.** Выполните read-only SQL на staging VPS.
 
    ```bash
    cd /opt/dmc-268-t2
@@ -664,48 +695,6 @@ push CI с публикацией immutable image и обычный disabled sta
      docker compose -p dmc-268-t2-staging --env-file .env.staging \
        -f docker-compose.staging.yml "$@"
    }
-   grep -qx 'SIMULATION__ENABLED=false' .env.staging
-   dc config --quiet
-   dc --profile simulation up -d --no-deps --wait --wait-timeout 60 simulation-redis
-   dc --profile simulation ps simulation-redis
-   docker inspect --format '{{json .Mounts}}' "$(dc --profile simulation ps -q simulation-redis)"
-   docker inspect --format '{{json .NetworkSettings.Networks}}' "$(dc --profile simulation ps -q simulation-redis)"
-   docker inspect --format '{{json .NetworkSettings.Networks}}' "$(dc ps -q redis)"
-   ```
-
-   Сверьте mount `/data` с подготовленным external volume, Compose project,
-   container/network identity и разрешение DNS `simulation-redis` внутри backend
-   network. Shared `redis` должен иметь другую instance. Запишите evidence
-   вне restore domain. URL preflight проверяет hostname/port/DB, но не способен
-   доказать физическую identity произвольного DNS alias. Не публикуйте Redis port.
-   `restart: "no"` сохранён; обычный disabled workflow этот service не запускает.
-5. **Operator-only provisioning.** Убедитесь в отсутствии writers, неизвестной
-   истории и restore incidents. Tools переданы workflow в `simulation-ops/`,
-   в стандартном API image их нет. Сначала read-only inspection:
-
-   ```bash
-   dc run --rm --no-deps --interactive=false -T \
-     -v "$PWD/simulation-ops:/app/scripts:ro" \
-     api python -m scripts.provision_simulation_admission --check
-   ```
-
-   Только для подтверждённой новой instance, с disabled API и двумя отдельными
-   attestation из E1-B2B:
-
-   ```bash
-   dc run --rm --no-deps --interactive=false -T \
-     -v "$PWD/simulation-ops:/app/scripts:ro" \
-     api python -m scripts.provision_simulation_admission --create \
-       --confirm-new-instance-no-history --confirm-exclusive-dedicated-instance
-   ```
-
-   Повторите `--check`. Требуются `state_exists=true`, `state_type=string`,
-   `structure=valid`, `hmac_identity=match`, `pttl_ms=-1`, безопасные persistence
-   и eviction policy. Один exit `0` недостаточен: utility допускает absent state.
-   `creation_unconfirmed` требует расследования; не повторять bootstrap/reset.
-6. **PostgreSQL inspection и backups.** Read-only SQL:
-
-   ```bash
    dc exec -T db psql -X -U dmc -d dmc -v ON_ERROR_STOP=1 <<'SQL'
    BEGIN READ ONLY;
    SELECT version_num FROM alembic_version;

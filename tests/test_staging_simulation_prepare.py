@@ -19,8 +19,19 @@ def test_prepare_is_a_main_only_manual_workflow() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     assert list(workflow[True]) == ["workflow_dispatch"]
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
-    assert inputs["operation"]["options"] == ["create-volume", "start-redis"]
-    for name in ("first_storage", "approve_create_volume", "approve_start_redis"):
+    assert inputs["operation"]["options"] == [
+        "create-volume",
+        "start-redis",
+        "provision-admission",
+    ]
+    for name in (
+        "first_storage",
+        "approve_create_volume",
+        "approve_start_redis",
+        "approve_provision_admission",
+        "confirm_new_instance_no_history",
+        "confirm_exclusive_dedicated_instance",
+    ):
         assert inputs[name]["type"] == "boolean"
         assert inputs[name]["default"] is False
     assert workflow["permissions"] == {"contents": "read"}
@@ -45,6 +56,9 @@ def test_prepare_is_a_main_only_manual_workflow() -> None:
 
 PROJECT = "dmc-268-t2-staging"
 VOLUME = PROJECT + "_simulation-redis-data"
+API_IMAGE = "ghcr.io/larchanka-training/dmc-268-api-t2:sha-" + "1" * 40
+HMAC = "c3ludGhldGljLXRlc3Qta2V5LWZvci1wcm92aXNpb25pbmc="
+CLI = ROOT / "scripts/provision_simulation_admission.py"
 SECRET = "synthetic-secret"
 SCRIPT = ROOT / ".github/scripts/staging_simulation_prepare.py"
 
@@ -73,13 +87,31 @@ with calls.open("a") as out:
     out.write(json.dumps(args) + "\\n")
 data = json.loads(Path(os.environ["DOCKER_DATA"]).read_text())
 project = "dmc-268-t2-staging"
+api_image = "ghcr.io/larchanka-training/dmc-268-api-t2:sha-" + "1" * 40
+hmac = data.get("hmac", "c3ludGhldGljLXRlc3Qta2V5LWZvci1wcm92aXNpb25pbmc=")
+redis_url = "redis://simulation-redis:6379/0"
 volume = project + "_simulation-redis-data"
 image_id = "sha256:" + "d" * 64
 created = next((c for c in previous if c[:2] == ["volume", "create"]), None)
 started = any("up" in c for c in previous if c[0] == "compose")
 if args[0] == "compose":
-    assert args.count("-f") == 2 and "-" in args
-    assert f"external: true, name: {project}_backend" in sys.stdin.read()
+    if "run" in args:
+        config = json.loads(sys.stdin.read())
+        assert config["networks"]["backend"] == {
+            "external": True, "name": project + "_backend",
+        }
+        assert set(config["services"]) == {"api"}
+        svc = config["services"]["api"]
+        assert svc["image"] == image_id
+        assert svc["networks"] == ["backend"]
+        assert svc["extra_hosts"] == {"simulation-redis": "172.18.0.5"}
+        assert "depends_on" not in svc and "ports" not in svc and "build" not in svc
+        assert {"--rm", "--no-deps", "--interactive=false", "-T"} <= set(args)
+        assert args[args.index("--pull") + 1] == "never"
+        assert "uvicorn" not in args and hmac not in args
+    else:
+        assert args.count("-f") == 2 and "-" in args
+        assert f"external: true, name: {project}_backend" in sys.stdin.read()
     assert os.environ["COMPOSE_REMOVE_ORPHANS"] == "false"
     assert os.environ["COMPOSE_IGNORE_ORPHANS"] == "true"
     if "up" in args and data.get("compose_timeout"):
@@ -114,18 +146,23 @@ elif args[0] == "ps":
         started or data.get("existing_container") or appeared
     ):
         print(services[service] * 64)
+    elif service is None and data.get("provision") and "volume=" + volume in args:
+        print("c" * 64)
     elif service is None and data.get("orphan_container"):
         print("e" * 64)
 elif args[0] == "inspect":
     service = {"a": "api", "b": "redis", "c": "simulation-redis"}[args[-1][0]]
+    live_redis = started or data.get("redis_running", False)
     entry = {
         "Id": args[-1],
         "Image": data.get("running_image_id", image_id),
-        "Config": {"Labels": {"com.docker.compose.project": project,
+        "Config": {"Image": api_image, "Labels": {"com.docker.compose.project": project,
                               "com.docker.compose.service": service},
                    "Env": ["SIMULATION__ENABLED=" + data.get("live_flag", "false"),
-                           "SIMULATION__HMAC_SECRET_B64=synthetic-secret"]},
-        "State": {"Running": service != "simulation-redis" or started,
+                           "SIMULATION__HMAC_SECRET_B64=" + hmac,
+                           "SIMULATION__REDIS_URL=" + redis_url,
+                           "REDIS__URL=redis://redis:6379/0", "GIT_SHA=" + "1" * 40]},
+        "State": {"Running": service != "simulation-redis" or live_redis,
                   "Health": {"Status": data.get("health", "healthy")}},
         "Mounts": [],
         "HostConfig": {"PortBindings": None},
@@ -145,6 +182,71 @@ elif args[0] == "inspect":
         if data.get("published"):
             entry["NetworkSettings"]["Ports"] = {"6379/tcp": [{"HostPort": "6379"}]}
     print(json.dumps([entry]))
+elif args[0] == "compose" and "config" in args and args[-1] == "api":
+    compose_hmac = data.get("compose_hmac", hmac)
+    print(json.dumps({
+        "name": project, "services": {"api": {
+            "image": api_image, "networks": {"backend": None},
+            "environment": {"SIMULATION__ENABLED": "false",
+                            "SIMULATION__HMAC_SECRET_B64": compose_hmac,
+                            "SIMULATION__REDIS_URL": redis_url,
+                            "REDIS__URL": "redis://redis:6379/0"},
+        }},
+    }))
+elif args[0] == "compose" and "run" in args:
+    create = "--create" in args
+    attempted = any("--create" in call for call in previous)
+    if create:
+        assert args[-3:] == ["--create", "--confirm-new-instance-no-history",
+                            "--confirm-exclusive-dedicated-instance"]
+    history = calls.with_name("redis-history")
+    if create and data.get("write_failure") != "concurrent_creation_refused":
+        assert not history.exists()
+        history.write_text("retained")
+    if create and data.get("write_failure") == "lost_response":
+        print("synthetic-secret")
+        print("synthetic-secret", file=sys.stderr)
+        sys.exit(124)
+    exists = history.exists() or create or attempted or data.get("existing_state", True)
+    report = {
+        "mode": "create" if create else "check",
+        "redis_available": True, "activation_authorized": False,
+        "history_continuity": "unproven", "eviction_policy": "noeviction",
+        "persistence": {"appendonly": "yes", "appendfsync": "always",
+                        "no-appendfsync-on-rewrite": "no", "aof_enabled": 1,
+                        "aof_last_write_status": "ok"},
+        "state_exists": exists, "state_type": "string" if exists else "none",
+        "structure": "valid" if exists else "absent",
+        "hmac_identity": "match" if exists else "unknown",
+        "pttl_ms": -1 if exists else -2,
+    }
+    if create:
+        report["status"] = "created"
+        if failure := data.get("write_failure"):
+            print(json.dumps({"error": failure, "mode": "check"}))
+            sys.exit(1)
+    elif not attempted and (failure := data.get("check_failure")):
+        if failure == "invalid_simulation_secret":
+            print(json.dumps({"error": failure}))
+            sys.exit(1)
+        if failure in {"invalid_state", "hmac_mismatch"}:
+            report.update(structure="invalid", error="invalid_state")
+            if failure == "hmac_mismatch":
+                report["hmac_identity"] = "mismatch"
+            print(json.dumps(report))
+            sys.exit(1)
+        if failure == "unsafe_policy":
+            report["persistence"]["appendfsync"] = "everysec"
+        if failure == "inconsistent_absence":
+            report["pttl_ms"] = -1
+    elif attempted and data.get("postflight_mismatch"):
+        report["pttl_ms"] = 5000
+    if data.get("noisy_output"):
+        report["unsafe_field"] = "synthetic-secret"
+        print("synthetic-secret", file=sys.stderr)
+    print(json.dumps(report))
+elif args[:2] == ["network", "inspect"]:
+    print("f" * 64)
 elif args[0] == "compose" and "config" in args:
     print(json.dumps({"name": data.get("compose_project", project), "services": {
         "simulation-redis": {"image": "redis:8-alpine", "profiles": ["simulation"],
@@ -174,11 +276,25 @@ else:
     ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
         script = tmp_path / "prepare.py"
         script.write_text(SCRIPT.read_text().replace("/opt/dmc-268-t2", str(tmp_path)))
+        if operation == "provision-admission":
+            data = {
+                "volume": True,
+                "existing_container": True,
+                "redis_running": True,
+                "provision": True,
+            } | data
         (tmp_path / "data.json").write_text(json.dumps(data))
+        ops = tmp_path / "simulation-ops"
+        ops.mkdir(exist_ok=True)
+        (ops / CLI.name).write_bytes(data.get("remote_cli", CLI.read_text()).encode())
         calls = tmp_path / "docker-calls"
         calls.write_text("")
+        deployed_hmac = json.dumps(data.get("compose_hmac", data.get("hmac", HMAC)))
         (tmp_path / ".env.staging").write_text(
             f"SIMULATION__ENABLED={data.get('file_flag', 'false')}\n"
+            f"API_IMAGE={API_IMAGE}\n"
+            f"SIMULATION__REDIS_URL=redis://simulation-redis:6379/0\n"
+            f"SIMULATION__HMAC_SECRET_B64={deployed_hmac}\n"
         )
         if data.get("rollback"):
             (tmp_path / ".env.staging.simulation-rollback").symlink_to("missing")
@@ -191,6 +307,15 @@ else:
                 approval,
                 first_storage,
                 hashlib.sha256(compose_file.read_bytes()).hexdigest(),
+                *(
+                    [
+                        data.get("new_instance", "true"),
+                        data.get("exclusive", "true"),
+                        hashlib.sha256(CLI.read_bytes()).hexdigest(),
+                    ]
+                    if operation == "provision-admission"
+                    else []
+                ),
             ],
             env=os.environ
             | {
@@ -204,6 +329,7 @@ else:
             check=False,
         )
         assert SECRET not in result.stdout + result.stderr
+        assert HMAC not in result.stdout + result.stderr + calls.read_text()
         return result, [json.loads(line) for line in calls.read_text().splitlines()]
 
     return run
@@ -530,3 +656,244 @@ def test_partial_engine_volume_listing_blocks_creation(prepare: Any) -> None:
     assert report["reason"] == "volume_inventory_warning"
     assert report["mutation_attempted"] is False
     assert all(call[:2] != ["volume", "create"] for call in calls)
+
+
+@pytest.mark.parametrize("missing", ["approval", "new_instance", "exclusive"])
+def test_provision_requires_each_independent_confirmation(
+    prepare: Any, missing: str
+) -> None:
+    confirmations = {"approval": "true", "new_instance": "true", "exclusive": "true"}
+    confirmations[missing] = "false"
+    result, calls = prepare("provision-admission", **confirmations)
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout)["reason"] == "confirmation_required"
+    assert calls == []
+
+
+def test_provision_blocks_existing_state_after_read_only_inspection(
+    prepare: Any,
+) -> None:
+    result, calls = prepare("provision-admission")
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout)["reason"] == "state_already_exists"
+    assert [call[-1] for call in calls if "run" in call] == ["--check"]
+
+
+def test_provision_creates_once_between_read_only_checks(prepare: Any) -> None:
+    result, calls = prepare(
+        "provision-admission", existing_state=False, noisy_output=True
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "operation": "provision-admission",
+        "status": "PROVISIONED_VERIFIED",
+        "mutation_attempted": True,
+        "activation_authorized": False,
+        "history_continuity": "unproven",
+        "state_exists": True,
+        "state_type": "string",
+        "structure": "valid",
+        "hmac_identity": "match",
+        "pttl_ms": -1,
+    }
+    assert [
+        "--create" if "--create" in call else call[-1]
+        for call in calls
+        if "run" in call
+    ] == ["--check", "--create", "--check"]
+    assert all(call[:2] != ["volume", "create"] and "up" not in call for call in calls)
+    assert all(call[1] == "c" * 64 for call in calls if call[0] == "exec")
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("lost_response", "creation_unconfirmed"),
+        ("creation_unconfirmed", "creation_unconfirmed"),
+        ("redis_operation_failed", "creation_unconfirmed"),
+        ("concurrent_creation_refused", "concurrent_creation_refused"),
+    ],
+)
+def test_provision_stops_after_failed_or_uncertain_write(
+    prepare: Any, failure: str, reason: str
+) -> None:
+    result, calls = prepare(
+        "provision-admission", existing_state=False, write_failure=failure
+    )
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout) == {
+        "operation": "provision-admission",
+        "status": "BLOCKED",
+        "mutation_attempted": True,
+        "reason": reason,
+    }
+    assert ["--create" in call for call in calls if "run" in call] == [False, True]
+
+
+def test_provision_requires_postflight_to_verify_the_created_state(
+    prepare: Any,
+) -> None:
+    result, calls = prepare(
+        "provision-admission", existing_state=False, postflight_mismatch=True
+    )
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout)["reason"] == "postflight_unverified"
+    assert ["--create" in call for call in calls if "run" in call] == [
+        False,
+        True,
+        False,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("settings", "reason"),
+    [
+        ({"hmac": ""}, "invalid_simulation_secret"),
+        ({"hmac": "invalid"}, "invalid_simulation_secret"),
+        ({"check_failure": "invalid_simulation_secret"}, "invalid_simulation_secret"),
+        ({"compose_hmac": "different"}, "api_environment_mismatch"),
+        ({"existing_container": False}, "redis_unhealthy"),
+        ({"redis_running": False}, "redis_unhealthy"),
+        ({"volume": False}, "volume_missing"),
+        ({"mount": "shared-volume"}, "wrong_redis_mount"),
+        ({"shared_ip": True}, "redis_instance_not_dedicated"),
+        ({"fsync": "everysec"}, "redis_policy_mismatch"),
+        ({"check_failure": "unsafe_policy"}, "redis_policy_mismatch"),
+        ({"check_failure": "invalid_state"}, "invalid_state"),
+        ({"check_failure": "hmac_mismatch"}, "hmac_identity_mismatch"),
+        ({"remote_cli": "synthetic-secret"}, "cli_digest_mismatch"),
+        ({"running_image_id": "sha256:" + "e" * 64}, "api_image_mismatch"),
+        (
+            {"check_failure": "inconsistent_absence", "existing_state": False},
+            "invalid_admission_inspection",
+        ),
+    ],
+)
+def test_provision_blocks_on_unsafe_or_inconsistent_preflight(
+    prepare: Any, settings: dict[str, Any], reason: str
+) -> None:
+    result, calls = prepare("provision-admission", **settings)
+    assert result.returncode == BLOCKED_EXIT
+    assert json.loads(result.stdout)["reason"] == reason
+    assert json.loads(result.stdout)["mutation_attempted"] is False
+    assert all("--create" not in call for call in calls)
+
+
+def test_provision_repeat_preserves_the_created_history(
+    prepare: Any, tmp_path: Path
+) -> None:
+    first, _ = prepare("provision-admission", existing_state=False)
+    assert first.returncode == 0
+    before = (tmp_path / "redis-history").stat()
+    repeat, calls = prepare("provision-admission", existing_state=False)
+    assert repeat.returncode == BLOCKED_EXIT
+    assert json.loads(repeat.stdout)["reason"] == "state_already_exists"
+    assert [call[-1] for call in calls if "run" in call] == ["--check"]
+    assert (tmp_path / "redis-history").stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize(
+    ("missing", "ssh_exit", "override", "expected"),
+    [
+        ("APPROVE_PROVISION_ADMISSION", 0, {}, ("BLOCKED", "confirmation_required")),
+        (
+            "CONFIRM_NEW_INSTANCE_NO_HISTORY",
+            0,
+            {},
+            ("BLOCKED", "confirmation_required"),
+        ),
+        (
+            "CONFIRM_EXCLUSIVE_DEDICATED_INSTANCE",
+            0,
+            {},
+            ("BLOCKED", "confirmation_required"),
+        ),
+        ("", 0, {}, ("PROVISIONED_VERIFIED", None)),
+        ("", 255, {}, ("UNKNOWN", "creation_unconfirmed")),
+        ("", 0, {"activation_authorized": True}, ("UNKNOWN", "creation_unconfirmed")),
+        (
+            "",
+            BLOCKED_EXIT,
+            {"reason": "synthetic_secret"},
+            ("UNKNOWN", "creation_unconfirmed"),
+        ),
+        (
+            "",
+            BLOCKED_EXIT,
+            {"reason": "creation_unconfirmed"},
+            ("BLOCKED", "creation_unconfirmed"),
+        ),
+    ],
+)
+def test_provision_dispatch_checks_approvals_and_accepts_only_safe_remote_reports(
+    tmp_path: Path,
+    missing: str,
+    ssh_exit: int,
+    override: dict[str, str | bool],
+    expected: tuple[str, str | None],
+) -> None:
+    expected_status, reason = expected
+    sshpass = tmp_path / "sshpass"
+    marker = tmp_path / "ssh-invoked"
+    sshpass.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" >> "$SSH_MARKER"\n'
+        'printf "%s\\n" "$SSH_REPORT"\n'
+        "echo synthetic-secret >&2\n"
+        'exit "$SSH_EXIT"\n'
+    )
+    sshpass.chmod(0o755)
+    step = yaml.safe_load(WORKFLOW.read_text())["jobs"]["prepare"]["steps"][-1]
+    report: dict[str, str | bool | int] = {
+        "operation": "provision-admission",
+        "status": "BLOCKED" if ssh_exit == BLOCKED_EXIT else "PROVISIONED_VERIFIED",
+        "mutation_attempted": True,
+    }
+    if ssh_exit != BLOCKED_EXIT:
+        report.update(
+            activation_authorized=False,
+            history_continuity="unproven",
+            state_exists=True,
+            state_type="string",
+            structure="valid",
+            hmac_identity="match",
+            pttl_ms=-1,
+        )
+    env = os.environ | {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "SSH_MARKER": str(marker),
+        "SSH_REPORT": json.dumps(report | override),
+        "SSH_EXIT": str(ssh_exit),
+        "SSH_USER": "fixture",
+        "SSH_HOST": "fixture",
+        "OPERATION": "provision-admission",
+        "APPROVE_CREATE_VOLUME": "false",
+        "APPROVE_START_REDIS": "false",
+        "FIRST_STORAGE": "false",
+        "APPROVE_PROVISION_ADMISSION": "true",
+        "CONFIRM_NEW_INSTANCE_NO_HISTORY": "true",
+        "CONFIRM_EXCLUSIVE_DEDICATED_INSTANCE": "true",
+    }
+    if missing:
+        env[missing] = "false"
+        env["APPROVE_CREATE_VOLUME"] = "true"
+        env["APPROVE_START_REDIS"] = "true"
+        env["FIRST_STORAGE"] = "true"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert "synthetic" not in result.stdout + result.stderr
+    assert json.loads(result.stdout)["status"] == expected_status
+    assert json.loads(result.stdout).get("reason") == reason
+    assert (result.returncode == 0) is (expected_status == "PROVISIONED_VERIFIED")
+    assert marker.exists() is (not missing)
+    if not missing:
+        command = marker.read_text()
+        assert command.count("exec python3") == 1
+        assert hashlib.sha256(CLI.read_bytes()).hexdigest() in command

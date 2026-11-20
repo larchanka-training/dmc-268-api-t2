@@ -679,30 +679,30 @@ push CI с публикацией immutable image и обычный disabled sta
    вне restore domain. URL preflight проверяет hostname/port/DB, но не способен
    доказать физическую identity произвольного DNS alias. Не публикуйте Redis port.
    `restart: "no"` сохранён; обычный disabled workflow этот service не запускает.
-5. **Operator-only provisioning.** Убедитесь в отсутствии writers, неизвестной
-   истории и restore incidents. Tools переданы workflow в `simulation-ops/`,
-   в стандартном API image их нет. Сначала read-only inspection:
+5. **Operator-only provisioning.** Запишите в team tracker происхождение volume
+   по независимому журналу создания и inventory, отсутствие нерешённых
+   recovery/restore incidents и подтверждение, что все конкурирующие writers
+   остановлены. Держите Playground выключенным и исключите параллельное
+   обслуживание Docker вне workflow до завершения проверки.
 
-   ```bash
-   dc run --rm --no-deps --interactive=false -T \
-     -v "$PWD/simulation-ops:/app/scripts:ro" \
-     api python -m scripts.provision_simulation_admission --check
-   ```
+   В **Actions → Staging simulation prepare → Run workflow** выберите **main**
+   и **provision-admission**. Отметьте `approve_provision_admission`,
+   `confirm_new_instance_no_history` и `confirm_exclusive_dedicated_instance`
+   только после проверки этих свидетельств. Подтверждения первых двух операций
+   оставьте выключенными. Workflow проверяет локальный image действующего API,
+   совпадение HMAC в runtime, целостность CLI и dedicated Redis. Проверка
+   `--check` может вернуть exit `0` при отсутствии state. Решение о начальной
+   записи требует всех проверок и свидетельств оператора.
 
-   Только для подтверждённой новой instance, с disabled API и двумя отдельными
-   attestation из E1-B2B:
-
-   ```bash
-   dc run --rm --no-deps --interactive=false -T \
-     -v "$PWD/simulation-ops:/app/scripts:ro" \
-     api python -m scripts.provision_simulation_admission --create \
-       --confirm-new-instance-no-history --confirm-exclusive-dedicated-instance
-   ```
-
-   Повторите `--check`. Требуются `state_exists=true`, `state_type=string`,
-   `structure=valid`, `hmac_identity=match`, `pttl_ms=-1`, безопасные persistence
-   и eviction policy. Один exit `0` недостаточен: utility допускает absent state.
-   `creation_unconfirmed` требует расследования; не повторять bootstrap/reset.
+   Сохраните JSON и URL запуска. `PROVISIONED_VERIFIED` подтверждает
+   `state_exists=true`, `state_type=string`, `structure=valid`,
+   `hmac_identity=match`, `pttl_ms=-1` и соблюдение persistence policy.
+   Отдельно запустите **Staging simulation audit** и сохраните его результат.
+   При `BLOCKED`, `UNKNOWN`, `creation_unconfirmed` или
+   `postflight_unverified` сохраните состояние Redis и расследуйте результат
+   с владельцем staging через read-only audit. Автоматический merge/deploy
+   не выполняет provisioning. Activation по-прежнему требует отдельного
+   operational approval и подтверждения истории.
 6. **PostgreSQL inspection и backups.** Read-only SQL:
 
    ```bash

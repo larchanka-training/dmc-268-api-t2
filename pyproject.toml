@@ -38,7 +38,7 @@ packages = ["src/app"]
 line-length = 88
 target-version = "py314"
 src = ["src"]
-extend-exclude = ["migrations", "docs"]
+extend-exclude = ["migrations", "docs", "examples"]
 
 [tool.ruff.lint]
 select = [

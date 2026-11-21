@@ -26,7 +26,14 @@ the same PR are excluded from inline comments and are listed under «Уже
 отмечено в прошлых циклах» instead (at most 20 listed, ordered the same way);
 the omitted count excludes those listed as already noted; suppressed repeats
 beyond the 20-item already-noted list count as not published inline, since
-they are named nowhere else. Text is masked again
+they are named nowhere else. An inline comment is title, optional rule
+reference, explanation and recommendation; a saved `proposed_diff_fix` follows
+as a fenced `diff` block («Пример исправления»). The fence is longer than any
+backtick run in the snippet, and the snippet is never applied automatically.
+Skipped files name their reason; budget and admission skips (`token_budget`,
+`file_limit`, `line_limit`) are spelled out in Russian with the code kept in
+parentheses. A review where no chunk fits gets `SKIPPED` and is not published;
+its skipped files stay visible in the API result coverage. Text is masked again
 before publication. These limits do not discard findings from the retained
 analysis or hide omitted comments.
 

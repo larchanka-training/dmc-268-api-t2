@@ -197,12 +197,23 @@ _SKIP_LABELS = {
     FileSkipReason.ALREADY_REVIEWED: "без изменений с прошлого ревью",
 }
 _LISTED_PATHS_PER_REASON = 10
+# Budget/admission skips are named in words; the raw code stays for grepping.
+_BUDGET_SKIP_LABELS = {
+    "token_budget": "не уместился в бюджет токенов",
+    "file_limit": "превышен лимит файлов на ревью",
+    "line_limit": "превышен лимит изменённых строк",
+}
+
+
+def _skip_reason(reason: str) -> str:
+    label = _BUDGET_SKIP_LABELS.get(reason)
+    return f"{label} ({reason})" if label else reason
 
 
 def _skipped_overview(skipped: list[dict[str, Any]]) -> str:
     """Input-guard skips grouped by reason; other skips keep one line each."""
     lines = [
-        f"- {item['path']}: {item['reason']}"
+        f"- {item['path']}: {_skip_reason(item['reason'])}"
         for item in skipped
         if "detail" not in item
     ]
@@ -227,6 +238,23 @@ def _strip_comments(text: str) -> str:
     raw stored text and stays unaffected.
     """
     return _HTML_COMMENT.sub("", text)
+
+
+_BACKTICK_RUN = re.compile(r"`+")
+
+
+def _fix_snippet(fix: str | None) -> str:
+    """Proposed fix as a fenced ``diff`` block; never applied automatically.
+
+    The fence is longer than any backtick run inside the model text, so the
+    snippet cannot close itself early and inject markdown into the comment.
+    """
+    code = _strip_comments(fix or "").strip("\n")
+    if not code.strip():
+        return ""
+    longest = max((len(run) for run in _BACKTICK_RUN.findall(code)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"Пример исправления:\n\n{fence}diff\n{code}\n{fence}\n\n"
 
 
 def _suppress_key(item: PersistedFinding) -> str:
@@ -435,6 +463,7 @@ def prepare_github_review(
                 + (f"Правило: {item.rule_ref}\n\n" if item.rule_ref else "")
                 + f"{_strip_comments(item.explanation)}\n\n"
                 + f"{_strip_comments(item.recommendation)}\n\n"
+                + _fix_snippet(item.proposed_diff_fix)
                 + f"<!-- dmc268-suppress:{_suppress_key(item)} -->\n"
                 f"<!-- dmc268-finding:{item.fingerprint} -->"
             ),

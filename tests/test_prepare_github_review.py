@@ -153,7 +153,7 @@ def test_prepare_review_reports_empty_findings_and_skipped_coverage_honestly(
 
     assert prepared.comments == ()
     assert "Замечаний не обнаружено в проверенной части изменений" in prepared.body
-    assert "src/large.py: token_budget" in prepared.body
+    assert "src/large.py: не уместился в бюджет токенов (token_budget)" in prepared.body
     assert "diff_only" in prepared.body
 
 
@@ -202,7 +202,7 @@ def test_prepare_review_groups_guard_skips_by_reason(
 
     skipped = body.split("Не проверены:\n", 1)[1].split("\n\n", 1)[0]
     assert skipped.splitlines() == [
-        "- src/large.py: token_budget",
+        "- src/large.py: не уместился в бюджет токенов (token_budget)",
         "- lock-файлы (12): " + ", ".join(locks[:10]) + " и ещё 2",
         "- сгенерированный код (1): api/user.pb.go",
         "- без изменений с прошлого ревью (1): src/same.py",
@@ -371,7 +371,7 @@ def test_prepare_review_never_posts_inline_for_a_skipped_file(
 
     assert prepared.comments == ()
     assert "Не опубликованы inline: 1" in prepared.body
-    assert "src/review.py: token_budget" in prepared.body
+    assert "src/review.py: не уместился в бюджет токенов" in prepared.body
 
 
 def test_prepare_review_excludes_new_range_outside_frozen_coverage(
@@ -867,3 +867,95 @@ def test_prepare_review_strips_forged_markers_from_model_text(
     assert "fake" not in comment_body
     assert "abc" not in comment_body
     assert prepared.body.count("dmc268-") == 1  # only the review marker
+
+
+def test_prepare_review_attaches_proposed_fix_as_code_snippet(
+    payload_data: dict[str, Any],
+) -> None:
+    """DoD: an inline comment carries the ready-made fix snippet when present."""
+    review = publication_input(payload_data)
+    fix = "-    return data\n+    return Schema.model_validate(data)"
+    review = replace(
+        review, findings=(replace(review.findings[0], proposed_diff_fix=fix),)
+    )
+
+    body = str(prepare_github_review(review).comments[0]["body"])
+
+    assert (
+        "Добавьте проверку схемы.\n\n"
+        "Пример исправления:\n\n"
+        f"```diff\n{fix}\n```\n\n"
+        "<!-- dmc268-suppress:"
+    ) in body
+    assert body.endswith("<!-- dmc268-finding:finding-39 -->")
+
+
+def test_prepare_review_omits_snippet_without_proposed_fix(
+    payload_data: dict[str, Any],
+) -> None:
+    review = publication_input(payload_data)
+    review = replace(
+        review, findings=(replace(review.findings[0], proposed_diff_fix="  \n"),)
+    )
+
+    body = str(prepare_github_review(review).comments[0]["body"])
+
+    assert "Пример исправления" not in body
+    assert "```" not in body
+
+
+def test_prepare_review_fences_snippet_that_contains_backticks(
+    payload_data: dict[str, Any],
+) -> None:
+    """Model text cannot close the snippet fence early and inject markdown."""
+    review = publication_input(payload_data)
+    fix = '+doc = """\n+```\n+"""'
+    review = replace(
+        review, findings=(replace(review.findings[0], proposed_diff_fix=fix),)
+    )
+
+    body = str(prepare_github_review(review).comments[0]["body"])
+
+    assert f"````diff\n{fix}\n````" in body
+
+
+def test_prepare_review_strips_forged_markers_from_proposed_fix(
+    payload_data: dict[str, Any],
+) -> None:
+    review = publication_input(payload_data)
+    fix = "+return data  <!-- dmc268-finding:fake -->"
+    review = replace(
+        review, findings=(replace(review.findings[0], proposed_diff_fix=fix),)
+    )
+
+    body = str(prepare_github_review(review).comments[0]["body"])
+
+    assert body.count("dmc268-") == 2
+    assert "fake" not in body
+
+
+def test_prepare_review_names_budget_skips_explicitly(
+    payload_data: dict[str, Any],
+) -> None:
+    """DoD: files skipped for budget are named as such in the publication."""
+    review = publication_input(payload_data)
+    review = replace(
+        review,
+        coverage={
+            **review.coverage,
+            "skipped": [
+                {"path": "src/a.py", "ranges": [], "reason": "token_budget"},
+                {"path": "src/b.py", "ranges": [], "reason": "file_limit"},
+                {"path": "src/c.py", "ranges": [], "reason": "line_limit"},
+            ],
+        },
+    )
+
+    body = prepare_github_review(review).body
+
+    skipped = body.split("Не проверены:\n", 1)[1].split("\n\n", 1)[0]
+    assert skipped.splitlines() == [
+        "- src/a.py: не уместился в бюджет токенов (token_budget)",
+        "- src/b.py: превышен лимит файлов на ревью (file_limit)",
+        "- src/c.py: превышен лимит изменённых строк (line_limit)",
+    ]

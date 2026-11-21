@@ -4,7 +4,7 @@ Version: 2.0.0 · Status: Active · Owners: Engineering + Security
 
 **Changes in 2.0.0** (MAJOR: new MUST rules, §12.5): added §16 AI agent operating guide (`AGENT-*` rules, forbidden actions, conflict priority, acceptance criteria), §17 Rule templates, §18 Graceful degradation, §19 Decisions and open questions; added the `AGENT` prefix and `process` category to §4.
 
-This guide defines verifiable engineering rules for four areas: **Python / FastAPI**, **TypeScript / React**, **Go** and a cross-cutting **Security Baseline**. Detailed, copy-ready versions of selected rules live in [`examples/rules/`](examples/rules/README.md).
+This guide defines verifiable engineering rules for four areas: **Python / FastAPI**, **TypeScript / React**, **Go** and a cross-cutting **Security Baseline**. Detailed, copy-ready versions of selected rules live in [`examples/rules/`](../../examples/rules/README.md).
 
 ## Contents
 
@@ -122,7 +122,7 @@ These principles explain *why* the rules look the way they do. They are not enfo
 Baseline tooling: Ruff (lint + format), mypy (strict), pytest, pip-audit. Python 3.10+, Pydantic v2.
 
 ### PY-API-001 · Validate request input with Pydantic models
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/python-fastapi/PY-API-001-input-validation.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/python-fastapi/PY-API-001-input-validation.md)
 
 - **Context:** All FastAPI path operations; path, query, header, cookie and body parameters.
 - **Rule:** Every client-supplied value MUST be a typed parameter or Pydantic field with explicit bounds. Body models MUST set `extra="forbid"`. Handlers MUST NOT use `await request.json()` / `request.form()` output without validating it through a model.
@@ -151,7 +151,7 @@ async def create_user(request: Request) -> dict:
 - **References:** [FastAPI Request Body](https://fastapi.tiangolo.com/tutorial/body/) · [Query validations](https://fastapi.tiangolo.com/tutorial/query-params-str-validations/) · [Pydantic models](https://pydantic.dev/docs/validation/latest/concepts/models/) · [OWASP Input Validation](https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html)
 
 ### PY-API-002 · Provide shared resources through `Depends`
-**Severity:** SHOULD · **Category:** maintainability · 📄 [Detailed example](examples/rules/python-fastapi/PY-API-002-dependency-injection.md)
+**Severity:** SHOULD · **Category:** maintainability · 📄 [Detailed example](../../examples/rules/python-fastapi/PY-API-002-dependency-injection.md)
 
 - **Context:** DB sessions, settings, current user, HTTP clients.
 - **Rule:** Shared resources SHOULD come from dependencies declared once as `Annotated[..., Depends(...)]`; lifecycle resources SHOULD use `yield` dependencies. Handlers SHOULD NOT construct them inline.
@@ -242,7 +242,7 @@ async def rates() -> dict:
 - **References:** [FastAPI Concurrency and async/await](https://fastapi.tiangolo.com/async/) · [Ruff rules](https://docs.astral.sh/ruff/rules/)
 
 ### PY-ERR-001 · Map errors to explicit HTTP responses; never swallow or leak them
-**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](examples/rules/python-fastapi/PY-ERR-001-error-handling.md)
+**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](../../examples/rules/python-fastapi/PY-ERR-001-error-handling.md)
 
 - **Context:** Handlers, services, exception handlers.
 - **Rule:** Expected failures MUST raise `HTTPException` or domain exceptions mapped by `@app.exception_handler`. Code MUST NOT use bare `except:` or discard exceptions. Responses MUST NOT include tracebacks or `str(exc)` of unexpected errors. Re-raises MUST chain (`raise ... from exc`). Production MUST NOT run with `debug=True`.
@@ -270,7 +270,7 @@ except Exception as exc:
 - **References:** [FastAPI Handling Errors](https://fastapi.tiangolo.com/tutorial/handling-errors/) · [OWASP Error Handling](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html)
 
 ### PY-SEC-001 · Authenticate every non-public endpoint and authorize every object access
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/python-fastapi/PY-SEC-001-authz.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/python-fastapi/PY-SEC-001-authz.md)
 
 - **Context:** All routers and endpoints.
 - **Rule:** Non-public endpoints MUST depend on an authentication dependency (preferably at `APIRouter(dependencies=[...])` level). Public endpoints MUST be an explicit allowlist. Access by ID MUST be scoped to the caller (owner/tenant). Roles MUST be checked server-side.
@@ -383,7 +383,7 @@ def apply_discount(price, percent):  # untyped; mypy --strict reports it
 Baseline tooling: `tsc` (strict), ESLint with typescript-eslint (type-checked configs), eslint-plugin-react, eslint-plugin-react-hooks, the project's test runner, `npm audit`.
 
 ### TS-CODE-001 · Compile in strict mode and do not use `any`
-**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](examples/rules/typescript-react/TS-CODE-001-strict-types.md)
+**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](../../examples/rules/typescript-react/TS-CODE-001-strict-types.md)
 
 - **Context:** All TypeScript code.
 - **Rule:** `"strict": true` MUST be enabled; explicit `any` MUST NOT be used; external data MUST be validated at runtime (not `as T`); `@ts-ignore` MUST NOT be used; CI MUST run `tsc --noEmit`.
@@ -432,7 +432,7 @@ navigate("/done");       // runs before save completes
 - **References:** [no-floating-promises](https://typescript-eslint.io/rules/no-floating-promises/) · [no-misused-promises](https://typescript-eslint.io/rules/no-misused-promises/)
 
 ### TS-REACT-001 · Typed, immutable props contracts and pure render
-**Severity:** SHOULD · **Category:** maintainability · 📄 [Detailed example](examples/rules/typescript-react/TS-REACT-001-component-contracts.md)
+**Severity:** SHOULD · **Category:** maintainability · 📄 [Detailed example](../../examples/rules/typescript-react/TS-REACT-001-component-contracts.md)
 
 - **Context:** Function components.
 - **Rule:** Exported components SHOULD declare a named props type; mutually exclusive props SHOULD be discriminated unions. Components MUST NOT mutate props and MUST NOT perform side effects during render (React requirement).
@@ -510,7 +510,7 @@ function Profile({ userId }: { userId: string | null }) {
 - **References:** [Rendering lists — keys](https://react.dev/learn/rendering-lists#keeping-list-items-in-order-with-key)
 
 ### TS-SEC-001 · Render untrusted data only through safe sinks
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/typescript-react/TS-SEC-001-untrusted-data.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/typescript-react/TS-SEC-001-untrusted-data.md)
 
 - **Context:** Rendering, links, dynamic code, `postMessage`.
 - **Rule:** Untrusted data MUST be rendered as JSX text. `dangerouslySetInnerHTML` MUST only receive sanitized HTML (e.g. DOMPurify). URLs from untrusted data MUST pass a scheme allowlist. `eval`/`new Function`/raw DOM HTML sinks MUST NOT receive untrusted strings. `message` handlers MUST check `event.origin`.
@@ -558,7 +558,7 @@ localStorage.setItem("access_token", token);
 - **References:** [OWASP HTML5 Security — Local Storage](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html#local-storage) · [OWASP Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) · [MDN Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)
 
 ### TS-STATE-001 · Fetch server data with cancellation, explicit states and runtime validation
-**Severity:** SHOULD · **Category:** correctness · 📄 [Detailed example](examples/rules/typescript-react/TS-STATE-001-data-fetching.md)
+**Severity:** SHOULD · **Category:** correctness · 📄 [Detailed example](../../examples/rules/typescript-react/TS-STATE-001-data-fetching.md)
 
 - **Context:** Components and hooks that load remote data.
 - **Rule:** Server state SHOULD go through a data-fetching library (e.g. TanStack Query) or one shared hook. Effect-based fetching MUST list dependencies and cancel/ignore stale responses. Responses MUST be checked (`res.ok`) and validated. Loading and error states SHOULD be rendered explicitly. You MAY use framework loaders/Server Components instead.
@@ -609,7 +609,7 @@ func add(a int,b int)int{return a+b}
 - **References:** [gofmt](https://pkg.go.dev/cmd/gofmt) · [Effective Go — Formatting](https://go.dev/doc/effective_go#formatting)
 
 ### GO-ERR-001 · Check, wrap and inspect errors correctly
-**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](examples/rules/go/GO-ERR-001-error-handling.md)
+**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](../../examples/rules/go/GO-ERR-001-error-handling.md)
 
 - **Context:** All Go code.
 - **Rule:** Every error MUST be checked; wrap with `%w`; compare with `errors.Is`/`errors.As`; handle once (log *or* return); no `panic` for expected failures.
@@ -664,7 +664,7 @@ func (c *Client) GetUser(id string) (*User, error) {
 - **References:** [context package](https://pkg.go.dev/context) · [Go Concurrency Patterns: Context](https://go.dev/blog/context) · [Code Review Comments — Contexts](https://go.dev/wiki/CodeReviewComments#contexts)
 
 ### GO-CONC-001 · Synchronize shared state; test with `-race`
-**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](examples/rules/go/GO-CONC-001-race-safety.md)
+**Severity:** MUST · **Category:** correctness · 📄 [Detailed example](../../examples/rules/go/GO-CONC-001-race-safety.md)
 
 - **Context:** Code reachable from multiple goroutines.
 - **Rule:** Shared mutable state MUST be protected (mutex, atomic, channel ownership); maps MUST NOT be written concurrently without sync; `sync` types MUST NOT be copied; CI MUST run `go test -race ./...`.
@@ -734,7 +734,7 @@ func startPoller() {
 - **References:** [errgroup](https://pkg.go.dev/golang.org/x/sync/errgroup) · [Go Concurrency Patterns: Pipelines and cancellation](https://go.dev/blog/pipelines) · [goleak](https://github.com/uber-go/goleak)
 
 ### GO-SEC-001 · Build SQL only with placeholders and allowlisted identifiers
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/go/GO-SEC-001-sql-injection.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/go/GO-SEC-001-sql-injection.md)
 
 - **Context:** `database/sql`, pgx, sqlx.
 - **Rule:** Values MUST be query arguments (`$1`/`?`); no `fmt.Sprintf`/`+` with input. Identifiers MUST come from an allowlist. `rows.Err()` MUST be checked and `rows.Close()` deferred.
@@ -784,7 +784,7 @@ resp, err := http.Get(externalURL)           // DefaultClient: no timeout
 - **References:** [net/http Server](https://pkg.go.dev/net/http#Server) · [http.MaxBytesReader](https://pkg.go.dev/net/http#MaxBytesReader) · [gosec rules](https://github.com/securego/gosec#available-rules)
 
 ### GO-TEST-001 · Fuzz parsers of untrusted input
-**Severity:** SHOULD · **Category:** security · 📄 [Detailed example](examples/rules/go/GO-TEST-001-fuzzing.md)
+**Severity:** SHOULD · **Category:** security · 📄 [Detailed example](../../examples/rules/go/GO-TEST-001-fuzzing.md)
 
 - **Context:** Functions parsing/decoding external bytes or strings.
 - **Rule:** Such functions SHOULD have a native fuzz test asserting a property; found crashers MUST be committed to `testdata/fuzz/`; CI SHOULD run bounded fuzzing.
@@ -821,7 +821,7 @@ f.Fuzz(func(t *testing.T, s string) { http.Get("http://localhost:8080/?q=" + s);
 Applies to every repository. Mapped to OWASP Top 10 (2025) and OWASP ASVS.
 
 ### SEC-INPUT-001 · Validate all untrusted input on the server with allowlists
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/security-baseline/SEC-INPUT-001-validation.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/security-baseline/SEC-INPUT-001-validation.md)
 
 - **Context:** Every trust boundary: APIs, queues, uploads, webhooks, CLI args.
 - **Rule:** Validate server-side with allowlists (type, length, range, format, enum); canonicalize before validating; bound all sizes; reject (don't silently fix) invalid input; still encode output for its sink.
@@ -845,7 +845,7 @@ path = UPLOAD_DIR / name    # absolute paths still escape
 - **References:** [OWASP Input Validation](https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html) · [OWASP ASVS](https://asvs.owasp.org/)
 
 ### SEC-AUTHZ-001 · Deny by default and grant least privilege
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/security-baseline/SEC-AUTHZ-001-least-privilege.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/security-baseline/SEC-AUTHZ-001-least-privilege.md)
 
 - **Context:** App authorization, DB users, service accounts, CI tokens, containers.
 - **Rule:** Deny unless explicitly granted; enforce server-side on every request including object level; each identity gets minimal permissions; CI declares minimal `permissions`; containers SHOULD run as non-root.
@@ -866,7 +866,7 @@ permissions: write-all
 - **References:** [OWASP Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) · [GITHUB_TOKEN permissions](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token#modifying-the-permissions-for-the-github_token)
 
 ### SEC-SECRET-001 · Never commit secrets
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/security-baseline/SEC-SECRET-001-no-hardcoded-secrets.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/security-baseline/SEC-SECRET-001-no-hardcoded-secrets.md)
 
 - **Context:** Code, config, Dockerfiles, CI, tests, docs, frontend bundles.
 - **Rule:** No secrets in repo/images/logs; load at runtime from env or a secret manager; fail fast if missing (no fallback values); `.env` git-ignored; secret scanning in CI; leaked secrets are revoked and rotated first.
@@ -888,7 +888,7 @@ DB_URL = os.getenv("DB_URL", "postgresql://admin:admin@db/prod")
 - **References:** [OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html) · [GitHub secret scanning](https://docs.github.com/en/code-security/how-tos/secure-your-secrets)
 
 ### SEC-LOG-001 · Keep sensitive data out of logs
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/security-baseline/SEC-LOG-001-sensitive-data.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/security-baseline/SEC-LOG-001-sensitive-data.md)
 
 - **Context:** Logs, traces, metrics labels, error trackers.
 - **Rule:** Never log passwords, tokens, session IDs, keys, auth headers, full card data; minimize/mask PII; log field allowlists not whole objects; use structured logging; scrub error-tracking events.
@@ -909,7 +909,7 @@ logger.info(f"login user={username} password={password}")
 - **References:** [OWASP Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) · [slog.LogValuer](https://pkg.go.dev/log/slog#LogValuer)
 
 ### SEC-DEP-001 · Pin dependencies and scan them for known vulnerabilities
-**Severity:** MUST · **Category:** security · 📄 [Detailed example](examples/rules/security-baseline/SEC-DEP-001-dependency-scanning.md)
+**Severity:** MUST · **Category:** security · 📄 [Detailed example](../../examples/rules/security-baseline/SEC-DEP-001-dependency-scanning.md)
 
 - **Context:** Python, npm, Go modules, base images, CI actions.
 - **Rule:** Commit lockfiles; install reproducibly; scan on every PR and on a schedule; fail on High/Critical (or reachable `govulncheck` findings) unless excepted; automated updates SHOULD be enabled; actions SHOULD be SHA-pinned.
@@ -1548,7 +1548,7 @@ A result that fails AC-1, AC-3, AC-6, AC-8 or AC-10 is rejected regardless of th
 
 ### 17.1 Template
 
-Use this template for `AGENT-*` rules and for any rule written primarily for agent consumption. It complements the code-rule template in [`examples/rules/README.md`](examples/rules/README.md#file-template); a copy-ready file is [`examples/rules/agent/AGENT-RULE-TEMPLATE.md`](examples/rules/agent/AGENT-RULE-TEMPLATE.md).
+Use this template for `AGENT-*` rules and for any rule written primarily for agent consumption. It complements the code-rule template in [`examples/rules/README.md`](../../examples/rules/README.md#file-template); a copy-ready file is [`examples/rules/agent/AGENT-RULE-TEMPLATE.md`](../../examples/rules/agent/AGENT-RULE-TEMPLATE.md).
 
 ````markdown
 ### <RULE-ID> · <Rule name in imperative form>

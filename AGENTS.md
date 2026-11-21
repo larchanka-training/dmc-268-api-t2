@@ -38,7 +38,7 @@ Do **not** assume npm/Vitest — that is UI follow-up scope. If a seam truly has
 
 ## Engineering rules
 
-- Coding rules: `docs/engineering-rules/RULES_GUIDE.md`. In this repo, apply §6 Python/FastAPI and §9 Security Baseline; the TypeScript/React and Go sections are out of scope. Per-rule detail lives in `docs/engineering-rules/examples/rules/{python-fastapi,security-baseline}/`.
+- Coding rules: `docs/engineering-rules/RULES_GUIDE.md`. In this repo, apply §6 Python/FastAPI and §9 Security Baseline; the TypeScript/React and Go sections are out of scope. Per-rule detail lives in `examples/rules/{python-fastapi,security-baseline}/`.
 - MUST rules are hard constraints: if a change cannot satisfy one, stop and report the rule ID. In Close, cite rule IDs in review findings.
 - Repo config and this file win over the guide's generic examples (Python 3.14, async SQLAlchemy, existing ruff/mypy settings). Report a gap; do not change config to match the guide unasked.
 - Not the same thing as product review rules (`.review/rules.md`, `docs/specs/RULES_FORMAT_SPEC.md`).

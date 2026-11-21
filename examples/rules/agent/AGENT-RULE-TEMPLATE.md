@@ -1,6 +1,6 @@
 # Agent rule template
 
-Copy this block when adding an `AGENT-*` rule (or any rule written primarily for AI agents). File name: `<RULE-ID>-<short-slug>.md`. Filled examples are in [RULES_GUIDE.md § 17.2](../../../RULES_GUIDE.md#172-filled-examples).
+Copy this block when adding an `AGENT-*` rule (or any rule written primarily for AI agents). File name: `<RULE-ID>-<short-slug>.md`. Filled examples are in [RULES_GUIDE.md § 17.2](../../../docs/engineering-rules/RULES_GUIDE.md#172-filled-examples).
 
 For code rules (`PY-*`, `TS-*`, `GO-*`, `SEC-*`) use the template in [`../README.md`](../README.md#file-template).
 
@@ -36,5 +36,5 @@ How a reviewer or a tool decides "followed / not followed": the command to run, 
 - [ ] The rule describes one behavior; a reviewer can answer "followed / not followed" for a given task result.
 - [ ] Every MUST has at least one verification method.
 - [ ] Examples show observable actions or output, not intentions.
-- [ ] No facts are invented; unknowns are marked **TBD** and added to [RULES_GUIDE.md § 19.2](../../../RULES_GUIDE.md#192-open-questions-tbd).
-- [ ] The rule is added to the table in [RULES_GUIDE.md § 16.3](../../../RULES_GUIDE.md#163-mandatory-rules).
+- [ ] No facts are invented; unknowns are marked **TBD** and added to [RULES_GUIDE.md § 19.2](../../../docs/engineering-rules/RULES_GUIDE.md#192-open-questions-tbd).
+- [ ] The rule is added to the table in [RULES_GUIDE.md § 16.3](../../../docs/engineering-rules/RULES_GUIDE.md#163-mandatory-rules).

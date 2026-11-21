@@ -1,6 +1,6 @@
 # examples/rules
 
-Reference implementations of selected rules from [RULES_GUIDE.md](../../RULES_GUIDE.md). Each file is one atomic rule with a severity, a correct and an incorrect example, an enforcement method, and official references.
+Reference implementations of selected rules from [RULES_GUIDE.md](../../docs/engineering-rules/RULES_GUIDE.md). Each file is one atomic rule with a severity, a correct and an incorrect example, an enforcement method, and official references.
 
 These files are meant to be:
 
@@ -123,11 +123,11 @@ Authoring checklist:
 | [SEC-LOG-001](security-baseline/SEC-LOG-001-sensitive-data.md) | No sensitive data in logs | MUST | security | Log-capture tests, `SecretStr`/`LogValuer`, CodeQL |
 | [SEC-DEP-001](security-baseline/SEC-DEP-001-dependency-scanning.md) | Pin and scan dependencies | MUST | security | `pip-audit`, `npm audit`, `govulncheck`, dependency-review-action |
 
-The full catalogue (32 rules, including those without a separate example file) is in [RULES_GUIDE.md § 13 Rule catalogue](../../RULES_GUIDE.md#13-rule-catalogue).
+The full catalogue (32 rules, including those without a separate example file) is in [RULES_GUIDE.md § 13 Rule catalogue](../../docs/engineering-rules/RULES_GUIDE.md#13-rule-catalogue).
 
 ## Using these files with an AI agent
 
 1. Include the relevant stack directory plus `security-baseline/` in the agent's context (e.g. via a project instruction file).
 2. Instruct the agent: *"Follow every MUST rule. If a change cannot satisfy a MUST rule, stop and report the rule ID instead of working around it."*
 3. Ask the agent to cite rule IDs in its PR description for any rule it relied on or requests an exception for.
-4. Load [RULES_GUIDE.md § 16–18](../../RULES_GUIDE.md#16-ai-agent-operating-guide) as well: they define the agent's mandatory and forbidden actions, conflict priority, acceptance criteria and degraded-mode behavior. Agent rules use the template in [`agent/AGENT-RULE-TEMPLATE.md`](agent/AGENT-RULE-TEMPLATE.md).
+4. Load [RULES_GUIDE.md § 16–18](../../docs/engineering-rules/RULES_GUIDE.md#16-ai-agent-operating-guide) as well: they define the agent's mandatory and forbidden actions, conflict priority, acceptance criteria and degraded-mode behavior. Agent rules use the template in [`agent/AGENT-RULE-TEMPLATE.md`](agent/AGENT-RULE-TEMPLATE.md).

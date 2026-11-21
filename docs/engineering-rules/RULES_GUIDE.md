@@ -1,6 +1,8 @@
 # Engineering Rules Guide
 
-Version: 1.0.0 · Status: Active · Owners: Engineering + Security
+Version: 2.0.0 · Status: Active · Owners: Engineering + Security
+
+**Changes in 2.0.0** (MAJOR: new MUST rules, §12.5): added §16 AI agent operating guide (`AGENT-*` rules, forbidden actions, conflict priority, acceptance criteria), §17 Rule templates, §18 Graceful degradation, §19 Decisions and open questions; added the `AGENT` prefix and `process` category to §4.
 
 This guide defines verifiable engineering rules for four areas: **Python / FastAPI**, **TypeScript / React**, **Go** and a cross-cutting **Security Baseline**. Detailed, copy-ready versions of selected rules live in [`examples/rules/`](examples/rules/README.md).
 
@@ -21,6 +23,10 @@ This guide defines verifiable engineering rules for four areas: **Python / FastA
 13. [Rule catalogue](#13-rule-catalogue)
 14. [Top 10 rules for the first rollout](#14-top-10-rules-for-the-first-rollout)
 15. [CI recommendations](#15-ci-recommendations)
+16. [AI agent operating guide](#16-ai-agent-operating-guide)
+17. [Rule templates](#17-rule-templates)
+18. [Graceful degradation](#18-graceful-degradation)
+19. [Decisions and open questions](#19-decisions-and-open-questions)
 
 ---
 
@@ -52,7 +58,7 @@ This guide defines verifiable engineering rules for four areas: **Python / FastA
 3. **New code vs. legacy code.** All rules apply to new and modified code. Existing code is brought into compliance when touched ("leave it better") or through a tracked remediation plan; CI MAY run new checks only on changed files during migration.
 4. **Code review.** Reviewers cite rule IDs in comments (e.g. `GO-ERR-001: error from Close() is ignored`). An unresolved MUST violation blocks merge.
 5. **CI.** Automated checks are the primary enforcement. If a rule is enforced by CI, reviewers do not need to re-check it manually.
-6. **AI agents.** Agents MUST treat MUST rules as hard constraints. If a task cannot be completed without violating a MUST rule, the agent MUST stop and report the rule ID rather than work around it. Agents SHOULD cite the rule IDs they applied in PR descriptions.
+6. **AI agents.** Agents MUST treat MUST rules as hard constraints. If a task cannot be completed without violating a MUST rule, the agent MUST stop and report the rule ID rather than work around it. Agents SHOULD cite the rule IDs they applied in PR descriptions. The full agent contract (mandatory and forbidden actions, conflict priority, acceptance criteria and degraded-mode behavior) is in [§16](#16-ai-agent-operating-guide)–[§18](#18-graceful-degradation).
 
 ---
 
@@ -78,7 +84,7 @@ Each rule in this guide uses the same fields:
 |---|---|
 | **ID** | `<STACK>-<AREA>-<NNN>`; permanent, never reused (e.g. `PY-SEC-002`) |
 | **Title** | Imperative summary |
-| **Severity / Category** | MUST·SHOULD·MAY / correctness·security·performance·maintainability |
+| **Severity / Category** | MUST·SHOULD·MAY / correctness·security·performance·maintainability (·process — `AGENT-*` rules only, §16) |
 | **Context** | Where and when the rule applies |
 | **Rule** | The requirement, using MUST / SHOULD / MAY |
 | **Why** | Risk prevented or benefit gained |
@@ -87,8 +93,8 @@ Each rule in this guide uses the same fields:
 | **Verification** | Linter rule, test, CI job or review step |
 | **References** | Official documentation, OWASP, CWE |
 
-Prefixes: `PY` Python/FastAPI · `TS` TypeScript/React · `GO` Go · `SEC` Security Baseline.
-Areas: `API`, `CODE`, `ERR`, `SEC`, `REACT`, `STATE`, `FMT`, `CTX`, `CONC`, `TEST`, `INPUT`, `AUTHZ`, `SECRET`, `LOG`, `DEP`, `CRYPTO`, `TRANSPORT`.
+Prefixes: `PY` Python/FastAPI · `TS` TypeScript/React · `GO` Go · `SEC` Security Baseline · `AGENT` AI agent behavior (§16–§18).
+Areas: `API`, `CODE`, `ERR`, `SEC`, `REACT`, `STATE`, `FMT`, `CTX`, `CONC`, `TEST`, `INPUT`, `AUTHZ`, `SECRET`, `LOG`, `DEP`, `CRYPTO`, `TRANSPORT`; agent areas: `SCOPE`, `RULE`, `VERIFY`, `REPORT`, `EXC`, `CHANGE`, `FACT`, `DEGRADE`.
 
 Rules marked **📄 Detailed example** have a full file in `examples/rules/`.
 
@@ -1011,6 +1017,8 @@ Rule IDs per cell:
 | performance | — | PY-API-004 |
 | maintainability | GO-FMT-001 | PY-API-002, PY-CODE-001, TS-REACT-001 |
 
+The matrix and the §13 catalogue cover code rules only; `AGENT-*` process rules are listed in §16.3.
+
 No standalone MAY rules exist: MAY is used inside rules to explicitly allow alternatives (e.g. `@ts-expect-error` with a description in TS-CODE-001, framework loaders in TS-STATE-001, `panic` for impossible states in GO-ERR-001).
 
 ---
@@ -1422,6 +1430,335 @@ Additional recommendations:
 - **Container images.** Scan built images (e.g. Trivy) and lint Dockerfiles (Hadolint) where containers are produced.
 - **Workflow security.** Run `zizmor` on `.github/workflows/` to catch excessive permissions and injection in workflow expressions (SEC-AUTHZ-001).
 - **Tool versions.** Pin linter and scanner versions (requirements-dev lockfile, `package-lock.json`, explicit golangci-lint version) so CI results are reproducible; update them through Dependabot/Renovate PRs.
+
+---
+
+## 16. AI agent operating guide
+
+This section turns §2.6 into a complete contract for AI coding agents. It adds no new code rules: every code requirement still comes from §6–§9. The `AGENT-*` rules below govern *how* an agent applies those rules, verifies them and reports on them.
+
+### 16.1 Purpose
+
+- Give an AI agent one unambiguous definition of what it MUST do, what it MUST NOT do, and when it MUST stop, while changing code in a repository governed by this guide.
+- Make agent output reviewable: a human can check every claim the agent makes about rule compliance against evidence (command output, test results, rule IDs).
+- Define predictable behavior when tools, CI or reference sources are unavailable (§18), so that a missing check is never silently reported as a passing check.
+
+### 16.2 Audience
+
+| Reader | Uses this section to |
+|---|---|
+| **AI coding agents** (primary) | Load it as context before starting a task; treat `AGENT-*` MUST rules as hard constraints. |
+| **Engineers who assign tasks to agents** | Know what the agent will do on its own, when it will stop, and what it will ask. |
+| **Code reviewers** | Check agent PRs against the acceptance criteria (§16.6) and the degradation notice (§18.4). |
+| **Maintainers of this guide** | Change agent behavior through the process in §12.5. |
+
+Agents have full permissions (shell, network, package installation, git push, PR creation) but MUST ask before using them to change anything (AGENT-CHANGE-002). Agents work as a **multi-agent system** (§19, D-10): several agents may share one task and pass work to each other. Agent failure modes (looping, hallucination, context loss, timeouts) are handled in §18. Every agent talks to the task owner directly (§19, D-11).
+
+The system has four agent roles (§19, D-13). All `AGENT-*` rules apply to every role.
+
+| Role | Responsibility |
+|---|---|
+| **Orchestrator** | Receives the task and distributes work between the other agents. |
+| **Planner** | Breaks the task into steps. |
+| **Executor** (worker / RAG) | Carries out the steps; uses retrieval (RAG) to find information. |
+| **Reviewer** | Reviews the executor's results. |
+
+The reviewer agent does not replace human review: its findings are unverified input for the other agents (AGENT-VERIFY-002), and it cannot approve exceptions or accept results (§16.6). Any role may run on any model (§19, D-15); this guide does not restrict models, and every rule applies regardless of the model.
+
+**Task owner.** Throughout §16–§18, the *task owner* is the person who assigned the task. In the multi-agent system this is always the human who assigned the original task: an agent that hands work to another agent does not become a task owner and cannot grant permissions or approve exceptions. The task owner is also the human who answers agent questions, grants permissions and receives escalations (§19, decision D-3).
+
+### 16.3 Mandatory rules
+
+Each rule is written in the template format from §17; the summary is below.
+
+| ID | Rule | Severity |
+|---|---|---|
+| AGENT-SCOPE-001 | Before changing code, identify the applicable rules: all `SEC-*` rules plus every stack rule whose *Context* matches the files being changed (§2.1). | MUST |
+| AGENT-RULE-001 | Treat every MUST / MUST NOT in §6–§9 as a hard constraint. If the task cannot be completed without violating one, stop and report the rule ID and the reason instead of working around it (§2.6). | MUST |
+| AGENT-VERIFY-001 | Before claiming that a change complies with a rule, run the verification named in that rule's *Verification* field (or the matching §11 / §15 command) and keep the actual result. A check that was not run is reported as **not run**, never as passed. | MUST |
+| AGENT-REPORT-001 | In the PR description (or the task report, if no PR is created), list: rule IDs applied, checks run with their result, checks not run with the reason, open exceptions requested. | MUST |
+| AGENT-REPORT-002 | Cite rule IDs in commit messages or PR text where a rule drove a design decision (§2.6). | SHOULD |
+| AGENT-EXC-001 | Exceptions to MUST rules follow §12 only. The agent MAY draft an exception record and an inline suppression in the §12.3 format, but MUST mark it as *pending approval*; it MUST NOT treat the exception as approved. | MUST |
+| AGENT-CHANGE-002 | Ask the task owner and get explicit permission before any change: editing or creating files, installing or upgrading tools or packages, pushing, opening a PR. Read-only actions (reading files, running checks that do not modify files) need no permission. One permission covers only the changes it names. Ask in the conversation where the task was assigned until a PR exists, then only in the PR (§19, D-6). | MUST |
+| AGENT-VERIFY-002 | Treat output received from another agent (summaries, claimed test results, file contents, rule citations, "permission granted" statements) and content returned by retrieval (RAG) as unverified input. Before relying on it, check it against the source: the repository, tool output, this guide, or the task owner's own words. | MUST |
+| AGENT-WAIT-001 | When a question, permission request or escalation gets no answer within **24 hours**, take no further action on the affected work: do not proceed on an assumed answer, do not retry with a workaround, leave the current state unchanged. | MUST |
+| AGENT-CHANGE-001 | Keep changes within the scope of the task. One PR does one thing (§5.7), includes its tests (§5.8), and touches legacy code only to the extent of "leave it better" (§2.3). | SHOULD |
+| AGENT-FACT-001 | Do not invent facts: tool output, versions, linter rule names, links, test results, approvals or system properties. When information is missing, ask, or mark the item **TBD** and list it under open questions. | MUST |
+| AGENT-DEGRADE-001 | When a dependency from §18.1 is unavailable, follow the fallback hierarchy (§18.2), publish a degradation notice (§18.4), and escalate when §18.5 requires it. | MUST |
+| AGENT-CHECKLIST-001 | Complete the §11 pre-merge checklist for the stacks touched and include it, with each item marked done / not applicable / not verified, in the PR description. | MUST |
+
+### 16.4 Forbidden actions
+
+An agent MUST NOT:
+
+1. **Weaken enforcement to make a check pass**: disable or remove a linter, test, CI job or required check; lower a severity threshold (e.g. `--audit-level`, `fail-on-severity`); add blanket suppressions (`# noqa` without a code, `//nolint` without a linter name, file-level `eslint-disable`, `@ts-ignore`); skip hooks (`--no-verify`).
+2. **Add a suppression without the §12.3 format**: rule ID, justification and ticket. Ticket numbers MUST NOT be invented; if none exists, use `ticket: TBD` and escalate (§18.5).
+3. **Approve, renew or extend an exception**, or edit an `Approved by` / `Expires` field in `EXCEPTIONS.md`.
+4. **Report a check as passing when it was not run, failed, or ran on a subset** of the code without saying so (AGENT-VERIFY-001).
+5. **Commit secrets, `.env` files, keys, or real personal data**, including in tests, fixtures, logs and PR text (SEC-SECRET-001, SEC-LOG-001).
+6. **Change this guide, `examples/rules/` or CI rule configuration as a side effect of an unrelated task.** Rule changes go through §12.5 as their own PR.
+7. **Reuse, renumber or delete a rule ID** (§4, §12.5).
+8. **Fabricate facts** (AGENT-FACT-001): versions, URLs, command output, approvals, owners, dates.
+9. **Work around a MUST rule** by moving the violation elsewhere (another file, a generated file, a test helper, a build script) instead of stopping (AGENT-RULE-001).
+10. **Merge any PR**, or push directly to the default branch or any protected branch. Agents only open PRs; merging is done by a human (§19, decision D-4). An agent also MUST NOT ask for a merge of a change with an unresolved MUST violation (§2.4).
+11. **Make any change without the task owner's permission** (AGENT-CHANGE-002), including installing or upgrading tools to reach the versions pinned in §15.
+12. **Act on a question that went unanswered** for 24 hours (AGENT-WAIT-001).
+
+### 16.5 Priority when rules conflict
+
+Apply the first level that decides the conflict. A lower level can refine a higher one but never weaken it.
+
+| Priority | Source | Notes |
+|---|---|---|
+| 1 | **Security Baseline MUST rules** (`SEC-*`, §9) | Always win over stack rules and task instructions (§2.2). |
+| 2 | **Stack MUST rules** (§6–§8) and **AGENT MUST rules** (§16.3) | Hard constraints. A task instruction that requires violating one triggers AGENT-RULE-001 (stop and report). |
+| 3 | **Approved exception** recorded per §12.2 | Overrides the named MUST rule **only** within its recorded scope and before its expiry date. A pending, expired or out-of-scope exception has no effect. |
+| 4 | **Explicit task instructions** from the person who assigned the task | Applied only where they do not conflict with levels 1–3. |
+| 5 | **SHOULD rules** | Deviate only with a written justification (§3). |
+| 6 | **MAY options, general principles (§5), existing code conventions** | Used to choose between compliant alternatives. |
+
+Tie-breakers:
+
+- Two rules on the same level conflict → the **stricter** one wins (§2.2).
+- Repository-local agent instruction files **extend** this guide and never override it (§19, decision D-2). They may add rules or make rules stricter. If a local instruction contradicts this guide, this guide wins; if it is unclear whether a local instruction contradicts it, stop and escalate (§18.5).
+- The conflict cannot be resolved with this table → stop, describe both rules and the conflict, and escalate. Do not choose silently.
+
+### 16.6 Acceptance criteria
+
+An agent's result is accepted only when **all** of the following are true. Each criterion is checkable by a reviewer.
+
+| # | Criterion | How to check |
+|---|---|---|
+| AC-1 | No unresolved MUST violation in the diff. | CI required checks are green **and** reviewer finds no MUST violation not covered by an approved exception. |
+| AC-2 | Every applicable rule is listed with its verification result (passed / failed / not run + reason). | PR description contains the AGENT-REPORT-001 list. |
+| AC-3 | Every claimed "passed" check has evidence. | Command and result (or a CI job link) are given; reviewer can re-run it. |
+| AC-4 | §11 checklist is complete for every stack touched. | PR description contains the checklist with no unmarked item. |
+| AC-5 | Every suppression follows §12.3 and has a matching pending or approved exception. | Search the diff for `noqa`, `nolint`, `eslint-disable`, `@ts-expect-error`, `type: ignore`. |
+| AC-6 | No forbidden action from §16.4 occurred. | Diff review: CI config, lint config, `EXCEPTIONS.md`, `RULES_GUIDE.md` unchanged unless that is the task. |
+| AC-7 | If any dependency was degraded, a degradation notice (§18.4) is present and every affected MUST rule is either verified by a fallback or listed as not verified. | PR description / task report. |
+| AC-8 | Every unknown is marked **TBD** or asked as a question; no fabricated facts. | Reviewer spot-checks versions, links and tool names against the sources cited. |
+| AC-9 | New behavior has tests; a bug fix has a regression test; a new security-relevant path has at least one negative test (§5.8). | Diff review; test run output. |
+| AC-10 | Every change was made with the task owner's permission, and the agent did not merge or push to a protected branch. | Permission requests and answers are in the task conversation (before the PR) or the PR; branch history. |
+
+A result that fails AC-1, AC-3, AC-6, AC-8 or AC-10 is rejected regardless of the others. Results that fail only other criteria MAY be returned to the agent for completion.
+
+---
+
+## 17. Rule templates
+
+### 17.1 Template
+
+Use this template for `AGENT-*` rules and for any rule written primarily for agent consumption. It complements the code-rule template in [`examples/rules/README.md`](examples/rules/README.md#file-template); a copy-ready file is [`examples/rules/agent/AGENT-RULE-TEMPLATE.md`](examples/rules/agent/AGENT-RULE-TEMPLATE.md).
+
+````markdown
+### <RULE-ID> · <Rule name in imperative form>
+**Severity:** MUST | SHOULD | MAY · **Category:** correctness | security | performance | maintainability | process
+
+- **Context:** When and where the rule applies (task type, files, stage of work). State what triggers it.
+- **Rule:** One checkable behavior, written with MUST / SHOULD / MAY.
+- **Correct behavior (example):** A short, concrete example of what the agent does.
+- **Incorrect behavior (example):** A short, concrete example of the violation.
+- **Verification:** How a reviewer or a tool decides "followed / not followed": the command, the artifact to inspect, or the review step.
+````
+
+Authoring rules for the template:
+
+- One rule = one checkable behavior. If the *Verification* field needs "and" between unrelated checks, split the rule.
+- Examples describe observable actions or output (commands, PR text, diff contents), not intentions.
+- Every MUST has at least one verification method (§3).
+
+### 17.2 Filled examples
+
+#### AGENT-RULE-001 · Stop and report instead of working around a MUST rule
+**Severity:** MUST · **Category:** process
+
+- **Context:** Any task where the requested change would violate a MUST / MUST NOT rule from §6–§9, and no approved exception (§12) covers it.
+- **Rule:** The agent MUST stop work on the conflicting part, report the rule ID, what in the task conflicts with it, and the compliant alternatives it sees. It MUST NOT implement a workaround that hides the violation.
+- **Correct behavior (example):** Task: "Return the full user record from `/users/{id}`." The agent reports: *"Blocked by PY-API-003: returning the ORM object would expose `hashed_password`. Options: (a) return `UserRead`; (b) define a new response model with the extra fields you need. Which one?"*
+- **Incorrect behavior (example):** The agent returns `db.get(User, id).__dict__` and removes the response-key test that would have caught it; or it serializes the object manually in a helper so the handler "looks" compliant.
+- **Verification:** Review: the PR or task report contains the rule ID and the blocked item; the diff contains no code matching the rule's *Incorrect* pattern; no tests or checks related to that rule were removed or weakened.
+
+#### AGENT-VERIFY-001 · Run the rule's verification before claiming compliance
+**Severity:** MUST · **Category:** process
+
+- **Context:** Any statement by the agent that code "complies with", "passes" or "satisfies" a rule or check.
+- **Rule:** The agent MUST run the verification named in the rule (or the §11 / §15 command for that stack) and report the real result. Checks that could not be run MUST be reported as *not run* with the reason.
+- **Correct behavior (example):** PR text: *"`ruff check .` — passed. `mypy .` — 2 errors fixed, now passed. `pip-audit -r requirements.txt` — not run: no network access to the vulnerability database (see degradation notice)."*
+- **Incorrect behavior (example):** PR text: *"All checks pass"* when `pip-audit` was never executed, or when `pytest` was run only on one test file without saying so.
+- **Verification:** Reviewer compares the reported results with CI job results for the same commit; any check reported as passed must exist in CI output or be reproducible with the stated command.
+
+#### AGENT-EXC-001 · Draft exceptions, never approve them
+**Severity:** MUST · **Category:** process
+
+- **Context:** The agent concludes that a MUST rule cannot be satisfied for a narrow, justified reason (for example, a linter false positive).
+- **Rule:** The agent MAY draft an `EXCEPTIONS.md` entry and a §12.3 inline suppression, MUST mark the entry *pending approval*, and MUST leave `Approved by` empty. Missing data (ticket, owner, expiry) is written as **TBD**, not invented.
+- **Correct behavior (example):** Adds `//nolint:gosec // G202, GO-SEC-001: column from sortColumns allowlist; ticket TBD` and an `EXCEPTIONS.md` row with `Approved by: pending`, then lists the request under "Open exceptions" in the PR.
+- **Incorrect behavior (example):** Adds `//nolint` with no linter name; or writes `Approved by: security-team` and `Ticket: SEC-999` without such an approval or ticket existing.
+- **Verification:** Diff review of `EXCEPTIONS.md` and suppressions (AC-5); `nolintlint` (`require-explanation`, `require-specific`) and `ban-ts-comment` in CI (§12.3).
+
+#### AGENT-FACT-001 · Mark unknowns as TBD instead of inventing them
+**Severity:** MUST · **Category:** process
+
+- **Context:** Writing code, configuration, documentation, PR text or exception records that need facts the agent cannot verify from the repository, tool output or cited official sources.
+- **Rule:** The agent MUST NOT fabricate the fact. It MUST either ask the task owner or mark the item **TBD** and add it to the open-questions list of its report.
+- **Correct behavior (example):** *"Rollback procedure for the payment service: TBD — not documented in the repository; who owns it?"*
+- **Incorrect behavior (example):** Writing *"The payment service has a 99.9 % SLA and is owned by the Billing team"* with no source.
+- **Verification:** Reviewer spot-checks factual statements in the diff and PR text against the repository and cited links; unsupported statements fail AC-8.
+
+---
+
+## 18. Graceful degradation
+
+This section defines what an agent does when something it depends on is unavailable. The governing principle follows §5.2 and §5.5: **fail closed for MUST rules, fail visibly for everything else.** A degraded run may produce a *partial* result, but it never produces an *unverified result presented as verified*.
+
+### 18.1 Dependencies and failure modes
+
+Only dependencies that this guide names or that were confirmed in §19 are listed.
+
+| # | Dependency | Used for | Possible failures |
+|---|---|---|---|
+| D1 | **This guide and `examples/rules/`** | Source of every rule ID, severity and verification method. | File missing or not loaded into the agent's context; context truncated so some sections are absent; outdated copy (version mismatch with the repository). |
+| D2 | **Local toolchains**: Python (Ruff, mypy, pytest, pip-audit), Node (tsc, ESLint, test runner, npm audit), Go (gofmt, go vet, golangci-lint, `go test -race`, govulncheck) | Running the *Verification* step of each rule locally (§11, §15). | Tool not installed; wrong version (e.g. typescript-eslint / TypeScript / ESLint compatibility, §15.2); config file missing; tool crashes or times out. |
+| D3 | **CI pipeline** (GitHub Actions jobs and required status checks, §15; configured in governed repositories, §19 D-8) | Authoritative enforcement before merge. | Job queued or not triggered; runner outage; flaky test; job fails for reasons unrelated to the change. |
+| D4 | **Security scanners**: Gitleaks, CodeQL, Semgrep, dependency-review-action (§15.4) | SEC-* verification. | Not enabled; licence missing (Gitleaks for organization repositories, §15.4); analysis timeout; scanner unavailable. |
+| D5 | **Vulnerability databases and package registries** used by pip-audit, npm audit, govulncheck, Dependabot/Renovate | SEC-DEP-001; installing pinned dependencies. | No network access; registry or advisory source unavailable or rate-limited; lockfile cannot be resolved. |
+| D6 | **Official reference documentation** linked in *References* | Confirming APIs, linter rule names and flags (authoring checklist in `examples/rules/README.md`). | No network access; page moved or changed. |
+| D7 | **Exception register**: `EXCEPTIONS.md` at the repository root (§12.2, §19 D-9) | Deciding whether an exception applies (priority level 3, §16.5). | File absent or unreadable; record incomplete or expired. |
+| D8 | **Task owner** — the person who assigned the task (§16.2, §19 D-3) | Granting permissions, answering questions, approving exceptions, resolving conflicts, accepting results. | No answer within 24 hours (AGENT-WAIT-001). |
+| D9 | **Version control and code host** (git, GitHub: PRs, push protection, branch protection) | Delivering the change and running D3/D4. | Push rejected (e.g. by push protection); no permission to open a PR; host unavailable. |
+| D10 | **The multi-agent system itself**: orchestrator, planner, executor, reviewer and the handoffs between them (§19, D-10, D-13) | Doing the work; passing tasks, context and results between agents. | **Looping**, **hallucination**, **context loss**, **timeouts** (§18.1.1). |
+| D11 | **Retrieval (RAG)** used by the executor | Finding information for the task. | Retrieval unavailable or times out; returns nothing; returns irrelevant or outdated content, which can lead to F2 (hallucination). The index may contain repository code and external resources such as documentation (§19, D-17); indexed copies can lag behind the current repository or the live documentation. |
+
+#### 18.1.1 Agent failure modes (D10)
+
+| Failure | What it looks like (observable signals) | How it is detected |
+|---|---|---|
+| **F1 Looping** | The same action, edit, command or question is repeated without new information; a check fails the same way after each "fix"; agents hand the same task back and forth; an edit is made and then reverted. | The agent compares each planned action with its own history and with the history of the handoff chain. The **10th** repetition of the same action without progress is a loop (§19, D-12). Repetitions are counted across the whole handoff chain, not per agent. |
+| **F2 Hallucination** | A claim that has no source: a file, function, API, CLI flag, linter rule or rule ID that does not exist; a test result or command output that was never produced; a permission or approval that was never given. In a multi-agent system, a claim invented by one agent can be passed on by others as fact. | Verification against the source (AGENT-VERIFY-001, AGENT-VERIFY-002, AGENT-FACT-001): the file is opened, the command is run, the rule is looked up in this guide, the permission is found in the task conversation or PR. |
+| **F3 Context loss** | Task instructions, constraints, applicable rules, given permissions, or earlier answers are missing — after context truncation, or after a handoff that passed only a partial summary. The agent repeats a question already answered, violates a constraint it was given, or cannot state which rules apply. | The agent checks, before each change, that it can state: the task, the task owner's constraints, the applicable rule IDs, and the permission covering the change. If it cannot, context is lost. |
+| **F4 Timeout** | An agent, a tool call, or a handoff does not complete or answer in the allowed time. No result within the time limit (§19, D-14, D-16): **10 minutes** for long-running checks from §11 / §15 (test suites, `go test -race`, CodeQL and other scanners, CI jobs); **30 seconds** for everything else: agents, other tool calls and handoffs. |
+
+### 18.2 Fallback hierarchy
+
+For every rule whose verification is affected, the agent walks down this hierarchy and stops at the first level it can complete. The level reached is recorded in the degradation notice.
+
+| Level | Name | What the agent does | Can a MUST rule be reported as verified? |
+|---|---|---|---|
+| **L0** | Normal | All dependencies available; CI and local checks run. | Yes. |
+| **L1** | Local equivalent | CI (D3/D4) unavailable → run the same command locally with the pinned versions from §15. | Yes, as *"verified locally, CI pending"*. CI MUST still pass before merge. |
+| **L2** | Partial automated | Full check impossible → run a narrower automated check: changed files only (§15 "Changed-files mode"), a subset of linters, or a different tool that implements the same rule (e.g. Ruff `S608` when CodeQL is unavailable for PY-SEC-002). | Only for the part covered, stated explicitly (scope and tool). |
+| **L3** | Manual review | No automated check possible → perform the manual review step named in the rule's *Verification* field and record what was inspected. | No. Reported as *"manually reviewed, not verified by tool"*; a human reviewer must confirm. |
+| **L4** | Stop and escalate | The rule cannot be checked at all, or the rule text itself is unavailable (D1). | No. Work on the affected part stops; escalate per §18.5. |
+
+Dependency-specific fallbacks:
+
+| Dependency | Fallback path |
+|---|---|
+| D1 Guide not loaded / truncated | Re-load the guide or the specific rule file from `examples/rules/`. If still unavailable → **L4**: do not work from memory of rule text. |
+| D2 Local tool missing / wrong version | Ask the task owner for permission to install the pinned version (AGENT-CHANGE-002). While waiting, or if refused → L2 (other tool for the same rule) → L3 → L4 for MUST rules. |
+| D3 CI unavailable | L1. Mark the PR as not ready for merge until CI passes. |
+| D4 Scanner unavailable | L1 (run locally if possible) → L2 (equivalent linter rules, e.g. Ruff `S105`–`S107` / gosec `G101` for secrets) → L3. SEC-* MUST rules never go below L3 without escalation. |
+| D5 Vulnerability DB / registry unavailable | Do not add or upgrade dependencies. Changes that do not touch dependencies MAY continue; SEC-DEP-001 is reported as *not run*. Changes that add or upgrade dependencies → L4. |
+| D6 Reference docs unavailable | Use only rule names and flags already present in this guide. Any new linter rule, flag or API that cannot be confirmed is marked **TBD** (AGENT-FACT-001). |
+| D7 Exception register unavailable | Treat every exception as **not approved** (§16.5 level 3 has no effect). |
+| D8 Task owner does not answer | Leave the change as it is with the question stated in the task conversation (before the PR) or the PR. After 24 hours without an answer, take no further action (AGENT-WAIT-001). |
+| D9 Code host unavailable / push rejected | Keep the work locally, report the error message verbatim. If push protection blocked a secret → treat as a SEC-SECRET-001 incident (§18.5). |
+| D10 F1 Looping | On the 10th repetition (D-12), stop the repeated action immediately. Do not try the same action again with cosmetic changes. Report the loop (what repeated, how many times, last error verbatim) → L4 for the affected work; escalate (E10). |
+| D10 F2 Hallucination | Discard the unsupported claim and re-derive it from the source. If the claim already reached a file, commit or PR, correct it (with permission, AGENT-CHANGE-002) and state the correction in the PR. If the source cannot confirm or refute it → mark **TBD** (AGENT-FACT-001); if the claim was a permission, approval or test result → treat it as **not given / not run**; escalate (E11) when the claim affected a MUST rule. |
+| D10 F3 Context loss | Re-load from durable sources: this guide and `examples/rules/`, the task conversation, the PR, `EXCEPTIONS.md`, the repository. A permission that cannot be found in the task conversation or the PR is treated as **not granted** and asked again. If the task itself cannot be reconstructed → stop and escalate (E12). Do not continue from memory or from another agent's summary alone (AGENT-VERIFY-002). |
+| D11 Retrieval fails, returns nothing relevant, or returns content that may be outdated | Read the source directly: for repository code, the current files in the working tree; for external documentation, the official page (D6); otherwise this guide, the task conversation or the PR. When retrieved content and the current source disagree, the current source wins. Retrieved content is never the only evidence for a MUST rule (AGENT-VERIFY-002). If the source cannot be read either → mark **TBD** (AGENT-FACT-001); escalate (E8) if that leaves the result unsafe or misleading. A retrieval timeout follows F4. |
+| D10 F4 Timeout | Treat the step as **not completed**; never assume its result. Before retrying a step that changes files or remote state, check what was actually applied (it may have completed partially). Retry at most once (as in E9). If it times out again → report verbatim and escalate (E13). Work that depends on the step stops; independent work may continue. |
+
+### 18.3 What must never degrade
+
+Regardless of fallback level, the agent:
+
+- never commits a secret, even if secret scanning is unavailable (SEC-SECRET-001);
+- never disables TLS verification, weakens authentication/authorization, or builds SQL from strings to "unblock" work (§9);
+- never reports L2–L4 results as L0/L1;
+- never treats an unavailable exception register as permission.
+
+### 18.4 Reporting degradation to the user
+
+Before a PR exists, degradation is reported in the conversation where the task was assigned; once the PR is open, notices are delivered **only in the PR** (§19, D-6), with no other channels. A notice given before the PR is repeated in the PR description when the PR is opened. Whenever the run reached L1 or below for any rule, the agent adds a **degradation notice** at the top of the PR description, before any summary of success:
+
+```markdown
+> **⚠ Degraded verification**
+>
+> | Dependency | Failure (verbatim error or symptom) | Fallback level | Rules affected | Status |
+> |---|---|---|---|---|
+> | D4 CodeQL | `<error message>` | L2 — Ruff S608 on changed files | PY-SEC-002 | Partially verified |
+> | D5 pip-audit | `<error message>` | L4 | SEC-DEP-001 | **Not verified** |
+>
+> **Not ready for merge until:** <list of checks that must still run / approvals needed>
+> **Questions for a human:** <list, or "none">
+```
+
+Reporting rules:
+
+- The notice comes **first**; a summary that says "done" or "all checks pass" MUST NOT appear above it.
+- Error messages are quoted verbatim, not paraphrased (AGENT-FACT-001).
+- Each affected rule is listed by ID with exactly one status: *Verified (L1)*, *Partially verified (L2, scope: …)*, *Manually reviewed (L3)*, *Not verified (L4)*.
+- If any MUST rule is *Not verified* or only *Manually reviewed*, the notice states that the change is **not ready for merge**.
+
+### 18.5 When a human must be involved (escalation)
+
+The agent that detects the trigger stops the affected work and escalates **directly** to the **task owner** (§16.2, §19 D-11) when any of the following is true; it does not route the escalation through another agent. The task owner acts in every role named in §12 (code owner, security reviewer, stack maintainer) for the agent's task (§19, D-3).
+
+| # | Trigger |
+|---|---|
+| E1 | A task requires violating a MUST rule and no approved exception exists (AGENT-RULE-001). |
+| E2 | A `SEC-*` MUST rule cannot be verified above L3, or reaches L4. |
+| E3 | An exception is needed (any MUST rule). Drafting is allowed, approval is not (AGENT-EXC-001). |
+| E4 | A suspected or detected secret in the diff, history or logs, or a push rejected by push protection. Leaked secrets are revoked and rotated first (SEC-SECRET-001). |
+| E5 | A rule conflict cannot be resolved with §16.5, including unclear conflicts with a repository-local instruction file. |
+| E6 | The rule source (D1) is unavailable or appears inconsistent (e.g. catalogue §13 and rule text disagree). |
+| E7 | A change adds or upgrades dependencies while vulnerability scanning (D5) is unavailable. |
+| E8 | Information needed to proceed is missing and cannot be marked TBD without making the result unsafe or misleading. |
+| E9 | CI fails for reasons the agent cannot attribute to its change after one retry (possible flaky test or infrastructure issue). |
+| E10 | A loop is detected (F1) and the agent cannot make progress without a different decision. |
+| E11 | A hallucinated claim (F2) affected a MUST rule, a permission, an approval, or a reported check result. |
+| E12 | Context was lost (F3) and the task, its constraints or its permissions cannot be reconstructed from durable sources. |
+| E13 | A step timed out (F4) twice. |
+
+Escalation procedure:
+
+1. **Channel:** the conversation where the task was assigned while no PR exists; the PR only once it is open (§19, D-6).
+2. **Content:** trigger ID (E1–E13), rule IDs involved, what was attempted, verbatim errors, the options the agent sees, and the specific decision requested.
+3. **While waiting:** no further changes to the affected work. Unaffected parts of the task may continue, with permission (AGENT-CHANGE-002).
+4. **No answer within 24 hours:** take no further action (AGENT-WAIT-001). The PR stays open and unmerged with the escalation visible; the agent does not retry, re-escalate, work around the issue, or close the PR.
+
+---
+
+## 19. Decisions and open questions
+
+### 19.1 Decisions
+
+These decisions answer the original open questions and are applied in §16–§18.
+
+| # | Decision | Applied in |
+|---|---|---|
+| D-1 | Agents have full permissions (shell, network, package installation, git push, PR creation) but MUST ask before making any change. | §16.2, AGENT-CHANGE-002 |
+| D-2 | Repository-local agent instruction files extend this guide; they never override it. | §16.5 |
+| D-3 | The person who assigns the task (task owner) is the agent's only human contact: answers questions, grants permissions, approves exceptions, receives escalations. | §16.2, §18.1 D8, §18.5 |
+| D-4 | Agents only open PRs; they never merge. | §16.4 item 10, AC-10 |
+| D-5 | Agents install or upgrade tools only with permission. | §16.4 item 11, §18.2 D2 |
+| D-6 | Before a PR exists, the agent asks for permission, reports degradation and escalates in the conversation where the task was assigned. Once the PR is open, all of this happens only in the PR. | AGENT-CHANGE-002, §18.4, §18.5 |
+| D-7 | Unanswered questions: wait 24 hours; if no answer, take no further action. | AGENT-WAIT-001, §18.5 |
+| D-8 | CI (§15) is configured in governed repositories. | §18.1 D3 |
+| D-9 | The exception register is `EXCEPTIONS.md` at the repository root. | §18.1 D7 |
+| D-10 | Agents run as a multi-agent system. Agent failure modes in scope: looping, hallucination, context loss, timeouts. | §16.2, §18.1 D10, §18.1.1, AGENT-VERIFY-002, E10–E13 |
+| D-11 | Every agent in the system talks to the task owner directly: asks questions, requests permissions, reports degradation and escalates. | §16.2, §18.5 |
+| D-12 | A loop (F1) is 10 repetitions of the same action without progress. | §18.1.1, §18.2 |
+| D-13 | Agent roles: orchestrator, planner, executor (worker / RAG), reviewer. | §16.2, §18.1 D10–D11 |
+| D-14 | Timeout (F4): 30 seconds for agents, tool calls and handoffs (except D-16). | §18.1.1, §18.2 |
+| D-15 | Any role may run on any model; models are not restricted. | §16.2 |
+| D-16 | Timeout (F4) for long-running checks from §11 / §15 (test suites, `go test -race`, CodeQL and other scanners, CI jobs): 10 minutes. | §18.1.1, AGENT-VERIFY-001 |
+| D-17 | The executor's retrieval (RAG) index may contain repository code and external resources such as documentation. | §18.1 D11, §18.2 |
+
+### 19.2 Open questions (TBD)
+
+No open questions at the moment. New unknowns found while applying §16–§18 are added here as `Q<n>` (numbering continues from Q14) and marked **TBD** where they are used (AGENT-FACT-001).
 
 ---
 

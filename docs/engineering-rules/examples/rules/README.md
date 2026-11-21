@@ -34,6 +34,8 @@ examples/rules/
     SEC-SECRET-001-no-hardcoded-secrets.md
     SEC-LOG-001-sensitive-data.md
     SEC-DEP-001-dependency-scanning.md
+  agent/
+    AGENT-RULE-TEMPLATE.md
 ```
 
 ## Rule ID scheme
@@ -128,3 +130,4 @@ The full catalogue (32 rules, including those without a separate example file) i
 1. Include the relevant stack directory plus `security-baseline/` in the agent's context (e.g. via a project instruction file).
 2. Instruct the agent: *"Follow every MUST rule. If a change cannot satisfy a MUST rule, stop and report the rule ID instead of working around it."*
 3. Ask the agent to cite rule IDs in its PR description for any rule it relied on or requests an exception for.
+4. Load [RULES_GUIDE.md § 16–18](../../RULES_GUIDE.md#16-ai-agent-operating-guide) as well: they define the agent's mandatory and forbidden actions, conflict priority, acceptance criteria and degraded-mode behavior. Agent rules use the template in [`agent/AGENT-RULE-TEMPLATE.md`](agent/AGENT-RULE-TEMPLATE.md).
